@@ -4,7 +4,7 @@ One or two sentences on what should be true when this is done.
 
 ## Spec
 
-The section of the design spec this implements, and anything in it
+The section of `_docs/spec.md` this implements, and anything in it
 that this task deliberately does not cover yet.
 
 ## Acceptance criteria

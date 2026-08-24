@@ -24,7 +24,7 @@ The oracle
 
 Correctness in this project is decided by SQLite, not by opinion. Every
 supported query runs through historian and through SQLite over the same
-data, and the results must be identical. See §1 of the design spec.
+data, and the results must be identical. See §1 of `_docs/spec.md`.
 
 Two consequences for the process:
 

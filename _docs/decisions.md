@@ -1,6 +1,6 @@
 Decisions made while building. Newest last, one short entry each.
 
-If a decision contradicts the design spec, edit the spec in the same
+If a decision contradicts `_docs/spec.md`, edit the spec in the same
 commit that records the decision here.
 
 ---

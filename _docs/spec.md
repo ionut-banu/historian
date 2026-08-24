@@ -832,12 +832,22 @@ too timid.
 16. Query generator, AST-first and weighted toward `NULL` — §4
 17. Shrinker, and the regression test workflow — §4
 
-### M6 — Finish v1
+### M6 — Finish phase 1
 
 18. Output formats and error presentation — §5
 19. REPL — §5
 20. README, with the differential and fuzz counts — §1
 
-Phases 2 to 4 of §1 — `commits`, `commit_files`, `refs`, `tree`, then
-joins, then `diffs` — are planned after M6, once the engine has been
-proven by something harder than its author's expectations.
+### After M6
+
+These six milestones deliver **phase 1 of §1 only** — the `blame`
+table, single-table queries, and pushdown. They are not v1. Phases 2
+to 4 of §1's build order still remain: `commits`, `commit_files`,
+`refs` and `tree`, then `INNER JOIN` and the co-change query, then
+`diffs` with pickaxe pushdown. v1 is done when all four phases are,
+per §1.
+
+They get their own milestones, planned after M6 rather than now. The
+engine will have been contradicted by the fuzzer several times by
+then, and planning phase 2 today would mean planning it from
+expectations rather than from what the oracle has taught us.

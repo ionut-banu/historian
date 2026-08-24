@@ -309,23 +309,202 @@ the reason `diffs` is viable at all.
 
 ---
 
-## Open decisions
+## §3 Engine architecture
 
-Resolved before §3.
+Python 3.11+, `uv`, pytest.
 
-- **Implementation language.** Not chosen. Python is familiar and fast
-  to build in; a compiled language gives a single binary and makes the
-  pushdown benchmarks more convincing. Reuse from `rulesmith` is not a
-  factor — SQL's three-valued logic and coercion rules mean the
-  expression evaluator would be rewritten regardless.
+### The pipeline
+
+```
+SQL text
+  → lexer      tokens
+  → parser     AST
+  → binder     AST + resolved columns, errors for unknown names
+  → planner    operator tree
+  → optimizer  operator tree, with predicates pushed into scans
+  → execute    rows
+```
+
+Only scan operators touch git. Everything above them consumes rows and
+is testable against in-memory fixtures with no repository present.
+
+### Modules
+
+```
+src/historian/
+  values.py        SQL values, comparison, three-valued logic
+  sql/lexer.py     text -> tokens
+  sql/ast.py       AST node definitions
+  sql/parser.py    tokens -> AST
+  sql/binder.py    name resolution, unknown column/table errors
+  plan/nodes.py    operator tree definitions
+  plan/planner.py  AST -> operator tree
+  plan/optimizer.py  pushdown negotiation
+  exec/operators.py  the operators
+  exec/expression.py expression evaluation against a row
+  tables/          one scan per table: blame.py, commits.py, ...
+  cli.py
+```
+
+### Values and three-valued logic
+
+The foundation, and the largest single source of differential
+mismatches. It gets its own module and its own tests before anything
+depends on it.
+
+A value is `None`, `int`, `float`, or `str`, mirroring SQLite's storage
+classes. A predicate evaluates to `TRUE`, `FALSE`, or `NULL`.
+
+Rules, all taken from SQLite rather than invented:
+
+| case | result |
+|---|---|
+| `NULL = NULL`, `NULL < 1`, any comparison with `NULL` | `NULL` |
+| `NULL AND FALSE` | `FALSE` |
+| `NULL AND TRUE`, `NULL AND NULL` | `NULL` |
+| `NULL OR TRUE` | `TRUE` |
+| `NULL OR FALSE`, `NULL OR NULL` | `NULL` |
+| `NOT NULL` | `NULL` |
+| `x IS NULL`, `x IS y` | never `NULL`; always `TRUE` or `FALSE` |
+
+`WHERE` and `HAVING` keep a row only when the predicate is `TRUE`.
+`FALSE` and `NULL` are both rejected, and confusing the two is the
+classic bug.
+
+Ordering across types follows SQLite's storage-class order:
+`NULL` < numeric < `TEXT`. An integer is always less than any string,
+regardless of contents. Text compares bytewise.
+
+Aggregate edge cases, which differential tests will find immediately:
+
+| case | result |
+|---|---|
+| `count(*)` over zero rows | `0` |
+| `sum`, `avg`, `min`, `max` over zero rows | `NULL` |
+| `count(x)` | counts non-`NULL` values only |
+| `sum`/`avg`/`min`/`max` with some `NULL`s | `NULL`s ignored |
+| `GROUP BY` a column containing `NULL`s | all `NULL`s form one group |
+| `DISTINCT` over `NULL`s | `NULL`s are equal to each other |
+| `ORDER BY` ascending with `NULL`s | `NULL`s sort first |
+
+### AST
+
+Frozen dataclasses, one per node. Expressions and statements are
+separate hierarchies. The AST records source positions so errors can
+point at the offending text.
+
+### One plan representation, not two
+
+Textbooks separate a logical plan from a physical plan, because one
+logical operation can have several physical implementations. In v1
+every logical operation has exactly one, so the split would be pure
+ceremony: two parallel type hierarchies and a translation pass that
+never makes a decision.
+
+v1 therefore has a single operator tree, built by the planner and
+rewritten by the optimizer. The split gets introduced when there is a
+real choice to make - the first candidate is joins, once there is both
+a hash join and a nested-loop join and something has to pick.
+
+### Operators
+
+Volcano-style iteration. Each operator pulls rows from its children.
+
+```python
+class Operator:
+    schema: Schema                       # column names and types
+    def rows(self) -> Iterator[Row]: ...
+```
+
+A `Row` is a tuple of values. The schema lives on the operator, not in
+the row, so rows stay cheap and column references resolve to integer
+offsets at bind time rather than by name at runtime.
+
+Phase 1 operators: `Scan`, `Filter`, `Project`, `Aggregate`, `Sort`,
+`Limit`, `Distinct`. Phase 3 adds `HashJoin`.
+
+`Aggregate` handles both the grouped case and the whole-table case,
+which differ in one respect that matters: with no `GROUP BY` and no
+rows, the whole-table case still emits exactly one row.
+
+Generators are used inside `rows()`, but the operator is an object
+rather than a bare generator function, so the tree can be inspected,
+printed by `EXPLAIN`, and asserted on in tests.
+
+### Expression evaluation
+
+`exec/expression.py` walks an expression against a row and returns a
+value. It is a plain function over `(expr, row, schema)` with no git,
+no I/O, and no operator dependencies.
+
+Aggregate calls are not evaluated here. The planner splits each
+`SELECT` and `HAVING` expression into aggregate calls, computed by the
+`Aggregate` operator, and the surrounding scalar expression, computed
+here over the aggregate's output row.
+
+### Pushdown negotiation
+
+The optimizer's one job in v1.
+
+1. Split the `WHERE` predicate on `AND` into conjunctive terms. `OR`
+   is not split - a disjunction is one term, and pushes down only if a
+   scan accepts the whole thing.
+2. Offer each term to the scan beneath it. The scan returns the terms
+   it can use.
+3. Pass the accepted terms to the scan as scan arguments.
+4. Leave the `Filter` in place, unchanged, with every term still in it.
+
+Step 4 is deliberate and is the subject of a decision entry. A scan
+that claims a term is exactly satisfied lets the filter above it be
+deleted, and then every scan becomes a place where wrong rows reach
+the user. Keeping the filter costs one pass over an already-reduced
+row set, and confines any pushdown bug to performance rather than
+correctness.
+
+The consequence for tests: a pushdown cannot be verified by its
+results, because results are identical with pushdown disabled. It is
+verified by asserting on the work done - which paths were blamed, how
+many git invocations were made. Scans record this, and tests read it.
+
+`LIMIT` pushdown is the same negotiation applied to a different part
+of the query, and the reason the optimizer sees the whole tree rather
+than one node at a time: `git log` streams newest-first, so `LIMIT n`
+with no `ORDER BY`, or with `ORDER BY authored_at DESC`, can stop the
+walk instead of consuming all history.
+
+### Errors
+
+Three kinds, all of them the user's fault and none of them tracebacks:
+
+- **Parse errors** name the position and what was expected.
+- **Binding errors** name the unknown column or table, and list what
+  is available.
+- **Unsupported grammar** says the feature is not supported and points
+  at the non-goals in §1. A query using a window function gets told
+  window functions are out of scope, not a syntax error.
+
+Do not invent runtime type errors. SQLite is permissive - comparing a
+string to an integer is a valid comparison with a defined answer, not
+a failure. Every error historian raises that SQLite does not is a
+differential mismatch.
+
+### Determinism and row order
+
+SQLite does not guarantee row order without `ORDER BY`. historian does:
+the same repository and query always produce the same rows in the same
+order, because reproducibility matters more here than the freedom to
+reorder.
+
+This makes the two engines legitimately disagree on order for queries
+without `ORDER BY`, so the differential harness compares results as
+sorted multisets unless the query has an `ORDER BY`, in which case
+order is compared exactly.
+
+---
 
 ## Not yet designed
 
-- §3 Engine architecture — lexer, parser, AST, logical plan, physical
-  plan, operator interfaces
-- §4 The optimizer — pushdown negotiation, predicate splitting, join
-  ordering
-- §5 Test architecture — fixture repos, the SQLite oracle harness, the
+- §4 Test architecture — fixture repos, the SQLite oracle harness, the
   fuzzer's generation grammar
-- §6 CLI surface — output formats, REPL, error reporting
-- §7 Milestones and issue breakdown
+- §5 CLI surface — output formats, `EXPLAIN`, REPL, error reporting
+- §6 Milestones and issue breakdown

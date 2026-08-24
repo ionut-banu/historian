@@ -44,3 +44,33 @@ lifecycle instead: _docs/spec.md is living and always true,
 _docs/decisions.md is append-only and never edited. The original path
 also carried the name of the tooling used to write it, which is not
 something this repo should know about.
+
+2026-08-24 - Python, not Rust
+
+Rust was the better language on the merits - gitoxide, single binary,
+enums that fit AST work. It was rejected because the author has not
+written Rust, and the process depends on the author being able to judge
+what the subagents produce. A QA loop whose reviewer cannot read the
+code is theatre, and a project whose value is being able to explain it
+cannot be written in a language its author cannot read.
+
+Speed did not enter into it. The cost is dominated by git subprocesses,
+and pushdown is a ~300x win in any language.
+
+A Rust port is a good v2, once the differential suite exists to prove
+the port correct. Until then the operator layer stays explicit and free
+of Python dynamism so it can be translated rather than redesigned.
+
+2026-08-24 - One plan representation in v1, not logical plus physical
+
+Every logical operation in v1 has exactly one physical implementation,
+so the split would be two parallel hierarchies and a translation pass
+that never makes a choice. It gets introduced when joins offer a real
+choice between hash and nested-loop.
+
+2026-08-24 - historian guarantees row order, SQLite does not
+
+SQLite may return rows in any order without ORDER BY. historian fixes
+an order, because reproducible output is worth more here than the
+freedom to reorder. The differential harness therefore compares sorted
+multisets unless the query has an ORDER BY.

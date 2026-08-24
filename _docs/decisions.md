@@ -96,3 +96,16 @@ fuzzer is seeded and reproducible, the shrinker reduces a failure to
 the smallest query that still fails, and the result is committed as a
 permanent differential test. The fuzzer feeds the suite rather than
 sitting beside it.
+
+2026-08-24 - Output format does not depend on whether stdout is a tty
+
+Tools that print a table interactively and CSV when piped break scripts
+that were developed interactively, in a way that is hard to see. Format
+is whatever --format says, defaulting to table in both cases. Only
+colour and paging look at the terminal.
+
+2026-08-24 - --explain is a flag, not an EXPLAIN keyword
+
+EXPLAIN as SQL would add grammar that §1 does not declare, and the
+grammar is the thing scope discipline depends on. A flag costs nothing
+and keeps the parser exactly as specified.

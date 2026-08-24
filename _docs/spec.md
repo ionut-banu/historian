@@ -672,7 +672,172 @@ tests/
 
 ---
 
-## Not yet designed
+## §5 The command line
 
-- §5 CLI surface — output formats, `EXPLAIN`, REPL, error reporting
-- §6 Milestones and issue breakdown
+```
+historian [OPTIONS] [QUERY]
+
+  -C, --repo PATH     repository to query (default: current directory)
+  -f, --file PATH     read the query from a file
+      --format FMT    table | csv | tsv | json   (default: table)
+      --explain       print the plan, do not run it
+      --stats         print the work done, after the results
+      --no-pushdown   disable pushdown
+```
+
+With no query and a terminal attached, it starts a REPL.
+
+### Formats
+
+`table` is aligned and human-facing. `csv` is RFC 4180. `json` is an
+array of objects. `tsv` is for pasting elsewhere.
+
+**The format never depends on whether stdout is a terminal.** Tools
+that switch format when piped break scripts that were developed
+interactively. Only colour and paging depend on the terminal.
+
+`NULL` renders as the word `NULL` in `table`, dimmed when colour is
+available; as an empty field in `csv` and `tsv`; as `null` in `json`.
+The ambiguity between `NULL` and the four-character string `'NULL'` is
+accepted in `table` and resolved by `--format json` when it matters.
+
+Results go to stdout, everything else to stderr, so piping works.
+
+### `--explain`
+
+Prints the operator tree with what the optimizer decided:
+
+```
+Sort (count(*) DESC)
+  Aggregate (group=[author_name], aggs=[count(*)])
+    Filter (path LIKE 'src/auth/%')
+      BlameScan (pushed: path LIKE 'src/auth/%' -> 12 of 4013 paths)
+```
+
+It is a debugging tool, a test surface, and the clearest single
+demonstration of what the project does. The `Filter` still appearing
+above a scan that already pushed the same predicate is correct and
+expected - see §3.
+
+A flag rather than an `EXPLAIN` keyword, so the grammar stays exactly
+what §1 declares.
+
+### `--stats`
+
+```
+12 paths blamed, 4013 skipped
+13 git invocations
+0.31s
+```
+
+The same counters the pushdown tests assert on, printed. Whatever
+proves pushdown works in a test should be visible to a user.
+
+### Errors
+
+Never a traceback. Position, cause, and what would have been valid:
+
+```
+error: no such column: authr_name
+
+  SELECT authr_name FROM blame
+         ^
+
+  blame has: path, line_no, line, commit_hash, author_name,
+             author_email, authored_at
+```
+
+Unsupported grammar says so plainly rather than reporting a syntax
+error, and points at §1:
+
+```
+error: window functions are not supported
+  historian implements a subset of SQL. See the non-goals in
+  _docs/spec.md §1.
+```
+
+Exit codes: `0` success, `1` bad query, `2` bad usage, `3` the
+repository could not be read.
+
+### REPL
+
+Deliberately small. Multi-line input until a semicolon, history,
+`.tables`, `.schema <table>`, `.quit`. No completion, no paging, no
+configuration.
+
+---
+
+## §6 Milestones
+
+Six milestones. Each one ends with something that can be run and
+shown, because a milestone that cannot be demonstrated cannot be
+verified either.
+
+Issues are filed from this list and groomed by the PM before
+implementation, per `_docs/process.md`. Each names the section it
+implements.
+
+### M1 — Foundations
+
+No demo. The parts everything else sits on.
+
+1. Project skeleton with a passing test — `uv`, pytest, `src/historian/`
+2. SQL values, comparison, three-valued logic — §3
+3. Lexer — §3
+
+Issue 2 is the one to slow down on. Every rule in §3's tables gets a
+test, including the ones that look obvious. It is the single largest
+source of differential mismatches later.
+
+### M2 — The first query
+
+Ends with: `historian "SELECT path, author_name FROM blame WHERE path = 'src/a.py'"`
+
+4. AST and parser for `SELECT` / `FROM` / `WHERE` — §3
+5. Binder: name resolution, unknown column and table errors — §3
+6. Deterministic fixture repositories — §4
+7. `blame` scan without pushdown, and its extraction tests — §2, §4
+8. Operators: `Scan`, `Filter`, `Project`, over in-memory rows — §3
+9. Planner and a CLI that runs a query end to end — §3, §5
+
+### M3 — The query that justifies the project
+
+Ends with: surviving-line ownership, the thing no other tool does off
+the shelf.
+
+```sql
+SELECT author_name, count(*) FROM blame
+WHERE path LIKE 'src/auth/%' GROUP BY author_name ORDER BY 2 DESC
+```
+
+10. The differential harness, loading SQLite from an unfiltered scan — §4
+11. `Aggregate`: `count`, `sum`, `avg`, `min`, `max`, `GROUP BY`, `HAVING` — §3
+12. `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT` — §3
+
+### M4 — Pushdown
+
+Ends with: the same query, `--stats` showing 12 paths blamed instead
+of 4,013, and a timing difference anyone can reproduce.
+
+13. Scan capability negotiation and predicate splitting — §3
+14. `path` pushdown into the `blame` scan, with work-done tests — §2, §4
+15. `--explain` and `--stats` — §5
+
+### M5 — The fuzzer
+
+Ends with: a mismatch found, shrunk, and committed as a regression
+test. Finding one is the milestone; a clean run means the generator is
+too timid.
+
+16. Query generator, AST-first and weighted toward `NULL` — §4
+17. Shrinker, and the regression test workflow — §4
+
+### M6 — Finish v1
+
+18. Output formats and error presentation — §5
+19. REPL — §5
+20. README, with the differential and fuzz counts — §1
+
+Phases 2 to 4 of §1 — `commits`, `commit_files`, `refs`, `tree`, then
+joins, then `diffs` — are planned after M6, once the engine has been
+proven by something harder than its author's expectations.

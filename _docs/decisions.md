@@ -74,3 +74,25 @@ SQLite may return rows in any order without ORDER BY. historian fixes
 an order, because reproducible output is worth more here than the
 freedom to reorder. The differential harness therefore compares sorted
 multisets unless the query has an ORDER BY.
+
+2026-08-24 - The SQLite side of a differential test is loaded from an
+unfiltered scan
+
+The obvious harness feeds SQLite from the same scan historian runs. It
+is wrong: a pushdown bug that drops rows removes them from both sides,
+the engines agree, and the bug is invisible. Loading SQLite from a scan
+with pushdown disabled lets historian be as clever as it likes, and any
+cleverness that changes the answer is caught.
+
+This is also why §3's earlier claim - that pushdown cannot be verified
+by results - was too strong. Wrong pushdown is caught by results.
+Absent pushdown is not, and needs the work-done assertions.
+
+2026-08-24 - Fuzzer findings are shrunk, then become differential tests
+
+An unshrunk mismatch is a twelve-clause query nobody can act on, and a
+mismatch that vanishes on the next run is not worth reporting. So the
+fuzzer is seeded and reproducible, the shrinker reduces a failure to
+the smallest query that still fails, and the result is committed as a
+permanent differential test. The fuzzer feeds the suite rather than
+sitting beside it.

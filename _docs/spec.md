@@ -461,10 +461,14 @@ the user. Keeping the filter costs one pass over an already-reduced
 row set, and confines any pushdown bug to performance rather than
 correctness.
 
-The consequence for tests: a pushdown cannot be verified by its
-results, because results are identical with pushdown disabled. It is
-verified by asserting on the work done - which paths were blamed, how
-many git invocations were made. Scans record this, and tests read it.
+The consequence for tests is that pushdown has two distinct failure
+modes and they need different tests. Pushdown that returns the *wrong*
+rows is caught by the differential suite, provided the SQLite side is
+loaded from an unfiltered scan - see §4. Pushdown that returns the
+right rows while doing all the work is invisible to any assertion on
+results, and is caught only by asserting on the work done: which paths
+were blamed, how many git invocations were made. Scans record this,
+and tests read it.
 
 `LIMIT` pushdown is the same negotiation applied to a different part
 of the query, and the reason the optimizer sees the whole tree rather
@@ -502,9 +506,173 @@ order is compared exactly.
 
 ---
 
+## §4 Test architecture
+
+Four layers, each answering a question the others cannot.
+
+| layer | question | oracle |
+|---|---|---|
+| unit | does this function do what it says? | assertions |
+| extraction | does the git data match the repository? | `git` itself |
+| differential | is the SQL correct? | SQLite |
+| pushdown | did the scan actually avoid the work? | work counters |
+
+### Fixture repositories
+
+Built by `tests/fixtures/build.py`, never committed as binaries.
+
+**They must be byte-identical on every machine and every run.** Git
+hashes derive from author, committer, timestamps and tree, so all of
+them are set explicitly:
+
+```
+GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL, GIT_AUTHOR_DATE
+GIT_COMMITTER_NAME, GIT_COMMITTER_EMAIL, GIT_COMMITTER_DATE
+```
+
+Without this, hashes differ per run, tests that assert on them are
+flaky, and nobody can reproduce a reported failure. It is the first
+thing to get right.
+
+Three fixtures:
+
+- **tiny** — a handful of commits, two authors, a rename, a deletion,
+  and a merge. The default for most tests, small enough to reason
+  about by hand.
+- **awkward** — built to break things: unicode in paths and author
+  names, a space and a quote in a path, an empty file, a binary file,
+  a file with no trailing newline, a file deleted and later recreated,
+  an empty commit message, and a line of content that looks like git
+  porcelain output.
+- **large** — generated, hundreds of commits. Benchmarks only, never
+  correctness.
+
+The fixture builder asserts what it built. A fixture that silently
+stops containing a merge commit takes a whole class of tests with it.
+
+### The differential harness
+
+For each test query:
+
+1. Scan the table **with pushdown disabled**, giving the complete set
+   of rows.
+2. Load those rows into an in-memory SQLite table with the same schema.
+3. Run the query through SQLite.
+4. Run the query through historian, with pushdown enabled.
+5. Compare.
+
+**Step 1 is the load-bearing one.** The obvious implementation feeds
+SQLite from the same scan historian uses, which is wrong: a pushdown
+bug that wrongly drops rows would remove them from both sides, both
+engines would agree, and the bug would be invisible. Loading SQLite
+from an unfiltered scan means historian is free to be clever and any
+cleverness that changes the answer is caught.
+
+Comparison follows §3: sorted multisets unless the query has an
+`ORDER BY`, exact order when it does.
+
+This layer tests the SQL engine, not the extraction — both sides read
+the same extracted rows, so a wrong `authored_at` is wrong in both.
+That is what the extraction layer is for.
+
+### The extraction layer
+
+Asserts that the git tables report what git reports, on fixtures whose
+contents are known. `blame` rows for a file are checked against
+`git blame --line-porcelain` for that file; `commits` against
+`git log`; `commit_files` against `git show --numstat`.
+
+Deliberately boring and deliberately separate. Nothing here involves
+SQL.
+
+### The fuzzer
+
+`uv run python -m historian.fuzz --queries N --seed S`
+
+**It generates ASTs and renders them to SQL, rather than generating
+text.** Every query is therefore well-formed by construction, and any
+mismatch is a semantic bug rather than a parser accident.
+
+**Weighted toward what breaks.** Uniform generation over the grammar
+produces `SELECT path FROM blame LIMIT 1` forever and finds nothing.
+The generator biases toward:
+
+- `NULL` literals, and columns known to contain `NULL`
+- comparisons between different types — integer against text
+- predicates that match zero rows, and `LIMIT 0`
+- aggregates over zero rows, and over groups containing `NULL`
+- `NOT` wrapped around something that can be `NULL`
+- `OR`, which never pushes down, exercising the residual path
+- one pushable predicate `AND` one that is not, in the same `WHERE`
+- `GROUP BY` and `DISTINCT` on columns containing `NULL`
+
+**Seeded and reproducible.** A reported mismatch names its seed, and
+that seed reproduces it exactly. A failure QA cannot hand to the
+engineer in reproducible form is not worth reporting.
+
+**Shrinking, before reporting.** A raw mismatch is a twelve-clause
+query nobody can read. The shrinker removes clauses, simplifies
+expressions, and replaces literals with simpler ones, keeping any
+reduction that still mismatches. What gets reported is the smallest
+query that still fails.
+
+**Every shrunk mismatch becomes a permanent differential test**, in
+`tests/differential/test_regressions.py`, with the seed that found it
+in a comment. This is the flywheel: the fuzzer finds a bug, shrinking
+makes it legible, it becomes a test that can never regress, and the
+differential count goes up. QA's count going up is the process working
+as designed.
+
+### The pushdown layer
+
+Differential testing catches pushdown that returns the **wrong** rows.
+It cannot catch pushdown that returns the right rows while doing all
+the work, because the results are identical either way. Both failures
+are real and they need different tests.
+
+Scans record what they did — which paths were blamed, how many git
+invocations were made — and pushdown tests assert on that record:
+
+```
+blame with WHERE path = 'src/a.py'       blamed exactly ['src/a.py']
+blame with WHERE path LIKE 'src/%'       blamed only paths under src/
+blame with WHERE author_name = 'Ana'     blamed everything, correctly
+commits with LIMIT 5, no ORDER BY        walked at most 5 commits
+```
+
+The third case matters as much as the first: a predicate that cannot
+push down must still produce correct results, and the test that proves
+it is the one asserting the scan did *not* try to be clever.
+
+The record is exposed on the scan object, not through global state, so
+tests observe it without a mechanism that could alter behaviour.
+
+### Layout
+
+```
+tests/
+  test_values.py          three-valued logic, comparison, coercion
+  test_lexer.py
+  test_parser.py
+  test_planner.py
+  test_optimizer.py
+  test_operators.py       against in-memory rows, no repository
+  extraction/
+    test_blame.py         vs git blame --line-porcelain
+    test_commits.py       vs git log
+  differential/
+    conftest.py           the harness
+    test_blame.py         hand-written cases
+    test_regressions.py   shrunk fuzzer findings, seed in a comment
+  pushdown/
+    test_blame_pushdown.py
+  fixtures/
+    build.py
+```
+
+---
+
 ## Not yet designed
 
-- §4 Test architecture — fixture repos, the SQLite oracle harness, the
-  fuzzer's generation grammar
 - §5 CLI surface — output formats, `EXPLAIN`, REPL, error reporting
 - §6 Milestones and issue breakdown

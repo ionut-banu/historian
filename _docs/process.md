@@ -39,6 +39,17 @@ The spec is binding
 `_docs/spec.md` is the source of truth and describes historian as it
 currently is. Every issue names the section it implements.
 
+It is the only specification. If you find another document in this
+repository describing what historian should do, it is stale. Do not
+act on it, do not reconcile it with the spec, and do not average the
+two. Say what you found, in a comment on the issue, and use the spec.
+
+Nothing that is no longer true is kept in the working tree. Superseded
+specs and plans live in git history, tagged - `git tag -l -n1` lists
+them. `_docs/decisions.md` is the one exception, because every entry
+is dated and written as a past decision, so reading it cannot be
+mistaken for reading current requirements.
+
 The non-goals and the out-of-scope list in §1 are binding. Work that
 contradicts them does not get implemented and does not get argued
 about in an issue comment - it gets filed as a v2 issue and dropped

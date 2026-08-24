@@ -19,6 +19,17 @@ Definition of done:
 - An engineer who has never spoken to you could implement it from the
   issue and the documents it links
 
+`_docs/spec.md` is the only specification
+
+If you find another document describing what historian should do, it
+is stale. Do not groom against it, and do not split the difference
+between it and the spec. Say what you found in a comment, and groom
+against the spec.
+
+Old specs live in git history, tagged - `git tag -l -n1` lists them.
+Anything of that kind still in the working tree is a mistake worth
+reporting.
+
 Scope is not negotiable
 
 §1 of the spec lists non-goals and out-of-scope grammar. If the issue

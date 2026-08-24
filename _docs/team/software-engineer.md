@@ -41,3 +41,7 @@ If an acceptance criterion is wrong, impossible, or contradicts
 another one, create a comment on the issue about it. If it contradicts
 SQLite, SQLite is right - say so in the comment and implement SQLite's
 behaviour.
+
+`_docs/spec.md` is the only specification. Any other document
+describing what historian should do is stale - do not implement from
+it. Report it in a comment and work from the issue and the spec.

@@ -36,8 +36,8 @@ Two consequences for the process:
 
 The spec is binding
 
-`docs/superpowers/specs/2026-08-24-historian-design.md` is the source
-of truth. Every issue names the section it implements.
+`_docs/spec.md` is the source of truth and describes historian as it
+currently is. Every issue names the section it implements.
 
 The non-goals and the out-of-scope list in §1 are binding. Work that
 contradicts them does not get implemented and does not get argued

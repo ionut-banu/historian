@@ -1,9 +1,16 @@
-# historian — design
+# historian
 
 A SQL query engine over git history.
 
-Status: in progress. §1 and §2 are settled. §3 onward are listed at the
-bottom and not yet designed.
+This document describes what historian is, currently. It is edited
+whenever a decision changes it, and it is always true of the code as
+it stands. Issues name the section they implement.
+
+Why a thing was decided, and what it replaced, belongs in
+`_docs/decisions.md` - dated entries, never edited.
+
+§1 and §2 are settled. §3 onward are listed at the bottom and not yet
+designed.
 
 ---
 

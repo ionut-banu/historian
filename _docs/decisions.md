@@ -34,3 +34,13 @@ right scan shape.
 Rename detection and merge handling are a month of work in a domain
 nobody is evaluating. The subject of this project is the engine above
 the scan.
+
+2026-08-24 - The spec lives in _docs/spec.md, undated
+
+It was first written as a dated design document, which made it a
+historical record - and historical records are never edited, while the
+source of truth has to change whenever the project does. Splitting by
+lifecycle instead: _docs/spec.md is living and always true,
+_docs/decisions.md is append-only and never edited. The original path
+also carried the name of the tooling used to write it, which is not
+something this repo should know about.

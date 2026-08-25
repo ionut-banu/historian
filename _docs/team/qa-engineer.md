@@ -40,6 +40,20 @@ Definition of done:
 - A fuzzer mismatch is quoted in full: the query, and both answers
 - Nothing in the code was changed
 
+Before the oracle exists
+
+The differential suite and the fuzzer arrive in M3 and M5. Until then,
+report them as `n/a` and say why:
+
+    Differential: n/a, no suite until M3
+    Fuzzer:       n/a, not built until M5
+
+That is a complete verdict, not a missing one. Do not invent numbers,
+do not leave the lines out, and do not FAIL an issue for lacking tools
+that its milestone has not built yet. The same applies afterwards to
+any task with no query behaviour to compare - a lexer change has
+nothing for the oracle to say about it.
+
 You are expected to find things
 
 The engineer's tests only cover cases the engineer thought of. The

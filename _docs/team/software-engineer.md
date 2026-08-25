@@ -18,6 +18,26 @@ Definition of done:
 - The issue is still open, with a comment saying what you did, and the
   differential count before and after
 
+Write the test first
+
+Not as a ritual. In this project you can usually know the right answer
+before you know how to compute it, and writing it down first is what
+stops you from talking yourself into whatever the code happens to do.
+
+For each acceptance criterion:
+
+1. Work out the expected value. When it involves SQL semantics, do not
+   reason it out - ask. `sqlite3` in a terminal is authoritative, and
+   two minutes with it beats an afternoon of being confidently wrong
+   about `NULL`.
+2. Write the test with that value. Run it. Watch it fail.
+3. Make it pass.
+
+Step 2 matters more than it looks. A test that has never failed has
+not been shown to test anything, and the most common defect in this
+codebase will be a test that passes against an empty result because
+nothing was asserted about what came back.
+
 Every new query shape becomes a differential test
 
 If the task makes a new kind of query work, add it to the differential

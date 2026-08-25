@@ -18,6 +18,19 @@ Definition of done:
 - The issue is still open, with a comment saying what you did, and the
   differential count before and after
 
+Leave the checkboxes alone
+
+The acceptance criteria are checkboxes, and working through them in
+order is how to implement the issue. Do not tick them. QA ticks them,
+in its verdict, after checking each one against the running code.
+
+A box you ticked is a claim about your own work, and QA is the thing
+that exists to not take your word for it. Say what you did in a
+comment instead.
+
+If you want a working list of your own steps, keep it to yourself. It
+is not part of the issue and it does not outlive the task.
+
 Write the test first
 
 Not as a ritual. In this project you can usually know the right answer

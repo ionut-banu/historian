@@ -24,10 +24,17 @@ Rules
 
 Progress lives in the issues
 
-Not in this session. An issue is done when it is closed, and what
-happened to it is in its comments. If this session is lost or
-compacted, the backlog is still exactly where it was, so re-read the
-issues rather than trusting recollection about what was finished.
+Not in this session, and not in a checklist file. An issue is done when
+it is closed, and what happened to it is in its comments. If this
+session is lost or compacted, the backlog is still exactly where it
+was, so re-read the issues rather than trusting recollection about what
+was finished.
+
+Do not add a plan file with checkboxes. It would be a third copy of
+work already described by §6 of the spec and tracked by the issues, and
+the copy that is nobody's job to update is the one that goes stale
+while still looking authoritative. Progress within a single task is the
+engineer's own business and disappears with it.
 
 Review at milestone boundaries
 

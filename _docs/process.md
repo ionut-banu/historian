@@ -44,6 +44,12 @@ repository describing what historian should do, it is stale. Do not
 act on it, do not reconcile it with the spec, and do not average the
 two. Say what you found, in a comment on the issue, and use the spec.
 
+`README.md` is the one exception, and it is not a specification. It
+describes what exists today, for someone who has just arrived, and
+points here for what is planned. Never implement from it. If it
+contradicts the spec, the README is wrong and gets fixed - which makes
+it the one document that has to be updated when behaviour changes.
+
 Nothing that is no longer true is kept in the working tree. Superseded
 specs and plans live in git history, tagged - `git tag -l -n1` lists
 them. `_docs/decisions.md` is the one exception, because every entry

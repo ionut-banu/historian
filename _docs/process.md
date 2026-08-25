@@ -27,6 +27,21 @@ Rules
 - The orchestrator never fixes the code itself. Fixing in the main
   session skips QA entirely and is how unverified work gets closed.
 
+Writing for GitHub
+
+Do not hard-wrap anything that goes into an issue body, a pull request
+body, or a comment. GitHub renders a single newline in those as an
+actual line break rather than reflowing the paragraph, so text wrapped
+at 70 columns comes out as a column of ragged short lines.
+
+One paragraph is one line, however long. One list item is one line,
+however long. Let the browser wrap it. Fenced code blocks are
+unaffected - wrap those however the code reads best.
+
+This is the opposite of the convention for files in `_docs/`, which are
+read as text and stay wrapped at about 70 columns. The difference is
+where it will be rendered, not who wrote it.
+
 Branches and pull requests
 
 One branch per issue, named for it - `issue-7-blame-scan`. The engineer

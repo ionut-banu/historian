@@ -1,3 +1,8 @@
+Do not hard-wrap this. GitHub turns a single newline in an issue body
+into a line break, so wrapped prose renders as ragged short lines. One
+paragraph per line, one list item per line, however long. See "Writing
+for GitHub" in `_docs/process.md`.
+
 ## Goal
 
 One or two sentences on what should be true when this is done.

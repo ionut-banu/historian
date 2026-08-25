@@ -18,6 +18,27 @@ Definition of done:
 - The issue is still open, with a comment saying what you did, and the
   differential count before and after
 
+Work on a branch
+
+One branch per issue, named for it - `issue-7-blame-scan`. Create it
+before your first commit. Never commit to `main`, never merge, never
+push unless you were told to.
+
+The pull request is not yours to open. That happens after QA passes.
+
+Before the oracle exists
+
+Your report includes the differential count before and after. The
+differential suite arrives at issue 10 and the fuzzer at issue 16.
+Until then, report them as `n/a` and say why:
+
+    Differential: n/a, no suite until M3
+    Fuzzer:       n/a, not built until M5
+
+That is a complete report, not a missing one. Do not invent numbers
+and do not leave the lines out. The same applies afterwards to any
+task with no query behaviour to compare.
+
 Leave the checkboxes alone
 
 The acceptance criteria are checkboxes, and working through them in

@@ -7,20 +7,41 @@ Lifecycle
 
 1. Pick the next open issue from the backlog
 2. PM grooms it
-3. Engineer implements it
-4. QA verifies it
+3. Engineer implements it on a branch
+4. QA verifies it on that branch
 5. On FAIL, back to step 3 with the QA comment as input
-6. On PASS, close the issue
-7. Repeat until the backlog is empty
+6. On PASS, push the branch and open a pull request into `main`
+7. Stop. A human reviews and merges it, and the merge closes the issue
+8. Repeat until the backlog is empty
 
 Rules
 
 - Do not skip step 2
 - The engineer does not close the issue
 - QA does not fix the code, only outputs PASS or FAIL
-- The orchestrator closes the issue only after QA outputs PASS
+- Nobody closes an issue by hand. The pull request says `Closes #N`
+  and merging it does the closing, so an issue can never be closed
+  while its code is still unmerged.
+- Nobody merges the pull request except a human. QA passing means the
+  work is ready to be looked at, not that it is ready to land.
 - The orchestrator never fixes the code itself. Fixing in the main
   session skips QA entirely and is how unverified work gets closed.
+
+Branches and pull requests
+
+One branch per issue, named for it - `issue-7-blame-scan`. The engineer
+creates it, commits to it, and never touches `main`.
+
+The pull request is opened by the orchestrator after QA passes, not by
+the engineer. It carries `Closes #N`, a link to the QA verdict comment,
+the test result, and anything known-broken and deliberately deferred.
+It is the one place a human sees the whole change at once, so it is
+written for a reader who has not followed the issue.
+
+Step 7 is a real stop. The loop does not continue to the next issue
+while a pull request is waiting, unless the next issue is independent
+of the one under review - and in this backlog most are not, because
+each milestone builds on the last.
 
 Progress lives in the issues
 

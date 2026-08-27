@@ -398,6 +398,29 @@ generate early and often. Whoever grooms the expression evaluator owns
 it, and it needs deciding before that work starts rather than being
 discovered by the oracle.
 
+**Numeric comparison is exact, and must never go through `float()`.**
+SQLite compares an integer against a real without casting either to the
+other:
+
+```
+9007199254740993 =  9007199254740992.0     FALSE
+9007199254740993 >  9007199254740992.0     TRUE
+float(9007199254740993) == 9007199254740992.0   would say TRUE
+```
+
+Past 2^53 a double cannot represent consecutive integers, so the cast
+loses the distinction and reverses the answer. Python's own `int`/`float`
+comparison is exact and agrees with SQLite on all three, so the correct
+implementation is to compare the values directly and add nothing. Any
+`float()` conversion introduced later for convenience - most plausibly
+in the expression evaluator's arithmetic path - breaks this silently, on
+inputs no hand-written test would think to try.
+
+SQLite also has no NaN: `typeof(0.0/0.0)` is `null`, so a NaN can never
+be a stored value. A computed NaN reaching `order_key` would violate the
+total order, which is a risk for the expression evaluator rather than
+for this module.
+
 Aggregate edge cases, which differential tests will find immediately:
 
 | case | result |

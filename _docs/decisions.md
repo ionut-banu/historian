@@ -128,3 +128,20 @@ Recorded now rather than when the expression evaluator is built,
 because blame.line_no is phase 1's only non-TEXT column and the
 fuzzer is weighted toward cross-type comparisons - it would have
 found this as a mismatch with no owner.
+
+2026-08-27 - Numeric comparison is exact; no float() anywhere
+
+Implementing issue 2 turned up that SQLite compares integers against
+reals exactly rather than casting. 9007199254740993 = 9007199254740992.0
+is FALSE and the > is TRUE; past 2^53 a double cannot hold consecutive
+integers, so a cast reverses the answer.
+
+Python's int/float comparison is already exact and agrees, so the fix
+is to add nothing. Recorded because the danger is not in values.py,
+where there is now a test pinning it, but in the expression evaluator's
+arithmetic path, where a float() conversion would look like a tidy-up
+and would break comparison on inputs no hand-written test would try.
+
+Also from the same session: SQLite has no NaN - typeof(0.0/0.0) is
+null - and typeof(true) is integer, which independently confirms that
+excluding bool from Value is required rather than merely tidy.

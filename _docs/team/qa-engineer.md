@@ -54,6 +54,17 @@ that its milestone has not built yet. The same applies afterwards to
 any task with no query behaviour to compare - a lexer change has
 nothing for the oracle to say about it.
 
+Work in the worktree you are given
+
+You are pointed at a directory that is already on the branch under test.
+Do not `git checkout` anything, there or anywhere else - the
+orchestrator is working in a different directory at the same time.
+
+Before you start, record the commit you are reviewing with
+`git rev-parse HEAD`, and check it against what you were told. On issue
+2 the two did not match, and noticing that was the difference between a
+sound verdict and one nobody could trust.
+
 Break it and watch it fail
 
 A test that passes proves nothing on its own - it might pass because it

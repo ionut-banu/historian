@@ -72,6 +72,32 @@ This is the opposite of the convention for files in `_docs/`, which are
 read as text and stay wrapped at about 70 columns. The difference is
 where it will be rendered, not who wrote it.
 
+One worktree per subagent
+
+A branch is not enough isolation. The orchestrator works on `main` in
+the main directory while a subagent works on a branch, and there is only
+one working directory - so `git checkout` from either side changes the
+files under the other.
+
+This is not hypothetical. On issue 2 it happened twice in one minute:
+the orchestrator switched to `main` while QA was mid-review and the
+module under test vanished, and QA switched back while the orchestrator
+was committing, so a documentation commit landed on the feature branch
+and a push to `main` silently pushed nothing.
+
+So each implementing subagent gets its own directory:
+
+    git worktree add ../historian-issue-7 -b issue-7-blame-scan
+
+The engineer and QA work there. The orchestrator stays in the main
+directory on `main` and never checks out a feature branch. Remove it
+when the pull request merges:
+
+    git worktree remove ../historian-issue-7
+
+Neither side can then disturb the other, and no amount of care is
+required to keep it that way.
+
 Branches and pull requests
 
 One branch per issue, named for it - `issue-7-blame-scan`. The engineer

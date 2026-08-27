@@ -145,3 +145,21 @@ and would break comparison on inputs no hand-written test would try.
 Also from the same session: SQLite has no NaN - typeof(0.0/0.0) is
 null - and typeof(true) is integer, which independently confirms that
 excluding bool from Value is required rather than merely tidy.
+
+2026-08-27 - One worktree per subagent, not just one branch
+
+Issue 2 raced twice in a minute. The orchestrator ran `git checkout
+main` while QA was mid-review, and the module under test vanished from
+under it. QA then restored its own branch, per its instructions, in the
+window between the orchestrator checking which branch it was on and
+committing - so a documentation commit landed on the feature branch
+instead of main, and `git push origin main` pushed nothing.
+
+Neither party did anything wrong. One working directory shared between
+an orchestrator on main and a subagent on a branch is a race, and the
+process creates that situation on every single issue.
+
+So each implementing subagent gets its own directory via `git worktree
+add`, and the orchestrator never checks out a feature branch. QA also
+now records the commit it is reviewing and checks it against what it
+was told - which is what caught this one.

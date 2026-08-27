@@ -18,7 +18,13 @@ Definition of done:
 - The issue is still open, with a comment saying what you did, and the
   differential count before and after
 
-Work on a branch
+Work in your own worktree
+
+You are given a directory of your own, made with `git worktree add`,
+already on your branch. Work only there. Do not `git checkout` another
+branch inside it - the orchestrator is working in a different directory
+on `main` at the same time, and on issue 2 exactly that cost a lost
+commit and a review of files that had disappeared.
 
 One branch per issue, named for it - `issue-7-blame-scan`. Create it
 before your first commit. Never commit to `main`, never merge, never

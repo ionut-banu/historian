@@ -163,3 +163,27 @@ So each implementing subagent gets its own directory via `git worktree
 add`, and the orchestrator never checks out a feature branch. QA also
 now records the commit it is reviewing and checks it against what it
 was told - which is what caught this one.
+
+2026-08-27 - One token type per keyword, not a shared KEYWORD type
+
+Grooming issue 3 left this open. Both work, so it was decided on which
+failure mode each produces.
+
+A shared KEYWORD type makes the parser match on `tok.type is KEYWORD
+and tok.text == "SELECT"`, where a mistyped literal silently never
+matches and surfaces later as a confusing parse error. One member per
+keyword makes the same mistake an AttributeError at import.
+
+The parser will have more keyword match sites than anywhere else in the
+codebase, so the safer failure mode is worth thirty enum members. It is
+also what SQLite and PostgreSQL do, and it translates to a Rust enum
+with exhaustive matching rather than to string comparison.
+
+An is_keyword() helper covers the cases that need "any keyword".
+
+2026-08-27 - Out-of-scope v1 work goes to the "v2 - Backlog" milestone
+
+The PM is told to file work that contradicts the non-goals as a v2
+issue, but nothing said where those live, so they would have collected
+with no milestone and been invisible. They now go to "v2 - Backlog",
+which holds nothing anyone is scheduled to build.

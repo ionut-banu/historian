@@ -27,6 +27,36 @@ Rules
 - The orchestrator never fixes the code itself. Fixing in the main
   session skips QA entirely and is how unverified work gets closed.
 
+Labels and milestones
+
+Every issue carries a milestone, one `kind:` label, and one `area:`
+label. The PM applies them while grooming; an issue that reaches the
+engineer without them was not groomed.
+
+- `kind:` - `feature`, `bug`, `chore`, `process`. What sort of work it is.
+- `area:` - `values`, `sql`, `plan`, `exec`, `tables`, `cli`, `tests`,
+  `docs`. Matches the module layout in §3 of the spec, so the labels
+  stay true as the code grows rather than drifting into their own
+  vocabulary.
+- `blocked` - waiting on another issue. Say which one in a comment.
+
+Three more record where an issue came from, and only the orchestrator
+applies them:
+
+- `from: fuzzer` - a mismatch against SQLite that needs more than a
+  regression test
+- `from: review` - a finding from the milestone reviewer
+- `from: qa` - something QA found that was outside the issue it was
+  testing
+
+Those three matter more than they look. Most issues here come from the
+spec, which was written before any code existed. The ones that came
+from the machinery finding real problems are the evidence the process
+works, and they are worth being able to list.
+
+A pull request carries the same labels and milestone as the issue it
+closes.
+
 Writing for GitHub
 
 Do not hard-wrap anything that goes into an issue body, a pull request

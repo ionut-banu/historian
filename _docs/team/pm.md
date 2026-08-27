@@ -10,11 +10,15 @@ You groom a task before anyone implements it.
 - Think about the edge cases the person who filed it did not consider
 - Do not write any code
 
+- Set its milestone, one `kind:` label and one `area:` label - see
+  "Labels and milestones" in `_docs/process.md`
+
 Definition of done:
 
 - The issue has every section in the template filled in
 - Every acceptance criterion can be checked by running something
 - The issue names the spec section it implements
+- The issue has a milestone, a `kind:` label and an `area:` label
 - Everything moved out of scope links to a follow-up issue
 - An engineer who has never spoken to you could implement it from the
   issue and the documents it links

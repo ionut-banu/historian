@@ -375,6 +375,29 @@ Ordering across types follows SQLite's storage-class order:
 `NULL` < numeric < `TEXT`. An integer is always less than any string,
 regardless of contents. Text compares bytewise.
 
+**Column affinity is not part of this module**, and the split is easy
+to get wrong. Comparing two values is one thing; comparing a *column*
+to a literal is another, because SQLite first converts the literal to
+the column's declared type:
+
+```
+5 = '5'                          FALSE   two literals, no conversion
+WHERE line_no = '5'              TRUE    line_no is INTEGER, so '5' becomes 5
+```
+
+`values.py` sees only values and cannot know which operand came from a
+column or what type it was declared as, so it implements the first line
+and never the second. Affinity belongs to `exec/expression.py`, which
+has the AST (so it knows which side is a column reference) and the
+operator's schema (so it knows the declared type).
+
+This matters more than one odd case suggests: `blame.line_no` is the
+only non-`TEXT` column in phase 1, and §4's fuzzer is weighted toward
+comparisons between different types - so this is a mismatch it will
+generate early and often. Whoever grooms the expression evaluator owns
+it, and it needs deciding before that work starts rather than being
+discovered by the oracle.
+
 Aggregate edge cases, which differential tests will find immediately:
 
 | case | result |

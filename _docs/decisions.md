@@ -109,3 +109,22 @@ colour and paging look at the terminal.
 EXPLAIN as SQL would add grammar that §1 does not declare, and the
 grammar is the thing scope discipline depends on. A flag costs nothing
 and keeps the parser exactly as specified.
+
+2026-08-27 - Column affinity lives in the expression evaluator, not in
+values.py
+
+Grooming issue 2 turned up a gap: section 1 requires SQLite's type
+affinity, but no part of the design owned it. Confirmed against
+sqlite3 that `5 = '5'` is FALSE while `WHERE line_no = '5'` is TRUE
+against an INTEGER column - SQLite converts the literal to the
+column's declared type first.
+
+values.py cannot do this. It sees two values and has no way to know
+which came from a column or how that column was declared. So it
+implements value-to-value comparison only, and affinity goes to
+exec/expression.py, which has both the AST and the schema.
+
+Recorded now rather than when the expression evaluator is built,
+because blame.line_no is phase 1's only non-TEXT column and the
+fuzzer is weighted toward cross-type comparisons - it would have
+found this as a mismatch with no owner.

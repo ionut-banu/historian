@@ -255,7 +255,49 @@ def tokenize(source: str) -> list[Token]:
     return _Lexer(source).run()
 
 
-_WHITESPACE = " \t\r"
+#: `\f` (form feed) is whitespace to SQLite; `\v` (vertical tab) is not and
+#: must stay out of this set - see _docs/decisions.md, 2026-09-01.
+_WHITESPACE = " \t\r\f"
+
+
+def _is_ascii_digit(char: str) -> bool:
+    """Is *char* one of `0`-`9`? Plain codepoint comparison, not
+    `str.isdigit()` - that also accepts non-ASCII digit-shaped characters
+    (superscripts, Arabic-Indic digits, ...) that SQLite does not treat as
+    numeric. See _docs/decisions.md, 2026-09-01."""
+    return "0" <= char <= "9"
+
+
+def _is_ascii_letter(char: str) -> bool:
+    """Is *char* one of `a`-`z` or `A`-`Z`? Plain codepoint comparison,
+    matching `_is_ascii_digit`."""
+    return ("a" <= char <= "z") or ("A" <= char <= "Z")
+
+
+def _is_identifier_start(char: str) -> bool:
+    """Can *char* start an identifier?
+
+    SQLite's rule (confirmed against `sqlite3` 3.51.0), not Python's: an
+    ASCII letter, an underscore, or any character at all above ASCII -
+    SQLite never asks whether a codepoint is alphabetic, so neither does
+    this. `²`, `™` and `café`'s `é` all qualify; only an ASCII digit,
+    a quote, or an operator/punctuation character does not. See
+    _docs/decisions.md, 2026-09-01.
+    """
+    if char == "":
+        return False
+    return _is_ascii_letter(char) or char == "_" or not char.isascii()
+
+
+def _is_identifier_char(char: str) -> bool:
+    """Can *char* continue an identifier already started?
+
+    Everything `_is_identifier_start` accepts, plus ASCII digits - `foo1`
+    is a valid identifier even though a digit cannot start one.
+    """
+    if char == "":
+        return False
+    return _is_identifier_start(char) or _is_ascii_digit(char)
 
 
 class _Lexer:
@@ -329,11 +371,11 @@ class _Lexer:
             return self._read_string(start)
         if char == '"':
             return self._read_quoted_identifier(start)
-        if char.isdigit():
+        if _is_ascii_digit(char):
             return self._read_number(start)
-        if char == "." and self._peek(1).isdigit():
+        if char == "." and _is_ascii_digit(self._peek(1)):
             return self._read_number(start)
-        if char.isalpha() or char == "_":
+        if _is_identifier_start(char):
             return self._read_identifier(start)
 
         return self._read_operator(start)
@@ -385,12 +427,12 @@ class _Lexer:
     def _read_number(self, start: Position) -> Token:
         chars: list[str] = []
         is_real = False
-        while self._peek().isdigit():
+        while _is_ascii_digit(self._peek()):
             chars.append(self._advance())
         if self._peek() == ".":
             is_real = True
             chars.append(self._advance())
-            while self._peek().isdigit():
+            while _is_ascii_digit(self._peek()):
                 chars.append(self._advance())
         token_type = TokenType.REAL if is_real else TokenType.INTEGER
         return Token(token_type, "".join(chars), start)
@@ -399,7 +441,7 @@ class _Lexer:
 
     def _read_identifier(self, start: Position) -> Token:
         chars: list[str] = []
-        while self._peek().isalnum() or self._peek() == "_":
+        while _is_identifier_char(self._peek()):
             chars.append(self._advance())
         text = "".join(chars)
         keyword_type = _KEYWORDS_BY_TEXT.get(text.upper())
@@ -447,8 +489,10 @@ class _Lexer:
             return Token(token_type, char, start)
 
         # `!` not followed by `=` (handled above as `NE`) starts no valid
-        # v1 token, the same as any other unrecognised character.
-        self._advance()
+        # v1 token, the same as any other unrecognised character. No
+        # `_advance()` here: `start` was captured before this character
+        # was consumed, so advancing past it first has no observable
+        # effect on the error we raise.
         raise LexError(
             f"unexpected character {char!r} at line {start.line}, "
             f"column {start.column}",

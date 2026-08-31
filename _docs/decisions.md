@@ -202,3 +202,46 @@ it ever reaches a Value position.
 Recorded now, matching the column-affinity precedent, because the
 fuzzer is expected to generate 0.0/0.0-shaped queries early and this
 is a mismatch with no owner until #12 lands.
+
+2026-09-01 - Any non-ASCII character can start or continue an
+identifier; the lexer never asks if it is a letter
+
+Issue #16 started as a narrower bug: `_read_number` used
+`str.isdigit()`, which is `True` for non-ASCII digit-shaped
+characters like `²` and Arabic-Indic `١٢٣`, so those could reach
+`int()`/`float()` and raise. The obvious fix - restrict the digit
+paths to ASCII and leave `_read_identifier` on Python's
+`isalpha`/`isalnum` - turned out to be wrong, not just incomplete.
+Confirmed against `sqlite3` 3.51.0: `select ™;` and `select café;`
+both fail with `no such column`, so SQLite lexed both as
+identifiers. But `'™'.isalpha()` and `'™'.isalnum()` are both
+`False` in Python, so the "obvious fix" still raises `LexError` on
+`™`, on `‽`, and on any other non-ASCII symbol Python does not
+classify as a letter or digit.
+
+SQLite's real rule has no such gap: an ASCII digit (`0`-`9`) can
+start a number, and literally every other non-quote, non-operator
+character - including every character above ASCII - can start an
+identifier. It never consults a Unicode property table. Decided to
+match this exactly rather than approximate it with Python's
+classifiers, so `_read_identifier` now accepts any character for
+which `not char.isascii()`, full stop, with no `isalpha`/`isalnum`
+call in the non-ASCII path at all.
+
+The cost is real: this makes `²`, `™`, and other symbol characters
+lex as identifiers, which reads as nonsense to a human. It is
+still the better rule, for three reasons. It is simpler than
+asking Python's Unicode database anything, and simpler still in
+Rust, where the equivalent is one `is_ascii()` check rather than a
+Unicode-aware classifier. It ports directly - the same plain
+codepoint comparisons work unchanged. And it means `²`, `café`,
+and `™` all fail the same way SQLite fails them: `no such column`
+once `sql/binder.py` exists (#9), not merely "some error" from the
+lexer today. Per this module's own docstring, an identifier that
+resolves to nothing is the binder's error to raise, not the
+lexer's - and a symbol character is exactly that case, not a
+lexing failure.
+
+Also decided in the same pass: `\f` (form feed) joins `\t`/`\r` as
+whitespace, confirmed against SQLite; `\v` (vertical tab) does
+not, because SQLite rejects it too.

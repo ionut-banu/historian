@@ -102,6 +102,107 @@ def test_identifier_that_is_not_a_keyword_lexes_as_identifier():
     assert tokens[0].text == "count"
 
 
+def test_leading_underscore_identifier():
+    tokens = tokenize("_foo")
+    assert tokens[0].type is TokenType.IDENTIFIER
+    assert tokens[0].text == "_foo"
+
+
+@pytest.mark.parametrize(
+    "source,keyword_type",
+    [("SELECTED", TokenType.SELECT), ("ANDy", TokenType.AND)],
+)
+def test_keyword_spelling_as_prefix_of_longer_identifier_is_one_token(
+    source, keyword_type
+):
+    """A keyword's spelling occurring as a strict prefix of a longer
+    identifier must not split into the keyword token followed by
+    whatever remains - the identifier scan has to consume the whole
+    run of identifier characters before checking the keyword table."""
+    tokens = tokenize(source)
+    assert _types(tokens) == [TokenType.IDENTIFIER, TokenType.EOF]
+    assert tokens[0].type is not keyword_type
+    assert tokens[0].text == source
+
+
+# --- Non-ASCII identifiers (issue #16) ------------------------------------
+#
+# SQLite's tokenizer rule, confirmed against sqlite3 3.51.0: an ASCII digit
+# starts a number, and every other non-quote, non-operator character -
+# including every character above ASCII - starts an identifier. It never
+# asks whether a codepoint is alphabetic. Python's str.isalpha()/isdigit()
+# do not partition non-ASCII characters this way (superscript '²' and
+# Arabic-Indic digits are "digits" to Python; '™' is neither a letter nor
+# a digit to Python), so the lexer must not consult them for anything
+# above ASCII. See _docs/decisions.md, 2026-09-01.
+
+
+def test_non_ascii_letters_lex_as_identifier():
+    # sqlite3: select café; select 中;  -> both "no such column", i.e.
+    # both lex as identifiers, not lexer errors.
+    for source in ("café", "中"):
+        tokens = tokenize(source)
+        assert _types(tokens) == [TokenType.IDENTIFIER, TokenType.EOF]
+        assert tokens[0].text == source
+
+
+def test_superscript_digit_lexes_as_identifier_not_integer():
+    # sqlite3: select ²;  -> "no such column: ²", not a parse/numeric
+    # error, so SQLite lexed it as an identifier. Python's '²'.isdigit()
+    # is True and '²'.isalpha() is False, so this is the case that
+    # catches a fix that only widens the digit path to ASCII while
+    # leaving the identifier path on Python's character classifiers.
+    tokens = tokenize("²")
+    assert _types(tokens) == [TokenType.IDENTIFIER, TokenType.EOF]
+    assert tokens[0].text == "²"
+
+
+def test_arabic_indic_digits_lex_as_single_identifier_not_integer():
+    # sqlite3: select ١٢٣;  -> "no such column: ١٢٣". Each of these three
+    # codepoints is individually str.isdigit() == True in Python, so a
+    # lexer that treats "isdigit" as "can start/continue a number" would
+    # produce a bogus INTEGER (or crash decoding it as one) instead.
+    tokens = tokenize("١٢٣")
+    assert _types(tokens) == [TokenType.IDENTIFIER, TokenType.EOF]
+    assert tokens[0].text == "١٢٣"
+
+
+def test_trademark_sign_lexes_as_identifier():
+    # sqlite3: select ™;  -> "no such column: ™". '™'.isalpha() and
+    # '™'.isalnum() are both False in Python, so this is the character
+    # that catches an incomplete fix: one that widens _read_identifier's
+    # digit handling but still gates on Python's isalpha/isalnum still
+    # raises LexError here. The only rule that gets this right is "any
+    # non-ASCII character can be part of an identifier," full stop.
+    tokens = tokenize("™")
+    assert _types(tokens) == [TokenType.IDENTIFIER, TokenType.EOF]
+    assert tokens[0].text == "™"
+
+
+@pytest.mark.parametrize(
+    "char",
+    [
+        "Ω",  # Greek capital letter (Lu) - already worked, must keep working
+        "é",  # Latin small letter with diacritic (Ll)
+        "中",  # CJK ideograph (Lo)
+        "²",  # superscript two (No) - digit-shaped, not alphabetic
+        "١",  # Arabic-Indic digit one (Nd) - isdigit() is True in Python
+        "™",  # trademark sign (So) - neither alpha nor digit in Python
+        "§",  # section sign (Po)
+        "‽",  # interrobang (Po)
+        "́",  # combining acute accent (Mn), alone
+        "😀",  # emoji (So), outside the Basic Multilingual Plane
+    ],
+)
+def test_non_ascii_characters_across_categories_always_lex_as_identifier(char):
+    """General check behind the named examples above: whatever Unicode
+    category a non-ASCII character falls in, it starts (and here, is the
+    whole of) an identifier - never a LexError, never INTEGER or REAL."""
+    tokens = tokenize(char)
+    assert _types(tokens) == [TokenType.IDENTIFIER, TokenType.EOF]
+    assert tokens[0].text == char
+
+
 def test_double_quoted_identifier_strips_quotes():
     tokens = tokenize('"path"')
     assert tokens[0].type is TokenType.IDENTIFIER
@@ -297,6 +398,47 @@ def test_block_comment_is_not_supported_in_v1():
     ]
 
 
+# --- Whitespace (issue #16) ----------------------------------------------
+
+
+def test_form_feed_is_skipped_like_other_whitespace():
+    tokens = tokenize("SELECT\f1")
+    assert _types(tokens) == [TokenType.SELECT, TokenType.INTEGER, TokenType.EOF]
+    assert tokens[1].text == "1"
+
+
+def test_form_feed_separates_arbitrary_tokens():
+    """Not just after a keyword: a separator between any two tokens."""
+    tokens = tokenize("a\fFROM\fb")
+    assert _types(tokens) == [
+        TokenType.IDENTIFIER,
+        TokenType.FROM,
+        TokenType.IDENTIFIER,
+        TokenType.EOF,
+    ]
+    assert tokens[0].text == "a"
+    assert tokens[2].text == "b"
+
+
+def test_form_feed_advances_column_not_line():
+    # Same convention as test_carriage_return_and_tab_advance_column_not_line:
+    # a single non-newline whitespace character advances the column by one.
+    source = "a\fb"
+    tokens = tokenize(source)
+    b_token = tokens[1]
+    assert b_token.position.line == 1
+    assert b_token.position.column == 3
+
+
+def test_form_feed_inside_string_literal_is_preserved():
+    """Whitespace-skipping must never reach inside a string literal - a
+    form feed between the quotes is data, not a separator."""
+    tokens = tokenize("'a\fb'")
+    assert tokens[0].type is TokenType.STRING
+    assert tokens[0].text == "a\fb"
+    assert len(tokens[0].text) == 3
+
+
 # --- Illegal characters -------------------------------------------------
 
 
@@ -316,6 +458,14 @@ def test_various_unrecognised_characters_raise(char):
 def test_bang_not_followed_by_equals_raises():
     with pytest.raises(LexError):
         tokenize("!")
+
+
+def test_vertical_tab_still_raises_lex_error():
+    """Unlike form feed, vertical tab is not whitespace to SQLite either
+    (confirmed: sqlite3 rejects it) - it must stay rejected here, not be
+    added alongside \\f."""
+    with pytest.raises(LexError):
+        tokenize("SELECT\v1")
 
 
 # --- Positions -----------------------------------------------------------

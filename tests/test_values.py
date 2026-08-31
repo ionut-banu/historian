@@ -69,6 +69,123 @@ def test_comparisons_reject_unsupported_types(func):
         func(b"bytes", 1)
 
 
+# --- NaN: rejected as a value, not silently ordered ----------------------
+#
+# sqlite3 has no NaN storage class - `select 0.0/0.0, typeof(0.0/0.0);`
+# -> (blank)|null - so a NaN reaching this module is never a value SQLite
+# could have produced; it can only be a bug upstream (issue #15). It is
+# rejected in `_rank`, the single chokepoint every public function in this
+# module routes through, with `ValueError` rather than `TypeError`: NaN is
+# the right Python type (`float`) carrying an invalid *value*, which is a
+# different failure mode from `bool`/`bytes` being the wrong *type*
+# entirely. Infinity is a normal `float` and stays legal - see the
+# "NaN does not take infinity down with it" tests below.
+
+NAN = float("nan")
+NEGATIVE_NAN = -float("nan")
+
+
+@pytest.mark.parametrize("func", COMPARISONS)
+@pytest.mark.parametrize("nan", [NAN, NEGATIVE_NAN])
+def test_comparisons_reject_nan_on_either_side_or_both(func, nan):
+    with pytest.raises(ValueError):
+        func(nan, 1.0)
+    with pytest.raises(ValueError):
+        func(1.0, nan)
+    with pytest.raises(ValueError):
+        func(nan, nan)
+
+
+def test_gt_of_nan_and_nan_no_longer_returns_true():
+    """The issue's own reproduction: `gt(float('nan'), float('nan'))`
+    used to return `True` because NaN's numeric rank made it compare
+    equal to itself before the value itself was ever examined."""
+    with pytest.raises(ValueError):
+        gt(NAN, NAN)
+
+
+@pytest.mark.parametrize("func", [is_, is_not])
+@pytest.mark.parametrize("nan", [NAN, NEGATIVE_NAN])
+def test_is_and_is_not_reject_nan(func, nan):
+    with pytest.raises(ValueError):
+        func(nan, nan)
+    with pytest.raises(ValueError):
+        func(nan, 1.0)
+    with pytest.raises(ValueError):
+        func(1.0, nan)
+
+
+@pytest.mark.parametrize("func", [is_null, is_not_null])
+@pytest.mark.parametrize("nan", [NAN, NEGATIVE_NAN])
+def test_is_null_and_is_not_null_reject_nan(func, nan):
+    with pytest.raises(ValueError):
+        func(nan)
+
+
+@pytest.mark.parametrize("nan", [NAN, NEGATIVE_NAN])
+def test_order_key_rejects_nan(nan):
+    with pytest.raises(ValueError):
+        order_key(nan)
+
+
+def test_sorted_by_order_key_raises_on_nan_instead_of_silently_misordering():
+    """The exact reproduction from the issue body: NaN's comparisons are
+    all False, so it used to sort into an arbitrary position rather than
+    raising. `sorted()` propagates whatever `order_key` raises."""
+    with pytest.raises(ValueError):
+        sorted([3.0, NAN, 1.0, 2.0], key=order_key)
+
+
+@pytest.mark.parametrize("func", COMPARISONS)
+def test_null_does_not_mask_nan_on_the_other_side(func):
+    """`_compare` ranks both operands before it looks at NULL, so a NaN
+    paired with a NULL must still raise - not be swallowed into the
+    ordinary NULL-propagation result of `None`."""
+    with pytest.raises(ValueError):
+        func(None, NAN)
+    with pytest.raises(ValueError):
+        func(NAN, None)
+
+
+def test_nan_raises_valueerror_not_typeerror():
+    """Rationale (see the issue #15 grooming comment): NaN is a value of
+    the correct Value type (float) that fails a value-level validity
+    check, which is a different failure mode from the TypeError raised
+    for a wrong-type operand like bool or bytes. Keeping them distinct
+    lets a caller tell the two apart without string-matching messages."""
+    with pytest.raises(ValueError):
+        eq(NAN, 1.0)
+    with pytest.raises(TypeError):
+        eq(True, 1.0)
+
+
+# --- NaN does not take infinity down with it ------------------------------
+
+# sqlite3 :memory: "select 9e999, typeof(9e999), -9e999, typeof(-9e999);"
+#   -> Inf|real|-Inf|real. Infinity is an ordinary, legal REAL in SQLite;
+# only NaN is impossible. A fix that guards against NaN by rejecting any
+# "not a finite float" value would wrongly take infinity down with it.
+
+
+def test_infinity_is_unaffected_by_the_nan_guard():
+    # Same rank as any other numeric, payload untouched.
+    assert order_key(float("inf")) == (order_key(1.0)[0], float("inf"))
+    assert order_key(float("-inf")) == (order_key(1.0)[0], float("-inf"))
+    assert gt(float("inf"), 5) is True
+    assert lt(float("-inf"), -1000000) is True
+    assert eq(float("inf"), float("inf")) is True
+
+
+def test_infinity_sorts_at_the_ends_via_order_key():
+    column = [3.0, float("inf"), 1.0, float("-inf")]
+    assert sorted(column, key=order_key) == [
+        float("-inf"),
+        1.0,
+        3.0,
+        float("inf"),
+    ]
+
+
 @pytest.mark.parametrize("func", [and3, or3])
 @pytest.mark.parametrize("bad", [1, 0, "x", 1.0])
 def test_connectives_reject_non_bool3(func, bad):

@@ -187,3 +187,18 @@ The PM is told to file work that contradicts the non-goals as a v2
 issue, but nothing said where those live, so they would have collected
 with no milestone and been invisible. They now go to "v2 - Backlog",
 which holds nothing anyone is scheduled to build.
+
+2026-08-31 - Arithmetic producing NaN yields NULL, enforced in
+exec/expression.py
+
+SQLite has no NaN - typeof(0.0/0.0) is null - confirmed against
+sqlite3. values.py now rejects a NaN that reaches it (issue #15),
+but nothing yet stops arithmetic from producing one in the first
+place: values.py has no arithmetic, so it cannot be the enforcement
+point. exec/expression.py, which does not exist yet (#12, blocked
+on #9), owns converting a NaN result of +, -, *, / into NULL before
+it ever reaches a Value position.
+
+Recorded now, matching the column-affinity precedent, because the
+fuzzer is expected to generate 0.0/0.0-shaped queries early and this
+is a mismatch with no owner until #12 lands.

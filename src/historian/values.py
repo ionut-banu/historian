@@ -40,6 +40,22 @@ Every function here validates its arguments and raises ``TypeError`` on a
 ``Bool3`` position). The cost is one isinstance check per call; the
 alternative is a class of bug that never announces itself.
 
+``float('nan')`` is not a ``Value`` either
+-------------------------------------------
+
+SQLite has no NaN storage class - ``typeof(0.0/0.0)`` is ``NULL``, not a
+NaN - so a NaN reaching this module can never be a value SQLite itself
+produced; it is always a bug upstream (issue #15). Every function routes
+through :func:`_rank`, which raises ``ValueError`` - not ``TypeError`` -
+for a NaN operand: NaN is the *right* Python type (``float``) carrying an
+*invalid value*, a different failure mode from ``bool``/``bytes`` being
+the wrong type outright, so it gets a different exception. This module
+has no arithmetic, so it cannot stop a NaN from being computed in the
+first place; that enforcement point is ``exec/expression.py`` (see
+``_docs/decisions.md``, 2026-08-31). Infinity is unaffected - it is an
+ordinary, legal ``float`` and ``typeof(9e999)`` is ``real`` - only NaN
+fails ``math.isnan``.
+
 Comparison is not ordering
 --------------------------
 
@@ -89,6 +105,8 @@ and ``||`` (all ``exec/expression.py``), and aggregate accumulation (the
 ``Aggregate`` operator).
 """
 
+import math
+
 __all__ = [
     "Bool3",
     "Value",
@@ -125,11 +143,21 @@ _RANK_TEXT = 2
 
 
 def _rank(value: Value) -> int:
-    """The storage-class rank of *value*, validating its type.
+    """The storage-class rank of *value*, validating its type and value.
 
     Raises ``TypeError`` for anything that is not a ``Value`` - including
     ``bool``, which is checked before ``int`` because it is a subclass of
-    it.
+    it. Raises ``ValueError`` for ``float('nan')`` (and ``-nan``): NaN is
+    the right Python type but not a value SQLite can ever produce or
+    store - ``typeof(0.0/0.0)`` is ``null``, not a NaN (see
+    `_docs/decisions.md`) - so it is a wrong *value*, not a wrong *type*,
+    which is why it gets a different exception than ``bool``/``bytes``
+    above. Infinity is an ordinary, legal ``float`` and is not affected;
+    only NaN fails ``math.isnan``.
+
+    This is the single chokepoint every public function in this module
+    routes through, so the guard lives here once rather than being
+    repeated in each of them.
     """
     if value is None:
         return _RANK_NULL
@@ -139,6 +167,13 @@ def _rank(value: Value) -> int:
             f"into a value position (got {value!r})"
         )
     if isinstance(value, (int, float)):
+        if isinstance(value, float) and math.isnan(value):
+            raise ValueError(
+                "NaN is not a SQL Value; SQLite has no NaN storage class "
+                "(typeof(0.0/0.0) is NULL) so one reaching this module is "
+                "always a bug upstream, not a valid value to compare or "
+                "order"
+            )
         return _RANK_NUMERIC
     if isinstance(value, str):
         return _RANK_TEXT

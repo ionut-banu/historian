@@ -553,12 +553,18 @@ def _format_float(value: float) -> str:
     return text
 
 
-def _coerce_to_text(value: Value) -> str:
+def _coerce_to_text(value: Value) -> str | None:
     """A `Value` as SQLite would render it as `TEXT` - used by `||`
-    unconditionally on both operands (after the NULL check, which
-    happens in the caller) and, later in this module, by column
-    affinity's numeric-to-text conversion and `LIKE`'s unconditional
-    text coercion. Never called with `None`."""
+    (after the NULL check, which happens in that caller, so `value`
+    is never `None` there), by `LIKE`'s unconditional text coercion
+    (same: NULL is checked by that caller first), and by column
+    affinity's numeric-to-text conversion in `_apply_affinity`, which
+    calls this on a raw operand with no NULL check of its own - `s =
+    NULL` against a `TEXT` column reaches this with `value is None`.
+    `None` falls through every `isinstance` check below and returns
+    unchanged, which is exactly right there: affinity never turns
+    `NULL` into anything else, and the eventual `values.eq`/`is_`
+    call is what actually decides what a `NULL` operand means."""
     if isinstance(value, bool):  # pragma: no cover - defensive; Value excludes bool
         raise TypeError(f"bool is not a SQL Value, got {value!r}")
     if isinstance(value, float):

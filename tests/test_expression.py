@@ -661,6 +661,20 @@ def test_text_affinity_converts_numeric_to_sqlite_text_not_python_str():
     assert evaluate(_bin(Operator.EQ, _col("s"), _lit(5.0)), _ROW, _SCHEMA) is False
 
 
+def test_affinity_never_turns_null_into_anything_else():
+    """sqlite3 (`n INT`, `s TEXT`, `n=5, s='5'`): `s = NULL` and
+    `n = NULL` are both `NULL`. A `TEXT`-affinity column compared
+    against a bare `NULL` literal reaches `_apply_affinity`'s text
+    branch with a `None` operand (no affinity of its own) - it must
+    pass straight through, not be coerced into `'None'`-shaped text
+    or anything else, leaving `values.eq`'s own NULL handling to
+    decide the outcome."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_bin(Operator.EQ, _col("s"), _lit(None)), _ROW, _SCHEMA) is None
+    assert evaluate(_bin(Operator.EQ, _col("n"), _lit(None)), _ROW, _SCHEMA) is None
+
+
 def test_real_column_affinity_behaves_identically_to_integer_column():
     """A synthetic `REAL` column, since none of phase 1's real tables
     have one (`blame.line_no` is the only non-TEXT column,

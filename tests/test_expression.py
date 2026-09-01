@@ -170,8 +170,9 @@ def test_null_propagates_through_every_arithmetic_operator(op):
 #
 # sqlite3: `select '5'+1, 'abc'+1, '5abc'+1, '  5  '+1, '0x10'+1, '5e'+1,
 # '+5'+1, '-5'+1, '1e2'+1, typeof('1e2'+1), '.5'+1, '5.'+1, '5.5.5'+1,
-# '5e+'+1, '   '+1;`
-# -> 6|1|6|6|1|6|6|-4|101.0|real|1.5|6.0|6.5|6|1
+# '5e+'+1, '   '+1, 'inf'+1;`
+# -> 6|1|6|6|1|6|6|-4|101.0|real|1.5|6.0|6.5|6|1|1 (the word "inf" is not
+# recognised as numeric either, same as "0x10" - contributes 0)
 
 
 @pytest.mark.parametrize(
@@ -190,6 +191,7 @@ def test_null_propagates_through_every_arithmetic_operator(op):
         ("5.5.5", 6.5),
         ("5e+", 6),
         ("   ", 1),
+        ("inf", 1),
     ],
 )
 def test_arithmetic_text_coercion_is_a_leading_prefix_parse(text, expected):
@@ -303,6 +305,16 @@ def test_multiply_overflowing_int64_becomes_real():
     result = evaluate(_bin(Operator.MUL, _lit(9223372036854775807), _lit(2)), _ROW, _SCHEMA)
     assert isinstance(result, float)
     assert result == float(9223372036854775807 * 2)
+
+
+def test_subtract_overflowing_int64_becomes_real():
+    """sqlite3: `select -9223372036854775807-2,
+    typeof(-9223372036854775807-2);` -> -9.22337203685478e+18|real."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.SUB, _lit(-9223372036854775807), _lit(2)), _ROW, _SCHEMA)
+    assert isinstance(result, float)
+    assert result == float(-9223372036854775807 - 2)
 
 
 def test_division_result_overflowing_int64_becomes_real():
@@ -698,6 +710,23 @@ def test_every_comparison_operator_is_wired(op, expected):
 # tests/test_values.py's own 2^53 pin: 9007199254740993 = 9007199254740992.0
 # is FALSE, 9007199254740993 > 9007199254740992.0 is TRUE. Confirmed the
 # same way against sqlite3 directly.
+
+
+def test_int64_overflow_conversion_never_applies_to_comparison():
+    """The int64-overflow-to-REAL rule is about arithmetic *result
+    production* only, per this issue's own acceptance criteria - never
+    about comparison, and the two must never be confused by a future
+    change. `9223372036854775807 = 9223372036854775807` involves no
+    arithmetic at all, so both operands must stay the exact `int`s
+    they are - confirmed against `sqlite3`: `9223372036854775807 =
+    9223372036854775807` is `1`, `9223372036854775807 >
+    9223372036854775806` is `1`."""
+    from historian.exec.expression import evaluate
+
+    eq = _bin(Operator.EQ, _lit(9223372036854775807), _lit(9223372036854775807))
+    gt = _bin(Operator.GT, _lit(9223372036854775807), _lit(9223372036854775806))
+    assert evaluate(eq, _ROW, _SCHEMA) is True
+    assert evaluate(gt, _ROW, _SCHEMA) is True
 
 
 def test_2_53_boundary_comparison_stays_exact_through_a_bound_column_ref():

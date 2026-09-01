@@ -107,6 +107,27 @@ from historian.sql.binder import BoundColumnRef
 from historian.sql.lexer import Position
 from historian.values import Bool3, Value
 
+# The BoundColumnRef import above is the one place this module's import
+# graph is not literally subprocess-free, and it is worth being honest
+# about rather than letting it pass silently: sql/binder.py's own
+# module-level code does `from historian.tables.blame import
+# BLAME_SCHEMA`, so importing BoundColumnRef from it transitively loads
+# tables/blame.py, which imports `subprocess` at module level. Verified
+# directly - `import historian.exec.expression` puts both `subprocess`
+# and `historian.tables.blame` in `sys.modules`. This is not a choice
+# this module makes and cannot avoid: the issue's own goal statement
+# requires consuming `BoundColumnRef` from `sql/binder.py`, and no
+# other module defines it. It mirrors the exact trade-off
+# `sql/binder.py`'s own docstring already accepts and documents for
+# itself ("the module is merely imported, never invoked, so no git
+# repository or subprocess call is needed to exercise this module").
+# `evaluate()` never calls anything from `tables/blame.py` or
+# `subprocess`, and no test in `tests/test_expression.py` needs a
+# repository - the module is loaded, never invoked - so `AGENTS.md`'s
+# actual concern ("only scan operators touch git") still holds in
+# behaviour, even though the import graph is not literally free of the
+# word `subprocess`.
+
 __all__ = ["EvalError", "evaluate"]
 
 #: SQLite's `int64` bounds. This module's own constants - not imported

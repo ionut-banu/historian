@@ -317,3 +317,74 @@ def test_add_within_int64_bounds_stays_int():
     result = evaluate(_bin(Operator.ADD, _lit(9223372036854775806), _lit(1)), _ROW, _SCHEMA)
     assert result == 9223372036854775807
     assert isinstance(result, int)
+
+
+# --- Concatenation (||) --------------------------------------------------
+#
+# sqlite3: `select 'a'||1, typeof('a'||1);` -> a1|text
+# sqlite3: `select 1||NULL, NULL||1;` -> (NULL)|(NULL)
+
+
+def test_concat_of_text_and_integer():
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.CONCAT, _lit("a"), _lit(1)), _ROW, _SCHEMA)
+    assert result == "a1"
+    assert isinstance(result, str)
+
+
+@pytest.mark.parametrize("left,right", [(1, None), (None, 1), (None, None)])
+def test_concat_with_null_operand_is_null(left, right):
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_bin(Operator.CONCAT, _lit(left), _lit(right)), _ROW, _SCHEMA) is None
+
+
+# --- Concatenation: SQLite's float-to-text formatting, not Python's ------
+#
+# sqlite3: `select 5.0||'', 100.0||'', 1e15||'', 1234567890123456.0||'',
+# (1.0/3.0)||'', 1e20||'', (0.1+0.2)||'';`
+# -> 5.0|100.0|1.0e+15|1.23456789012346e+15|0.333333333333333|1.0e+20|0.3
+# Python's str() disagrees with every non-trivial one of these:
+# str(1e15) == '1000000000000000.0', str(1234567890123456.0) keeps all
+# 16 digits unrounded, str(1/3) == '0.3333333333333333' (16 digits),
+# str(1e20) == '1e+20' (no '.0'), str(0.1+0.2) == '0.30000000000000004'.
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (5.0, "5.0"),
+        (100.0, "100.0"),
+        (1e15, "1.0e+15"),
+        (1234567890123456.0, "1.23456789012346e+15"),
+        (1.0 / 3.0, "0.333333333333333"),
+        (1e20, "1.0e+20"),
+        (0.1 + 0.2, "0.3"),
+    ],
+)
+def test_real_to_text_uses_sqlites_15_significant_digit_format(value, expected):
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.CONCAT, _lit(value), _lit("")), _ROW, _SCHEMA)
+    assert result == expected
+
+
+def test_real_to_text_disagrees_with_python_str_to_prove_the_point():
+    """Not a claim about this module - a check that the fixture values
+    above are actually adversarial, so this test file cannot pass by
+    accident against a naive `str(value)` implementation."""
+    adversarial = [1e15, 1234567890123456.0, 1.0 / 3.0, 1e20, 0.1 + 0.2]
+    expected = ["1.0e+15", "1.23456789012346e+15", "0.333333333333333", "1.0e+20", "0.3"]
+    for value, sqlite_text in zip(adversarial, expected):
+        assert str(value) != sqlite_text
+
+
+def test_infinity_formats_as_inf_not_a_python_float_string():
+    """sqlite3: `select 1e400||'', -1e400||'', typeof(1e400);`
+    -> Inf|-Inf|real - Infinity is an ordinary, legal REAL (values.py's
+    own docstring), unlike NaN, so it needs a real text form too."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_bin(Operator.CONCAT, _lit(math.inf), _lit("")), _ROW, _SCHEMA) == "Inf"
+    assert evaluate(_bin(Operator.CONCAT, _lit(-math.inf), _lit("")), _ROW, _SCHEMA) == "-Inf"

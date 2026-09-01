@@ -914,3 +914,78 @@ def test_not_between_is_not3_of_the_unnegated_result():
 
     assert evaluate(_between(_lit(5), _lit(1), _lit(10), negated=True), _ROW, _SCHEMA) is False
     assert evaluate(_between(_lit(50), _lit(1), _lit(10), negated=True), _ROW, _SCHEMA) is True
+
+
+# --- Code-level enforcement: no stray float() outside named exceptions --
+
+
+def test_no_stray_float_calls_outside_the_named_exceptions():
+    """The 2026-08-27 decision: comparison must never route through
+    `float()` - past 2^53 that loses an `int`'s exact value and can
+    reverse the answer
+    (`test_2_53_boundary_comparison_stays_exact_through_a_bound_column_ref`
+    above is the *value* pin for this rule; this is the *code-level*
+    pin, so a future "tidy-up" cannot silently reintroduce a call the
+    value-level test happens not to exercise - matching how
+    `tests/test_values.py` pins the 2^53 case for `values.py`).
+
+    Walks this module's own source with `ast`, and asserts every
+    `float(` call site sits inside a function on an explicit allowlist
+    of three - not the issue body's stated two:
+
+    - `_scan_number` - exception (a): affinity's/arithmetic's own
+      text-to-number *conversion*, constructing a new `Value` from a
+      string. Not a lossy comparison cast.
+    - `_format_float` - exception (b): the float-formatting helper for
+      `||`/text-affinity, converting a number *to* text, never used to
+      convert a number *for* comparison. Named here because the issue
+      names it, even though this implementation's `_format_float`
+      happens not to call `float()` itself (it only formats an
+      already-`float` argument) - nothing about this test should
+      depend on that being true if a future change makes it call
+      `float()` too, e.g. to normalize an int argument.
+    - `_int64_bounded` - a third, genuine exception this issue's own
+      int64-overflow criteria require and the "two named exceptions"
+      list does not mention: `9223372036854775807 + 1` must become
+      `REAL`, which needs converting an already-overflowed *exact*
+      Python `int` (computed first with unbounded `int` arithmetic) to
+      `float`. This is arithmetic *result production*, a different
+      path from comparison and never confused with it per this issue's
+      own "applies only to arithmetic result production, never to
+      comparison" criterion - kept true structurally by living in its
+      own function, never called from `_apply_affinity`, `_eval_is`,
+      `_eval_in`, `_eval_between`, or the comparison branch of
+      `_eval_binary`.
+
+    Any `float(` call appearing anywhere else in this module - most
+    plausibly, a future "normalize this before comparing" edit to the
+    comparison path - fails this test.
+    """
+    import ast
+    import inspect
+
+    from historian.exec import expression
+
+    allowed_functions = {"_scan_number", "_format_float", "_int64_bounded"}
+    tree = ast.parse(inspect.getsource(expression))
+
+    violations: list[tuple[str, int]] = []
+
+    class _FloatCallVisitor(ast.NodeVisitor):
+        def __init__(self):
+            self._function_stack: list[str] = []
+
+        def visit_FunctionDef(self, node: ast.FunctionDef):
+            self._function_stack.append(node.name)
+            self.generic_visit(node)
+            self._function_stack.pop()
+
+        def visit_Call(self, node: ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id == "float":
+                enclosing = self._function_stack[-1] if self._function_stack else "<module>"
+                if enclosing not in allowed_functions:
+                    violations.append((enclosing, node.lineno))
+            self.generic_visit(node)
+
+    _FloatCallVisitor().visit(tree)
+    assert violations == []

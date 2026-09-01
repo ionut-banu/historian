@@ -92,6 +92,7 @@ from historian.sql.ast import (
     Expr,
     FunctionCall,
     Is,
+    Like,
     Literal,
     Not,
     Operator,
@@ -189,7 +190,74 @@ def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
         return values.or3(evaluate(expr.left, row, schema), evaluate(expr.right, row, schema))
     if isinstance(expr, Not):
         return values.not3(evaluate(expr.operand, row, schema))
+    if isinstance(expr, Like):
+        return _eval_like(expr, row, schema)
     raise AssertionError(f"exec/expression.py: unhandled expression node type {type(expr).__name__}")
+
+
+# --- LIKE: unconditional text coercion, no affinity, ASCII-only fold ----
+
+
+def _ascii_fold(text: str) -> str:
+    """Fold only the ASCII letters `A`-`Z` to `a`-`z`; leave every
+    other character - including everything outside ASCII - untouched.
+    SQLite's own identifier- and `LIKE`-matching rule, not Python's
+    Unicode-aware `str.lower()` (confirmed against `sqlite3`: `'café'
+    LIKE 'CAFÉ'` is `FALSE`, the é/É pair is not folded).
+
+    Deliberately a second copy of `sql/binder.py`'s own `_ascii_fold`
+    rather than an import of it: importing `sql/binder.py` transitively
+    imports `historian.tables.blame` (for `BLAME_SCHEMA`), which
+    imports `subprocess` at module level - `sql/binder.py`'s own
+    docstring accepts that trade-off for itself, but this module's own
+    constraints are explicit (`AGENTS.md`'s "only scan operators touch
+    git"; this issue's own "no import of anything under tables/") and
+    that trade-off is not this module's to inherit. Three lines,
+    identical behaviour, kept in sync by inspection rather than a
+    shared dependency neither module already has a reason to need.
+    """
+    return "".join(chr(ord(ch) + 32) if "A" <= ch <= "Z" else ch for ch in text)
+
+
+def _like_pattern_to_regex(pattern: str) -> re.Pattern[str]:
+    """Compile a `LIKE` pattern (`%` any sequence including empty, `_`
+    exactly one character) to a `re.fullmatch`-ready pattern. Every
+    other character is escaped literally via `re.escape`, so the
+    pattern text can never be interpreted as a regex metacharacter by
+    accident. `re.DOTALL` so `_`/`%` match a newline too - `LIKE` has
+    no notion of "line"."""
+    pieces = []
+    for ch in pattern:
+        if ch == "%":
+            pieces.append(".*")
+        elif ch == "_":
+            pieces.append(".")
+        else:
+            pieces.append(re.escape(ch))
+    return re.compile("".join(pieces), re.DOTALL)
+
+
+def _eval_like(expr: Like, row: Row, schema: Schema) -> Bool3:
+    """`LIKE` / `NOT LIKE`. Confirmed against `sqlite3`: unlike every
+    comparison above, `LIKE` never applies column affinity - both
+    operands are cast to their SQLite text representation
+    unconditionally (`n LIKE '5'` is `TRUE` for the INTEGER column
+    `n=5`; `5 LIKE 5`, two integer literals, is also `TRUE`). `NULL`
+    on either side makes the whole expression `NULL`
+    (`NULL LIKE anything`, `anything LIKE NULL`). `NOT LIKE` is
+    `values.not3` applied to the plain (un-negated) result - never a
+    separately reasoned-out negation - which is what keeps `NULL`
+    propagation correct through the negation for free.
+    """
+    left = evaluate(expr.left, row, schema)
+    pattern = evaluate(expr.pattern, row, schema)
+    if left is None or pattern is None:
+        result: Bool3 = None
+    else:
+        left_text = _ascii_fold(_coerce_to_text(left))
+        pattern_text = _ascii_fold(_coerce_to_text(pattern))
+        result = bool(_like_pattern_to_regex(pattern_text).fullmatch(left_text))
+    return values.not3(result) if expr.negated else result
 
 
 # --- Column affinity -----------------------------------------------------

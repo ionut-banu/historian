@@ -213,3 +213,146 @@ def _merge(repo: Path, branch: str, message: str, *, author: tuple[str, str], ti
     }
     _run_git(repo, ["merge", "--no-ff", "--quiet", "-m", message, branch], overrides)
     return _run_git(repo, ["rev-parse", "HEAD"]).strip()
+
+
+def _hex40_commit_hashes(porcelain_output: str) -> set[str]:
+    """The set of commit hashes appearing in a `git blame --line-porcelain`
+    header line (a 40-hex-digit line not starting with a tab)."""
+    hashes = set()
+    for line in porcelain_output.splitlines():
+        if line[:1] == "\t":
+            continue
+        head = line.split(" ", 1)[0]
+        if len(head) == 40 and all(c in "0123456789abcdef" for c in head):
+            hashes.add(head)
+    return hashes
+
+
+# ---------------------------------------------------------------------------
+# tiny
+#
+# "a handful of commits, two authors, a rename, a deletion, and a
+# merge" - spec.md §4. Exact content and the reasoning behind each
+# element is in the issue #10 grooming comment; the git graph built
+# here is the smallest one realizing every element without padding:
+#
+#   C1 (Ana)  add src/util.py, docs/todo.md
+#   C2 (Bo)   git mv src/util.py -> src/utils.py   (rename, no edit)
+#   C3 (Ana)  on branch "feature": add feature/thing.py
+#   C4 (Bo)   on main: remove docs/todo.md
+#   C5        merge feature into main (--no-ff, two parents: C4, C3)
+#
+# C3 and C4 touch different files, so the merge is conflict-free by
+# construction - if it weren't, `git merge` would exit nonzero and
+# _run_git would raise right there.
+# ---------------------------------------------------------------------------
+
+_TINY_ANA = ("Ana Petrova", "ana@example.com")
+_TINY_BO = ("Bo Lindqvist", "bo@example.com")
+
+# Filled in once, from this builder's own first deterministic build,
+# and then pinned: the strongest and cheapest regression check
+# available for byte-identical fixtures. See _docs/decisions.md,
+# 2026-09-01. Update in the same commit as any deliberate content
+# change to build_tiny.
+TINY_HEAD = "a088fde0619f0dd70e70eb47dad70cccf521f80e"
+
+
+def build_tiny(dest: Path) -> Path:
+    """Build the `tiny` fixture at dest, verify it, and return dest.
+
+    Raises FixtureError if the built repository does not match what
+    this function was told to build, including a determinism
+    regression against the pinned TINY_HEAD.
+    """
+    if dest.exists():
+        shutil.rmtree(dest)
+    _init_repo(dest, branch="main")
+    clock = _Clock()
+
+    (dest / "src").mkdir()
+    (dest / "src" / "util.py").write_text("def util():\n    return 42\n")
+    (dest / "docs").mkdir()
+    (dest / "docs" / "todo.md").write_text("- write blame\n")
+    _run_git(dest, ["add", "-A"])
+    _commit(dest, "Add util and todo", author=_TINY_ANA, timestamp=clock.tick())
+
+    _run_git(dest, ["mv", "src/util.py", "src/utils.py"])
+    _commit(dest, "Rename util.py to utils.py", author=_TINY_BO, timestamp=clock.tick())
+
+    _run_git(dest, ["checkout", "--quiet", "-b", "feature"])
+    (dest / "feature").mkdir()
+    (dest / "feature" / "thing.py").write_text("print('feature')\n")
+    _run_git(dest, ["add", "-A"])
+    _commit(dest, "Add feature/thing.py", author=_TINY_ANA, timestamp=clock.tick())
+
+    _run_git(dest, ["checkout", "--quiet", "main"])
+    _run_git(dest, ["rm", "--quiet", "docs/todo.md"])
+    _commit(dest, "Remove docs/todo.md", author=_TINY_BO, timestamp=clock.tick())
+
+    _merge(dest, "feature", "Merge feature into main", author=_TINY_ANA, timestamp=clock.tick())
+    _run_git(dest, ["branch", "-d", "feature"])
+
+    _verify_tiny(dest)
+
+    head = _run_git(dest, ["rev-parse", "HEAD"]).strip()
+    if head != TINY_HEAD:
+        raise FixtureError(
+            f"tiny: HEAD is {head}, pinned TINY_HEAD is {TINY_HEAD} - "
+            "this is a determinism regression, not a content change, "
+            "unless build_tiny was deliberately edited (update the "
+            "pinned constant in the same commit if so)"
+        )
+    return dest
+
+
+def _verify_tiny(repo: Path) -> None:
+    """Assert that repo matches what build_tiny is supposed to build.
+
+    Inspects only the finished repository through git itself - not any
+    bookkeeping from build_tiny - so it can also be pointed at a repo
+    that no longer matches (a mutated builder, a bad checkout) and
+    catch that directly, per spec §4: "the fixture builder asserts
+    what it built."
+    """
+    count = int(_run_git(repo, ["rev-list", "--count", "HEAD"]).strip())
+    if count != 5:
+        raise FixtureError(f"tiny: expected exactly 5 commits, found {count}")
+
+    merges = _run_git(repo, ["log", "--all", "--merges", "--format=%H"]).strip().splitlines()
+    merges = [m for m in merges if m]
+    if len(merges) != 1:
+        raise FixtureError(f"tiny: expected exactly one merge commit, found {len(merges)}")
+    parents = _run_git(repo, ["log", "-1", "--format=%P", merges[0]]).strip().split()
+    if len(parents) != 2:
+        raise FixtureError(f"tiny: merge commit {merges[0]} has {len(parents)} parents, expected 2")
+
+    identities = set(_run_git(repo, ["log", "--format=%an <%ae>"]).strip().splitlines())
+    if len(identities) != 2:
+        raise FixtureError(f"tiny: expected exactly 2 author identities, found {identities}")
+
+    head_paths = set(_run_git(repo, ["ls-tree", "-r", "--name-only", "HEAD"]).splitlines())
+    if "src/util.py" in head_paths:
+        raise FixtureError("tiny: src/util.py (pre-rename path) is still present at HEAD")
+    if "src/utils.py" not in head_paths:
+        raise FixtureError("tiny: src/utils.py (post-rename path) is missing from HEAD")
+    if "docs/todo.md" in head_paths:
+        raise FixtureError("tiny: docs/todo.md should have been deleted before HEAD")
+
+    deletion_history = _run_git(repo, ["log", "--all", "--format=%H", "--", "docs/todo.md"]).strip()
+    if not deletion_history:
+        raise FixtureError("tiny: docs/todo.md was never tracked - deletion needs prior history")
+
+    root_lines = _run_git(repo, ["rev-list", "--max-parents=0", "HEAD"]).strip().splitlines()
+    if len(root_lines) != 1:
+        raise FixtureError(f"tiny: expected exactly one root commit, found {len(root_lines)}")
+    root = root_lines[0]
+
+    porcelain = _run_git(repo, ["blame", "--line-porcelain", "src/utils.py"])
+    blamed = _hex40_commit_hashes(porcelain)
+    if blamed != {root}:
+        raise FixtureError(
+            "tiny: blame on src/utils.py at HEAD should attribute every "
+            f"line to the root commit {root} (the rename must not have "
+            f"changed content); got {blamed}"
+        )

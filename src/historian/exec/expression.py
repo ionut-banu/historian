@@ -88,13 +88,10 @@ from historian import values
 from historian.schema import ColumnType, Row, Schema
 from historian.sql.ast import (
     And,
-    Between,
     BinaryOp,
     Expr,
     FunctionCall,
-    In,
     Is,
-    Like,
     Literal,
     Not,
     Operator,
@@ -186,6 +183,12 @@ def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
         return _eval_unary(expr, row, schema)
     if isinstance(expr, Is):
         return _eval_is(expr, row, schema)
+    if isinstance(expr, And):
+        return values.and3(evaluate(expr.left, row, schema), evaluate(expr.right, row, schema))
+    if isinstance(expr, Or):
+        return values.or3(evaluate(expr.left, row, schema), evaluate(expr.right, row, schema))
+    if isinstance(expr, Not):
+        return values.not3(evaluate(expr.operand, row, schema))
     raise AssertionError(f"exec/expression.py: unhandled expression node type {type(expr).__name__}")
 
 

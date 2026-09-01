@@ -211,11 +211,15 @@ Pushdown:
 `author_name`, `commit_hash`, `authored_at`, and `line_no` cannot push
 down: a line's author is unknown until the file has been blamed.
 
-Implementation: `git ls-tree -r HEAD --name-only` to enumerate
+Implementation: `git ls-tree -rz HEAD --name-only` to enumerate
 candidate paths, filtered by pushed path predicates, then
-`git blame --line-porcelain` per surviving file, parsed into rows and
-streamed. Blame is always at `HEAD` in v1; blaming at an arbitrary
-revision is deferred.
+`git blame --line-porcelain` per surviving file, parsed into rows
+and streamed. The `-z` form is required: plain `--name-only`
+quote-escapes any path containing a space or a double quote, and
+`git blame`'s own `filename` header re-quotes the same way with no
+unquoted form to parse back out, so `path` always comes from the
+enumeration instead. Blame is always at `HEAD` in v1; blaming at
+an arbitrary revision is deferred.
 
 Shelling out to `git blame` is deliberate. Rename detection and merge
 handling are a month of work in a domain nobody is evaluating, and the

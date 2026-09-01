@@ -165,3 +165,146 @@ def test_building_twice_is_byte_identical(tmp_path):
     objects_a = build._run_git(tmp_path / "a", ["rev-list", "--objects", "--all"])
     objects_b = build._run_git(tmp_path / "b", ["rev-list", "--objects", "--all"])
     assert objects_a == objects_b
+
+
+# ---------------------------------------------------------------------------
+# tiny
+#
+# A handful of commits, two authors, a rename, a deletion, and a merge.
+# See spec.md §4 and the issue #10 grooming comment for exact content.
+# ---------------------------------------------------------------------------
+
+
+def test_tiny_branch_is_main(tmp_path):
+    repo = build.build_tiny(tmp_path / "tiny")
+    branch = build._run_git(repo, ["branch", "--show-current"]).strip()
+    assert branch == "main"
+
+
+def test_tiny_commit_count_is_minimal(tmp_path):
+    """The builder asserts the exact count so a later accidental addition
+    or removal fails loudly, per the grooming comment."""
+    repo = build.build_tiny(tmp_path / "tiny")
+    count = int(build._run_git(repo, ["rev-list", "--count", "HEAD"]).strip())
+    assert count == 5
+
+
+def test_tiny_has_exactly_one_merge_commit_with_two_parents(tmp_path):
+    repo = build.build_tiny(tmp_path / "tiny")
+    merges = build._run_git(repo, ["log", "--all", "--merges", "--format=%H"]).strip().splitlines()
+    assert len(merges) == 1
+    parents = build._run_git(repo, ["log", "-1", "--format=%P", merges[0]]).strip().split()
+    assert len(parents) == 2
+
+
+def test_tiny_has_two_distinct_author_identities(tmp_path):
+    repo = build.build_tiny(tmp_path / "tiny")
+    identities = set(build._run_git(repo, ["log", "--format=%an <%ae>"]).strip().splitlines())
+    assert len(identities) == 2
+
+
+def test_tiny_rename_preserves_blame_attribution_at_head(tmp_path):
+    """A line predating the rename is still attributed by git blame on
+    the post-rename path at HEAD, to the original (root) commit - the
+    case this fixture requirement exists to exercise."""
+    repo = build.build_tiny(tmp_path / "tiny")
+
+    root = build._run_git(repo, ["rev-list", "--max-parents=0", "HEAD"]).strip()
+    assert "\n" not in root, "expected exactly one root commit"
+
+    porcelain = build._run_git(repo, ["blame", "--line-porcelain", "src/utils.py"])
+    commit_hashes = {
+        line.split(" ", 1)[0]
+        for line in porcelain.splitlines()
+        if len(line) >= 40 and all(c in "0123456789abcdef" for c in line[:40]) and line[:1] != "\t"
+    }
+    assert commit_hashes == {root}
+
+
+def test_tiny_old_path_absent_and_new_path_present_at_head(tmp_path):
+    repo = build.build_tiny(tmp_path / "tiny")
+    paths = build._run_git(repo, ["ls-tree", "-r", "--name-only", "HEAD"]).splitlines()
+    assert "src/util.py" not in paths
+    assert "src/utils.py" in paths
+
+
+def test_tiny_deleted_file_absent_from_head_but_existed_earlier(tmp_path):
+    repo = build.build_tiny(tmp_path / "tiny")
+    head_paths = build._run_git(repo, ["ls-tree", "-r", "--name-only", "HEAD"]).splitlines()
+    assert "docs/todo.md" not in head_paths
+
+    history = build._run_git(repo, ["log", "--all", "--format=%H", "--", "docs/todo.md"]).strip()
+    assert history != "", "docs/todo.md must have existed in some earlier commit"
+
+
+def test_tiny_is_deterministic_across_independent_builds(tmp_path):
+    head_a = build.build_tiny(tmp_path / "a")
+    head_b = build.build_tiny(tmp_path / "b")
+    assert build._run_git(head_a, ["rev-parse", "HEAD"]) == build._run_git(head_b, ["rev-parse", "HEAD"])
+
+    objects_a = build._run_git(tmp_path / "a", ["rev-list", "--objects", "--all"])
+    objects_b = build._run_git(tmp_path / "b", ["rev-list", "--objects", "--all"])
+    assert objects_a == objects_b
+
+
+def test_tiny_head_matches_pinned_hash(tmp_path):
+    """The strongest, cheapest regression check available: a determinism
+    regression fails this immediately, with no need to reproduce anyone
+    else's machine."""
+    repo = build.build_tiny(tmp_path / "tiny")
+    assert build._run_git(repo, ["rev-parse", "HEAD"]).strip() == build.TINY_HEAD
+
+
+def test_verify_tiny_raises_when_merge_commit_is_missing(tmp_path):
+    """The builder asserts what it built: if a fixture silently stopped
+    containing its merge commit, build-time verification must catch it,
+    not a downstream test. Simulated here by directly building a
+    mutated repo - same commit count, no merge - the way a broken
+    build_tiny might, and confirming _verify_tiny names the problem."""
+    repo = tmp_path / "no-merge"
+    build._init_repo(repo, branch="main")
+    clock = build._Clock()
+    for i in range(5):
+        (repo / f"file{i}.txt").write_text(f"content {i}\n")
+        build._run_git(repo, ["add", "-A"])
+        build._commit(repo, f"commit {i}", author=("Ana Petrova", "ana@example.com"), timestamp=clock.tick())
+
+    with pytest.raises(build.FixtureError, match="merge"):
+        build._verify_tiny(repo)
+
+
+def test_verify_tiny_raises_when_a_required_file_is_dropped(tmp_path):
+    """A different way a broken builder could silently fail: the
+    excludes-file hazard from §4 dropping a required fixture file. Here
+    a repo has the right shape - 5 commits, one 2-parent merge, two
+    authors - but src/utils.py never made it in, the way a hostile
+    excludesFile silently dropping a file would look. Verification
+    must say so rather than passing an incomplete fixture through."""
+    repo = tmp_path / "missing-file"
+    build._init_repo(repo, branch="main")
+    clock = build._Clock()
+    ana = ("Ana Petrova", "ana@example.com")
+    bo = ("Bo Lindqvist", "bo@example.com")
+
+    (repo / "f0.txt").write_text("zero\n")
+    build._run_git(repo, ["add", "-A"])
+    build._commit(repo, "commit 0", author=ana, timestamp=clock.tick())
+
+    (repo / "f1.txt").write_text("one\n")
+    build._run_git(repo, ["add", "-A"])
+    build._commit(repo, "commit 1", author=bo, timestamp=clock.tick())
+
+    build._run_git(repo, ["checkout", "--quiet", "-b", "feature"])
+    (repo / "f2.txt").write_text("two\n")
+    build._run_git(repo, ["add", "-A"])
+    build._commit(repo, "commit 2", author=ana, timestamp=clock.tick())
+
+    build._run_git(repo, ["checkout", "--quiet", "main"])
+    (repo / "f3.txt").write_text("three\n")
+    build._run_git(repo, ["add", "-A"])
+    build._commit(repo, "commit 3", author=bo, timestamp=clock.tick())
+
+    build._merge(repo, "feature", "merge", author=ana, timestamp=clock.tick())
+
+    with pytest.raises(build.FixtureError, match="utils.py"):
+        build._verify_tiny(repo)

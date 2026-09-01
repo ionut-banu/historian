@@ -88,6 +88,7 @@ from historian import values
 from historian.schema import ColumnType, Row, Schema
 from historian.sql.ast import (
     And,
+    Between,
     BinaryOp,
     Expr,
     FunctionCall,
@@ -195,7 +196,27 @@ def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
         return _eval_like(expr, row, schema)
     if isinstance(expr, In):
         return _eval_in(expr, row, schema)
+    if isinstance(expr, Between):
+        return _eval_between(expr, row, schema)
     raise AssertionError(f"exec/expression.py: unhandled expression node type {type(expr).__name__}")
+
+
+def _eval_between(expr: Between, row: Row, schema: Schema) -> Bool3:
+    """`x BETWEEN low AND high` is `values.and3(values.ge(x, low),
+    values.le(x, high))`, per this issue's own criteria - not bespoke
+    logic. Confirmed against `sqlite3`: `20 BETWEEN 30 AND NULL` is
+    `FALSE`, not `NULL` - the first comparison alone already makes it
+    `FALSE`, and `and3(FALSE, NULL)` is `FALSE`. Affinity is applied
+    to each bound independently: `x`'s own affinity can interact
+    differently with `low` and with `high`.
+    """
+    operand_low_left, operand_low_right = _evaluate_affinity_pair(expr.operand, expr.low, row, schema)
+    operand_high_left, operand_high_right = _evaluate_affinity_pair(expr.operand, expr.high, row, schema)
+    result = values.and3(
+        values.ge(operand_low_left, operand_low_right),
+        values.le(operand_high_left, operand_high_right),
+    )
+    return values.not3(result) if expr.negated else result
 
 
 def _eval_in(expr: In, row: Row, schema: Schema) -> Bool3:

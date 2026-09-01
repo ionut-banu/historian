@@ -28,6 +28,7 @@ import pytest
 from historian.schema import Column, ColumnType, Row, Schema
 from historian.sql.ast import (
     And,
+    Between,
     BinaryOp,
     FunctionCall,
     In,
@@ -881,3 +882,35 @@ def test_in_empty_list_is_always_false():
     from historian.exec.expression import evaluate
 
     assert evaluate(_in(_lit(5), []), _ROW, _SCHEMA) is False
+
+
+# --- BETWEEN: and3(ge(x, low), le(x, high)), affinity per bound ---------
+
+
+def _between(operand, low, high, negated=False) -> Between:
+    return Between(operand=operand, low=low, high=high, negated=negated, position=_POS)
+
+
+def test_between_applies_affinity_to_each_bound_independently():
+    """sqlite3 (`n INT`, `n=5`): `n BETWEEN '1' AND '10'` -> 1."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_between(_col("n"), _lit("1"), _lit("10")), _ROW, _SCHEMA)
+    assert result is True
+
+
+def test_between_null_propagation_matches_and3_short_circuit():
+    """sqlite3: `select 20 between 30 and NULL;` -> FALSE, not NULL -
+    the first comparison (`20 >= 30`) alone is already `FALSE`, and
+    `and3(FALSE, NULL)` is `FALSE`, not `NULL`."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_between(_lit(20), _lit(30), _lit(None)), _ROW, _SCHEMA)
+    assert result is False
+
+
+def test_not_between_is_not3_of_the_unnegated_result():
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_between(_lit(5), _lit(1), _lit(10), negated=True), _ROW, _SCHEMA) is False
+    assert evaluate(_between(_lit(50), _lit(1), _lit(10), negated=True), _ROW, _SCHEMA) is True

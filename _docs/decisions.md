@@ -294,3 +294,88 @@ would round incorrectly starting from the float), which has no
 home until exec/expression.py (#12). Recorded now, matching the
 NaN-yields-NULL precedent above, so whoever builds arithmetic knows
 to revisit it rather than rediscover it.
+
+2026-09-01 - Deeply nested expressions raise ParseError, not
+RecursionError; two limits, not one
+
+Issue #8 round 1 (QA FAIL): `SELECT` + 89 `(` + `1` + 89 `)` +
+`FROM blame` parsed; 90 raised a raw, unhandled RecursionError -
+the exact traceback spec §5 forbids. Root cause: `_parse_expr`
+descends through nine more precedence methods to `_parse_primary`,
+which recurses into `_parse_expr` again for a parenthesised
+group's contents, so one level of `(...)` nesting costs several
+Python stack frames, not one.
+
+Measured before changing anything, with `sys.getrecursionlimit()`
+at its default of 1000. Frames consumed per level of nesting, by
+instrumenting `_parse_primary` and reading the call-stack depth at
+each visit: bare parens 12, function-call arguments 15, IN-list
+values 6, a NOT chain 1, a unary +/- chain 1. These numbers explain
+the observed crash points exactly (1000 / 12 = 89.9, matching the
+89-parses/90-crashes boundary) and are not expected to be stable
+across Python versions or builds - the fix does not depend on
+their staying exact, only on having measured rather than guessed
+them.
+
+`sqlite3 3.51.0` accepts 90 levels of bare parens and returns 1
+(AGENTS.md: "where historian and SQLite disagree, SQLite is
+right"), so a depth limit below 90 would itself be a new
+disagreement, not a fix. Checked what SQLite itself does at
+depth, by binary search against a live sqlite3 process:
+
+    bare parens:            93 ok, 94 fails
+    nested function calls:  31 ok, 32 fails
+    nested IN-lists:        31 ok, 32 fails
+
+All three fail the same way: "Error: in prepare, parser stack
+overflow" - SQLite's own LALR parser stack, not its documented
+`SQLITE_MAX_EXPR_DEPTH` (confirmed present at its default of 1000
+via `PRAGMA compile_options`, but never reached for any of these
+three shapes on this build).
+
+Two consequences. First, `sys.setrecursionlimit` is not a fix -
+it relocates the cliff and risks a hard interpreter crash in place
+of a catchable exception. Second, catching RecursionError and
+re-raising as ParseError is a patch on the symptom: the real limit
+would still be however much stack Python's own machinery happened
+to have left, which depends on where `parse()` was called from -
+breaking the determinism AGENTS.md requires ("the same repository
+and the same query always produce the same rows"). The fix has to
+count depth explicitly and check it before recursing, the way
+SQLite counts `SQLITE_MAX_EXPR_DEPTH` rather than relying on its
+own C call stack.
+
+A single counter does not work in either direction. A run of `(`,
+`NOT`, or unary `+`/`-` is pure repetition with no semantic content
+of its own - `(((x)))` is exactly `x` - so `sql/parser.py` now
+parses each such run with an explicit loop instead of recursing
+once per token: `_parse_primary`, `_parse_not`, and `_parse_unary`.
+A loop costs one iteration per token, not one Python stack frame,
+so these three forms are bounded by a generous limit,
+`_MAX_NESTING_DEPTH = 1000`, matching SQLite's own documented
+default rather than its build-specific parser-stack quirk - this
+is the number the issue's guidance pointed at directly, and it
+clears all three measured SQLite boundaries above with large
+margin.
+
+Genuine recursion remains where a *new* sub-expression is parsed
+from within another one: a parenthesised group's contents, a value
+inside an `IN (...)` list, or a function-call argument. These
+still go through `_parse_expr` calling itself and really do cost
+Python stack frames, so they are bounded separately by
+`_MAX_RECURSION_DEPTH = 50`, sized from the measured 15
+frames/level worst case (function-call arguments) with several
+times the margin measured as already used before `parse()` is even
+called (31 frames, observed under pytest) - and still clears
+SQLite's own 31-level boundary for these two forms. Collapsing
+this to one limit does not work: low enough to be safe for genuine
+recursion is too low to accept plain deeply-parenthesised input
+SQLite itself accepts, and high enough to match SQLite's declared
+1000 would let genuine recursion exhaust Python's real call stack
+before the counter ever fires.
+
+Not a rewrite of the precedence-climbing structure that passed QA
+in round 1 - only these four call sites change, and `(expr)`
+continues to produce no AST node of its own, so the loop-based
+paren handling is behaviourally identical to the recursive version
+it replaces.

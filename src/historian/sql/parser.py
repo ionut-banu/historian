@@ -51,6 +51,49 @@ SQLite's int64 range, and a Python `float` otherwise - see
 construction, not comparison, and is unrelated to the 2026-08-27
 "numeric comparison is exact" decision - see that entry and `sql/
 ast.py`'s `Literal` docstring.
+
+Nesting depth: two limits, not one
+------------------------------------
+
+Deeply nested input must never raise a bare `RecursionError` - spec §5
+("never a traceback") and issue #8's round-1 QA finding, recorded in
+full in `_docs/decisions.md`, 2026-09-01. That entry has the measured
+numbers behind the two constants below; this is the shape of the fix.
+
+A recursive-descent parser pays Python stack frames for genuine
+recursion, and `sys.setrecursionlimit` is not a lever available here -
+raising it only moves the crash, and catching `RecursionError` after
+the fact would make whether a query parses depend on how much stack
+the caller already used before calling `parse()`, which breaks the
+determinism `AGENTS.md` requires. So depth has to be counted
+explicitly and checked before it becomes a Python-level problem, the
+same way SQLite counts `SQLITE_MAX_EXPR_DEPTH` rather than relying on
+its own C call stack.
+
+But not all recursion in this grammar is equal, which is why there are
+two limits:
+
+- A run of `(`, `NOT`, or unary `+`/`-` is pure repetition - `(((x)))`
+  is exactly `x`, `NOT NOT NOT x` is `x` wrapped three times - so
+  `_parse_primary`, `_parse_not`, and `_parse_unary` each parse their
+  run with a loop, not by recursing once per token. A loop costs one
+  iteration per token, not one Python stack frame, so these three
+  forms are bounded by the generous `_MAX_NESTING_DEPTH` (1000,
+  matching SQLite's own documented default).
+- Genuine recursion - parsing a *new* sub-expression from within
+  another one, which only happens for a parenthesised group's
+  contents, an `IN (...)` list value, or a function-call argument -
+  still goes through `_parse_expr` calling itself, and every such call
+  really does cost Python stack frames. That path is bounded by the
+  much smaller `_MAX_RECURSION_DEPTH` (50), sized from measured frame
+  costs with margin, not from SQLite's declared limit.
+
+Collapsing this to one limit does not work in either direction: a
+value low enough to be safe for genuine recursion is too low to accept
+ordinary deeply-parenthesised input SQLite itself accepts, and a value
+high enough to match SQLite's declared limit would let genuine
+recursion exhaust Python's real call stack before the counter ever
+fires.
 """
 
 from __future__ import annotations
@@ -85,6 +128,28 @@ __all__ = ["ParseError", "parse"]
 #: emits a signed `INTEGER` token (a leading `-` is always its own
 #: `MINUS` token), so there is no negative bound to check here.
 _INT64_MAX = 9223372036854775807
+
+#: How many `(`, `NOT`, or unary `+`/`-` tokens may run together before
+#: `_parse_primary`/`_parse_not`/`_parse_unary` (below) give up and
+#: raise `ParseError` instead of continuing. Mirrors SQLite's own
+#: `SQLITE_MAX_EXPR_DEPTH`, whose documented default is 1000
+#: (confirmed via `PRAGMA compile_options` against the `sqlite3`
+#: build used to verify this project's SQL behaviour) - see the
+#: module docstring and `_docs/decisions.md`, 2026-09-01, for why this
+#: is safe to enforce with a plain counter rather than Python's call
+#: stack: each of those three forms is parsed with a loop, not
+#: recursion, so a run this long costs one loop iteration per token,
+#: not one Python stack frame per token.
+_MAX_NESTING_DEPTH = 1000
+
+#: How many times `_parse_expr` may recursively re-enter itself while
+#: parsing one query - once per parenthesised group's contents, once
+#: per value inside an `IN (...)` list, and once per function-call
+#: argument. Unlike `_MAX_NESTING_DEPTH` above, this recursion is real
+#: Python call-stack recursion, so it cannot be set anywhere near
+#: 1000: see the module docstring and `_docs/decisions.md`,
+#: 2026-09-01 for the measured frame costs this is sized against.
+_MAX_RECURSION_DEPTH = 50
 
 # Tier-1 comparison tokens (`<  <=  >  >=`) and the operator each maps to.
 _RELATIONAL_OPERATORS: dict[TokenType, Operator] = {
@@ -173,6 +238,9 @@ class _Parser:
     def __init__(self, tokens: list[Token]) -> None:
         self._tokens = tokens
         self._index = 0
+        # How many nested `_parse_expr` calls are currently on the
+        # Python call stack - see `_MAX_RECURSION_DEPTH`.
+        self._depth = 0
 
     # -- cursor -----------------------------------------------------
 
@@ -277,7 +345,26 @@ class _Parser:
     # -- expressions, loosest to tightest -----------------------------
 
     def _parse_expr(self) -> Expr:
-        return self._parse_or()
+        """Parse one expression. The single choke point every genuine
+        recursive re-entry passes through - a parenthesised group's
+        contents, an `IN (...)` list value, a function-call argument -
+        so it is where `_MAX_RECURSION_DEPTH` is enforced, before
+        Python's own call stack ever gets close to its limit. See the
+        module docstring."""
+        start = self._peek()
+        self._depth += 1
+        if self._depth > _MAX_RECURSION_DEPTH:
+            self._depth -= 1
+            raise ParseError(
+                "expression nested too deeply "
+                f"(max {_MAX_RECURSION_DEPTH} levels of parentheses, "
+                "IN, or function-call nesting)",
+                start.position,
+            )
+        try:
+            return self._parse_or()
+        finally:
+            self._depth -= 1
 
     def _parse_or(self) -> Expr:
         left = self._parse_and()
@@ -296,11 +383,26 @@ class _Parser:
         return left
 
     def _parse_not(self) -> Expr:
-        if self._check(TokenType.NOT):
+        """`NOT NOT NOT x` nests. An explicit loop rather than the
+        obvious `self._parse_not()` self-recursion for the operand:
+        that would cost one Python stack frame per `NOT`, and this is
+        one of the two forms `_MAX_NESTING_DEPTH` (not
+        `_MAX_RECURSION_DEPTH`) governs precisely because it doesn't
+        have to - see the module docstring."""
+        positions: list[Position] = []
+        while self._check(TokenType.NOT):
             token = self._advance()
-            operand = self._parse_not()  # NOT NOT x nests
-            return Not(operand=operand, position=token.position)
-        return self._parse_comparison()
+            positions.append(token.position)
+            if len(positions) > _MAX_NESTING_DEPTH:
+                raise ParseError(
+                    "expression nested too deeply "
+                    f"(max {_MAX_NESTING_DEPTH} levels of NOT)",
+                    token.position,
+                )
+        node = self._parse_comparison()
+        for position in reversed(positions):
+            node = Not(operand=node, position=position)
+        return node
 
     def _parse_comparison(self) -> Expr:
         """Comparison tier 2: `=  <>  !=  IS [NOT]  LIKE  IN  BETWEEN`,
@@ -458,22 +560,32 @@ class _Parser:
 
     def _parse_unary(self) -> Expr:
         """Prefix `+`/`-`, the tightest-binding operators in the
-        table. Right-recursive so `--x`/`+-x` nest instead of being
-        rejected."""
-        token = self._peek()
-        if token.type is TokenType.PLUS:
+        table. `--x`/`+-x` nest, via an explicit loop rather than
+        `self._parse_unary()` self-recursion on the operand - the same
+        reasoning as `_parse_not` above: this is governed by
+        `_MAX_NESTING_DEPTH`, not `_MAX_RECURSION_DEPTH`, because a
+        loop costs no Python stack per `+`/`-`."""
+        ops: list[tuple[UnaryOperator, Position]] = []
+        while True:
+            token = self._peek()
+            if token.type is TokenType.PLUS:
+                op = UnaryOperator.POS
+            elif token.type is TokenType.MINUS:
+                op = UnaryOperator.NEG
+            else:
+                break
             self._advance()
-            operand = self._parse_unary()
-            return UnaryOp(
-                op=UnaryOperator.POS, operand=operand, position=token.position
-            )
-        if token.type is TokenType.MINUS:
-            self._advance()
-            operand = self._parse_unary()
-            return UnaryOp(
-                op=UnaryOperator.NEG, operand=operand, position=token.position
-            )
-        return self._parse_primary()
+            ops.append((op, token.position))
+            if len(ops) > _MAX_NESTING_DEPTH:
+                raise ParseError(
+                    "expression nested too deeply "
+                    f"(max {_MAX_NESTING_DEPTH} levels of unary +/-)",
+                    token.position,
+                )
+        node = self._parse_primary()
+        for op, position in reversed(ops):
+            node = UnaryOp(op=op, operand=node, position=position)
+        return node
 
     # -- primary expressions ------------------------------------------
 
@@ -493,9 +605,27 @@ class _Parser:
             self._advance()
             return Literal(value=None, position=token.position)
         if token.type is TokenType.LPAREN:
-            self._advance()
+            # A run of `(` is stripped with a loop, not by recursing
+            # once per paren: `(expr)` produces no AST node of its own
+            # (`inner` is returned unchanged below), so however many
+            # parens wrap one expression, only one `_parse_expr` call
+            # is needed for its contents. Bounded by
+            # `_MAX_NESTING_DEPTH`, not `_MAX_RECURSION_DEPTH` - the
+            # module docstring explains why this one form gets the
+            # much larger limit.
+            depth = 0
+            while self._check(TokenType.LPAREN):
+                paren = self._advance()
+                depth += 1
+                if depth > _MAX_NESTING_DEPTH:
+                    raise ParseError(
+                        "expression nested too deeply "
+                        f"(max {_MAX_NESTING_DEPTH} levels of parentheses)",
+                        paren.position,
+                    )
             inner = self._parse_expr()
-            self._expect(TokenType.RPAREN, "')'")
+            for _ in range(depth):
+                self._expect(TokenType.RPAREN, "')'")
             return inner
         if token.type is TokenType.IDENTIFIER:
             return self._parse_identifier_primary()

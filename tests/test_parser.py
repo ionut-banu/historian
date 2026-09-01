@@ -479,6 +479,170 @@ def test_no_traceback_reaches_caller_as_syntax_or_value_error():
             _parse(sql)
 
 
+# --- Nesting depth: no RecursionError may ever escape (issue #8, round 1) -
+#
+# QA found `parse()` crashing with a raw, unhandled `RecursionError`
+# on deeply nested parentheses: 89 levels of `(...)` parsed, 90 raised
+# a bare traceback. `sqlite3 3.51.0` accepts 90 levels of bare parens
+# and returns `1`. Two requirements follow, per AGENTS.md ("where
+# historian and SQLite disagree, SQLite is right") and spec §5 ("never
+# a traceback"): historian must parse everything SQLite parses here,
+# and must raise `ParseError` - never let `RecursionError` escape -
+# wherever it does decline to go further.
+#
+# Measured directly against this build of `sqlite3 3.51.0` (see
+# `_docs/decisions.md` for the full numbers and how they were taken):
+# its *documented* limit is `SQLITE_MAX_EXPR_DEPTH` = 1000 (confirmed
+# via `PRAGMA compile_options`), but its own parser's internal stack
+# overflows well before that in practice - at 93 levels of bare
+# parens, and at 31 levels of nested function calls or nested
+# `IN`-lists. `sql/parser.py`'s two limits below (`_MAX_NESTING_DEPTH`
+# and `_MAX_RECURSION_DEPTH`) are chosen to clear all three of those
+# numbers with room to spare, while staying safely inside Python's own
+# recursion budget regardless of how much stack the caller of parse()
+# has already used - see the module docstring for why there are two
+# limits and not one.
+
+_MAX_NESTING_DEPTH = 1000  # sql/parser.py's _MAX_NESTING_DEPTH
+_MAX_RECURSION_DEPTH = 50  # sql/parser.py's _MAX_RECURSION_DEPTH
+
+
+def _nested_parens(depth: int) -> str:
+    return f"SELECT {'(' * depth}1{')' * depth} FROM blame"
+
+
+def _not_chain(depth: int) -> str:
+    return f"SELECT {'NOT ' * depth}1 FROM blame"
+
+
+def _unary_chain(depth: int) -> str:
+    # Space-separated: `--` lexes as a SQL line comment, which would
+    # swallow the rest of the query instead of producing `depth`
+    # separate MINUS tokens.
+    return f"SELECT {'- ' * depth}1 FROM blame"
+
+
+def _nested_in(depth: int) -> str:
+    return f"SELECT {'a IN (' * depth}1{')' * depth} FROM blame"
+
+
+def _nested_calls(depth: int) -> str:
+    return f"SELECT {'f(' * depth}1{')' * depth} FROM blame"
+
+
+def test_qa_reported_depth_parses_like_sqlite():
+    """The exact case QA reported: `sqlite3` accepts 90 levels of bare
+    parens and returns `1`. historian must too - a depth limit is only
+    correct if it sits above what SQLite actually accepts."""
+    expr = _select_expr(_nested_parens(90))
+    assert expr == Literal(value=1, position=expr.position)
+
+
+def test_nested_parens_up_to_max_depth_parse():
+    expr = _select_expr(_nested_parens(_MAX_NESTING_DEPTH))
+    assert expr == Literal(value=1, position=expr.position)
+
+
+def test_nested_parens_beyond_max_depth_raise_parse_error():
+    with pytest.raises(ParseError) as excinfo:
+        _parse(_nested_parens(_MAX_NESTING_DEPTH + 1))
+    assert isinstance(excinfo.value.position, Position)
+
+
+def test_absurdly_deep_nested_parens_raise_parse_error_not_recursion_error():
+    """No RecursionError may escape at any depth, including far beyond
+    anything a real query - or a fuzzer - would plausibly generate."""
+    with pytest.raises(ParseError):
+        _parse(_nested_parens(20_000))
+
+
+def test_not_chain_up_to_max_depth_parses():
+    expr = _select_expr(_not_chain(_MAX_NESTING_DEPTH))
+    assert isinstance(expr, Not)
+
+
+def test_not_chain_beyond_max_depth_raises_parse_error():
+    with pytest.raises(ParseError) as excinfo:
+        _parse(_not_chain(_MAX_NESTING_DEPTH + 1))
+    assert isinstance(excinfo.value.position, Position)
+
+
+def test_absurdly_long_not_chain_raises_parse_error_not_recursion_error():
+    with pytest.raises(ParseError):
+        _parse(_not_chain(20_000))
+
+
+def test_unary_chain_up_to_max_depth_parses():
+    expr = _select_expr(_unary_chain(_MAX_NESTING_DEPTH))
+    assert isinstance(expr, UnaryOp)
+
+
+def test_unary_chain_beyond_max_depth_raises_parse_error():
+    with pytest.raises(ParseError) as excinfo:
+        _parse(_unary_chain(_MAX_NESTING_DEPTH + 1))
+    assert isinstance(excinfo.value.position, Position)
+
+
+def test_absurdly_long_unary_chain_raises_parse_error_not_recursion_error():
+    with pytest.raises(ParseError):
+        _parse(_unary_chain(20_000))
+
+
+def test_nested_in_list_up_to_recursion_depth_parses():
+    # Each of the `depth` nested `IN (...)` layers costs one
+    # `_parse_expr` re-entry *on top of* the one already spent parsing
+    # the select-list item itself, so `depth` layers reach
+    # `depth + 1` on `self._depth` - `_MAX_RECURSION_DEPTH - 1` layers
+    # is the deepest that stays at exactly `_MAX_RECURSION_DEPTH`.
+    expr = _select_expr(_nested_in(_MAX_RECURSION_DEPTH - 1))
+    assert isinstance(expr, In)
+
+
+def test_nested_in_list_beyond_recursion_depth_raises_parse_error():
+    with pytest.raises(ParseError) as excinfo:
+        _parse(_nested_in(_MAX_RECURSION_DEPTH))
+    assert isinstance(excinfo.value.position, Position)
+
+
+def test_absurdly_deep_nested_in_list_raises_parse_error_not_recursion_error():
+    with pytest.raises(ParseError):
+        _parse(_nested_in(20_000))
+
+
+def test_nested_function_calls_up_to_recursion_depth_parse():
+    # Same off-by-one as the IN-list case above: `depth` nested calls
+    # cost `depth + 1` on `self._depth`.
+    expr = _select_expr(_nested_calls(_MAX_RECURSION_DEPTH - 1))
+    assert isinstance(expr, FunctionCall)
+
+
+def test_nested_function_calls_beyond_recursion_depth_raises_parse_error():
+    with pytest.raises(ParseError) as excinfo:
+        _parse(_nested_calls(_MAX_RECURSION_DEPTH))
+    assert isinstance(excinfo.value.position, Position)
+
+
+def test_absurdly_deep_nested_function_calls_raise_parse_error_not_recursion_error():
+    with pytest.raises(ParseError):
+        _parse(_nested_calls(20_000))
+
+
+def test_deep_nesting_parse_error_message_names_the_problem():
+    with pytest.raises(ParseError) as excinfo:
+        _parse(_nested_parens(_MAX_NESTING_DEPTH + 1))
+    assert "nest" in str(excinfo.value).lower()
+
+
+def test_long_and_chain_still_parses_unaffected_by_depth_limit():
+    """AND/OR/comparison chaining is loop-based, not recursive, so it
+    was never at risk of RecursionError - unaffected by this fix. QA
+    already checked a 500-clause chain by hand; this pins it as a
+    regression test."""
+    sql = "SELECT " + " AND ".join(["a"] * 5000) + " FROM blame"
+    expr = _select_expr(sql)
+    assert isinstance(expr, And)
+
+
 # --- Module and node-shape constraints -------------------------------
 
 

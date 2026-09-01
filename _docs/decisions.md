@@ -436,3 +436,38 @@ than waiting to be noticed downstream. `large` (spec §4's third
 fixture) is out of scope here - split into issue #27, since it
 gates no correctness test and needs its own build and caching
 decisions.
+
+2026-09-01 - Git bytes are decoded as UTF-8 with errors="replace",
+not surrogateescape
+
+Settled while grooming #11, answering the question #20 asked.
+Confirmed directly:
+
+    surrogateescape  ->  UnicodeEncodeError: surrogates not allowed
+    replace          ->  inserts, round-trips equal
+
+surrogateescape produces a Python str that Python's own sqlite3
+module cannot insert at all. Since §1 makes SQLite the definition
+of correct, and M3's differential harness loads every scanned row
+into SQLite, that choice would have made the oracle itself
+unusable - the failure would have surfaced in M3 as a harness
+crash, not as a decoding bug, long after #11's context was gone.
+`errors="replace"` inserts cleanly and round-trips equal, and is
+tables/blame.py's `_decode`, used for both `path` and a blamed
+`line`.
+
+Consequence for values.py: `errors="replace"` can never produce a
+lone surrogate, which is what makes that module's UTF-8-ordering
+assumption true. Not a general fact about Unicode - false for a
+lone surrogate, which is exactly what #20 asked about - but a
+narrow one about every string this decode call can ever produce.
+tests/test_values.py's docstring on
+test_text_comparison_is_bytewise_for_non_ascii was corrected in
+this same branch to state the narrow claim instead of the general
+one.
+
+Known gap, recorded rather than fixed: neither `tiny` nor
+`awkward` exercises non-UTF-8 bytes in a *path*, only in file
+content (`awkward`'s binary.bin). It is the same decode call
+either way, so this is a coverage remark, not an open design
+question.

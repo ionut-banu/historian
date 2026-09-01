@@ -245,3 +245,52 @@ lexing failure.
 Also decided in the same pass: `\f` (form feed) joins `\t`/`\r` as
 whitespace, confirmed against SQLite; `\v` (vertical tab) does
 not, because SQLite rejects it too.
+
+2026-09-01 - An INTEGER literal past int64 max becomes a float,
+enforced in sql/parser.py
+
+Issue #17: SQLite's integers are int64
+(-9223372036854775808..9223372036854775807). Confirmed against
+sqlite3 3.51.0:
+
+    select 9223372036854775807, typeof(9223372036854775807);
+    9223372036854775807|integer
+    select 9223372036854775808, typeof(9223372036854775808);
+    9.22337203685478e+18|real
+    select 9223372036854775808 = 9223372036854775809;
+    1
+
+A decimal literal that overflows becomes a REAL, and every literal
+past the boundary that rounds to the same double compares equal to
+every other one that does. Python's int() never overflows, so
+without an explicit check historian would keep such literals
+distinct and disagree with SQLite. sql/parser.py's literal
+construction now parses an INTEGER token's digit text with int();
+if the result exceeds 9223372036854775807, it constructs float()
+from the same text instead. The lexer never emits a signed INTEGER
+token - a leading `-` is always its own MINUS token - so the rule
+is one-directional and there is no negative bound to check here.
+
+This is unrelated to the 2026-08-27 "numeric comparison is exact;
+no float() anywhere" decision, and the two must not be conflated.
+That decision governs comparison in values.py, which stays exact
+and is pinned by a test at the 2^53 case - nothing here adds a
+float() call there. What is decided here is literal construction
+in sql/parser.py, which happens before any value ever reaches
+values.py.
+
+Not implemented: SQLite special-cases a unary minus written
+directly against the int64-min literal, so
+typeof(-9223372036854775808) is integer even though the unsigned
+digit sequence alone (9223372036854775808) overflows to REAL.
+Checked whether Part A's grammar can observe the gap between that
+and the naive path (negate an overflowed float) - it cannot: 2^63
+is exactly representable as a double, so -9223372036854775808.0
+compares exactly equal to the true int -9223372036854775808 under
+Python's (and SQLite's) exact int/float comparison, and this
+grammar has no typeof() and no arithmetic to tell them apart by.
+They diverge only once arithmetic exists (-9223372036854775808 + 1
+would round incorrectly starting from the float), which has no
+home until exec/expression.py (#12). Recorded now, matching the
+NaN-yields-NULL precedent above, so whoever builds arithmetic knows
+to revisit it rather than rediscover it.

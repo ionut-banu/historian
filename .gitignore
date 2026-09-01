@@ -5,3 +5,11 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Built fixture repositories (tests/fixtures/build.py). Never
+# committed as binaries - see spec.md §4. No trailing slash: a
+# directory-only pattern only matches a path git can confirm is a
+# directory, which fails `git check-ignore` on a path that does not
+# exist on disk yet - and pytest may check this before anything has
+# built a fixture into it.
+tests/fixtures/_built

@@ -552,3 +552,65 @@ def _verify_awkward(repo: Path) -> None:
             "awkward: the porcelain-lookalike line did not appear as a "
             "tab-prefixed content line in git blame --line-porcelain output"
         )
+
+
+# ---------------------------------------------------------------------------
+# Caching
+#
+# tiny and awkward are rebuilt exactly once per change to this file,
+# not once per test run - the whole suite is run on every engineer and
+# QA pass (_docs/process.md), and rebuilding a handful of commits is
+# proven idempotent above, so paying for it every time is pure waste.
+#
+# Built under a path inside tests/fixtures/ rather than a system temp
+# directory: that survives between runs (what makes caching worth
+# anything) and can be cd-ed into for manual debugging. Never
+# committed as binaries (spec.md §4) - see .gitignore.
+# ---------------------------------------------------------------------------
+
+CACHE_DIR = Path(__file__).parent / "_built"
+
+
+def _builder_digest() -> str:
+    """A digest of this file's own source, used to invalidate a cached
+    build when build.py itself changes - a version constant bumped by
+    hand can be forgotten; hashing the file it would have needed to
+    change to be forgotten cannot."""
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+def _cached(cache_dir: Path, name: str, builder) -> Path:
+    repo = cache_dir / name
+    digest_file = cache_dir / f"{name}.digest"
+    digest = _builder_digest()
+    if repo.exists() and digest_file.exists() and digest_file.read_text() == digest:
+        return repo
+    builder(repo)
+    digest_file.parent.mkdir(parents=True, exist_ok=True)
+    digest_file.write_text(digest)
+    return repo
+
+
+def get_tiny_repo(cache_dir: Path = CACHE_DIR) -> Path:
+    """Return the path to a built `tiny` repository, building (or
+    rebuilding, if build.py has changed since the cached one) it first
+    if necessary."""
+    return _cached(cache_dir, "tiny", build_tiny)
+
+
+def get_awkward_repo(cache_dir: Path = CACHE_DIR) -> Path:
+    """Return the path to a built `awkward` repository, building (or
+    rebuilding, if build.py has changed since the cached one) it first
+    if necessary."""
+    return _cached(cache_dir, "awkward", build_awkward)
+
+
+if __name__ == "__main__":
+    # Manual invocation for debugging: `uv run python -m tests.fixtures.build`
+    # (or `python tests/fixtures/build.py` from the repo root) builds
+    # both fixtures into the cache directory and prints where they
+    # landed, so they can be inspected or cd-ed into by hand.
+    for repo_name, getter in (("tiny", get_tiny_repo), ("awkward", get_awkward_repo)):
+        path = getter()
+        head = _run_git(path, ["rev-parse", "HEAD"]).strip()
+        print(f"{repo_name}: {path} (HEAD {head})")

@@ -471,3 +471,46 @@ Known gap, recorded rather than fixed: neither `tiny` nor
 content (`awkward`'s binary.bin). It is the same decode call
 either way, so this is a coverage remark, not an open design
 question.
+
+2026-09-01 - Negating the int64-min literal is fixed
+structurally in exec/expression.py, not completely - sql/ast.py
+has no field to tell it apart from an equal-valued REAL literal
+
+Closes the gap the 2026-09-01 "An INTEGER literal past int64
+max becomes a float" entry left open for #12. `sql/parser.py`
+parses the bare digit sequence "9223372036854775808" (no
+decimal point) as the float 9223372036854775808.0, since it
+overflows int64 as an INTEGER token - so `-9223372036854775808`
+written directly in source parses to `UnaryOp(NEG,
+Literal(9223372036854775808.0))`. Confirmed against sqlite3
+3.51.0 that naively negating that float loses the point once
+arithmetic follows: `-9223372036854775808.0 + 1.0` rounds right
+back to the same double (the ULP at 2**63 is 2048), while real
+SQLite keeps `-9223372036854775808 + 1` an exact integer,
+-9223372036854775807.
+
+exec/expression.py now special-cases exactly this AST shape -
+`UnaryOp(NEG, Literal(v))` where `v == 2**63` - and returns the
+exact int64 minimum directly, bypassing the general negate-
+then-bound path. This also fixes the division-overflow example
+named in #12's own criteria (`-9223372036854775808 / -1`),
+though that one happened to already agree either way and so
+did not itself prove the fix necessary - the `+ 1` case above
+is what does.
+
+The fix is necessarily incomplete, and this records why rather
+than hiding it: `sql/ast.py`'s `Literal` carries only a `Value`,
+with no field saying whether it came from an INTEGER token that
+overflowed or a REAL token spelled with an explicit decimal
+point. Confirmed directly against sqlite3: `-9223372036854775808.0`
+(explicit ".0") stays REAL under negation - real SQLite does not
+special-case it - but exec/expression.py cannot tell the two
+spellings apart once parsed, since `sql/parser.py` (out of scope
+for #12) already erases the distinction into the identical float
+value by the time either reaches this module. The structural
+check therefore also mis-types the rare ".0"-spelled case as
+INTEGER instead of REAL. Chose to fix the far more common
+bare-digit spelling - what a hand-written query or the fuzzer
+would actually produce - at that cost, rather than leave both
+spellings broken waiting on a `Literal` field that belongs to a
+different issue (`sql/ast.py` is off-limits for #12).

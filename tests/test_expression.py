@@ -31,6 +31,7 @@ from historian.sql.ast import (
     BinaryOp,
     FunctionCall,
     Is,
+    Like,
     Literal,
     Not,
     Operator,
@@ -770,3 +771,66 @@ def test_not_three_valued_logic():
     assert evaluate(Not(_NULL, _POS), _ROW, _SCHEMA) is None
     assert evaluate(Not(_TRUE, _POS), _ROW, _SCHEMA) is False
     assert evaluate(Not(_FALSE, _POS), _ROW, _SCHEMA) is True
+
+
+# --- LIKE: unconditional text coercion, no affinity, ASCII-only fold ----
+
+
+def _like(left, pattern, negated=False) -> Like:
+    return Like(left=left, pattern=pattern, negated=negated, position=_POS)
+
+
+def test_like_does_not_use_affinity_casts_both_sides_to_text_unconditionally():
+    """sqlite3 (`n INT`, `n=5`): `n LIKE '5'` -> 1; `5 LIKE 5` -> 1
+    (two integer literals, no column at all - LIKE always converts,
+    affinity or not)."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_like(_col("n"), _lit("5")), _ROW, _SCHEMA) is True
+    assert evaluate(_like(_lit(5), _lit(5)), _ROW, _SCHEMA) is True
+
+
+@pytest.mark.parametrize(
+    "text,pattern,expected",
+    [
+        ("abc", "a%c", True),
+        ("abc", "a_c", True),
+        ("abc", "a__", True),
+        ("ABC", "abc", True),
+    ],
+)
+def test_like_wildcards_and_ascii_case_insensitivity(text, pattern, expected):
+    """sqlite3: `'abc' like 'a%c'`, `'abc' like 'a_c'`, `'abc' like
+    'a__'`, `'ABC' like 'abc'` -> all 1."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_like(_lit(text), _lit(pattern)), _ROW, _SCHEMA) is expected
+
+
+def test_like_case_folding_is_ascii_only_not_unicode():
+    """sqlite3: `select 'café' like 'CAFÉ';` -> 0 - the é/É pair is not
+    ASCII and is not folded, reusing the same rule
+    `sql/binder.py`'s `_ascii_fold` implements (only A-Z/a-z move),
+    matching the straße/STRASSE precedent already recorded in
+    `_docs/decisions.md` (2026-09-01) for the same reason."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_like(_lit("café"), _lit("CAFÉ")), _ROW, _SCHEMA) is False
+
+
+@pytest.mark.parametrize("left,pattern", [(None, "x"), ("x", None)])
+def test_like_with_null_operand_is_null(left, pattern):
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_like(_lit(left), _lit(pattern)), _ROW, _SCHEMA) is None
+
+
+def test_not_like_is_not3_of_the_unnegated_result():
+    """sqlite3: `select 'abc' not like 'abc';` -> 0. Also proves NULL
+    propagation survives the negation (`not3(None)` is `None`, not
+    `True`) via `null not like 'x'` -> NULL."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_like(_lit("abc"), _lit("abc"), negated=True), _ROW, _SCHEMA) is False
+    assert evaluate(_like(_lit("abc"), _lit("xyz"), negated=True), _ROW, _SCHEMA) is True
+    assert evaluate(_like(_lit(None), _lit("x"), negated=True), _ROW, _SCHEMA) is None

@@ -91,6 +91,7 @@ from historian.sql.ast import (
     BinaryOp,
     Expr,
     FunctionCall,
+    In,
     Is,
     Like,
     Literal,
@@ -192,7 +193,29 @@ def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
         return values.not3(evaluate(expr.operand, row, schema))
     if isinstance(expr, Like):
         return _eval_like(expr, row, schema)
+    if isinstance(expr, In):
+        return _eval_in(expr, row, schema)
     raise AssertionError(f"exec/expression.py: unhandled expression node type {type(expr).__name__}")
+
+
+def _eval_in(expr: In, row: Row, schema: Schema) -> Bool3:
+    """`x IN (v1, ..., vn)` is `values.or3` folded over each
+    `values.eq(x, vi)`, per this issue's own criteria - not bespoke
+    NULL-handling logic. Confirmed against `sqlite3`: `5 IN (5,
+    NULL)` is `TRUE` (`or3` short-circuits on the first match before
+    the `NULL` element matters), `6 IN (5, NULL)` is `NULL` (no
+    element matches, but a `NULL` element means "maybe", not "no").
+    `IN ()` folds over zero elements, leaving the `False` starting
+    accumulator untouched - matching `sql/ast.py`'s own docstring that
+    `IN ()` is always `FALSE`. Affinity is applied to each `(x, vi)`
+    pair independently, exactly as for `=`: `x`'s own affinity can
+    interact differently with each element's.
+    """
+    result: Bool3 = False
+    for element in expr.values:
+        left, right = _evaluate_affinity_pair(expr.left, element, row, schema)
+        result = values.or3(result, values.eq(left, right))
+    return values.not3(result) if expr.negated else result
 
 
 # --- LIKE: unconditional text coercion, no affinity, ASCII-only fold ----

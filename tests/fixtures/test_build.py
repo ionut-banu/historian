@@ -308,3 +308,203 @@ def test_verify_tiny_raises_when_a_required_file_is_dropped(tmp_path):
 
     with pytest.raises(build.FixtureError, match="utils.py"):
         build._verify_tiny(repo)
+
+
+# ---------------------------------------------------------------------------
+# awkward
+#
+# "built to break things" - spec.md §4. One item per required property,
+# per the issue #10 grooming comment.
+# ---------------------------------------------------------------------------
+
+
+def test_awkward_branch_is_main(tmp_path):
+    repo = build.build_awkward(tmp_path / "awkward")
+    branch = build._run_git(repo, ["branch", "--show-current"]).strip()
+    assert branch == "main"
+
+
+def test_awkward_commit_count_is_minimal(tmp_path):
+    repo = build.build_awkward(tmp_path / "awkward")
+    count = int(build._run_git(repo, ["rev-list", "--count", "HEAD"]).strip())
+    assert count == 3
+
+
+def test_awkward_exact_file_list(tmp_path):
+    repo = build.build_awkward(tmp_path / "awkward")
+    raw = build._run_git(repo, ["ls-files", "-z"])
+    paths = set(raw.split("\0")) - {""}
+    assert paths == build.AWKWARD_FILES
+
+
+def test_awkward_unicode_path_is_tracked(tmp_path):
+    repo = build.build_awkward(tmp_path / "awkward")
+    paths = set(build._run_git(repo, ["ls-files", "-z"]).split("\0")) - {""}
+    assert "café.py" in paths
+
+
+def test_awkward_space_and_quote_path_is_tracked(tmp_path):
+    repo = build.build_awkward(tmp_path / "awkward")
+    paths = set(build._run_git(repo, ["ls-files", "-z"]).split("\0")) - {""}
+    assert any(" " in p and '"' in p for p in paths)
+
+
+def test_awkward_unicode_author_name_appears(tmp_path):
+    repo = build.build_awkward(tmp_path / "awkward")
+    authors = build._run_git(repo, ["log", "--format=%an"])
+    assert "Zoë Müller" in authors
+
+
+def test_awkward_two_distinct_author_identities(tmp_path):
+    repo = build.build_awkward(tmp_path / "awkward")
+    identities = set(build._run_git(repo, ["log", "--format=%an <%ae>"]).strip().splitlines())
+    assert len(identities) == 2
+
+
+def test_awkward_empty_file_is_zero_bytes(tmp_path):
+    repo = build.build_awkward(tmp_path / "awkward")
+    size = int(build._run_git(repo, ["cat-file", "-s", "HEAD:empty.txt"]).strip())
+    assert size == 0
+
+
+def test_awkward_binary_blob_is_byte_identical_to_source(tmp_path):
+    repo = build.build_awkward(tmp_path / "awkward")
+    content = build._run_git_bytes(repo, ["cat-file", "-p", "HEAD:binary.bin"])
+    assert content == build.AWKWARD_BINARY_CONTENT
+    assert content[0:1] == b"\x00", "the NUL must be within the first bytes git samples"
+
+
+def test_awkward_no_trailing_newline_file_has_none(tmp_path):
+    repo = build.build_awkward(tmp_path / "awkward")
+    content = build._run_git_bytes(repo, ["cat-file", "-p", "HEAD:no_newline.txt"])
+    assert content == build.AWKWARD_NO_NEWLINE_CONTENT
+    assert not content.endswith(b"\n")
+
+
+def test_awkward_blame_on_no_trailing_newline_file_reports_final_line(tmp_path):
+    repo = build.build_awkward(tmp_path / "awkward")
+    porcelain = build._run_git(repo, ["blame", "--line-porcelain", "no_newline.txt"])
+    content_lines = [line[1:] for line in porcelain.splitlines() if line.startswith("\t")]
+    expected_last = build.AWKWARD_NO_NEWLINE_CONTENT.decode().splitlines()[-1]
+    assert content_lines[-1] == expected_last
+
+
+def test_awkward_phoenix_file_at_head_is_the_recreation_not_the_original(tmp_path):
+    repo = build.build_awkward(tmp_path / "awkward")
+    content = build._run_git(repo, ["show", "HEAD:phoenix.txt"])
+    assert content == build.AWKWARD_PHOENIX_RECREATED
+    assert content != build.AWKWARD_PHOENIX_ORIGINAL
+
+
+def test_awkward_phoenix_file_was_genuinely_deleted_in_history(tmp_path):
+    """Not a no-op restore: the file was actually absent from some
+    commit's tree, so a stale-cache bug reading ls-tree at HEAD only
+    would be exposed, per the grooming's "not a no-op restore" note."""
+    repo = build.build_awkward(tmp_path / "awkward")
+    deletions = build._run_git(
+        repo, ["log", "--all", "--diff-filter=D", "--format=%H", "--", "phoenix.txt"]
+    ).strip()
+    assert deletions != ""
+
+
+def test_awkward_has_an_empty_commit_message(tmp_path):
+    repo = build.build_awkward(tmp_path / "awkward")
+    hashes = build._run_git(repo, ["log", "--format=%H"]).strip().splitlines()
+    messages = [build._run_git(repo, ["log", "-1", "--format=%B", h]).strip("\n") for h in hashes]
+    assert "" in messages
+
+
+def test_awkward_porcelain_lookalike_line_is_tab_prefixed_content(tmp_path):
+    """Verified against real git blame --line-porcelain output: content
+    lines are tab-prefixed, header lines never are. The lookalike line
+    must appear as tab-prefixed content, and must not itself start with
+    a tab in the source blob."""
+    repo = build.build_awkward(tmp_path / "awkward")
+
+    source = build._run_git(repo, ["cat-file", "-p", "HEAD:café.py"])
+    assert build.AWKWARD_LOOKALIKE_LINE in source.splitlines()
+    for line in source.splitlines():
+        if line == build.AWKWARD_LOOKALIKE_LINE:
+            assert not line.startswith("\t")
+
+    porcelain = build._run_git(repo, ["blame", "--line-porcelain", "café.py"])
+    tab_content_lines = [line[1:] for line in porcelain.splitlines() if line.startswith("\t")]
+    assert build.AWKWARD_LOOKALIKE_LINE in tab_content_lines
+
+
+def test_awkward_naive_header_check_without_tab_falsely_matches_lookalike_line(tmp_path):
+    """The acceptance test for #11's extraction parser, run here against
+    the fixture directly: a parser that strips whitespace and then
+    checks header keyword prefixes - without checking for the leading
+    tab first - misidentifies our fixture's content line as a header.
+    A parser that checks for the tab first does not."""
+    repo = build.build_awkward(tmp_path / "awkward")
+    porcelain = build._run_git(repo, ["blame", "--line-porcelain", "café.py"])
+
+    naive_keywords = (
+        "author ", "author-mail ", "author-time ", "author-tz ",
+        "committer ", "committer-mail ", "committer-time ", "committer-tz ",
+        "summary ", "filename ", "previous ",
+    )
+    naive_false_positives = [
+        line for line in porcelain.splitlines()
+        if line.startswith("\t") and line.lstrip().startswith(naive_keywords)
+    ]
+    assert any(
+        build.AWKWARD_LOOKALIKE_LINE in line for line in naive_false_positives
+    ), "the fixture should make a tab-blind naive parser misfire on this line"
+
+    tab_correct_matches = [
+        line for line in porcelain.splitlines()
+        if (not line.startswith("\t")) and line.startswith(naive_keywords)
+    ]
+    assert not any(
+        build.AWKWARD_LOOKALIKE_LINE in line for line in tab_correct_matches
+    ), "a parser that checks for the tab first must not misidentify the content line as a header"
+
+
+def test_awkward_is_deterministic_across_independent_builds(tmp_path):
+    head_a = build.build_awkward(tmp_path / "a")
+    head_b = build.build_awkward(tmp_path / "b")
+    assert build._run_git(head_a, ["rev-parse", "HEAD"]) == build._run_git(head_b, ["rev-parse", "HEAD"])
+
+    objects_a = build._run_git(tmp_path / "a", ["rev-list", "--objects", "--all"])
+    objects_b = build._run_git(tmp_path / "b", ["rev-list", "--objects", "--all"])
+    assert objects_a == objects_b
+
+
+def test_awkward_head_matches_pinned_hash(tmp_path):
+    repo = build.build_awkward(tmp_path / "awkward")
+    assert build._run_git(repo, ["rev-parse", "HEAD"]).strip() == build.AWKWARD_HEAD
+
+
+def test_verify_awkward_raises_when_a_file_is_dropped(tmp_path):
+    """Simulates exactly the hostile-excludesFile hazard from §4: a
+    fixture with the right commit shape (3 commits, 2 authors) but
+    missing one required file, the way a silently-dropped file would
+    look. Built directly rather than through build_awkward, so the
+    commit count stays 3 and the file-presence check is what fires."""
+    repo = tmp_path / "missing-file"
+    build._init_repo(repo, branch="main")
+    clock = build._Clock()
+    zoe = ("Zoë Müller", "zoe@example.com")
+    sam = ("Sam Lee", "sam@example.com")
+
+    # Every awkward file except empty.txt.
+    (repo / "café.py").write_text(build._AWKWARD_CAFE_INITIAL)
+    (repo / 'a "quoted" name.txt').write_text(build._AWKWARD_QUOTED_CONTENT)
+    (repo / "binary.bin").write_bytes(build.AWKWARD_BINARY_CONTENT)
+    (repo / "no_newline.txt").write_bytes(build.AWKWARD_NO_NEWLINE_CONTENT)
+    (repo / "phoenix.txt").write_text(build.AWKWARD_PHOENIX_ORIGINAL)
+    build._run_git(repo, ["add", "-A"])
+    build._commit(repo, "initial", author=zoe, timestamp=clock.tick())
+
+    build._run_git(repo, ["rm", "--quiet", "phoenix.txt"])
+    build._commit(repo, "remove phoenix", author=sam, timestamp=clock.tick())
+
+    (repo / "phoenix.txt").write_text(build.AWKWARD_PHOENIX_RECREATED)
+    build._run_git(repo, ["add", "-A"])
+    build._commit(repo, "", author=sam, timestamp=clock.tick(), allow_empty_message=True)
+
+    with pytest.raises(build.FixtureError, match="empty.txt"):
+        build._verify_awkward(repo)

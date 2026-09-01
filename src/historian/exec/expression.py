@@ -184,7 +184,82 @@ def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
         return _eval_binary(expr, row, schema)
     if isinstance(expr, UnaryOp):
         return _eval_unary(expr, row, schema)
+    if isinstance(expr, Is):
+        return _eval_is(expr, row, schema)
     raise AssertionError(f"exec/expression.py: unhandled expression node type {type(expr).__name__}")
+
+
+# --- Column affinity -----------------------------------------------------
+#
+# Per this issue's own grooming (revising the 2026-08-27 decision entry's
+# "convert the literal" phrasing, which was too narrow): affinity is
+# decided per operand, independently, by a purely structural question -
+# is this operand a *bare* BoundColumnRef? - never by "which side is a
+# literal". `(n + 0) = '5'` has no affinity on its left side even though
+# `n` is INTEGER, because the left operand there is a BinaryOp, not a
+# bare BoundColumnRef.
+
+_NUMERIC_AFFINITIES = (ColumnType.INTEGER, ColumnType.REAL)
+
+
+def _affinity_of(expr: Expr, schema: Schema) -> ColumnType | None:
+    """The affinity *expr* itself contributes to a comparison: the
+    declared type of a bare `BoundColumnRef`, `None` for anything
+    else - a literal, arithmetic, concatenation, or any other computed
+    expression, even one that merely mentions a column."""
+    if isinstance(expr, BoundColumnRef):
+        return schema.columns[expr.offset].type
+    return None
+
+
+def _apply_affinity(
+    left: Value, left_affinity: ColumnType | None, right: Value, right_affinity: ColumnType | None
+) -> tuple[Value, Value]:
+    """SQLite's own two-rule algorithm, run on one already-evaluated
+    operand pair: numeric affinity wins whenever either operand has it
+    (confirmed against `sqlite3`: this applies numeric conversion to
+    *both* operands, including one that is itself `TEXT`-affinity, as
+    in `n = s` above - not just the "other" side); otherwise, text
+    affinity applies to a no-affinity operand whenever the other side
+    has it. Neither rule ever fires when both operands carry no
+    affinity at all - two literals compare with no coercion, matching
+    `values.py`'s own class-rank comparison."""
+    if left_affinity in _NUMERIC_AFFINITIES or right_affinity in _NUMERIC_AFFINITIES:
+        return _try_numeric_affinity(left), _try_numeric_affinity(right)
+    if left_affinity is ColumnType.TEXT or right_affinity is ColumnType.TEXT:
+        return _coerce_to_text(left), _coerce_to_text(right)
+    return left, right
+
+
+def _strip_numeric_whitespace(text: str) -> str:
+    """`text` with `_NUMERIC_WHITESPACE` characters trimmed from both
+    ends - not Python's `str.strip()`, which trims a broader,
+    Unicode-aware set this module has no evidence SQLite's own
+    whole-string numeric-affinity check agrees with (only plain ASCII
+    space is exercised by this issue's own criteria)."""
+    return text.strip(_NUMERIC_WHITESPACE)
+
+
+def _try_numeric_affinity(value: Value) -> Value:
+    """Column affinity's text-to-number conversion: the *entire*
+    (whitespace-trimmed) string must be a well-formed number, or the
+    value is left as text, unconverted - a stricter rule than
+    arithmetic's leading-prefix parse above (`n = '5abc'` is `FALSE`;
+    `'5abc' + 1` is `6`). A non-`str` value passes through unchanged -
+    it is already numeric, or `NULL`, and affinity never touches
+    either."""
+    if not isinstance(value, str):
+        return value
+    stripped = _strip_numeric_whitespace(value)
+    if not stripped:
+        return value
+    scanned = _scan_number(stripped, 0)
+    if scanned is None:
+        return value
+    number, end = scanned
+    if end != len(stripped):
+        return value
+    return number
 
 
 #: `2**63`, exactly representable as a double. The one value a bare
@@ -246,9 +321,20 @@ def _eval_unary(expr: UnaryOp, row: Row, schema: Schema) -> Value:
     return _squash_nan(-numeric)
 
 
-# --- BinaryOp: arithmetic (comparison and concat join this later) ------
+# --- BinaryOp: arithmetic, concatenation, comparison --------------------
 
 _ARITHMETIC_OPS = frozenset({Operator.ADD, Operator.SUB, Operator.MUL, Operator.DIV})
+
+#: One `values.py` comparison function per comparison `Operator`. All
+#: six take affinity-adjusted operands - see `_eval_binary` below.
+_COMPARISON_FNS = {
+    Operator.EQ: values.eq,
+    Operator.NE: values.ne,
+    Operator.LT: values.lt,
+    Operator.LE: values.le,
+    Operator.GT: values.gt,
+    Operator.GE: values.ge,
+}
 
 
 def _eval_binary(expr: BinaryOp, row: Row, schema: Schema) -> Value | Bool3:
@@ -262,7 +348,34 @@ def _eval_binary(expr: BinaryOp, row: Row, schema: Schema) -> Value | Bool3:
         if left is None or right is None:
             return None
         return _coerce_to_text(left) + _coerce_to_text(right)
+    if expr.op in _COMPARISON_FNS:
+        left, right = _evaluate_affinity_pair(expr.left, expr.right, row, schema)
+        return _COMPARISON_FNS[expr.op](left, right)
     raise AssertionError(f"exec/expression.py: BinaryOp operator not yet handled: {expr.op}")
+
+
+def _evaluate_affinity_pair(
+    left_expr: Expr, right_expr: Expr, row: Row, schema: Schema
+) -> tuple[Value, Value]:
+    """Evaluate both sides of a comparison-shaped pair of operands
+    (`=`/`<>`/.../`IS`/`IS NOT`, and - later - each element of `IN`
+    and each bound of `BETWEEN`) and apply column affinity to the
+    result. Shared by every predicate that this issue's own criteria
+    says goes through "the identical affinity algorithm" as `=`."""
+    left = evaluate(left_expr, row, schema)
+    right = evaluate(right_expr, row, schema)
+    return _apply_affinity(left, _affinity_of(left_expr, schema), right, _affinity_of(right_expr, schema))
+
+
+def _eval_is(expr: Is, row: Row, schema: Schema) -> bool:
+    """`IS` / `IS NOT`, including the `IS NULL` / `IS NOT NULL`
+    spelling (`sql/ast.py`'s own docstring: `IS NULL` is `IS` against
+    a `NULL` literal, not a separate node). Goes through the identical
+    affinity algorithm as `=`/`<>` before calling `values.is_`/
+    `values.is_not` - confirmed against `sqlite3`: `5 IS '5'` is
+    `FALSE` like `5 = '5'`, but `n IS '5'` (INTEGER column) is `TRUE`."""
+    left, right = _evaluate_affinity_pair(expr.left, expr.right, row, schema)
+    return values.is_not(left, right) if expr.negated else values.is_(left, right)
 
 
 # --- SQLite's number-to-text conversion, shared by ||, text affinity, --

@@ -29,6 +29,7 @@ from historian.schema import Column, ColumnType, Row, Schema
 from historian.sql.ast import (
     BinaryOp,
     FunctionCall,
+    Is,
     Literal,
     Operator,
     Star,
@@ -514,3 +515,215 @@ def test_unary_plus_is_a_true_no_op(value):
     result = evaluate(_unary(UnaryOperator.POS, _lit(value)), _ROW, _SCHEMA)
     assert result == value
     assert type(result) is type(value)
+
+
+# --- Column affinity ------------------------------------------------------
+#
+# sqlite3, `t(n INTEGER, s TEXT, r REAL)`, row `(5, '5', 5.0)`:
+#
+#   select n = s, n = 'hello', s = 5.0, n = r;      -> 1|0|0|1
+#   select s = (5+0);                               -> 1
+#   select n = ('5' || '');                          -> 1
+#   select (n+0) = '5';                               -> 0
+#
+# `_ROW_HELLO` is the same schema with `s = 'hello'` instead of `'5'`,
+# for the "conversion fails, compares by class rank" half of `n = s`.
+
+_ROW_HELLO: Row = (5, "hello", 5.0)
+
+
+def test_two_literals_no_affinity_applied():
+    """sqlite3: `select 5 = '5';` -> 0. No column is involved on
+    either side, so `values.eq` runs with no coercion at all."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_bin(Operator.EQ, _lit(5), _lit("5")), _ROW, _SCHEMA) is False
+
+
+def test_bare_integer_column_converts_text_literal():
+    """sqlite3 (`n INT`, `n=5`): `n = '5'` -> 1."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_bin(Operator.EQ, _col("n"), _lit("5")), _ROW, _SCHEMA) is True
+
+
+def test_bare_text_column_converts_integer_literal():
+    """sqlite3 (`s TEXT`, `s='5'`): `s = 5` -> 1."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_bin(Operator.EQ, _col("s"), _lit(5)), _ROW, _SCHEMA) is True
+
+
+def test_computed_expression_has_no_affinity_even_though_it_contains_a_column():
+    """sqlite3: `(n + 0) = '5'` -> 0, even though `n` is `INTEGER` -
+    the left operand is a `BinaryOp`, not a bare `BoundColumnRef`, so
+    it contributes no affinity at all. This is the exact correction
+    this issue's grooming made to the 2026-08-27 decision entry's
+    "convert the literal" phrasing."""
+    from historian.exec.expression import evaluate
+
+    computed = _bin(Operator.ADD, _col("n"), _lit(0))
+    assert evaluate(_bin(Operator.EQ, computed, _lit("5")), _ROW, _SCHEMA) is False
+
+
+def test_column_versus_column_applies_numeric_affinity_to_the_text_side():
+    """sqlite3: `n = s` -> 1 for `n=5, s='5'`, -> 0 for `n=5,
+    s='hello'` (conversion of 'hello' fails, no crash, compares by
+    class rank)."""
+    from historian.exec.expression import evaluate
+
+    cmp = _bin(Operator.EQ, _col("n"), _col("s"))
+    assert evaluate(cmp, _ROW, _SCHEMA) is True
+    assert evaluate(cmp, _ROW_HELLO, _SCHEMA) is False
+
+
+def test_text_affinity_applied_to_a_no_affinity_numeric_operand():
+    """sqlite3: `s = (5+0)` -> 1 - `s` is `TEXT` affinity, `(5+0)` is
+    a computed, no-affinity operand holding the int `5`; text affinity
+    converts it to `'5'` before comparing."""
+    from historian.exec.expression import evaluate
+
+    computed = _bin(Operator.ADD, _lit(5), _lit(0))
+    assert evaluate(_bin(Operator.EQ, _col("s"), computed), _ROW, _SCHEMA) is True
+
+
+def test_numeric_affinity_applied_to_a_no_affinity_text_operand():
+    """sqlite3: `n = ('5' || '')` -> 1 - `n` is numeric affinity, the
+    concatenation result is a no-affinity `'5'`; numeric affinity
+    converts it to `5` before comparing."""
+    from historian.exec.expression import evaluate
+
+    computed = _bin(Operator.CONCAT, _lit("5"), _lit(""))
+    assert evaluate(_bin(Operator.EQ, _col("n"), computed), _ROW, _SCHEMA) is True
+
+
+@pytest.mark.parametrize(
+    "text,matches",
+    [
+        ("  5  ", True),
+        ("+5", True),
+        ("5e0", True),
+        ("5.0", True),
+        ("5 5", False),
+        ("abc", False),
+        ("5abc", False),
+    ],
+)
+def test_affinity_text_to_number_requires_the_whole_trimmed_string(text, matches):
+    """sqlite3 (`n INT`, `n=5`): `n = '  5  '` -> 1 (surrounding
+    whitespace only), `n = '+5'` -> 1, `n = '5e0'` -> 1 (exponent
+    form, becomes 5.0, numerically equal to 5), `n = '5 5'` -> 0,
+    `n = 'abc'` / `n = '5abc'` -> 0 (no conversion at all - stays
+    TEXT, never equal). This is a *whole-string* rule, distinct from
+    arithmetic's leading-prefix rule tested above - '5abc' converts
+    for arithmetic but not for affinity."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.EQ, _col("n"), _lit(text)), _ROW, _SCHEMA)
+    assert result is matches
+
+
+def test_numeric_affinity_preserves_int_versus_float_distinction():
+    """sqlite3: `n = '5'` -> 1 (becomes the exact int 5), `n = '5.0'`
+    -> 1 (becomes 5.0, numerically equal to 5 via values.py's
+    exact numeric comparison) - both true, but for different reasons,
+    which only matters once a value goes on to be compared again."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_bin(Operator.EQ, _col("n"), _lit("5")), _ROW, _SCHEMA) is True
+    assert evaluate(_bin(Operator.EQ, _col("n"), _lit("5.0")), _ROW, _SCHEMA) is True
+
+
+def test_text_affinity_converts_numeric_to_sqlite_text_not_python_str():
+    """sqlite3: `s = 5.0` -> 0 even though `s='5'` - the REAL `5.0`
+    becomes the text `'5.0'` (via this module's own SQLite float
+    formatter), not `'5'`, so it does not match."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_bin(Operator.EQ, _col("s"), _lit(5.0)), _ROW, _SCHEMA) is False
+
+
+def test_real_column_affinity_behaves_identically_to_integer_column():
+    """A synthetic `REAL` column, since none of phase 1's real tables
+    have one (`blame.line_no` is the only non-TEXT column,
+    `_docs/decisions.md` 2026-08-27) - this module must not special-
+    case `INTEGER` over `REAL`. sqlite3 (`r REAL`, `r=5.0`): `r = '5'`
+    -> 1, same whole-string numeric conversion as the INTEGER case."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_bin(Operator.EQ, _col("r"), _lit("5")), _ROW, _SCHEMA) is True
+    assert evaluate(_bin(Operator.EQ, _col("r"), _lit("5abc")), _ROW, _SCHEMA) is False
+
+
+# --- Comparisons: all six operators wire through affinity too -----------
+#
+# sqlite3 (`n INT`, `n=5`): `n < '10'` -> 1, `n > '3'` -> 1
+
+
+def test_less_than_and_greater_than_apply_affinity_too():
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_bin(Operator.LT, _col("n"), _lit("10")), _ROW, _SCHEMA) is True
+    assert evaluate(_bin(Operator.GT, _col("n"), _lit("3")), _ROW, _SCHEMA) is True
+
+
+@pytest.mark.parametrize(
+    "op,expected",
+    [
+        (Operator.EQ, True),
+        (Operator.NE, False),
+        (Operator.LT, False),
+        (Operator.LE, True),
+        (Operator.GT, False),
+        (Operator.GE, True),
+    ],
+)
+def test_every_comparison_operator_is_wired(op, expected):
+    """Sanity sweep over all six, `5 <op> 5` - each one's own
+    three-valued semantics are `values.py`'s job and already tested
+    there; this only proves this module's dispatch reaches all six."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_bin(op, _lit(5), _lit(5)), _ROW, _SCHEMA) is expected
+
+
+# --- Numeric comparison stays exact through this module too -------------
+#
+# tests/test_values.py's own 2^53 pin: 9007199254740993 = 9007199254740992.0
+# is FALSE, 9007199254740993 > 9007199254740992.0 is TRUE. Confirmed the
+# same way against sqlite3 directly.
+
+
+def test_2_53_boundary_comparison_stays_exact_through_a_bound_column_ref():
+    """The checkable form of the exactness rule: via `evaluate()` and
+    a `BoundColumnRef`, not `values.eq` called directly."""
+    from historian.exec.expression import evaluate
+
+    big_row: Row = (9007199254740993, "5", 5.0)
+    eq = _bin(Operator.EQ, _col("n"), _lit(9007199254740992.0))
+    gt = _bin(Operator.GT, _col("n"), _lit(9007199254740992.0))
+    assert evaluate(eq, big_row, _SCHEMA) is False
+    assert evaluate(gt, big_row, _SCHEMA) is True
+
+
+# --- IS / IS NOT: the same affinity algorithm, then values.is_/is_not ---
+#
+# sqlite3: `select 5 IS '5';` -> 0 (two literals, matches `5 = '5'`)
+# sqlite3 (`n INT`, `n=5`): `n IS '5'` -> 1, `n IS NOT '5'` -> 0
+
+
+def _is(left, right, negated=False) -> Is:
+    return Is(left=left, right=right, negated=negated, position=_POS)
+
+
+def test_is_two_literals_mirrors_eq_no_affinity():
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_is(_lit(5), _lit("5")), _ROW, _SCHEMA) is False
+
+
+def test_is_and_is_not_apply_affinity_like_eq():
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_is(_col("n"), _lit("5")), _ROW, _SCHEMA) is True
+    assert evaluate(_is(_col("n"), _lit("5"), negated=True), _ROW, _SCHEMA) is False

@@ -379,3 +379,60 @@ in round 1 - only these four call sites change, and `(expr)`
 continues to produce no AST node of its own, so the loop-based
 paren handling is behaviourally identical to the recursive version
 it replaces.
+
+2026-09-01 - Fixture builds isolate from all ambient git
+configuration, not just the six GIT_* variables
+
+Issue #10 grooming found that spec §4's six GIT_AUTHOR_*/
+GIT_COMMITTER_* variables are necessary but not sufficient for
+byte-identical fixtures. Confirmed on this machine (git 2.50.1,
+Apple Git-155), with all six identical either way:
+`core.autocrlf=input` versus `core.autocrlf=false` produces
+different blob hashes for the same content, and a global
+`core.excludesFile` with a `*~` pattern silently drops a matching
+fixture file from `git add -A` with no error at all - no warning,
+no nonzero exit, just a fixture with one fewer file than intended.
+`commit.gpgsign=true` with no working signing key makes the commit
+fail outright, and `core.fileMode=false` changes what mode gets
+recorded at add time, not only what a later diff reports.
+
+`init.defaultBranch` is the sharpest case. Pointing
+`GIT_CONFIG_SYSTEM` at `/dev/null` alone does not suppress it on
+this platform, because Apple's Command Line Tools git ships its
+own hardcoded system-scope gitconfig, one directory below its
+install root, that `GIT_CONFIG_SYSTEM` does not point git away
+from - `GIT_CONFIG_NOSYSTEM=1` is required in addition. Verified
+directly: `GIT_CONFIG_SYSTEM=/dev/null` alone still resolves
+`init.defaultBranch` to "main" from Apple's file; adding
+`GIT_CONFIG_NOSYSTEM=1` falls back to git's real compiled-in
+default, "master".
+
+Considered enumerating and overriding every setting found to
+matter - the six env vars plus the four above - and rejected it,
+because a list like that is exactly the shape of thing that is
+missing an entry: the platform-specific system config above was
+found by testing, not by reading documentation, and a different
+contributor's machine can have another one nobody has hit yet. The
+fixture builder instead inherits nothing: `GIT_CONFIG_GLOBAL` and
+`GIT_CONFIG_SYSTEM` set to `/dev/null`, `GIT_CONFIG_NOSYSTEM=1`,
+every other ambient `GIT_*` environment variable stripped before
+any git subprocess runs, an explicit branch name passed to every
+`git init` rather than relying on any default, and the settings
+above still set explicitly as local repo config immediately
+afterward - defense in depth on top of the environment-level
+isolation, not instead of it. Proven, not just argued: the same
+fixture built under a hostile ambient config (autocrlf, gpgsign,
+excludesFile and defaultBranch all set adversarially) produces an
+identical HEAD, tree and full object set to a build with no
+ambient config present at all.
+
+spec.md §4 is edited in this commit. Its "so all of them are set
+explicitly," following the six variables, read as a complete
+recipe and was not one; per _docs/process.md, a spec edit that
+turns out wrong lands in the same commit as the decision that
+found it wrong. tiny and awkward now also pin their HEAD hash as
+an assertion, so a determinism regression fails immediately rather
+than waiting to be noticed downstream. `large` (spec §4's third
+fixture) is out of scope here - split into issue #27, since it
+gates no correctness test and needs its own build and caching
+decisions.

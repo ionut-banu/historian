@@ -568,17 +568,33 @@ Four layers, each answering a question the others cannot.
 Built by `tests/fixtures/build.py`, never committed as binaries.
 
 **They must be byte-identical on every machine and every run.** Git
-hashes derive from author, committer, timestamps and tree, so all of
-them are set explicitly:
+hashes derive from author, committer, timestamps and tree - but also
+from the ambient git configuration a build inherits. The six `GIT_*`
+variables below are necessary but not sufficient: on a real
+contributor machine, `core.autocrlf` alone was observed to change a
+blob's - and therefore a commit's - hash, and `init.defaultBranch`
+changes the branch name, independent of these six variables entirely.
 
 ```
 GIT_AUTHOR_NAME, GIT_AUTHOR_EMAIL, GIT_AUTHOR_DATE
 GIT_COMMITTER_NAME, GIT_COMMITTER_EMAIL, GIT_COMMITTER_DATE
 ```
 
-Without this, hashes differ per run, tests that assert on them are
-flaky, and nobody can reproduce a reported failure. It is the first
-thing to get right.
+So the builder isolates itself from all ambient git configuration
+rather than overriding known settings one at a time - a list of
+settings to override can always be missing an entry, while an
+environment that inherits nothing is closed by construction. It sets
+`GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` to `/dev/null` and
+`GIT_CONFIG_NOSYSTEM=1` before any git command runs (the third is
+required in addition to the second on at least one real platform:
+Apple's Command Line Tools git reads its own hardcoded system-scope
+config regardless of `GIT_CONFIG_SYSTEM`), always passes an explicit
+branch name to `git init` rather than relying on `init.defaultBranch`,
+and sets `core.autocrlf`, `core.fileMode`, `core.symlinks`,
+`core.ignoreCase`, `commit.gpgsign`, and `core.safecrlf` explicitly on
+the fixture repository as defense in depth. Without this, hashes and
+branch names differ per contributor machine, hash assertions are
+flaky, and no reported failure reproduces on anyone else's machine.
 
 Three fixtures:
 

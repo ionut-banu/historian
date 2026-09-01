@@ -195,7 +195,67 @@ def _eval_binary(expr: BinaryOp, row: Row, schema: Schema) -> Value | Bool3:
         left = evaluate(expr.left, row, schema)
         right = evaluate(expr.right, row, schema)
         return _arithmetic(expr.op, left, right)
+    if expr.op is Operator.CONCAT:
+        left = evaluate(expr.left, row, schema)
+        right = evaluate(expr.right, row, schema)
+        if left is None or right is None:
+            return None
+        return _coerce_to_text(left) + _coerce_to_text(right)
     raise AssertionError(f"exec/expression.py: BinaryOp operator not yet handled: {expr.op}")
+
+
+# --- SQLite's number-to-text conversion, shared by ||, text affinity, --
+# --- and LIKE's unconditional text coercion -----------------------------
+
+
+def _format_float(value: float) -> str:
+    """SQLite's `REAL -> TEXT` algorithm: `%.15g` (15 significant
+    digits, C's own rounding), then guarantee the result contains a
+    `.` or an `e` so it can never be mistaken for an `INTEGER`'s text
+    form - appending `.0` when neither is present, or inserting it
+    immediately before the `e` when an exponent is present but bare
+    (`"1e+15"` -> `"1.0e+15"`). Deliberately not Python's
+    `str()`/`repr()`, which disagree in ways confirmed against
+    `sqlite3` 3.51.0 and pinned by
+    `test_real_to_text_disagrees_with_python_str_to_prove_the_point` in
+    `tests/test_expression.py`: `str(1e15)` is `'1000000000000000.0'`
+    (wrong shape), `str(1234567890123456.0)` keeps all 16 digits
+    unrounded (wrong precision), `str(1/3)` keeps 16 digits too,
+    `str(1e20)` is `'1e+20'` (missing the `.0`).
+
+    Infinity is not NaN - it is an ordinary, legal `REAL`
+    (`values.py`'s own docstring) - and gets its own SQLite-specific
+    spelling, confirmed against `sqlite3`: `1e400||''` is `'Inf'`,
+    `-1e400||''` is `'-Inf'`, neither of which `%.15g` would produce
+    unaided (Python's own `"%.15g" % float("inf")` is `'inf'`,
+    lowercase, with no trailing `.0` to insert sensibly).
+    """
+    if math.isinf(value):
+        return "-Inf" if value < 0 else "Inf"
+    text = "%.15g" % value
+    if "e" in text:
+        mantissa, _, exponent = text.partition("e")
+        if "." not in mantissa:
+            mantissa += ".0"
+        return f"{mantissa}e{exponent}"
+    if "." not in text:
+        text += ".0"
+    return text
+
+
+def _coerce_to_text(value: Value) -> str:
+    """A `Value` as SQLite would render it as `TEXT` - used by `||`
+    unconditionally on both operands (after the NULL check, which
+    happens in the caller) and, later in this module, by column
+    affinity's numeric-to-text conversion and `LIKE`'s unconditional
+    text coercion. Never called with `None`."""
+    if isinstance(value, bool):  # pragma: no cover - defensive; Value excludes bool
+        raise TypeError(f"bool is not a SQL Value, got {value!r}")
+    if isinstance(value, float):
+        return _format_float(value)
+    if isinstance(value, int):
+        return str(value)
+    return value
 
 
 # --- Numeric text scanning: shared by arithmetic and affinity -----------

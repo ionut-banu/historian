@@ -27,11 +27,14 @@ import pytest
 
 from historian.schema import Column, ColumnType, Row, Schema
 from historian.sql.ast import (
+    And,
     BinaryOp,
     FunctionCall,
     Is,
     Literal,
+    Not,
     Operator,
+    Or,
     Star,
     UnaryOp,
     UnaryOperator,
@@ -727,3 +730,43 @@ def test_is_and_is_not_apply_affinity_like_eq():
 
     assert evaluate(_is(_col("n"), _lit("5")), _ROW, _SCHEMA) is True
     assert evaluate(_is(_col("n"), _lit("5"), negated=True), _ROW, _SCHEMA) is False
+
+
+# --- AND / OR / NOT: three-valued logic, via values.and3/or3/not3 -------
+#
+# spec §3's own table: NULL AND FALSE -> FALSE; NULL AND TRUE, NULL AND
+# NULL -> NULL; NULL OR TRUE -> TRUE; NULL OR FALSE, NULL OR NULL ->
+# NULL; NOT NULL -> NULL. Already exhaustively tested for values.py
+# itself in tests/test_values.py - this only proves evaluate() reaches
+# and3/or3/not3 correctly for predicate-shaped operands built from real
+# expression nodes (comparisons), not hand-fed bools.
+
+_TRUE = _bin(Operator.EQ, _lit(1), _lit(1))
+_FALSE = _bin(Operator.EQ, _lit(1), _lit(0))
+_NULL = _bin(Operator.EQ, _lit(1), _lit(None))
+
+
+def test_and_three_valued_logic():
+    from historian.exec.expression import evaluate
+
+    assert evaluate(And(_NULL, _FALSE, _POS), _ROW, _SCHEMA) is False
+    assert evaluate(And(_NULL, _TRUE, _POS), _ROW, _SCHEMA) is None
+    assert evaluate(And(_NULL, _NULL, _POS), _ROW, _SCHEMA) is None
+    assert evaluate(And(_TRUE, _TRUE, _POS), _ROW, _SCHEMA) is True
+
+
+def test_or_three_valued_logic():
+    from historian.exec.expression import evaluate
+
+    assert evaluate(Or(_NULL, _TRUE, _POS), _ROW, _SCHEMA) is True
+    assert evaluate(Or(_NULL, _FALSE, _POS), _ROW, _SCHEMA) is None
+    assert evaluate(Or(_NULL, _NULL, _POS), _ROW, _SCHEMA) is None
+    assert evaluate(Or(_FALSE, _FALSE, _POS), _ROW, _SCHEMA) is False
+
+
+def test_not_three_valued_logic():
+    from historian.exec.expression import evaluate
+
+    assert evaluate(Not(_NULL, _POS), _ROW, _SCHEMA) is None
+    assert evaluate(Not(_TRUE, _POS), _ROW, _SCHEMA) is False
+    assert evaluate(Not(_FALSE, _POS), _ROW, _SCHEMA) is True

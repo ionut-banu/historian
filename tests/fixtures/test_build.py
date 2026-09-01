@@ -508,3 +508,71 @@ def test_verify_awkward_raises_when_a_file_is_dropped(tmp_path):
 
     with pytest.raises(build.FixtureError, match="empty.txt"):
         build._verify_awkward(repo)
+
+
+# ---------------------------------------------------------------------------
+# Caching
+#
+# tiny and awkward are cheap enough to build but rebuilding them for
+# every test would still add up over a full run repeated on every
+# engineer and QA pass. Cached between runs; invalidated when build.py
+# itself changes, per the issue #10 grooming comment.
+# ---------------------------------------------------------------------------
+
+
+def test_get_tiny_repo_reuses_a_cached_build(tmp_path):
+    cache_dir = tmp_path / "cache"
+    repo = build.get_tiny_repo(cache_dir)
+    sentinel = repo / ".sentinel"
+    sentinel.write_text("still here")
+
+    repo_again = build.get_tiny_repo(cache_dir)
+
+    assert repo_again == repo
+    assert sentinel.exists(), "a cached build must not be rebuilt"
+
+
+def test_get_tiny_repo_rebuilds_when_the_builder_digest_is_stale(tmp_path):
+    cache_dir = tmp_path / "cache"
+    repo = build.get_tiny_repo(cache_dir)
+    sentinel = repo / ".sentinel"
+    sentinel.write_text("should be gone after rebuild")
+    (cache_dir / "tiny.digest").write_text("a stale digest, not build.py's real one")
+
+    build.get_tiny_repo(cache_dir)
+
+    assert not sentinel.exists(), "a stale builder digest must force a rebuild"
+
+
+def test_get_awkward_repo_reuses_a_cached_build(tmp_path):
+    cache_dir = tmp_path / "cache"
+    repo = build.get_awkward_repo(cache_dir)
+    sentinel = repo / ".sentinel"
+    sentinel.write_text("still here")
+
+    repo_again = build.get_awkward_repo(cache_dir)
+
+    assert repo_again == repo
+    assert sentinel.exists(), "a cached build must not be rebuilt"
+
+
+def test_default_cache_dir_is_gitignored():
+    """Fixtures are never committed as binaries (spec.md §4): the
+    default cache location must be excluded from the outer historian
+    repo, not merely a temp directory nobody happens to add."""
+    repo_root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        ["git", "check-ignore", "--quiet", str(build.CACHE_DIR)],
+        cwd=repo_root,
+    )
+    assert result.returncode == 0, f"{build.CACHE_DIR} is not gitignored"
+
+
+def test_tiny_repo_session_fixture_resolves_to_the_pinned_build(tiny_repo):
+    """Wiring test for the session-scoped fixture in tests/conftest.py
+    that #11 (and later issues) will consume."""
+    assert build._run_git(tiny_repo, ["rev-parse", "HEAD"]).strip() == build.TINY_HEAD
+
+
+def test_awkward_repo_session_fixture_resolves_to_the_pinned_build(awkward_repo):
+    assert build._run_git(awkward_repo, ["rev-parse", "HEAD"]).strip() == build.AWKWARD_HEAD

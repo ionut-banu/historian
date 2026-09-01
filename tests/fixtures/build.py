@@ -356,3 +356,199 @@ def _verify_tiny(repo: Path) -> None:
             f"line to the root commit {root} (the rename must not have "
             f"changed content); got {blamed}"
         )
+
+
+# ---------------------------------------------------------------------------
+# awkward
+#
+# "built to break things" - spec.md §4. One item per required property,
+# per the issue #10 grooming comment. Commit graph, smallest realizing
+# every item without padding:
+#
+#   C1 (Zoë)  add café.py, the space-and-quote path, empty.txt,
+#             binary.bin, no_newline.txt, phoenix.txt (original content)
+#   C2 (Sam)  edit café.py (append lines - exercises blame's compact
+#             header form on both C1's and C2's lines), delete
+#             phoenix.txt
+#   C3 (Sam)  recreate phoenix.txt with different content, empty
+#             commit message
+#
+# phoenix.txt's create/delete/recreate lifecycle is the one thing that
+# structurally needs three separate commits; everything else is
+# bundled into those three rather than padding the graph further.
+# ---------------------------------------------------------------------------
+
+_AWKWARD_ZOE = ("Zoë Müller", "zoe@example.com")
+_AWKWARD_SAM = ("Sam Lee", "sam@example.com")
+
+_AWKWARD_CAFE_PATH = "café.py"
+_AWKWARD_QUOTED_PATH = 'a "quoted" name.txt'
+_AWKWARD_EMPTY_PATH = "empty.txt"
+_AWKWARD_BINARY_PATH = "binary.bin"
+_AWKWARD_NO_NEWLINE_PATH = "no_newline.txt"
+_AWKWARD_PHOENIX_PATH = "phoenix.txt"
+
+AWKWARD_FILES = frozenset(
+    {
+        _AWKWARD_CAFE_PATH,
+        _AWKWARD_QUOTED_PATH,
+        _AWKWARD_EMPTY_PATH,
+        _AWKWARD_BINARY_PATH,
+        _AWKWARD_NO_NEWLINE_PATH,
+        _AWKWARD_PHOENIX_PATH,
+    }
+)
+
+# The porcelain-lookalike line: begins with exactly one of the real
+# `git blame --line-porcelain` header keywords followed by a space
+# ("author "), and is plain file content - not tab-prefixed in the
+# source blob. See the issue #10 grooming comment: this is precisely
+# the case a parser keying off `line.startswith("author ")` without
+# first checking for a leading tab misparses.
+AWKWARD_LOOKALIKE_LINE = "author nobody@nowhere.example claims to be a porcelain header but is not"
+
+_AWKWARD_CAFE_INITIAL = (
+    "# café.py - awkward fixture content\n"
+    "def greet():\n"
+    f'    return "café"\n'
+    f"{AWKWARD_LOOKALIKE_LINE}\n"
+)
+_AWKWARD_CAFE_APPENDED = "# appended by Sam\nprint(greet())\n"
+
+_AWKWARD_QUOTED_CONTENT = "content of the file with a space and a quote in its name\n"
+
+# Starts with a NUL byte, which git's binary-detection heuristic
+# samples from the first bytes of a blob - so this is unambiguously
+# binary-detected regardless of core.autocrlf. Fixed, not random: a
+# fixture must be byte-identical on every run.
+AWKWARD_BINARY_CONTENT = (
+    bytes([0x00, 0x01, 0x02, 0x03, 0xDE, 0xAD, 0xBE, 0xEF])
+    + b"not-a-real-image"
+    + bytes([0xFF, 0xFE, 0x00, 0x7F])
+)
+
+AWKWARD_NO_NEWLINE_CONTENT = b"first line\nsecond line\nthird line without a trailing newline"
+
+AWKWARD_PHOENIX_ORIGINAL = "phoenix: version one\n"
+AWKWARD_PHOENIX_RECREATED = "phoenix: reborn, version two\n"
+
+# Filled in once, from this builder's own first deterministic build,
+# and then pinned - see the note on TINY_HEAD above; the same applies
+# here.
+AWKWARD_HEAD = "c19c831743450c1c0bdf0a5d5096e2c25fa104f1"
+
+
+def build_awkward(dest: Path) -> Path:
+    """Build the `awkward` fixture at dest, verify it, and return dest.
+
+    Raises FixtureError if the built repository does not match what
+    this function was told to build, including a determinism
+    regression against the pinned AWKWARD_HEAD.
+    """
+    if dest.exists():
+        shutil.rmtree(dest)
+    _init_repo(dest, branch="main")
+    clock = _Clock()
+
+    (dest / _AWKWARD_CAFE_PATH).write_text(_AWKWARD_CAFE_INITIAL)
+    (dest / _AWKWARD_QUOTED_PATH).write_text(_AWKWARD_QUOTED_CONTENT)
+    (dest / _AWKWARD_EMPTY_PATH).write_bytes(b"")
+    (dest / _AWKWARD_BINARY_PATH).write_bytes(AWKWARD_BINARY_CONTENT)
+    (dest / _AWKWARD_NO_NEWLINE_PATH).write_bytes(AWKWARD_NO_NEWLINE_CONTENT)
+    (dest / _AWKWARD_PHOENIX_PATH).write_text(AWKWARD_PHOENIX_ORIGINAL)
+    _run_git(dest, ["add", "-A"])
+    _commit(dest, "Add the awkward fixture's initial files", author=_AWKWARD_ZOE, timestamp=clock.tick())
+
+    with (dest / _AWKWARD_CAFE_PATH).open("a") as f:
+        f.write(_AWKWARD_CAFE_APPENDED)
+    _run_git(dest, ["rm", "--quiet", _AWKWARD_PHOENIX_PATH])
+    _run_git(dest, ["add", "-A"])
+    _commit(dest, "Edit café.py, remove phoenix.txt", author=_AWKWARD_SAM, timestamp=clock.tick())
+
+    (dest / _AWKWARD_PHOENIX_PATH).write_text(AWKWARD_PHOENIX_RECREATED)
+    _run_git(dest, ["add", "-A"])
+    _commit(dest, "", author=_AWKWARD_SAM, timestamp=clock.tick(), allow_empty_message=True)
+
+    _verify_awkward(dest)
+
+    head = _run_git(dest, ["rev-parse", "HEAD"]).strip()
+    if head != AWKWARD_HEAD:
+        raise FixtureError(
+            f"awkward: HEAD is {head}, pinned AWKWARD_HEAD is {AWKWARD_HEAD} - "
+            "this is a determinism regression, not a content change, "
+            "unless build_awkward was deliberately edited (update the "
+            "pinned constant in the same commit if so)"
+        )
+    return dest
+
+
+def _verify_awkward(repo: Path) -> None:
+    """Assert that repo matches what build_awkward is supposed to build.
+
+    Inspects only the finished repository through git itself, per the
+    same reasoning as _verify_tiny above.
+    """
+    count = int(_run_git(repo, ["rev-list", "--count", "HEAD"]).strip())
+    if count != 3:
+        raise FixtureError(f"awkward: expected exactly 3 commits, found {count}")
+
+    identities = set(_run_git(repo, ["log", "--format=%an <%ae>"]).strip().splitlines())
+    if len(identities) != 2:
+        raise FixtureError(f"awkward: expected exactly 2 author identities, found {identities}")
+    if not any("Zoë Müller" in identity for identity in identities):
+        raise FixtureError(f"awkward: expected an author with a unicode name, found {identities}")
+
+    raw = _run_git(repo, ["ls-files", "-z"])
+    paths = {p for p in raw.split("\0") if p}
+    missing = AWKWARD_FILES - paths
+    if missing:
+        raise FixtureError(f"awkward: missing required file(s): {sorted(missing)}")
+    extra = paths - AWKWARD_FILES
+    if extra:
+        raise FixtureError(f"awkward: unexpected tracked file(s): {sorted(extra)}")
+
+    empty_size = int(_run_git(repo, ["cat-file", "-s", f"HEAD:{_AWKWARD_EMPTY_PATH}"]).strip())
+    if empty_size != 0:
+        raise FixtureError(f"awkward: {_AWKWARD_EMPTY_PATH} is not empty ({empty_size} bytes)")
+
+    binary_content = _run_git_bytes(repo, ["cat-file", "-p", f"HEAD:{_AWKWARD_BINARY_PATH}"])
+    if binary_content != AWKWARD_BINARY_CONTENT:
+        raise FixtureError(f"awkward: {_AWKWARD_BINARY_PATH}'s committed blob does not match its source bytes")
+
+    no_newline_content = _run_git_bytes(repo, ["cat-file", "-p", f"HEAD:{_AWKWARD_NO_NEWLINE_PATH}"])
+    if no_newline_content != AWKWARD_NO_NEWLINE_CONTENT:
+        raise FixtureError(f"awkward: {_AWKWARD_NO_NEWLINE_PATH}'s committed blob does not match its source bytes")
+    if no_newline_content.endswith(b"\n"):
+        raise FixtureError(f"awkward: {_AWKWARD_NO_NEWLINE_PATH} has a trailing newline, expected none")
+
+    phoenix_content = _run_git(repo, ["show", f"HEAD:{_AWKWARD_PHOENIX_PATH}"])
+    if phoenix_content != AWKWARD_PHOENIX_RECREATED:
+        raise FixtureError(
+            f"awkward: {_AWKWARD_PHOENIX_PATH} at HEAD is not the recreation "
+            f"(expected {AWKWARD_PHOENIX_RECREATED!r}, got {phoenix_content!r})"
+        )
+    deletions = _run_git(
+        repo, ["log", "--all", "--diff-filter=D", "--format=%H", "--", _AWKWARD_PHOENIX_PATH]
+    ).strip()
+    if not deletions:
+        raise FixtureError(f"awkward: {_AWKWARD_PHOENIX_PATH} was never deleted in history")
+
+    hashes = _run_git(repo, ["log", "--format=%H"]).strip().splitlines()
+    messages = [_run_git(repo, ["log", "-1", "--format=%B", h]).strip("\n") for h in hashes]
+    if "" not in messages:
+        raise FixtureError("awkward: expected one commit with an empty message")
+
+    cafe_source = _run_git(repo, ["cat-file", "-p", f"HEAD:{_AWKWARD_CAFE_PATH}"])
+    if AWKWARD_LOOKALIKE_LINE not in cafe_source.splitlines():
+        raise FixtureError(f"awkward: the porcelain-lookalike line is missing from {_AWKWARD_CAFE_PATH}")
+    for line in cafe_source.splitlines():
+        if line == AWKWARD_LOOKALIKE_LINE and line.startswith("\t"):
+            raise FixtureError("awkward: the porcelain-lookalike line must not start with a tab in the source")
+
+    porcelain = _run_git(repo, ["blame", "--line-porcelain", _AWKWARD_CAFE_PATH])
+    tab_content_lines = [line[1:] for line in porcelain.splitlines() if line.startswith("\t")]
+    if AWKWARD_LOOKALIKE_LINE not in tab_content_lines:
+        raise FixtureError(
+            "awkward: the porcelain-lookalike line did not appear as a "
+            "tab-prefixed content line in git blame --line-porcelain output"
+        )

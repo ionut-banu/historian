@@ -281,9 +281,18 @@ def test_text_compares_bytewise():
 
 
 def test_text_comparison_is_bytewise_for_non_ascii():
-    """UTF-8 byte order coincides with code point order for all of
-    Unicode, so Python's default string ordering already matches
-    SQLite's BINARY collation. Pinned down rather than assumed."""
+    """UTF-8 byte order coincides with code point order for every
+    string historian actually produces - not "for all of Unicode" in
+    general, which is false for a lone surrogate (issue #20: a string
+    containing one sorts inconsistently with its own UTF-8 bytes).
+    What makes the narrower claim true is historian's own decoding
+    policy, not a fact about Unicode: git bytes are decoded as UTF-8
+    with `errors="replace"` (`tables/blame.py`, settled by #20's
+    grooming), which can never produce a lone surrogate, so no string
+    this module ever compares can exhibit the mismatch. Python's
+    default string ordering therefore matches SQLite's BINARY
+    collation for every value in play here. Pinned down rather than
+    assumed."""
     assert lt("é", "z") is False
     assert lt("z", "é") is True
     assert gt("é", "z") is True

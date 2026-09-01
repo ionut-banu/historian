@@ -32,6 +32,8 @@ from historian.sql.ast import (
     Literal,
     Operator,
     Star,
+    UnaryOp,
+    UnaryOperator,
 )
 from historian.sql.binder import BoundColumnRef
 from historian.sql.lexer import Position
@@ -60,6 +62,10 @@ def _col(name: str) -> BoundColumnRef:
 
 def _bin(op: Operator, left, right) -> BinaryOp:
     return BinaryOp(op=op, left=left, right=right, position=_POS)
+
+
+def _unary(op: UnaryOperator, operand) -> UnaryOp:
+    return UnaryOp(op=op, operand=operand, position=_POS)
 
 
 # --- Literals and bound column references -----------------------------
@@ -388,3 +394,123 @@ def test_infinity_formats_as_inf_not_a_python_float_string():
 
     assert evaluate(_bin(Operator.CONCAT, _lit(math.inf), _lit("")), _ROW, _SCHEMA) == "Inf"
     assert evaluate(_bin(Operator.CONCAT, _lit(-math.inf), _lit("")), _ROW, _SCHEMA) == "-Inf"
+
+
+# --- Unary minus: leading-prefix text coercion, then negate -------------
+#
+# sqlite3: `select -'5', typeof(-'5'), -'abc', typeof(-'abc'), -'5.5',
+# typeof(-'5.5');` -> -5|integer|0|integer|-5.5|real
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [("5", -5), ("abc", 0), ("5.5", -5.5)],
+)
+def test_unary_minus_on_text_goes_through_leading_prefix_parse(text, expected):
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_unary(UnaryOperator.NEG, _lit(text)), _ROW, _SCHEMA)
+    assert result == expected
+    assert type(result) is type(expected)
+
+
+def test_unary_minus_on_ordinary_numbers():
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_unary(UnaryOperator.NEG, _lit(5)), _ROW, _SCHEMA) == -5
+    assert evaluate(_unary(UnaryOperator.NEG, _lit(5.5)), _ROW, _SCHEMA) == -5.5
+
+
+def test_unary_minus_on_null_is_null():
+    """sqlite3: `select -NULL, typeof(-NULL);` -> NULL|null."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_unary(UnaryOperator.NEG, _lit(None)), _ROW, _SCHEMA) is None
+
+
+def test_unary_minus_overflowing_int64_becomes_real():
+    """Negating a plain `int` (not the int64-min-literal special case
+    below) past the negative boundary must still promote to `float`,
+    reusing the same overflow rule as binary arithmetic. This
+    `Literal` holds the raw Python int `-9223372036854775808` directly
+    - not built via a negated literal - so it does not hit the
+    special-case path in the next test; it isolates the general
+    overflow-on-negate rule instead."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_unary(UnaryOperator.NEG, _lit(-9223372036854775808)), _ROW, _SCHEMA)
+    assert isinstance(result, float)
+    assert result == float(9223372036854775808)
+
+
+# --- Unary minus on the int64-min literal: a documented, partial fix ----
+#
+# sqlite3: `select -9223372036854775808, typeof(-9223372036854775808);`
+# -> -9223372036854775808|integer
+# sqlite3: `select -9223372036854775808+1, typeof(-9223372036854775808+1);`
+# -> -9223372036854775807|integer
+#
+# `sql/parser.py` (out of scope for #12) parses the digit sequence
+# "9223372036854775808" alone as the float 9223372036854775808.0,
+# since it overflows int64 as a plain INTEGER literal
+# (`_docs/decisions.md`, 2026-09-01) - so `-9223372036854775808` in
+# source text becomes `UnaryOp(NEG, Literal(9223372036854775808.0))`
+# once parsed. Naively negating that float loses precision once
+# arithmetic is involved (the double's ULP at 2**63 is 2048, so
+# `-9223372036854775808.0 + 1.0` rounds right back to
+# `-9223372036854775808.0` - the wrong answer). This module special-
+# cases exactly this AST shape to recover the correct exact int64-min
+# integer - see `_docs/decisions.md`, 2026-09-01 (int64 literal
+# overflow) for why the fix is necessarily incomplete: `sql/ast.py`'s
+# `Literal` has no field distinguishing this from an explicitly
+# `.0`-spelled REAL literal of the same value, and `sql/ast.py` is out
+# of scope for this issue.
+
+
+def test_negated_int64_min_literal_is_the_exact_integer():
+    from historian.exec.expression import evaluate
+
+    overflowed_literal = _lit(9223372036854775808.0)
+    result = evaluate(_unary(UnaryOperator.NEG, overflowed_literal), _ROW, _SCHEMA)
+    assert result == -9223372036854775808
+    assert isinstance(result, int)
+
+
+def test_negated_int64_min_literal_arithmetic_stays_exact():
+    """The case that actually distinguishes the fix from doing
+    nothing: naive float negation followed by + 1 silently loses the
+    +1 entirely (rounds back to the same float), where SQLite (and
+    this module, with the special case above) gives the exact
+    integer."""
+    from historian.exec.expression import evaluate
+
+    negated = _unary(UnaryOperator.NEG, _lit(9223372036854775808.0))
+    result = evaluate(_bin(Operator.ADD, negated, _lit(1)), _ROW, _SCHEMA)
+    assert result == -9223372036854775807
+    assert isinstance(result, int)
+
+
+# --- Unary plus: SQLite's real behaviour is a no-op, not a coercion -----
+#
+# This issue's own body claims "unary -/+ on a text operand goes
+# through the identical leading-prefix parse", citing only unary
+# minus's own sqlite3-verified examples as evidence for both. Directly
+# checked against sqlite3 3.51.0 and this half of the claim is false:
+# `select +'5', typeof(+'5'), +'abc', typeof(+'abc'), +'5.5',
+# typeof(+'5.5');` -> 5|text|abc|text|5.5|text - unary + does not touch
+# its operand's storage class or value at all, confirmed further with
+# `select +n, typeof(+n) from u;` (u.n INTEGER 5) -> 5|integer, i.e. a
+# real no-op/identity, not "coerce then pass through as-is because it
+# was already a number". Per AGENTS.md, SQLite is right; implemented
+# as an identity here rather than as the criterion's claimed leading-
+# prefix parse. Reported on the issue per the software-engineer role's
+# instructions for a criterion that contradicts SQLite.
+
+
+@pytest.mark.parametrize("value", ["5abc", "  5  ", "abc", 5, 5.5, None])
+def test_unary_plus_is_a_true_no_op(value):
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_unary(UnaryOperator.POS, _lit(value)), _ROW, _SCHEMA)
+    assert result == value
+    assert type(result) is type(value)

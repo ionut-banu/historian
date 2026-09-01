@@ -182,7 +182,68 @@ def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
         )
     if isinstance(expr, BinaryOp):
         return _eval_binary(expr, row, schema)
+    if isinstance(expr, UnaryOp):
+        return _eval_unary(expr, row, schema)
     raise AssertionError(f"exec/expression.py: unhandled expression node type {type(expr).__name__}")
+
+
+#: `2**63`, exactly representable as a double. The one value a bare
+#: `Literal` can hold that came from `sql/parser.py` overflowing an
+#: unsigned INTEGER-token digit sequence to REAL, per
+#: `_docs/decisions.md` (2026-09-01, "An INTEGER literal past int64 max
+#: becomes a float").
+_INT64_MIN_MAGNITUDE_AS_FLOAT = 9223372036854775808.0
+
+
+def _eval_unary(expr: UnaryOp, row: Row, schema: Schema) -> Value:
+    """Unary `+`/`-`.
+
+    `-` performs real numeric negation, going through the same
+    leading-prefix text coercion arithmetic uses (`-'5'` is `-5`,
+    `-'abc'` is `0`) and the same int64-overflow-to-REAL rule.
+
+    `+` is a true no-op in SQLite - confirmed directly against
+    `sqlite3` 3.51.0, and contradicting this issue's own body, which
+    claims unary `+` "goes through the identical leading-prefix
+    parse" as unary `-` while only actually verifying `-`'s examples:
+    `+'5abc'` stays the TEXT `'5abc'`, unconverted, and `+5` stays the
+    exact `INTEGER` `5` - `+` never touches its operand's storage
+    class or value at all. Per `AGENTS.md`, SQLite is right; see
+    `tests/test_expression.py`'s
+    `test_unary_plus_is_a_true_no_op` docstring for the exact queries
+    run, and this issue's closing comment for the report.
+
+    A `UnaryOp(NEG, Literal(...))` whose literal is exactly
+    `2**63` (`9223372036854775808.0`) is `-9223372036854775808`
+    written directly in source, per `sql/parser.py`'s int64-overflow
+    rule - and real SQLite keeps that spelling as the exact `int64`
+    minimum rather than negating a `REAL`
+    (`_docs/decisions.md`, 2026-09-01). Special-cased structurally
+    here since it cannot be computed by the general path below without
+    losing precision once arithmetic is involved - see
+    `tests/test_expression.py`'s
+    `test_negated_int64_min_literal_arithmetic_stays_exact` for why
+    the general path is actually wrong, not just imprecise, and that
+    test group's own docstring for why this fix cannot be complete
+    (`sql/ast.py`'s `Literal` cannot distinguish this from an
+    explicitly `.0`-spelled REAL literal of the same value, and
+    `sql/ast.py` is out of scope for this issue).
+    """
+    if expr.op is UnaryOperator.POS:
+        return evaluate(expr.operand, row, schema)
+    if (
+        isinstance(expr.operand, Literal)
+        and isinstance(expr.operand.value, float)
+        and expr.operand.value == _INT64_MIN_MAGNITUDE_AS_FLOAT
+    ):
+        return _INT64_MIN
+    operand = evaluate(expr.operand, row, schema)
+    if operand is None:
+        return None
+    numeric = _arithmetic_operand(operand)
+    if isinstance(numeric, int):
+        return _int64_bounded(-numeric)
+    return _squash_nan(-numeric)
 
 
 # --- BinaryOp: arithmetic (comparison and concat join this later) ------

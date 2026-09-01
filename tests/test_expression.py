@@ -30,6 +30,7 @@ from historian.sql.ast import (
     And,
     BinaryOp,
     FunctionCall,
+    In,
     Is,
     Like,
     Literal,
@@ -834,3 +835,49 @@ def test_not_like_is_not3_of_the_unnegated_result():
     assert evaluate(_like(_lit("abc"), _lit("abc"), negated=True), _ROW, _SCHEMA) is False
     assert evaluate(_like(_lit("abc"), _lit("xyz"), negated=True), _ROW, _SCHEMA) is True
     assert evaluate(_like(_lit(None), _lit("x"), negated=True), _ROW, _SCHEMA) is None
+
+
+# --- IN: per-element affinity, or3-folded, values.not3 for NOT IN -------
+
+
+def _in(left, values_, negated=False) -> In:
+    return In(left=left, values=tuple(values_), negated=negated, position=_POS)
+
+
+def test_in_applies_affinity_to_each_element_independently():
+    """sqlite3 (`n INT`, `n=5`): `n IN ('5', '6')` -> 1, `n IN ('5',
+    'abc')` -> 1 (the 'abc' element fails to convert and simply
+    doesn't match - no error)."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_in(_col("n"), [_lit("5"), _lit("6")]), _ROW, _SCHEMA) is True
+    assert evaluate(_in(_col("n"), [_lit("5"), _lit("abc")]), _ROW, _SCHEMA) is True
+
+
+def test_in_null_propagation_matches_or3_folding():
+    """sqlite3: `5 IN (5, NULL)` -> 1 (short-circuits: the first
+    element already matches); `6 IN (5, NULL)` -> NULL (no element
+    matches, but a NULL element means "maybe", not "no")."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_in(_lit(5), [_lit(5), _lit(None)]), _ROW, _SCHEMA) is True
+    assert evaluate(_in(_lit(6), [_lit(5), _lit(None)]), _ROW, _SCHEMA) is None
+
+
+def test_not_in_is_not3_of_the_unnegated_result():
+    """sqlite3: `select 6 not in (5, NULL);` -> NULL, not TRUE -
+    `NOT NULL` is `NULL`, confirming NOT IN is `values.not3` applied to
+    the un-negated IN result, never a separately reasoned-out
+    negation."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_in(_lit(6), [_lit(5), _lit(None)], negated=True), _ROW, _SCHEMA) is None
+    assert evaluate(_in(_lit(6), [_lit(5), _lit(7)], negated=True), _ROW, _SCHEMA) is True
+
+
+def test_in_empty_list_is_always_false():
+    """`sql/ast.py`'s own docstring: "`IN ()` is valid SQL, always
+    false - confirmed against `sqlite3`."."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_in(_lit(5), []), _ROW, _SCHEMA) is False

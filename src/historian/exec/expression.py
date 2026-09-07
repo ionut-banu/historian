@@ -539,9 +539,24 @@ def _format_float(value: float) -> str:
     `-1e400||''` is `'-Inf'`, neither of which `%.15g` would produce
     unaided (Python's own `"%.15g" % float("inf")` is `'inf'`,
     lowercase, with no trailing `.0` to insert sensibly).
+
+    SQLite also normalises negative zero to positive when rendering to
+    TEXT - confirmed against `sqlite3`: `(-0.0)||''` and `(0.0*-1)||''`
+    are both `'0.0'`, never `'-0.0'` - where Python's own `-0.0`,
+    `0.0 * -1`, and `"%.15g" % -0.0` (`'-0'`) all preserve the sign.
+    Comparison is unaffected either way (`-0.0 = 0.0` is TRUE under
+    IEEE 754, in both engines, and in Python), so this is purely a
+    presentation fix, made here rather than on the arithmetic path: no
+    observable in the v1 grammar distinguishes "normalise at negation"
+    from "normalise at formatting" (`printf('%.20f', ...)`, `sign()`,
+    `hex(cast(... as blob))` all show positive zero either way), and
+    confining the fix to this one function is the smaller change and
+    cannot affect arithmetic, comparison, or ordering.
     """
     if math.isinf(value):
         return "-Inf" if value < 0 else "Inf"
+    if value == 0.0:
+        value = 0.0  # comparison, not a float() call: folds -0.0 to 0.0
     text = "%.15g" % value
     if "e" in text:
         mantissa, _, exponent = text.partition("e")

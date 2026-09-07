@@ -415,6 +415,66 @@ def test_infinity_formats_as_inf_not_a_python_float_string():
     assert evaluate(_bin(Operator.CONCAT, _lit(-math.inf), _lit("")), _ROW, _SCHEMA) == "-Inf"
 
 
+# --- Float-to-text formatting: negative zero is normalised, like SQLite --
+#
+# Issue #12, QA round 1 FAIL. sqlite3: `select (-0.0)||'', (0.0*-1)||'',
+# (-1*0.0)||'', (0.0/-1)||'', (-(1.0-1.0))||'';` -> 0.0|0.0|0.0|0.0|0.0 -
+# SQLite renders every one of these as positive zero, never `-0.0`, even
+# though Python's own `-0.0`, `0.0 * -1`, and `"%.15g" % -0.0` all
+# preserve the sign. Comparison is unaffected either way (`-0.0 = 0.0` is
+# TRUE under IEEE 754, in both engines) - this is purely a TEXT-rendering
+# mismatch, caught through `||` exactly as QA found it.
+
+
+def test_format_float_normalises_negative_zero_directly():
+    """sqlite3: `select (-0.0)||'';` -> 0.0. Calls the formatter
+    directly, not just through the evaluator, per the issue's
+    instruction to test the formatter itself."""
+    from historian.exec.expression import _format_float
+
+    assert _format_float(-0.0) == "0.0"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [-0.0, 0.0 * -1, -1 * 0.0, 0.0 / -1, -(1.0 - 1.0)],
+    ids=["literal_neg_zero", "zero_times_neg_one", "neg_one_times_zero", "zero_div_neg_one", "negated_computed_zero"],
+)
+def test_negative_zero_renders_as_positive_through_concat(value):
+    """sqlite3: `select (-0.0)||'', (0.0*-1)||'', (-1*0.0)||'',
+    (0.0/-1)||'', (-(1.0-1.0))||'';` -> 0.0|0.0|0.0|0.0|0.0 in every
+    case, regardless of how the negative zero was produced - a literal,
+    multiplication, division, or unary minus on a computed zero."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_bin(Operator.CONCAT, _lit(value), _lit("")), _ROW, _SCHEMA) == "0.0"
+
+
+def test_negative_zero_via_unary_minus_on_computed_zero_through_evaluator():
+    """sqlite3: `select (-(1.0-1.0))||'';` -> 0.0. Reached through
+    UnaryOp(NEG, ...) rather than a Python-level negative-zero literal,
+    to confirm the arithmetic path's own output gets normalised too,
+    not only a value that was already -0.0 going in."""
+    from historian.exec.expression import evaluate
+
+    computed_zero = _bin(Operator.SUB, _lit(1.0), _lit(1.0))
+    negated = _unary(UnaryOperator.NEG, computed_zero)
+    assert evaluate(_bin(Operator.CONCAT, negated, _lit("")), _ROW, _SCHEMA) == "0.0"
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(-0.5, "-0.5"), (-1.0, "-1.0"), (-1e15, "-1.0e+15")],
+)
+def test_genuinely_negative_values_keep_their_sign(value, expected):
+    """sqlite3: `select (-0.5)||'', (-1.0)||'', (-1e15)||'';` ->
+    -0.5|-1.0|-1.0e+15. The negative-zero fix must not touch any value
+    that is actually negative, not just zero-valued."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_bin(Operator.CONCAT, _lit(value), _lit("")), _ROW, _SCHEMA) == expected
+
+
 # --- Unary minus: leading-prefix text coercion, then negate -------------
 #
 # sqlite3: `select -'5', typeof(-'5'), -'abc', typeof(-'abc'), -'5.5',

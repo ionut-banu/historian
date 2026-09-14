@@ -238,7 +238,7 @@ def test_qualified_star_illegal_as_a_function_argument():
     sql = "SELECT count(blame.*) FROM blame"
     with pytest.raises(ParseError) as excinfo:
         _parse(sql)
-    star_token = tokenize(sql)[6]
+    star_token = tokenize(sql)[5]
     assert star_token.type.name == "STAR"
     assert excinfo.value.position == star_token.position
 
@@ -250,7 +250,7 @@ def test_qualified_star_illegal_as_argument_to_any_function_name():
     sql = "SELECT sum(blame.*) FROM blame"
     with pytest.raises(ParseError) as excinfo:
         _parse(sql)
-    star_token = tokenize(sql)[6]
+    star_token = tokenize(sql)[5]
     assert star_token.type.name == "STAR"
     assert excinfo.value.position == star_token.position
 
@@ -261,7 +261,7 @@ def test_bare_star_illegal_as_a_non_first_function_argument():
     sql = "SELECT foo(1, *) FROM blame"
     with pytest.raises(ParseError) as excinfo:
         _parse(sql)
-    star_token = tokenize(sql)[6]
+    star_token = tokenize(sql)[5]
     assert star_token.type.name == "STAR"
     assert excinfo.value.position == star_token.position
 
@@ -273,7 +273,7 @@ def test_bare_star_must_be_the_sole_function_argument():
     sql = "SELECT foo(*, 1) FROM blame"
     with pytest.raises(ParseError) as excinfo:
         _parse(sql)
-    comma_token = tokenize(sql)[5]
+    comma_token = tokenize(sql)[4]
     assert comma_token.type.name == "COMMA"
     assert excinfo.value.position == comma_token.position
 
@@ -285,7 +285,7 @@ def test_count_star_must_be_the_sole_function_argument():
     sql = "SELECT count(*, path) FROM blame"
     with pytest.raises(ParseError) as excinfo:
         _parse(sql)
-    comma_token = tokenize(sql)[5]
+    comma_token = tokenize(sql)[4]
     assert comma_token.type.name == "COMMA"
     assert excinfo.value.position == comma_token.position
 
@@ -297,7 +297,7 @@ def test_bare_star_illegal_trailing_a_function_argument():
     sql = "SELECT count(blame.path, *) FROM blame"
     with pytest.raises(ParseError) as excinfo:
         _parse(sql)
-    star_token = tokenize(sql)[8]
+    star_token = tokenize(sql)[7]
     assert star_token.type.name == "STAR"
     assert excinfo.value.position == star_token.position
 

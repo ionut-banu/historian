@@ -319,7 +319,17 @@ class _Parser:
         start = self._peek().position
         expr = self._parse_star_or_expr()
         alias: str | None = None
-        if self._match(TokenType.AS):
+        if self._check(TokenType.AS):
+            # `*`/`table.*` cannot take an alias - confirmed against
+            # sqlite3 3.51.0 ("near \"AS\": syntax error") during
+            # issue #31's grooming. A `FunctionCall` wrapping a Star
+            # (`count(*) AS n`) is unaffected: the alias attaches to
+            # the call, not to the Star inside it, so this check is
+            # only reached when *this* select item's own expression is
+            # a bare or qualified star.
+            if isinstance(expr, Star):
+                raise self._error("AS is not allowed after '*'")
+            self._advance()
             alias = self._expect(TokenType.IDENTIFIER, "an alias name").text
         return SelectItem(expr=expr, alias=alias, position=start)
 
@@ -632,40 +642,62 @@ class _Parser:
         raise self._error(f"expected expression, found {_describe(token)}")
 
     def _parse_identifier_primary(self) -> Expr:
-        """A bare identifier, resolved to one of three shapes by what
+        """A bare identifier, resolved to one of two shapes by what
         follows it: `name(` is a `FunctionCall`, `name.` is a
-        table-qualified `ColumnRef` (or `Star`, for `name.*`), and
-        anything else is a bare `ColumnRef`."""
+        table-qualified `ColumnRef`, and anything else is a bare
+        `ColumnRef`.
+
+        `name.*` is deliberately not a third shape here: a `Star` may
+        only be built at the two sanctioned call sites -
+        `_parse_star_or_expr` (a whole select-list item) and
+        `_parse_function_call` (a function's sole bare argument) - and
+        both recognise `identifier.*`/bare `*` themselves, before ever
+        reaching this method. Every other expression context (an
+        arithmetic or comparison operand, a parenthesised group, an
+        `IN (...)` list value, a non-sole function argument) parses an
+        identifier through here, so `table.*` there now falls through
+        to the ordinary `_expect(IDENTIFIER, ...)` below, which raises
+        `ParseError` pointing at the `*` token - exactly where sqlite3
+        points (issue #31)."""
         first = self._advance()
         if self._check(TokenType.LPAREN):
             return self._parse_function_call(first)
         if self._check(TokenType.DOT):
             self._advance()
-            if self._check(TokenType.STAR):
-                self._advance()
-                return Star(table=first.text, position=first.position)
             name = self._expect(TokenType.IDENTIFIER, "a column name after '.'").text
             return ColumnRef(table=first.text, name=name, position=first.position)
         return ColumnRef(table=None, name=first.text, position=first.position)
 
     def _parse_function_call(self, name_token: Token) -> Expr:
+        """A call is exactly one of three shapes, matching sqlite3's
+        own grammar (confirmed during issue #31's grooming) - never a
+        mix of them: no arguments (`count()`), the single bare token
+        `*` (`count(*)`, legal for any function name - arity and
+        name validation happen later, not in the parser), or an
+        ordinary comma-separated expression list. A bare `*` is
+        recognised once, before that list is entered, so it can never
+        appear anywhere else in it: `foo(1, *)` and `foo(*, 1)` both
+        fail naturally - the first in `_parse_primary`, which has no
+        `STAR` case, and the second when `,` is found where `)` was
+        expected."""
         self._advance()  # LPAREN
-        args: list[Expr] = []
-        if not self._check(TokenType.RPAREN):
-            args.append(self._parse_function_arg())
-            while self._match(TokenType.COMMA):
-                args.append(self._parse_function_arg())
+        if self._check(TokenType.RPAREN):
+            self._advance()
+            return FunctionCall(
+                name=name_token.text, args=(), position=name_token.position
+            )
+        if self._check(TokenType.STAR):
+            star_token = self._advance()
+            self._expect(TokenType.RPAREN, "')'")
+            return FunctionCall(
+                name=name_token.text,
+                args=(Star(table=None, position=star_token.position),),
+                position=name_token.position,
+            )
+        args = [self._parse_expr()]
+        while self._match(TokenType.COMMA):
+            args.append(self._parse_expr())
         self._expect(TokenType.RPAREN, "')'")
         return FunctionCall(
             name=name_token.text, args=tuple(args), position=name_token.position
         )
-
-    def _parse_function_arg(self) -> Expr:
-        """A function-call argument, with a bare `*` (`count(*)`)
-        handled first the same way `_parse_star_or_expr` handles a
-        select-list `*` - it cannot start any other expression, so it
-        is unambiguous here too."""
-        if self._check(TokenType.STAR):
-            token = self._advance()
-            return Star(table=None, position=token.position)
-        return self._parse_expr()

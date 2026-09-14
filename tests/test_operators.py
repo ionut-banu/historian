@@ -255,6 +255,40 @@ def test_filter_streams_rather_than_materializing():
     assert source.pulled == 1
 
 
+def test_filter_raises_rather_than_silently_coercing_a_value_shaped_predicate():
+    """Pins the `Filter` -> `values.is_true` call, not just its result.
+
+    QA's FAIL on this issue found that the three tests above cannot
+    tell `values.is_true(evaluate(...))` apart from a bare
+    `if evaluate(...):` - every predicate they construct is
+    comparison-shaped, so `evaluate()` only ever hands back a `Bool3`
+    (`True`/`False`/`None`), and Python's `bool(None) == bool(False) ==
+    False` makes the two implementations agree on every one of those
+    inputs. `is_true`'s only actual behavioural difference from bare
+    truthiness is that it rejects anything that isn't exactly `True`,
+    `False`, or `None` - and no predicate above ever produces such a
+    value to exercise that rejection.
+
+    `WHERE line_no` does: a bare `BoundColumnRef` is value-shaped (see
+    `exec/expression.py`'s module docstring), so `evaluate()` returns
+    the row's plain `line_no` integer, never a `Bool3`. Every row here
+    has a nonzero `line_no` (2, 5, 1, 4), so bare truthiness would keep
+    all four rows silently - `is_true` instead raises `TypeError` per
+    the module's own documented Value/Bool3 boundary (#38, not
+    implemented by this issue). Asserting the raise, rather than a
+    result, is what makes this test go red if `Filter.rows()` is ever
+    changed back to bare truthiness - confirmed by hand: substituting
+    `if evaluate(...):` for the `is_true` call and rerunning the suite
+    turns exactly this test red (no exception raised, all rows kept)
+    while every other `Filter` test keeps passing.
+    """
+    predicate = _col("line_no")
+    result = Filter(_child(), predicate)
+
+    with pytest.raises(TypeError):
+        list(result.rows())
+
+
 # --- Project --------------------------------------------------------------
 
 

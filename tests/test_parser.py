@@ -170,6 +170,234 @@ def test_function_call_with_expression_arg():
     assert isinstance(expr.args[0], BinaryOp)
 
 
+# --- Star positions (issue #31) --------------------------------------------
+#
+# `*`/`table.*` is legal in exactly two grammar positions: a whole,
+# alias-less select-list item, and a function call's sole, unqualified
+# argument. Every shape below was confirmed against `sqlite3` 3.51.0
+# during grooming - see the issue thread for the full mapping and the
+# reasoning for why the parser must not special-case `count`.
+
+
+def test_bare_star_is_legal_anywhere_in_the_select_list():
+    """`sqlite3`: `SELECT *, path FROM blame` and `SELECT path, * FROM
+    blame` both parse - a bare `*` is not restricted to the first
+    position."""
+    stmt = _parse("SELECT *, path FROM blame")
+    assert isinstance(stmt.select_list[0].expr, Star)
+    assert stmt.select_list[1].expr == ColumnRef(
+        table=None, name="path", position=stmt.select_list[1].expr.position
+    )
+
+    stmt = _parse("SELECT path, * FROM blame")
+    assert stmt.select_list[0].expr == ColumnRef(
+        table=None, name="path", position=stmt.select_list[0].expr.position
+    )
+    assert isinstance(stmt.select_list[1].expr, Star)
+
+
+def test_qualified_star_is_legal_anywhere_in_the_select_list():
+    """`sqlite3`: `SELECT blame.*, path FROM blame` and
+    `SELECT path, blame.* FROM blame` both parse, the same rule as the
+    bare-star case above."""
+    stmt = _parse("SELECT blame.*, path FROM blame")
+    assert isinstance(stmt.select_list[0].expr, Star)
+    assert stmt.select_list[0].expr.table == "blame"
+
+    stmt = _parse("SELECT path, blame.* FROM blame")
+    assert isinstance(stmt.select_list[1].expr, Star)
+    assert stmt.select_list[1].expr.table == "blame"
+
+
+def test_bare_star_cannot_take_an_alias():
+    """`sqlite3 3.51.0`: `SELECT * AS x FROM blame` ->
+    `near "AS": syntax error`, at the `AS` token."""
+    sql = "SELECT * AS x FROM blame"
+    with pytest.raises(ParseError) as excinfo:
+        _parse(sql)
+    as_token = tokenize(sql)[2]
+    assert as_token.type.name == "AS"
+    assert excinfo.value.position == as_token.position
+
+
+def test_qualified_star_cannot_take_an_alias():
+    """`sqlite3 3.51.0`: `SELECT blame.* AS x FROM blame` ->
+    `near "AS": syntax error`, same rule as the bare-star case."""
+    sql = "SELECT blame.* AS x FROM blame"
+    with pytest.raises(ParseError) as excinfo:
+        _parse(sql)
+    as_token = tokenize(sql)[4]
+    assert as_token.type.name == "AS"
+    assert excinfo.value.position == as_token.position
+
+
+def test_qualified_star_illegal_as_a_function_argument():
+    """`sqlite3 3.51.0`: `SELECT count(blame.*) FROM blame` ->
+    `near "*": syntax error`, at the `*` token. Not special-cased to
+    `count` - `sum(blame.*)` fails the same way, checked next."""
+    sql = "SELECT count(blame.*) FROM blame"
+    with pytest.raises(ParseError) as excinfo:
+        _parse(sql)
+    star_token = tokenize(sql)[6]
+    assert star_token.type.name == "STAR"
+    assert excinfo.value.position == star_token.position
+
+
+def test_qualified_star_illegal_as_argument_to_any_function_name():
+    """`sqlite3 3.51.0`: `SELECT sum(blame.*) FROM blame` ->
+    `near "*": syntax error` - `table.*` is illegal as an argument to
+    any function, not only `count`."""
+    sql = "SELECT sum(blame.*) FROM blame"
+    with pytest.raises(ParseError) as excinfo:
+        _parse(sql)
+    star_token = tokenize(sql)[6]
+    assert star_token.type.name == "STAR"
+    assert excinfo.value.position == star_token.position
+
+
+def test_bare_star_illegal_as_a_non_first_function_argument():
+    """`sqlite3 3.51.0`: `SELECT foo(1, *) FROM blame` ->
+    `near "*": syntax error`, at the `*` token."""
+    sql = "SELECT foo(1, *) FROM blame"
+    with pytest.raises(ParseError) as excinfo:
+        _parse(sql)
+    star_token = tokenize(sql)[6]
+    assert star_token.type.name == "STAR"
+    assert excinfo.value.position == star_token.position
+
+
+def test_bare_star_must_be_the_sole_function_argument():
+    """`sqlite3 3.51.0`: `SELECT foo(*, 1) FROM blame` ->
+    `near ",": syntax error` - a bare `*` may not be followed by more
+    arguments, at the `,` token."""
+    sql = "SELECT foo(*, 1) FROM blame"
+    with pytest.raises(ParseError) as excinfo:
+        _parse(sql)
+    comma_token = tokenize(sql)[5]
+    assert comma_token.type.name == "COMMA"
+    assert excinfo.value.position == comma_token.position
+
+
+def test_count_star_must_be_the_sole_function_argument():
+    """`sqlite3 3.51.0`: `SELECT count(*, path) FROM blame` ->
+    `near ",": syntax error`, same rule as `foo(*, 1)` above, on the
+    aggregate most likely to be tried first."""
+    sql = "SELECT count(*, path) FROM blame"
+    with pytest.raises(ParseError) as excinfo:
+        _parse(sql)
+    comma_token = tokenize(sql)[5]
+    assert comma_token.type.name == "COMMA"
+    assert excinfo.value.position == comma_token.position
+
+
+def test_bare_star_illegal_trailing_a_function_argument():
+    """`sqlite3 3.51.0`: `SELECT count(blame.path, *) FROM blame` ->
+    `near "*": syntax error` - same rule as `foo(1, *)`, with the star
+    trailing instead of leading."""
+    sql = "SELECT count(blame.path, *) FROM blame"
+    with pytest.raises(ParseError) as excinfo:
+        _parse(sql)
+    star_token = tokenize(sql)[8]
+    assert star_token.type.name == "STAR"
+    assert excinfo.value.position == star_token.position
+
+
+@pytest.mark.parametrize("name", ["sum", "min", "max", "avg", "foo"])
+def test_bare_star_sole_argument_is_legal_for_any_function_name(name):
+    """`sqlite3 3.51.0` accepts `sum(*)`, `min(*)`, `max(*)`, `avg(*)`,
+    and even `foo(*)` for a name that is not a real function, as
+    syntactically valid calls - it rejects the first four afterward
+    with "wrong number of arguments to function X()" and the last with
+    "no such function: foo", neither of which is a syntax error. The
+    parser must not special-case `count`: arity and function-name
+    validation are out of scope for this issue."""
+    expr = _select_expr(f"SELECT {name}(*) FROM blame")
+    assert isinstance(expr, FunctionCall)
+    assert expr.name == name
+    assert len(expr.args) == 1
+    assert isinstance(expr.args[0], Star)
+    assert expr.args[0].table is None
+
+
+def test_count_star_unchanged_by_the_restructure():
+    """`FunctionCall(name="count", args=(Star(table=None),))` is what
+    #9's binder depends on for `count(*)` - pinned again here so the
+    `_parse_function_call` restructure cannot silently change it."""
+    expr = _select_expr("SELECT count(*) FROM blame")
+    assert isinstance(expr, FunctionCall)
+    assert expr.name == "count"
+    assert expr.args == (
+        Star(table=None, position=expr.args[0].position),
+    )
+
+
+def test_count_star_alias_attaches_to_the_call_not_the_star():
+    """`sqlite3`: `SELECT count(*) AS n FROM blame` parses - unlike a
+    bare select-list `*`, a function call's result can be aliased. The
+    alias belongs to the `SelectItem` wrapping the `FunctionCall`, not
+    to the `Star` argument inside it."""
+    stmt = _parse("SELECT count(*) AS n FROM blame")
+    item = stmt.select_list[0]
+    assert item.alias == "n"
+    assert isinstance(item.expr, FunctionCall)
+    assert isinstance(item.expr.args[0], Star)
+
+
+def test_zero_argument_function_call_unaffected():
+    """`sqlite3`: `SELECT count() FROM blame` parses - a different,
+    already-working shape, unrelated to this fix and re-pinned so the
+    `_parse_function_call` restructure cannot break it."""
+    expr = _select_expr("SELECT count() FROM blame")
+    assert isinstance(expr, FunctionCall)
+    assert expr.name == "count"
+    assert expr.args == ()
+
+
+def test_multiplication_still_parses_unaffected_by_star_position_rules():
+    """The lexer emits one `STAR` token type for both the multiplication
+    operator and the star forms above; the parser must keep
+    disambiguating by position alone, with no new token type."""
+    expr = _select_expr("SELECT 2 * 3 FROM blame")
+    assert isinstance(expr, BinaryOp)
+    assert expr.op is Operator.MUL
+
+    where = _where("SELECT path FROM blame WHERE line_no > 1 * 2")
+    assert isinstance(where, BinaryOp)
+    assert where.op is Operator.GT
+    assert isinstance(where.right, BinaryOp)
+    assert where.right.op is Operator.MUL
+
+
+def test_where_star_still_raises_parse_error():
+    """Already correct today, not a defect - `sqlite3 3.51.0` also
+    rejects `SELECT path FROM blame WHERE *` (`near "*": syntax
+    error`). Re-pinned as a regression test so a future change cannot
+    silently reintroduce it: `STAR` is not a valid `_parse_primary`
+    token and `WHERE`'s expression parsing has no star special-case."""
+    with pytest.raises(ParseError):
+        _parse("SELECT path FROM blame WHERE *")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * + 1 FROM blame",
+        "SELECT (*) FROM blame",
+        "SELECT -* FROM blame",
+        "SELECT path FROM blame WHERE line_no IN (*, 1)",
+        "SELECT path FROM blame WHERE line_no IN (1, *)",
+    ],
+)
+def test_star_already_illegal_shapes_stay_illegal(sql):
+    """Already correctly rejected today - re-pinned as regression tests
+    since they share the same underlying rule this issue fixes: a bare
+    `*` may only start an expression at the two sanctioned call sites,
+    and `_parse_primary` has no other case that accepts a `STAR`
+    token."""
+    with pytest.raises(ParseError):
+        _parse(sql)
+
+
 # --- Precedence -----------------------------------------------------------
 #
 # `select 3 = 0 < 3;` -> 0, confirmed against sqlite3 during grooming:

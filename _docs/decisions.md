@@ -514,3 +514,45 @@ bare-digit spelling - what a hand-written query or the fuzzer
 would actually produce - at that cost, rather than leave both
 spellings broken waiting on a `Literal` field that belongs to a
 different issue (`sql/ast.py` is off-limits for #12).
+
+2026-09-15 - An IN/NOT IN list has no affinity of its own, ever;
+BETWEEN's bounds keep theirs
+
+Found by the M2 milestone review (#47), not by a test: `_eval_in`
+called the same `_evaluate_affinity_pair` helper as `=`, `IS`, and
+`_eval_between`, applying column affinity to each list element the
+same way `=`'s right operand gets it. SQLite's rule for IN is
+narrower than that: the right-hand side of IN/NOT IN with a list has
+no affinity at all, full stop, regardless of what kind of expression
+the element itself is - not "usually," not "unless the element is
+itself a bare column."
+
+Confirmed against sqlite3 3.51.0, t(n INTEGER, s TEXT, r REAL), row
+(5, '5', 5.0):
+
+    select '5' in (n);   -> 0
+    select '5' in (r);   -> 0
+    select 5 in (s);     -> 0
+
+Each was 1 under the old code: a bare-column element converted the
+literal to the column's own declared type before comparing, treating
+the element exactly like `=`'s right operand. This reached the
+shipped CLI - `'1' IN (line_no)` returned 42 rows instead of 0.
+
+The trap is that BETWEEN looks structurally identical in the same
+file - it walks the same shape of operand pair through the same
+shared helper - and is not governed by the same rule. Each BETWEEN
+bound is an independent right-hand operand, symmetric with `=`, and
+keeps its own affinity. Confirmed for the identical operand shape,
+same row (n = 1): `'1' BETWEEN n AND n` -> 1, while `'1' IN (n)` ->
+0 for that same row. A fix that unifies the two operators onto one
+code path reintroduces this bug in the other direction.
+
+The fix adds `right_has_affinity` to `_evaluate_affinity_pair`, an
+explicit keyword forcing the list side's affinity to None; only
+`_eval_in` passes `right_has_affinity=False`, and `_eval_between` is
+untouched. Recorded here on the precedent of the 2026-08-27 "column
+affinity lives in the expression evaluator" entry - the same category
+of mismatch, an operator implemented by analogy to `=` where SQLite's
+actual rule diverges, now proven to reach a real query rather than
+staying hypothetical.

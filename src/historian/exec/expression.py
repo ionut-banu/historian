@@ -249,13 +249,36 @@ def _eval_in(expr: In, row: Row, schema: Schema) -> Bool3:
     element matches, but a `NULL` element means "maybe", not "no").
     `IN ()` folds over zero elements, leaving the `False` starting
     accumulator untouched - matching `sql/ast.py`'s own docstring that
-    `IN ()` is always `FALSE`. Affinity is applied to each `(x, vi)`
-    pair independently, exactly as for `=`: `x`'s own affinity can
-    interact differently with each element's.
+    `IN ()` is always `FALSE`.
+
+    Affinity (issue #47, correcting this docstring's own former claim
+    that it worked "exactly as for `=`" - it does not): a list element
+    contributes no affinity of its own, ever - not "usually," not
+    "unless the element happens to itself be a bare column." Confirmed
+    against `sqlite3` (`t(n INTEGER, s TEXT, r REAL)`, row `(5, '5',
+    5.0)`): `'5' IN (n)` -> `0`, `'5' IN (r)` -> `0`, `5 IN (s)` -> `0`
+    - each is `1` if the element's own affinity were (wrongly)
+    consulted the way `=`'s right operand's is. Only `x`'s own
+    affinity - the same structural question `_affinity_of` already
+    asks for every other operator - is ever applied, and it is applied
+    once per element independently: `x IN ('5', 'abc')` still converts
+    `'5'` and `'abc'` against `x`'s affinity individually, per the
+    already-correct `test_in_applies_affinity_to_each_element_independently`.
+    `_evaluate_affinity_pair`'s `right_has_affinity=False` is the
+    single change this makes: `x`'s own affinity still applies to each
+    element, the element's affinity never does.
+
+    This is genuinely different from `_eval_between`, not a case that
+    "tidying" the two onto one path would preserve: a `BETWEEN` bound
+    is an independent RHS operand, symmetric with `=`, and keeps its
+    own affinity. Confirmed against `sqlite3` for the identical
+    operand shape, same row (`n = 1`): `'1' BETWEEN n AND n` -> `1`,
+    `'1' IN (n)` -> `0`. `_eval_between` is intentionally left calling
+    `_evaluate_affinity_pair` with its default `right_has_affinity=True`.
     """
     result: Bool3 = False
     for element in expr.values:
-        left, right = _evaluate_affinity_pair(expr.left, element, row, schema)
+        left, right = _evaluate_affinity_pair(expr.left, element, row, schema, right_has_affinity=False)
         result = values.or3(result, values.eq(left, right))
     return values.not3(result) if expr.negated else result
 
@@ -491,16 +514,31 @@ def _eval_binary(expr: BinaryOp, row: Row, schema: Schema) -> Value | Bool3:
 
 
 def _evaluate_affinity_pair(
-    left_expr: Expr, right_expr: Expr, row: Row, schema: Schema
+    left_expr: Expr, right_expr: Expr, row: Row, schema: Schema, *, right_has_affinity: bool = True
 ) -> tuple[Value, Value]:
     """Evaluate both sides of a comparison-shaped pair of operands
-    (`=`/`<>`/.../`IS`/`IS NOT`, and - later - each element of `IN`
-    and each bound of `BETWEEN`) and apply column affinity to the
-    result. Shared by every predicate that this issue's own criteria
-    says goes through "the identical affinity algorithm" as `=`."""
+    (`=`/`<>`/.../`IS`/`IS NOT`, each bound of `BETWEEN`) and apply
+    column affinity to the result. Shared by every predicate that goes
+    through "the identical affinity algorithm" as `=` - which is every
+    caller except `_eval_in`.
+
+    `right_has_affinity` (issue #47) is the explicit, structural
+    escape hatch `_eval_in` uses: SQLite's own rule is that the
+    right-hand side of `IN`/`NOT IN` *with a list* has no affinity at
+    all, regardless of what kind of expression a given element is -
+    unlike `=`/`IS`/`BETWEEN`, where each operand independently asks
+    `_affinity_of` the normal way. `_eval_in` passes
+    `right_has_affinity=False` for every element; every other caller
+    takes the default and is unaffected. A plain keyword parameter,
+    not a dynamic-dispatch trick (`AGENTS.md`), and it does not touch
+    `_eval_between`, which must keep applying each bound's own
+    affinity independently - see `_eval_in`'s docstring for the
+    evidence that the two operators, though structurally identical
+    here, are not supposed to behave alike."""
     left = evaluate(left_expr, row, schema)
     right = evaluate(right_expr, row, schema)
-    return _apply_affinity(left, _affinity_of(left_expr, schema), right, _affinity_of(right_expr, schema))
+    right_affinity = _affinity_of(right_expr, schema) if right_has_affinity else None
+    return _apply_affinity(left, _affinity_of(left_expr, schema), right, right_affinity)
 
 
 def _eval_is(expr: Is, row: Row, schema: Schema) -> bool:

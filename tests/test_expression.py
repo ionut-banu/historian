@@ -987,6 +987,123 @@ def test_in_empty_list_is_always_false():
     assert evaluate(_in(_lit(5), []), _ROW, _SCHEMA) is False
 
 
+# --- IN: a list element has no affinity of its own, ever (issue #47) ----
+#
+# sqlite3, `t(n INTEGER, s TEXT, r REAL)`, row `(5, '5', 5.0)`:
+#
+#   select '5' in (n), '5' not in (n);             -> 0|1
+#   select '5' in (n, 99), '5' in (99, n);          -> 0|0
+#   select '5' in (r), '5.0' in (r);                -> 0|0
+#   select 5 in (s), 5 in (s, 99);                  -> 0|0
+#   select (n+0) in ('5');                          -> 0
+#
+# Independently re-verified during this issue's own work, matching the
+# grooming comment's evidence table exactly.
+
+
+def test_in_list_element_that_is_a_bare_column_has_no_affinity():
+    """sqlite3 (`n INT`, `n=5`): `'5' IN (n)` -> 0, `'5' NOT IN (n)` ->
+    1. This is the exact shape from the shipped CLI defect (`'1' IN
+    (line_no)` returning 42 rows instead of 0): naively applying `=`'s
+    per-operand affinity rule to the list element converts '5' to the
+    column's own type and gets this backwards. The list element
+    contributes no affinity of its own, regardless of being a bare
+    `BoundColumnRef`."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_in(_lit("5"), [_col("n")]), _ROW, _SCHEMA) is False
+    assert evaluate(_in(_lit("5"), [_col("n")], negated=True), _ROW, _SCHEMA) is True
+
+
+def test_in_list_element_affinity_is_order_independent():
+    """sqlite3 (`n INT`, `n=5`): `'5' IN (n, 99)` -> 0, `'5' IN (99, n)`
+    -> 0 - position within the list doesn't matter, and the numeric
+    literal element 99 doesn't leak affinity onto n either."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_in(_lit("5"), [_col("n"), _lit(99)]), _ROW, _SCHEMA) is False
+    assert evaluate(_in(_lit("5"), [_lit(99), _col("n")]), _ROW, _SCHEMA) is False
+
+
+def test_in_list_element_no_affinity_for_real_column():
+    """sqlite3 (`r REAL`, `r=5.0`): `'5' IN (r)` -> 0, `'5.0' IN (r)` ->
+    0 - REAL columns are affected identically to INTEGER, not a special
+    case."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_in(_lit("5"), [_col("r")]), _ROW, _SCHEMA) is False
+    assert evaluate(_in(_lit("5.0"), [_col("r")]), _ROW, _SCHEMA) is False
+
+
+def test_in_list_element_no_affinity_mirror_direction():
+    """sqlite3 (`s TEXT`, `s='5'`): `5 IN (s)` -> 0, `5 IN (s, 99)` ->
+    0 - the mirror direction, a numeric left operand with a TEXT
+    column inside the list."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_in(_lit(5), [_col("s")]), _ROW, _SCHEMA) is False
+    assert evaluate(_in(_lit(5), [_col("s"), _lit(99)]), _ROW, _SCHEMA) is False
+
+
+def test_in_applies_affinity_to_each_element_independently_still_passes():
+    """Same shape as the pre-existing
+    `test_in_applies_affinity_to_each_element_independently`
+    (`n` on the *left* of IN), restated here to make explicit that this
+    issue's fix does not touch that direction: sqlite3 (`n INT`, `n=5`):
+    `n IN ('5', '6')` -> 1, `n IN ('5', 'abc')` -> 1."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_in(_col("n"), [_lit("5"), _lit("6")]), _ROW, _SCHEMA) is True
+    assert evaluate(_in(_col("n"), [_lit("5"), _lit("abc")]), _ROW, _SCHEMA) is True
+
+
+def test_in_computed_left_operand_still_has_no_affinity():
+    """sqlite3 (`n INT`, `n=5`): `(n + 0) IN ('5')` -> 0 - matches `=`'s
+    existing behaviour for computed operands: the left side is a
+    `BinaryOp`, not a bare `BoundColumnRef`, so it contributes no
+    affinity and class-rank comparison never matches."""
+    from historian.exec.expression import evaluate
+
+    computed = _bin(Operator.ADD, _col("n"), _lit(0))
+    assert evaluate(_in(computed, [_lit("5")]), _ROW, _SCHEMA) is False
+
+
+def test_in_null_column_element_propagates_null_not_false():
+    """sqlite3 (`n INTEGER`, `n=NULL`), `.nullvalue NULL`:
+    `select '5' in (n);` -> NULL, `select '5' in (n, 99);` -> NULL,
+    `select '5' not in (n);` -> NULL. A bare-column list element that
+    is itself NULL at the row is not treated specially for being a
+    column - it must still propagate NULL, not collapse to FALSE. Every
+    existing NULL-in-IN test above (`test_in_null_propagation_matches_or3_folding`,
+    `test_not_in_is_not3_of_the_unnegated_result`) uses `Literal`
+    elements only, so none of them exercises a NULL element that also
+    carries a declared column type - exactly the combination the bug
+    lived in."""
+    from historian.exec.expression import evaluate
+
+    null_row: Row = (None, "5", 5.0)
+    assert evaluate(_in(_lit("5"), [_col("n")]), null_row, _SCHEMA) is None
+    assert evaluate(_in(_lit("5"), [_col("n"), _lit(99)]), null_row, _SCHEMA) is None
+    assert evaluate(_in(_lit("5"), [_col("n")], negated=True), null_row, _SCHEMA) is None
+
+
+def test_in_versus_between_diverge_on_the_same_operand_shape():
+    """sqlite3 (`n INTEGER`, `n=1`): `select '1' between n and n;` -> 1
+    (each bound independently carries its own affinity, symmetric with
+    `=`), while `select '1' in (n);` -> 0 for the same row. The two
+    operators look structurally identical in this module - both walk
+    operand pairs through `_evaluate_affinity_pair` - but must not be
+    unified: BETWEEN's bounds are not "a list" in SQLite's own terms,
+    and this fix must not touch `_eval_between` or generalize the
+    shared helper in a way that would also strip BETWEEN's per-bound
+    affinity."""
+    from historian.exec.expression import evaluate
+
+    one_row: Row = (1, "5", 5.0)
+    assert evaluate(_between(_lit("1"), _col("n"), _col("n")), one_row, _SCHEMA) is True
+    assert evaluate(_in(_lit("1"), [_col("n")]), one_row, _SCHEMA) is False
+
+
 # --- BETWEEN: and3(ge(x, low), le(x, high)), affinity per bound ---------
 
 

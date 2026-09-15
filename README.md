@@ -3,18 +3,18 @@
 A SQL query engine over git history.
 
 ```sql
--- Who wrote the code that is still alive in this directory?
--- Not who made the most commits. Who is actually in the file, now.
+-- Who wrote the lines of this file that are still alive at HEAD?
 
-SELECT author_name, count(*) AS surviving_lines
+SELECT path, author_name
 FROM blame
-WHERE path LIKE 'src/auth/%'
-GROUP BY author_name
-ORDER BY surviving_lines DESC;
+WHERE path = 'AGENTS.md';
 ```
 
-**Status: in design. There is no code yet.** The specification is
-complete and the first milestone is filed as issues. Nothing here runs.
+**Status: early.** Single-table `SELECT` / `WHERE` queries over
+`blame` run today - see the example above. `GROUP BY`, aggregates,
+`ORDER BY`, joins, and the other tables are still being built;
+`_docs/spec.md` describes the finished shape and `_docs/process.md`
+how the work is tracked.
 
 ## Why this exists
 

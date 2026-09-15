@@ -182,6 +182,10 @@ which is the most expensive one. Name a model on every dispatch.
   of code for what is wrong with it is the hardest job here.
 - **Escalation** - one tier up from whatever just failed.
 
+Each role's full definition - what it does, and what counts as
+done - lives in `_docs/team/`: `pm.md`, `software-engineer.md`,
+`qa-engineer.md`, `reviewer.md`.
+
 Cheapest is not the same as fastest. A weak model on a task beyond it
 takes several times the turns and costs more than the right one would
 have. Mid-tier is the floor, not the target.

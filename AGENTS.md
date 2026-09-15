@@ -48,3 +48,16 @@ Documents
 - `_docs/spec.md` - the only specification, always current
 - `_docs/decisions.md` - why things were decided, dated, append-only
 - `_docs/process.md` - how work is organized
+- `_docs/task-template.md` - the format a groomed issue body must
+  be in
+- `_docs/team/pm.md` - the PM role: grooms a task before anyone
+  implements it
+- `_docs/team/software-engineer.md` - the engineer role: implements
+  one groomed task at a time
+- `_docs/team/qa-engineer.md` - the QA role: checks finished work
+  against the issue that specified it
+- `_docs/team/reviewer.md` - the reviewer role: reads a milestone
+  of code and says what is wrong with it
+
+Anyone working one of the four roles above - PM, engineer, QA,
+reviewer - reads its own role file before doing anything else.

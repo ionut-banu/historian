@@ -7,8 +7,6 @@ Commands
 - `uv sync` - install dependencies
 - `uv run pytest` - the whole suite
 - `uv run pytest tests/test_parser.py` - one test file
-- `uv run pytest tests/differential` - the SQLite oracle suite
-- `uv run python -m historian.fuzz --queries 1000` - the fuzzer
 - `uv run historian "SELECT ..."` - run a query against the repo you
   are standing in
 
@@ -16,8 +14,8 @@ Layout
 
 - `src/historian/` - the package (importable as `historian`)
 - `tests/` - pytest tests, one file per module under test
-- `tests/differential/` - queries run against both historian and
-  SQLite, asserting identical results
+- `tests/extraction/` - tests checking the git-backed tables against
+  `git` itself, e.g. `test_blame.py`
 - `tests/fixtures/` - scripts that build git repositories with known,
   asserted contents
 

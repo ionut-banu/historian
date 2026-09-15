@@ -457,12 +457,42 @@ def test_nulls_sort_first_ascending():
 
 
 def test_descending_is_the_ascending_list_reversed():
-    """sqlite3 confirms ORDER BY x DESC is exactly the ascending list
-    reversed, NULLs included - so Sort gets DESC by reversing and needs
-    no NULLS-LAST rule of its own."""
+    """Pins the single-key case only, not the general Sort contract - see
+    test_multi_key_sort_is_not_the_ascending_list_reversed below for why
+    that distinction matters. sqlite3 confirms ORDER BY x DESC, alone, is
+    exactly the ascending list reversed, NULLs included - so a single-key
+    Sort gets DESC by reversing and needs no NULLS-LAST rule of its own."""
     column = [None, 1, 2, None, 3]
     ascending = sorted(column, key=order_key)
     assert list(reversed(ascending)) == [3, 2, 1, None, None]
+
+
+def test_multi_key_sort_is_not_the_ascending_list_reversed():
+    """The single-key reversal rule above does NOT generalize to more than
+    one sort key - reversing the both-ascending order is wrong once a
+    second key is mixed-direction. The correct algorithm, per the module
+    docstring's multi-key contract: a stable sort once per key, applied
+    from the last key to the first, each pass using order_key on that
+    key's value with reverse=True iff that key is DESC.
+
+    sqlite3 :memory: "create table t(a,b); insert into t
+    values ('x',1),('x',2),('y',1),('y',2); select a,b from t
+    order by a asc, b desc;" -> x|2  x|1  y|2  y|1
+    """
+    rows = [("x", 1), ("x", 2), ("y", 1), ("y", 2)]
+    both_ascending = sorted(rows, key=lambda r: (order_key(r[0]), order_key(r[1])))
+    assert both_ascending == [("x", 1), ("x", 2), ("y", 1), ("y", 2)]
+    wrongly_reversed = list(reversed(both_ascending))
+    assert wrongly_reversed == [("y", 2), ("y", 1), ("x", 2), ("x", 1)]
+
+    # a ASC, b DESC: stable-sort last key to first, reverse=True iff DESC.
+    result = list(rows)
+    result = sorted(result, key=lambda r: order_key(r[1]), reverse=True)  # b DESC
+    result = sorted(result, key=lambda r: order_key(r[0]), reverse=False)  # a ASC
+
+    expected = [("x", 2), ("x", 1), ("y", 2), ("y", 1)]
+    assert result == expected
+    assert result != wrongly_reversed
 
 
 def test_order_key_ranks_null_before_numeric_before_text():

@@ -64,15 +64,54 @@ operand being NULL makes the result NULL. ``ORDER BY`` needs something
 different - a total order with a defined position for NULL - so sorting
 uses :func:`order_key` instead. They are separate functions on purpose.
 
-Contract for the future ``Sort`` operator: ``sorted(rows, key=...)`` on
-:func:`order_key` gives SQLite's ``ASC`` order, and ``DESC`` is that list
-**reversed**, not a negated or complemented key. Confirmed against
-``sqlite3`` that ``ORDER BY x DESC`` is exactly the ascending result
-reversed, NULLs included - so ``Sort`` needs no NULLS-LAST special case
-of its own. (Reversing also reverses the relative order of values that
-compare equal; SQLite does not define that order, and historian's
-own determinism rule is satisfied as long as the reversal is applied to
-an already-deterministic list.)
+Contract for the future ``Sort`` operator, single key: ``sorted(rows,
+key=...)`` on :func:`order_key` gives SQLite's ``ASC`` order, and for a
+**single** sort key, ``DESC`` is that list **reversed**, not a negated
+or complemented key. Confirmed against ``sqlite3`` that ``ORDER BY x
+DESC`` is exactly the ascending result reversed, NULLs included - so a
+single-key ``Sort`` needs no NULLS-LAST special case of its own.
+(Reversing also reverses the relative order of values that compare
+equal; SQLite does not define that order, and historian's own
+determinism rule is satisfied as long as the reversal is applied to an
+already-deterministic list.)
+
+This does **not** generalize past one key. For more than one sort key,
+"sort ascending on every key, then reverse the whole list" is wrong -
+confirmed against ``sqlite3`` 3.51.0::
+
+    create table t(a,b);
+    insert into t values ('x',1),('x',2),('y',1),('y',2);
+    select a,b from t order by a asc, b desc;
+    -- x|2  x|1  y|2  y|1
+
+Both the both-ascending order (``x1,x2,y1,y2``) and its full reversal
+(``y2,y1,x2,x1``) disagree with this. The correct multi-key rule: apply
+a **stable** sort once per key, processing keys from the **last** to
+the **first**, each pass using :func:`order_key` on that key's value
+with ``reverse=True`` iff that key is ``DESC``. Python's ``sorted`` is
+stable, so a later pass (an earlier key) never disturbs the relative
+order two rows already have from an earlier pass (a later key) among
+rows that tie on the later pass's key. This is what produces
+``x|2, x|1, y|2, y|1`` above: the ``b DESC`` pass runs first and sorts
+within no groups yet (``2,1,2,1`` order per original row), then the
+``a ASC`` pass stably groups by ``a`` without disturbing the ``b``
+order within each group.
+
+Within each key's own pass, NULLs still sort first on ``ASC`` and last
+on ``DESC`` - the single-key NULL guarantee above holds **per key**,
+not as one global rule for the whole multi-key sort. This falls out
+directly of "stable sort with ``reverse=True`` on :func:`order_key`,
+whose NULL payload already ranks lowest" and needs no separate
+NULLS-LAST case of its own, exactly as the single-key rule does.
+Confirmed against ``sqlite3`` with NULLs in both a leading and a
+trailing key, ``a ASC, b DESC``, data ``('x',NULL),('x',1),(NULL,1),
+(NULL,2),('y',NULL),('y',1)``::
+
+    -- NULL|2  NULL|1  x|1  x|NULL  y|1  y|NULL
+
+NULLs land first within the NULL-valued group of the ascending key
+(``a``) and last within each ``x``/``y`` group on the descending key
+(``b``), matching the per-key rule exactly.
 
 Grouping is not comparison either
 ---------------------------------
@@ -343,7 +382,9 @@ def order_key(value: Value) -> tuple[int, int | float | str]:
     column of all NULLs sorts as happily as any other. NULL sorts first,
     then numerics, then text, matching SQLite.
 
-    ``DESC`` is this ordering reversed; see the module docstring.
+    For a single sort key, ``DESC`` is this ordering reversed; for more
+    than one key it is not - see the module docstring's "Contract for
+    the future Sort operator" section for the multi-key rule.
     """
     rank = _rank(value)
     if rank == _RANK_NULL:

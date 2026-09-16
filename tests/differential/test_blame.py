@@ -240,6 +240,30 @@ def test_where_like(tiny_repo):
     _assert_differential(tiny_repo, "SELECT path FROM blame WHERE path LIKE 'src/%'")
 
 
+def test_where_like_single_char_wildcard(tiny_repo):
+    """`_` matches exactly one character, distinct from `%`'s "any
+    sequence including empty" - `sqlite3 :memory: "select
+    'feature/thing.py' like 'feature/th_ng.py';"` -> `1`. The existing
+    `%`-only case above cannot by itself tell `_` compiling to the
+    right thing (`.`) apart from, say, a literal underscore - a bug
+    isolated to `_`'s own translation would pass it silently."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE path LIKE 'feature/th_ng.py'")
+
+
+def test_where_like_single_char_wildcard_requires_exactly_one_char(tiny_repo):
+    """The other half of the pair directly above, needed to rule out
+    `_` compiling to `.*` (any sequence, zero included) rather than
+    `.` (exactly one) - a bug the positive case above cannot see,
+    since `.*` matches everywhere `.` does and then some. `path` is
+    `'src/utils.py'`; the pattern below asks for a character between
+    the final `s` and the `.` that is not actually there -
+    `sqlite3 :memory: "select 'src/utils.py' like
+    'src/utils_.py';"` -> `0`. `.` correctly requires and fails to
+    find that character; `.*` would match zero characters there and
+    wrongly report the row as `1`."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE path LIKE 'src/utils_.py'")
+
+
 def test_where_in(tiny_repo):
     _assert_differential(tiny_repo, "SELECT path FROM blame WHERE line_no IN (1, 2)")
 

@@ -556,3 +556,49 @@ affinity lives in the expression evaluator" entry - the same category
 of mismatch, an operator implemented by analogy to `=` where SQLite's
 actual rule diverges, now proven to reach a real query rather than
 staying hypothetical.
+
+2026-09-16 - tests/extraction/ and tests/differential/ get an
+__init__.py each, to stop a same-basename test_blame.py collision
+
+Issue #59 gives tests/differential/ its own test_blame.py, and §4's
+layout already names tests/extraction/test_blame.py (#11) next to
+it. Neither directory had an __init__.py, and pyproject.toml sets no
+pytest import mode, so under pytest's default "prepend" mode a test
+module's name comes from its bare basename - both files became
+module "test_blame" and the whole suite failed to collect:
+
+    import file mismatch: imported module 'test_blame' has this
+    __file__ attribute: .../tests/differential/test_blame.py which
+    is not the same as the test file we want to collect:
+    .../tests/extraction/test_blame.py
+
+Three ways out were on the table: add __init__.py to both
+directories, set --import-mode=importlib globally, or rename a
+file. importlib mode was tried and rejected first, not assumed -
+it stops pytest from prepending anything to sys.path, which breaks
+tests/conftest.py's existing `from fixtures.build import ...`
+outright (ModuleNotFoundError), and fixing that reaches into a file
+this issue has no reason to touch. Renaming a file was rejected for
+losing §4's layout symmetry between the two directories.
+
+__init__.py has direct precedent already - tests/fixtures/ has had
+one from the start - and §4 names two more files landing in these
+same two directories later: tests/pushdown/test_blame_pushdown.py
+(M4) and tests/differential/test_regressions.py (M5). A future
+basename collision between any of these is closed by the same fix,
+not reopened.
+
+One consequence, found by running it rather than by predicting it:
+once a directory has an __init__.py, pytest imports its conftest.py
+under a dotted name (`differential.conftest`) rather than the bare
+`conftest`, and - because `tests/` itself has no __init__.py of its
+own - a bare `from conftest import ...` inside tests/differential/
+test_blame.py silently resolves to the unrelated top-level
+tests/conftest.py instead of raising, once that module is already
+in sys.modules from collecting anything else first. It fails
+loudly enough in practice (ImportError: cannot import name
+'assert_rows_match' from 'conftest') that it was caught immediately,
+but it would not fail loudly for two conftest.py files that
+happened to share a name. Fixed by importing it as
+`from differential.conftest import ...`, its real dotted name now
+that the package exists.

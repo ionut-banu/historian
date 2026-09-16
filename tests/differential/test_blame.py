@@ -283,6 +283,180 @@ def test_arithmetic(tiny_repo):
     _assert_differential(tiny_repo, "SELECT line_no + 1 FROM blame")
 
 
+# --- Three-valued logic through the engine ------------------------------
+#
+# QA's FAIL on this issue's first attempt (issue #59): `blame` has no
+# nullable column across either fixture (confirmed live - zero NULLs in
+# all 7 columns x 15 rows total), so no query over table data alone can
+# produce a NULL comparison. Every case below routes a NULL through the
+# pipeline via a literal instead - SQLite executes all of them happily,
+# per the orchestrator's own list of what would close the gap. Each
+# expected shape below is confirmed against `sqlite3` 3.51.0 (see the
+# inline invocation in each docstring); `_assert_differential` then
+# checks historian agrees, live, rather than pinning a literal value
+# here.
+#
+# The specific mutation this section exists to kill: `_compare`
+# (`values.py`) returning `0` instead of `None` when either operand's
+# storage-class rank is NULL - turning "any comparison with NULL is
+# NULL" into "NULL equals everything", spec §3's "classic bug". Every
+# comparison operator (`eq`/`ne`/`lt`/`le`/`gt`/`ge`) routes through
+# `_compare`, so a single row reaching any of them with a NULL operand
+# is enough to expose it - confirmed by re-running the mutation below.
+
+
+def test_where_eq_against_null_literal(tiny_repo):
+    """`sqlite3 :memory: "create table blame(path text); insert into
+    blame values ('a.py'); select count(*) from blame where path =
+    NULL;"` -> `0`. A column compared to a NULL literal is never TRUE,
+    so no row matches - not "matches every row" (the classic bug) and
+    not "matches whichever rows equal NULL under Python's own `==`",
+    which would raise before returning a count at all."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE path = NULL")
+
+
+def test_select_eq_against_null_literal(tiny_repo):
+    """`sqlite3 :memory: "select 1 = NULL;"` -> empty (NULL), for every
+    row regardless of `line_no`'s actual value. This is `SELECT`, not
+    `WHERE`, so - unlike the case above - a wrong `TRUE` would not be
+    filtered out; it would show up directly as `True` in the row
+    instead of `None`."""
+    _assert_differential(tiny_repo, "SELECT line_no = NULL FROM blame")
+
+
+def test_null_literal_equals_null_literal(tiny_repo):
+    """`sqlite3 :memory: "select (NULL = NULL) is NULL;"` -> `1`
+    (TRUE): `NULL = NULL` is `NULL`, not `TRUE`. This is the exact
+    shape of the mutation QA found - both operands NULL, not just
+    one - and the case the general `path = NULL` test above does not
+    by itself guarantee catches every way `_compare` could special-case
+    "both sides NULL" differently from "one side NULL"."""
+    _assert_differential(tiny_repo, "SELECT NULL = NULL FROM blame")
+
+
+def test_where_in_with_null_element(tiny_repo):
+    """`sqlite3 :memory: "create table blame(line_no integer); insert
+    into blame values (1),(1),(2); select count(*) from blame where
+    line_no IN (1, NULL);"` -> `2`: a NULL in the list only turns a
+    non-match into NULL (excluded), it never turns every row TRUE. The
+    two `line_no = 1` rows still match on their own merits."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE line_no IN (1, NULL)")
+
+
+def test_where_not_in_with_null_element(tiny_repo):
+    """`sqlite3 :memory: "create table blame(line_no integer); insert
+    into blame values (1),(1),(2); select count(*) from blame where
+    line_no NOT IN (1, NULL);"` -> `0`: a NULL anywhere in a `NOT IN`
+    list poisons every row, matching or not - `line_no = 1` rows get
+    `NOT (TRUE)` = `FALSE`, and the `line_no = 2` row gets
+    `NOT (NULL)` = `NULL`. Neither is kept."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE line_no NOT IN (1, NULL)")
+
+
+def test_where_between_with_null_bound(tiny_repo):
+    """`sqlite3 :memory: "create table blame(line_no integer); insert
+    into blame values (1),(1),(2); select count(*) from blame where
+    line_no BETWEEN 1 AND NULL;"` -> `0`: `line_no >= 1` is TRUE for
+    every row here, so each becomes `TRUE AND (line_no <= NULL)` =
+    `TRUE AND NULL` = `NULL`, not `TRUE`."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE line_no BETWEEN 1 AND NULL")
+
+
+def test_where_or_with_null_and_true_operand(tiny_repo):
+    """`sqlite3 :memory: "select (NULL OR 1);"` -> `1` (TRUE): `OR`
+    short-circuits to TRUE even with a NULL operand present, unlike
+    `AND`. `path = NULL` is NULL for every row here, so only the
+    `line_no = 1` rows survive via their own `TRUE OR NULL` = `TRUE` -
+    the same count as `test_where_in_with_null_element` above, reached
+    through `OR` instead of `IN`, to pin that `OR`'s own NULL handling
+    (not just `IN`'s) is correct."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE (path = NULL) OR (line_no = 1)")
+
+
+def test_where_not_of_null_comparison(tiny_repo):
+    """`sqlite3 :memory: "select (NOT (1 = NULL)) is NULL;"` -> `1`
+    (TRUE): `NOT NULL` is `NULL`, not `TRUE` - so negating a
+    NULL-valued comparison does not turn it into a match."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE NOT (path = NULL)")
+
+
+def test_concatenation_with_null_operand(tiny_repo):
+    """`sqlite3 :memory: "select ('a' || NULL) is NULL;"` -> `1`
+    (TRUE): `||` propagates NULL from either side rather than treating
+    it as an empty string, for every row regardless of `path`'s actual
+    value."""
+    _assert_differential(tiny_repo, "SELECT path || NULL FROM blame")
+
+
+# --- Division: truncation toward zero, and division by zero ------------
+#
+# `blame.line_no` is the only non-TEXT column in phase 1 and the case
+# set had no division anywhere, so `_truncating_int_div`
+# (`exec/expression.py`) - which exists specifically because Python's
+# `//` floors instead of truncating - was entirely unexercised. Same
+# root cause as the NULL gap above: an operator historian implements
+# but the hand-written cases never reached.
+
+
+def test_division_truncates_toward_zero_negative_dividend(tiny_repo):
+    """`sqlite3 :memory: "select -5/2;"` -> `-2`. Python's `-5 // 2` is
+    `-3` (floors toward negative infinity); SQLite/C truncate toward
+    zero instead."""
+    _assert_differential(tiny_repo, "SELECT -5 / 2 FROM blame")
+
+
+def test_division_truncates_toward_zero_negative_divisor(tiny_repo):
+    """`sqlite3 :memory: "select 5/-2;"` -> `-2`, same rule with the
+    sign on the other operand - Python's `5 // -2` is `-3`."""
+    _assert_differential(tiny_repo, "SELECT 5 / -2 FROM blame")
+
+
+def test_integer_division_by_zero_is_null(tiny_repo):
+    """`sqlite3 :memory: "select (5/0) is NULL;"` -> `1` (TRUE):
+    division by zero is NULL, not a `ZeroDivisionError` and not `0`."""
+    _assert_differential(tiny_repo, "SELECT 5 / 0 FROM blame")
+
+
+def test_float_division_by_zero_is_null(tiny_repo):
+    """`sqlite3 :memory: "select (5.0/0) is NULL;"` -> `1` (TRUE): the
+    same rule holds for a `REAL` operand, which raises
+    `ZeroDivisionError` in raw Python rather than producing `inf`."""
+    _assert_differential(tiny_repo, "SELECT 5.0 / 0 FROM blame")
+
+
+# --- Float-to-text: precision and shape must survive a `%.15g` change --
+#
+# `blame` has no REAL column and the case set had no float literal
+# anywhere, so `_format_float` (`exec/expression.py`) - SQLite's
+# `%.15g`-based `REAL -> TEXT` algorithm - was entirely unexercised.
+# `historian`'s lexer has no exponent-literal syntax (`1e15` lexes as
+# `1` followed by the identifier `e15`), so a large float is produced
+# via arithmetic overflow instead, exactly the path
+# `_int64_bounded` promotes to `float` on overflow
+# (`_docs/decisions.md`, 2026-09-01).
+
+
+def test_float_addition_renders_with_sqlite_precision(tiny_repo):
+    """`sqlite3 :memory: "select (0.1+0.2)||'';"` -> `'0.3'`. Python's
+    `str(0.1 + 0.2)` is `'0.30000000000000004'` - the same double, a
+    different number of significant digits kept. `||` forces the
+    REAL -> TEXT path; a bare `SELECT 0.1 + 0.2` would return a Python
+    float either side and could match by coincidence of identical
+    underlying doubles, never exercising `_format_float` at all."""
+    _assert_differential(tiny_repo, "SELECT (0.1 + 0.2) || '' FROM blame")
+
+
+def test_large_float_renders_in_scientific_notation(tiny_repo):
+    """`sqlite3 :memory: "select (9223372036854775807*10)||'';"` ->
+    `'9.22337203685478e+19'`: 15 significant digits, and an exponent
+    with the `.0` `_format_float` inserts before a bare `e` - not
+    Python's `str()`, which keeps 17 digits and a different exponent
+    spelling. `9223372036854775807 * 10` overflows `int64`
+    (`9223372036854775807` is `int64`'s own max) and is promoted to
+    `float` on both engines before `||` renders it."""
+    _assert_differential(tiny_repo, "SELECT (9223372036854775807 * 10) || '' FROM blame")
+
+
 # --- awkward_repo: unicode, quoting, binary content --------------------
 
 

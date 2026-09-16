@@ -236,6 +236,100 @@ def test_where_is_not_null(tiny_repo):
     _assert_differential(tiny_repo, "SELECT path FROM blame WHERE author_email IS NOT NULL")
 
 
+# --- IS / IS NOT over non-NULL, same-rank operands -----------------------
+#
+# QA's second-round FAIL on this issue (#59): `is_()` mutated to
+# `return _rank(left) == _rank(right)` - dropping the actual value
+# comparison and answering from storage-class rank alone - passes the
+# entire 767-test suite, unit and differential layers both. It makes
+# `IS` agree that any two same-rank values are equal: `'a' IS 'b'`
+# becomes TRUE. The two cases directly above only ever compare against
+# NULL, so neither puts two non-NULL operands in front of `is_()` at
+# all - confirmed by grep, this is the actual gap, not a guess.
+#
+# The orchestrator scoped round 2 to this one mutation and named three
+# others explicitly out of scope: the negated int64-minimum literal,
+# IN's FALSE-starting accumulator, and cross-storage-class comparison
+# direction. All three are already killed by tests/test_expression.py
+# or tests/test_values.py - this is the one killed by nothing, unit or
+# differential, until now.
+#
+# `tiny_repo`'s blame table has 3 rows: ('feature/thing.py', 1),
+# ('src/utils.py', 1), ('src/utils.py', 2) - two distinct `path`
+# values and two distinct `line_no` values, so `WHERE ... IS <literal>`
+# naturally splits rows into matching and non-matching with no
+# synthetic table needed. Under the mutant, every row in a same-rank
+# comparison agrees regardless of its actual value: a matching case
+# would undercount what the mutant reports (it sees all 3, not the
+# smaller true count) and a non-matching case would overcount it (it
+# sees all 3, not 0) - both directions covered below, for both TEXT
+# and INTEGER rank, for both `IS` and `IS NOT`.
+
+
+def test_where_is_matching_text(tiny_repo):
+    """`sqlite3 :memory: "create table blame(path text, line_no
+    integer); insert into blame values ('feature/thing.py',1),
+    ('src/utils.py',1),('src/utils.py',2); select count(*) from blame
+    where path IS 'src/utils.py';"` -> `2`. Under the mutant every row
+    is same-rank (TEXT) as the literal, so all 3 would match instead
+    of the 2 whose `path` actually equals it."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE path IS 'src/utils.py'")
+
+
+def test_where_is_non_matching_text(tiny_repo):
+    """`sqlite3 :memory: "... where path IS 'no-such-file.py';"` ->
+    `0`: no row's `path` is that literal, so `IS` is FALSE everywhere.
+    The mutant, which only checks that both sides are TEXT, would say
+    TRUE for all 3 rows - the starkest form of the bug, matching
+    everything instead of nothing."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE path IS 'no-such-file.py'")
+
+
+def test_where_is_matching_integer(tiny_repo):
+    """`sqlite3 :memory: "... where line_no IS 1;"` -> `2`. Same shape
+    as the TEXT case above, over the INTEGER-ranked column instead -
+    the mutant's rank check does not care which storage class it was
+    fooled on."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE line_no IS 1")
+
+
+def test_where_is_non_matching_integer(tiny_repo):
+    """`sqlite3 :memory: "... where line_no IS 999;"` -> `0`: no row's
+    `line_no` is `999`. The mutant would match all 3 rows, since `999`
+    and every `line_no` value share the INTEGER rank."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE line_no IS 999")
+
+
+def test_where_is_not_matching_text(tiny_repo):
+    """`sqlite3 :memory: "... where path IS NOT 'src/utils.py';"` ->
+    `1`: the one row whose `path` is `'feature/thing.py'`. `is_not` is
+    `not is_()`, so the mutant - which says `is_` is TRUE for every
+    same-rank pair - would say `is_not` is FALSE for every row here,
+    matching 0 instead of 1."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE path IS NOT 'src/utils.py'")
+
+
+def test_where_is_not_non_matching_text(tiny_repo):
+    """`sqlite3 :memory: "... where path IS NOT 'no-such-file.py';"`
+    -> `3`: every row's `path` differs from that literal, so `IS NOT`
+    holds everywhere. The mutant would say 0 - the complementary miss
+    to the case directly above."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE path IS NOT 'no-such-file.py'")
+
+
+def test_where_is_not_matching_integer(tiny_repo):
+    """`sqlite3 :memory: "... where line_no IS NOT 1;"` -> `1`: the
+    one row whose `line_no` is `2`. Same INTEGER-rank shape as the
+    TEXT `IS NOT` case above."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE line_no IS NOT 1")
+
+
+def test_where_is_not_non_matching_integer(tiny_repo):
+    """`sqlite3 :memory: "... where line_no IS NOT 999;"` -> `3`:
+    every row's `line_no` differs from `999`. The mutant would say 0."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE line_no IS NOT 999")
+
+
 def test_where_like(tiny_repo):
     _assert_differential(tiny_repo, "SELECT path FROM blame WHERE path LIKE 'src/%'")
 

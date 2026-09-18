@@ -291,3 +291,125 @@ def test_success_path_prints_nothing_but_header_and_rows(tiny_repo, capsys):
     assert lines[0] == "path"
     assert all(line == "src/utils.py" for line in lines[1:])
     assert len(lines) > 1
+
+
+# --- issue #49: the backstop around the pipeline ----------------------
+
+
+class _InjectedBug(Exception):
+    """A test-local exception type, never one of historian's own. Used
+    to prove the backstop catches an *arbitrary* internal error rather
+    than being satisfied by coincidence of a real bug (see #63, which
+    fixes the two live reproductions this issue's body cites - neither
+    of those exception types is used here on purpose)."""
+
+
+#: The fixed diagnostic issue #49 assigns to any exception that isn't
+#: one of the four query-error types and isn't a repository-read
+#: failure - never `str(exc)`, the exception's class name, or a
+#: traceback (spec §3 "none of them tracebacks", §5 "Never a
+#: traceback").
+_INTERNAL_ERROR_MESSAGE = (
+    "error: historian hit an internal error and could not finish this "
+    "query - this is a bug in historian, not a mistake in your SQL. "
+    "Please report it, with the query that triggered it.\n"
+)
+
+
+def _plan_that_raises_while_materializing(monkeypatch, exc_type):
+    """Monkeypatch `historian.cli.plan` (the name as imported into
+    `cli.py`) with a wrapper that builds a genuine operator tree via
+    the real `plan()` - correct schema, correct everything - and then
+    replaces that tree's bound `rows` method with a function raising
+    *exc_type*. This is the injection recipe the groomed issue body
+    specifies: it doesn't depend on any real internal bug existing, so
+    it keeps working regardless of what #63 does to the two live
+    reproductions."""
+    real_plan = cli.plan
+
+    def _wrapped_plan(bound, repo):
+        tree = real_plan(bound, repo)
+
+        def _boom() -> object:
+            raise exc_type("injected-bug-marker: should never reach the user")
+
+        tree.rows = _boom
+        return tree
+
+    monkeypatch.setattr(cli, "plan", _wrapped_plan)
+
+
+def test_internal_error_during_materialization_exits_4_with_fixed_message(
+    tiny_repo, capsys, monkeypatch
+):
+    """An arbitrary exception raised while pulling rows from the
+    operator tree - not one of the four query-error types, not an
+    `OSError`/`RuntimeError` repository failure - is caught by the new
+    backstop clause: exit 4, nothing on stdout, exactly the fixed
+    diagnostic on stderr, with no trace of the injected exception's own
+    message or class name."""
+    _plan_that_raises_while_materializing(monkeypatch, _InjectedBug)
+
+    ret = cli.main(["-C", str(tiny_repo), "SELECT path FROM blame"])
+
+    assert ret == 4
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == _INTERNAL_ERROR_MESSAGE
+    assert "injected-bug-marker" not in captured.out
+    assert "injected-bug-marker" not in captured.err
+    assert "_InjectedBug" not in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_internal_error_during_rendering_exits_4(tiny_repo, capsys, monkeypatch):
+    """The guarded region is widened to cover rendering and writing the
+    result, not just lex/parse/bind/plan/materialize - an exception
+    raised from `_render_table` (before this issue, entirely outside
+    the `try`) is caught by the same backstop, not left to traceback."""
+
+    def _raise(schema, rows):
+        raise _InjectedBug("injected-bug-marker: should never reach the user")
+
+    monkeypatch.setattr(cli, "_render_table", _raise)
+
+    ret = cli.main(["-C", str(tiny_repo), "SELECT path FROM blame WHERE path = 'src/utils.py'"])
+
+    assert ret == 4
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == _INTERNAL_ERROR_MESSAGE
+    assert "injected-bug-marker" not in captured.err
+
+
+def test_keyboard_interrupt_during_materialization_propagates(tiny_repo, capsys, monkeypatch):
+    """`KeyboardInterrupt` is a `BaseException`, not an `Exception`, so
+    the new `except Exception` backstop must not swallow it - it
+    propagates out of `main` uncaught, exactly like a query error would
+    not."""
+    _plan_that_raises_while_materializing(monkeypatch, KeyboardInterrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(["-C", str(tiny_repo), "SELECT path FROM blame"])
+
+
+def test_broken_pipe_while_writing_exits_0_and_prints_nothing(tiny_repo, capsys, monkeypatch):
+    """`BrokenPipeError` (stdout closed, e.g. piped to `head`) raised
+    while rendering/writing the result is an `OSError` subclass, so
+    without its own clause it would be silently misreported as exit 3
+    by the existing "could not read repository" handling. It gets its
+    own clause instead, ordered before both the repository-read clause
+    and the new internal-error backstop: `main` returns 0 and nothing
+    further reaches stdout or stderr."""
+
+    def _raise(schema, rows):
+        raise BrokenPipeError()
+
+    monkeypatch.setattr(cli, "_render_table", _raise)
+
+    ret = cli.main(["-C", str(tiny_repo), "SELECT path FROM blame WHERE path = 'src/utils.py'"])
+
+    assert ret == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""

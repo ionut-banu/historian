@@ -712,3 +712,48 @@ than a separately specified grammar feature.
 prior pinning tests for the old "conservatively rejected" behaviour
 are rewritten to assert the new, correct resolution rather than
 deleted - the gap they documented is what this issue closes.
+
+2026-09-18 - Exit code 4 is an internal-error backstop; §3's
+"never a traceback" applied to a case it didn't name
+
+Issue #49. `cli.py`'s `main` caught exactly four query-error
+types plus `(OSError, RuntimeError)` for an unreadable repository,
+with no fallback - any other exception, including a bug in
+historian itself (most recently #63's `TypeError` from `SELECT
+(1=1) = 1 FROM blame`), reached the user as a Python traceback.
+Spec §3 and §5 both say "never a traceback" without carving out
+an exception for this case; it is a gap in the enumeration, not a
+conflict with it, since an internal invariant failure is not a
+parse error, a binding error, or a rejection of known-unsupported
+grammar. `main` gains two more `except` clauses, added to the
+chain rather than rewriting what was already there: `except
+BrokenPipeError`, ordered first, returning 0 with nothing written
+- confirmed `issubclass(BrokenPipeError, OSError)` is `True`, so
+without its own clause a broken pipe (stdout closed under a `|
+head`) would be misreported as "could not read repository" by the
+existing `(OSError, RuntimeError)` clause; and `except Exception`,
+ordered last, printing a fixed message that never repeats `str
+(exc)`, the exception's class name, or a traceback, returning a
+new exit code, `4`. Confirmed `issubclass(KeyboardInterrupt,
+Exception)` is `False`, so `except Exception` (never `except
+BaseException`) leaves `KeyboardInterrupt` to propagate
+uncaught, same as today. The guarded region widens to include
+rendering and writing the result (`_render_table`,
+`sys.stdout.write`), previously outside the `try` entirely and
+therefore unprotected even from the four original exception
+types - a bug in rendering, or a closed pipe on the write, could
+only ever be caught by moving the write inside the same `try`.
+Tested by injection rather than by a real bug or a real `| head`:
+a test-local exception class, never one of historian's own,
+raised from a monkeypatched `tree.rows()` or `_render_table`, so
+the test doesn't depend on which internal bugs exist at any given
+moment (in particular, not on #63's two live reproductions, which
+are unrelated fixes). A real `| head` against a small fixture
+repository does not reproduce the bug at all - the output fits in
+the pipe buffer and the process exits 0 before the pipe closes -
+so no integration test attempts one. `_docs/spec.md` §5's
+exit-codes line is edited in the same commit to list `4`, per
+process.md's rule that a decision contradicting the spec edits
+the spec alongside it; here the spec was silent rather than
+wrong, but the same rule was followed to keep the exit-codes line
+complete rather than leaving the fourth code undocumented.

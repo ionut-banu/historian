@@ -57,6 +57,48 @@ traceback" spirit by leaking a different kind of unstructured wall of
 text instead - this module substitutes one plain, single-line message
 naming the repository path, regardless of which of the two exception
 types triggered it or what git itself said.
+
+Issue #49: a backstop for everything else, and a pipe of its own
+------------------------------------------------------------------
+
+The four exception types above cover every way a *query* can be the
+user's fault. They do not cover a bug in historian itself - an
+internal invariant broken somewhere between a clean bind/plan and a
+row actually being produced or rendered, which is neither a parse
+error, a binding error, nor a documented "unsupported grammar"
+rejection. Spec §3 and §5 both say "never a traceback" without
+carving out an exception for that case, so it needs a backstop rather
+than being left to whatever Python does by default (a traceback).
+
+`main` therefore gains two more `except` clauses, added to the chain
+without touching the two above:
+
+- `except BrokenPipeError`, ordered *before* both `except (OSError,
+  RuntimeError)` and the new catch-all below. `BrokenPipeError` is an
+  `OSError` subclass (stdout closed under it, e.g. piped to `head`),
+  so without its own clause it would be silently misreported as "the
+  repository could not be read", exit 3 - a diagnosis that is simply
+  wrong for an ordinary broken pipe. Caught on its own, `main` returns
+  `0` and nothing further is written anywhere; a `| head` is not a
+  failure.
+- `except Exception`, last in the chain, after every clause above it.
+  Never `except BaseException` - `KeyboardInterrupt` is deliberately
+  not an `Exception` subclass, and this clause must not swallow it.
+  Anything landing here is historian's own bug, not the user's, so the
+  message says that and discards the exception's own text entirely -
+  same reasoning as the `RuntimeError` case above, generalized: `str
+  (exc)`, the exception's class name, and any traceback text must
+  never reach the user. Exit code `4`, distinct from `1` (bad query),
+  `2` (bad usage), and `3` (repository unreadable) - see
+  `_docs/spec.md` §5 and `_docs/decisions.md`.
+
+The guarded region also grows to match: rendering and writing the
+result (`_render_table`, `sys.stdout.write`) move *inside* the `try`,
+where they were not before. A bug while rendering is exactly the kind
+of internal error this backstop exists for, and a `BrokenPipeError`
+from a closed pipe can only ever be raised from the write itself - so
+both new clauses need the write to be reachable from inside the same
+`try` that already guards lex/parse/bind/plan/materialize.
 """
 
 from __future__ import annotations
@@ -150,13 +192,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     in-process, per this issue's own constraint - no test spawns a
     `historian` subprocess.
 
-    Runs the full pipeline - lex, parse, bind, plan, then materialize
-    every row from the resulting operator tree - inside one `try`, so
-    a query that fails at any stage (including mid-evaluation, for
-    `EvalError`) prints nothing to stdout at all: `_render_table` is
-    only ever called with a complete, successful row list, which is
-    also what keeps "the header line printed, or nothing" true rather
-    than a partial table appearing before a late failure.
+    Runs the full pipeline - lex, parse, bind, plan, materialize every
+    row from the resulting operator tree, then render and write the
+    table - inside one `try`. A query that fails at any stage
+    (including mid-evaluation, for `EvalError`, or while rendering)
+    prints nothing to stdout at all, which is also what keeps "the
+    header line printed, or nothing" true rather than a partial table
+    appearing before a late failure.
+
+    Five clauses handle everything that `try` can raise, in this
+    order:
+
+    1. The four query-error types (`LexError`/`ParseError`/
+       `BindError`/`EvalError`): the user's SQL is at fault. Exit 1.
+    2. `BrokenPipeError`: stdout was closed on the other end (e.g.
+       piped to `head`) while the result was being written. Not the
+       user's fault and not historian's bug either - exit 0, nothing
+       further written anywhere.
+    3. `(OSError, RuntimeError)`: the repository itself could not be
+       read. Exit 3. Ordered after `BrokenPipeError` deliberately -
+       `BrokenPipeError` is an `OSError` subclass, and without its own
+       clause first it would be misreported as this case instead.
+    4. `Exception` (never `BaseException` - see below): anything else,
+       which by elimination is a bug in historian rather than in the
+       user's query. Exit 4, with a fixed message that never repeats
+       `str(exc)`, the exception's class name, or a traceback (see
+       #49). `KeyboardInterrupt` is a `BaseException`, not an
+       `Exception`, so this clause does not catch it and it propagates
+       out of `main` uncaught, same as it would with no handler here
+       at all.
     """
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -168,14 +232,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         bound = bind(stmt)
         tree = plan(bound, repo)
         rows = list(tree.rows())
+        sys.stdout.write(_render_table(tree.schema, rows))
     except (LexError, ParseError, BindError, EvalError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    except BrokenPipeError:
+        return 0
     except (OSError, RuntimeError):
         print(f"error: could not read repository: {repo}", file=sys.stderr)
         return 3
+    except Exception:
+        print(
+            "error: historian hit an internal error and could not finish this "
+            "query - this is a bug in historian, not a mistake in your SQL. "
+            "Please report it, with the query that triggered it.",
+            file=sys.stderr,
+        )
+        return 4
 
-    sys.stdout.write(_render_table(tree.schema, rows))
     return 0
 
 

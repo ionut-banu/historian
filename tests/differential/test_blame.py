@@ -29,6 +29,7 @@ from historian.exec.operators import ScanSource
 from historian.plan.planner import ScanFactory
 from historian.schema import Row
 from historian.sql.binder import BindError
+from historian.sql.lexer import LexError
 from historian.sql.parser import ParseError
 from historian.tables.blame import BLAME_SCHEMA, BlameScan
 
@@ -856,18 +857,125 @@ def test_like_escape_is_a_parse_error(tiny_repo):
         run_historian("SELECT path FROM blame WHERE path LIKE '100|%' ESCAPE '|'", tiny_repo)
 
 
-# --- Known disagreements deliberately not included here ----------------
+# --- Fixed by this issue: a digit run glued to an identifier (#22) -----
 #
-# #22 (a digit run glued to an identifier, `SELECT 3abc FROM blame`) is
-# not a case: it is currently masked by #25. Confirmed live that both
-# engines already reject it today, for unrelated reasons - historian:
-# "expected FROM, found identifier 'abc'" (the bare-alias parse error,
-# since `3abc` lexes as `3` followed by the identifier `abc`, which
-# without #25 support is read as an alias attempt gone wrong before it
-# even reaches whatever #22's own bug would be); SQLite: "unrecognized
-# token: \"3abc\"". Two engines erroring for two different reasons is
-# not a comparable pair of outcomes - there is nothing to diff yet.
-# Add it once #25 resolves and the masking parse error goes away.
+# `sql/lexer.py`'s `tokenize` now raises `LexError` for a completed
+# digit run immediately followed, with no separator, by a character
+# that would otherwise start an identifier - before #25's bare-alias
+# `ParseError` ever gets a chance to fire, since `cli.py` calls
+# `tokenize` then `parse` in sequence and `parse()` is never reached
+# once `tokenize` raises. Each case below is `sqlite3 :memory:`
+# "unrecognized token" - see `tests/test_lexer.py` for the full
+# character-class rule and its lexer-level regression guards.
+
+
+def test_digit_glued_to_ascii_identifier_is_a_lex_error(tiny_repo):
+    """sqlite3: select 3abc;  -> Error: unrecognized token: "3abc".
+    Confirms the fix, not #25: `LexError`, never `ParseError` - `3abc`
+    never reaches the parser at all."""
+    with pytest.raises(LexError):
+        run_historian("SELECT 3abc FROM blame", tiny_repo)
+
+
+def test_digit_glued_to_non_ascii_symbol_is_a_lex_error(tiny_repo):
+    """sqlite3: select 1²;  -> Error: unrecognized token: "1²"."""
+    with pytest.raises(LexError):
+        run_historian("SELECT 1² FROM blame", tiny_repo)
+
+
+def test_digit_glued_to_non_ascii_word_is_a_lex_error(tiny_repo):
+    """sqlite3: select 3café;  -> Error: unrecognized token: "3café" -
+    the trigger is the ASCII 'c' right after the digit run; the
+    non-ASCII 'é' later in the same run doesn't need to be the first
+    character to matter."""
+    with pytest.raises(LexError):
+        run_historian("SELECT 3café FROM blame", tiny_repo)
+
+
+def test_digit_glued_directly_to_a_non_ascii_letter_is_a_lex_error(tiny_repo):
+    """sqlite3: select 3é;  -> Error: unrecognized token: "3é" - the
+    non-ASCII letter itself directly glued, not buried mid-identifier."""
+    with pytest.raises(LexError):
+        run_historian("SELECT 3é FROM blame", tiny_repo)
+
+
+def test_digit_glued_to_a_spacing_accent_mark_is_a_lex_error(tiny_repo):
+    """sqlite3: select 3´;  -> Error: unrecognized token: "3´" (U+00B4,
+    spacing acute accent, directly glued)."""
+    with pytest.raises(LexError):
+        run_historian("SELECT 3´ FROM blame", tiny_repo)
+
+
+def test_leading_zero_digit_run_glued_to_a_letter_is_a_lex_error(tiny_repo):
+    """sqlite3: select 0y;  -> Error: unrecognized token: "0y" - a lone
+    leading-zero digit run glued to an ordinary letter, not a hex or
+    exponent marker."""
+    with pytest.raises(LexError):
+        run_historian("SELECT 0y FROM blame", tiny_repo)
+
+
+def test_digit_run_glued_to_a_where_keyword_spelling_is_a_lex_error(tiny_repo):
+    """sqlite3: select 3from;  -> Error: unrecognized token: "3from" -
+    a digit run glued to a keyword-shaped identifier behaves the same
+    as an ordinary one: keyword classification happens after the
+    identifier text is scanned, and the glue check sits earlier, at the
+    number/identifier boundary, so it never has to special-case
+    keywords."""
+    with pytest.raises(LexError):
+        run_historian("SELECT 3from FROM blame", tiny_repo)
+
+
+def test_digit_run_glued_to_a_select_keyword_spelling_is_a_lex_error(tiny_repo):
+    """sqlite3: select 1select;  -> Error: unrecognized token:
+    "1select" - same reasoning as `3from`, a different keyword and a
+    different `TokenType`."""
+    with pytest.raises(LexError):
+        run_historian("SELECT 1select FROM blame", tiny_repo)
+
+
+# --- Regression guards: deferred glue shapes stay unchanged (#22) ------
+#
+# `e`/`E`/`x`/`X` (scientific notation and hex markers - issue #6) and
+# `_` (SQLite 3.46+'s digit-group separator - issue #70) are excluded
+# from the rule above, so these three still lex as two tokens - a
+# completed number followed by a separate identifier - and still hit
+# #25's bare-alias `ParseError`, exactly as before this issue. A naive
+# version of the fix (reject any digit run followed by any identifier-
+# start character, no exceptions) would have turned each of these into
+# a `LexError` instead; these guards prove it didn't overreach.
+
+
+def test_scientific_notation_glue_still_hits_the_bare_alias_parse_error(tiny_repo):
+    """sqlite3: select 3e2;  -> 300.0, a valid REAL historian does not
+    implement (#6) - unaffected by this issue either way. `3e2` still
+    lexes as INTEGER '3' + IDENTIFIER 'e2', so the query still fails at
+    #25's parser branch, not at the lexer."""
+    with pytest.raises(ParseError):
+        run_historian("SELECT 3e2 FROM blame", tiny_repo)
+
+
+def test_hex_glue_still_hits_the_bare_alias_parse_error(tiny_repo):
+    """sqlite3: select 0x1f;  -> 31, a valid hex integer historian does
+    not implement (#6). `0x1f` still lexes as INTEGER '0' + IDENTIFIER
+    'x1f', unaffected by this issue."""
+    with pytest.raises(ParseError):
+        run_historian("SELECT 0x1f FROM blame", tiny_repo)
+
+
+def test_digit_group_separator_glue_still_hits_the_bare_alias_parse_error(tiny_repo):
+    """sqlite3: select 3_1;  -> 31, SQLite 3.46+'s digit-group
+    separator - not implemented, and not tracked anywhere before this
+    issue's grooming surfaced it (#70). `3_1` still lexes as INTEGER
+    '3' + IDENTIFIER '_1'; excluding `_` from this issue's rule is what
+    keeps it that way. The naive version of the fix (reject any digit
+    run followed by any identifier-start character) would have turned
+    this into a `LexError` instead - a regression against SQLite, not
+    an improvement."""
+    with pytest.raises(ParseError):
+        run_historian("SELECT 3_1 FROM blame", tiny_repo)
+
+
+# --- Known disagreements deliberately not included here ----------------
 #
 # #24 (rejecting §1's non-goals by name - CTEs, window functions, and
 # the rest of the permanently-out-of-scope grammar) is not included

@@ -302,6 +302,139 @@ def test_sign_is_not_part_of_a_numeric_token():
     assert _types(tokens) == [TokenType.MINUS, TokenType.INTEGER, TokenType.EOF]
 
 
+# --- Digit run glued to an identifier (issue #22) ----------------------
+#
+# A completed digit run immediately followed, with no separator, by a
+# character that would otherwise start an identifier is one bad token to
+# SQLite, not two good ones - confirmed against sqlite3 3.51.0, exact
+# output quoted per case below. The exception is e/E/x/X (scientific
+# notation and hex markers, out of scope - issue #6) and _ (a digit-group
+# separator SQLite accepts, out of scope - issue #70): those five stay
+# excluded from the rule and the glued run keeps lexing as two tokens,
+# unchanged from before this issue.
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "3abc",  # sqlite3: unrecognized token: "3abc"
+        "1²",  # sqlite3: unrecognized token: "1²"
+        "3café",  # sqlite3: unrecognized token: "3café"
+        "3é",  # sqlite3: unrecognized token: "3é"
+        "3´",  # sqlite3: unrecognized token: "3´" (U+00B4, spacing acute accent)
+        "3" + "́",  # sqlite3: unrecognized token: "3́" (combining acute, U+0301)
+        "0y",  # sqlite3: unrecognized token: "0y"
+        "3from",  # sqlite3: unrecognized token: "3from" (keyword-shaped)
+        "1select",  # sqlite3: unrecognized token: "1select" (keyword-shaped)
+    ],
+)
+def test_digit_run_glued_to_identifier_raises_lex_error(source):
+    with pytest.raises(LexError) as exc_info:
+        tokenize(source)
+    # The Position is the start of the digit run, matching where
+    # sqlite3's own "^--- error here" caret lands (confirmed above) and
+    # the convention the other three LexError messages already use.
+    assert exc_info.value.position.offset == 0
+    assert exc_info.value.position.column == 1
+    message = str(exc_info.value)
+    # Fixed acceptance criteria (issue #22): the message must never be
+    # mistakable for issue #25's bare-alias ParseError, which mentions
+    # both words.
+    assert "AS" not in message
+    assert "alias" not in message.lower()
+
+
+def test_digit_run_glued_error_names_the_digit_runs_own_start_not_the_query_start():
+    # sqlite3: select 3abc;  ->  ^--- error here lands under the "3abc",
+    # 8 columns into the line, not at column 1.
+    with pytest.raises(LexError) as exc_info:
+        tokenize("SELECT 3abc FROM blame")
+    assert exc_info.value.position.offset == 7
+    assert exc_info.value.position.column == 8
+
+
+@pytest.mark.parametrize(
+    "source,expected_types,expected_texts",
+    [
+        # e/E - scientific notation marker, out of scope, issue #6.
+        # sqlite3: select 3e2;  -> 300.0 (a valid REAL); historian does
+        # not implement exponents, so this stays two tokens, unchanged.
+        ("3e2", ["INTEGER", "IDENTIFIER", "EOF"], ["3", "e2", ""]),
+        ("3E2", ["INTEGER", "IDENTIFIER", "EOF"], ["3", "E2", ""]),
+        # sqlite3: select 3e;  -> Error: unrecognized token: "3e" (bad in
+        # SQLite too, but telling it apart from 3e2 needs #6's own
+        # exponent-boundary analysis - out of scope here).
+        ("3e", ["INTEGER", "IDENTIFIER", "EOF"], ["3", "e", ""]),
+        ("3e2abc", ["INTEGER", "IDENTIFIER", "EOF"], ["3", "e2abc", ""]),
+        # x/X - hex marker, out of scope, issue #6.
+        # sqlite3: select 0x1f;  -> 31 (a valid hex integer).
+        ("0x1f", ["INTEGER", "IDENTIFIER", "EOF"], ["0", "x1f", ""]),
+        ("0X1F", ["INTEGER", "IDENTIFIER", "EOF"], ["0", "X1F", ""]),
+        # sqlite3: select 3x;  -> Error: unrecognized token: "3x" (bad in
+        # SQLite too, but telling a hex marker apart from a bad one needs
+        # #6's own "0x is the only valid prefix" analysis).
+        ("3x", ["INTEGER", "IDENTIFIER", "EOF"], ["3", "x", ""]),
+        ("30x1f", ["INTEGER", "IDENTIFIER", "EOF"], ["30", "x1f", ""]),
+        # _ - digit-group separator, out of scope, issue #70.
+        # sqlite3: select 3_1;  -> 31 (a valid separated integer).
+        ("3_1", ["INTEGER", "IDENTIFIER", "EOF"], ["3", "_1", ""]),
+        ("1_000_000", ["INTEGER", "IDENTIFIER", "EOF"], ["1", "_000_000", ""]),
+        # sqlite3: select 3_;  -> Error: unrecognized token: "3_" (bad in
+        # SQLite too, but see issue #70 - the same undertracked feature).
+        ("3_", ["INTEGER", "IDENTIFIER", "EOF"], ["3", "_", ""]),
+        ("3_abc", ["INTEGER", "IDENTIFIER", "EOF"], ["3", "_abc", ""]),
+        ("3e2_", ["INTEGER", "IDENTIFIER", "EOF"], ["3", "e2_", ""]),
+    ],
+)
+def test_excluded_glue_characters_lex_exactly_as_before_this_issue(
+    source, expected_types, expected_texts
+):
+    """e/E/x/X/_ are excluded from the glued-identifier rule (issues #6
+    and #70), so these thirteen shapes must lex byte-for-byte the same
+    as they did on `main` before this issue - the same token sequence,
+    not merely "does not raise". A naive version of this fix (reject any
+    digit run followed by any identifier-start character) breaks every
+    one of these."""
+    tokens = tokenize(source)
+    assert _types(tokens) == [TokenType[name] for name in expected_types]
+    assert _texts(tokens) == expected_texts
+
+
+@pytest.mark.parametrize(
+    "source,expected_types,expected_texts",
+    [
+        # Digits inside an identifier, not at its start - never touched
+        # by a rule that only fires right after a digit run ends.
+        (
+            "line_no2x",
+            ["IDENTIFIER", "EOF"],
+            ["line_no2x", ""],
+        ),
+        # An identifier starting with _, not a digit run at all.
+        (
+            "_123abc",
+            ["IDENTIFIER", "EOF"],
+            ["_123abc", ""],
+        ),
+        # A digit glued to a *quoted* identifier: '"' is not
+        # _is_identifier_start, so the new rule never fires here - two
+        # tokens, same as sqlite3 (select 3"abc";  -> 3, "abc" a quoted
+        # identifier, distinct tokens).
+        (
+            '3"abc"',
+            ["INTEGER", "IDENTIFIER", "EOF"],
+            ["3", "abc", ""],
+        ),
+    ],
+)
+def test_shapes_confirmed_unaffected_by_the_glued_identifier_rule(
+    source, expected_types, expected_texts
+):
+    tokens = tokenize(source)
+    assert _types(tokens) == [TokenType[name] for name in expected_types]
+    assert _texts(tokens) == expected_texts
+
+
 # --- Operators and maximal munch --------------------------------------
 
 

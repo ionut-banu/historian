@@ -26,6 +26,15 @@ branch inside it - the orchestrator is working in a different directory
 on `main` at the same time, and on issue 2 exactly that cost a lost
 commit and a review of files that had disappeared.
 
+Once the worktree exists, before you implement anything, run `uv
+run python3 -c "import historian; print(historian.__file__)"` and
+confirm the path it prints is under this worktree's own directory,
+not the main checkout's. A bare `python3` resolves to the main
+checkout's interpreter no matter which directory you are standing
+in - see "One worktree per subagent" in `_docs/process.md` for why
+- so a probe run without `uv run` can silently execute the wrong
+checkout's code.
+
 One branch per issue, named for it - `issue-7-blame-scan`. Create it
 before your first commit. Never commit to `main`, never merge, never
 push unless you were told to.

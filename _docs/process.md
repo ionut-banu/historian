@@ -98,6 +98,48 @@ when the pull request merges:
 Neither side can then disturb the other, and no amount of care is
 required to keep it that way.
 
+A worktree carries a second hazard that a directory does not fix:
+a bare `python` or `python3` inside it can silently run the main
+checkout's code. The subagent's shell inherits the orchestrator's
+`PATH`, and the main checkout's `.venv/bin` is first on it no
+matter which directory the shell is in. That `.venv`'s editable
+install of `historian` has a `.pth` file hardcoding an absolute
+path to the main checkout's `src/`, so a bare interpreter imports
+the orchestrator's code regardless of where it is run from -
+`VIRTUAL_ENV` travels alongside `PATH` but is not what causes
+this, and unsetting it would not help. `uv run` does not have the
+problem: it re-resolves against the worktree's own
+`pyproject.toml` and warns when it overrides a mismatched
+`VIRTUAL_ENV`.
+
+This cannot be fixed once at `git worktree add` time the way the
+`git checkout` hazard above was. A directory persists across every
+command a subagent runs, which is why making one per subagent
+holds for the whole session. An environment variable does not -
+shell state does not survive between one invocation and the next,
+only the working directory does - so there is no single moment to
+unset `PATH` or `VIRTUAL_ENV` that would stay fixed. The rule has
+to hold at each invocation instead: every ad hoc probe run inside
+a worktree uses `uv run` - `uv run python3 -c "..."`, matching the
+existing `uv run pytest` / `uv run historian` convention - never a
+bare `python` or `python3`.
+
+Run this once on entering a worktree, before anything else, and
+confirm the path it prints is under that worktree's own directory
+rather than the main checkout's:
+
+    uv run python3 -c "import historian; print(historian.__file__)"
+
+This is not hypothetical either. On issue #25 the entire
+observable change was one error-message string. QA's probe with a
+bare interpreter showed the old string - main's, not the branch's
+- and the only reason a wrong PASS did not ship is that QA
+happened to compare `historian.__file__` and noticed the mismatch.
+Nothing required that comparison at the time. A change to actual
+query results, rather than to a string, would look plausible
+instead of obviously stale, with no equivalent signal to catch it
+by luck a second time.
+
 Branches and pull requests
 
 One branch per issue, named for it - `issue-7-blame-scan`. The engineer

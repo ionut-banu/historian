@@ -757,3 +757,65 @@ process.md's rule that a decision contradicting the spec edits
 the spec alongside it; here the spec was silent rather than
 wrong, but the same rule was followed to keep the exit-codes line
 complete rather than leaving the fourth code undocumented.
+2026-09-18 - AS stays mandatory before a select-list alias;
+SQLite's bare form is not adopted
+
+Issue #25 (a re-grooming; the previous PM correctly flagged
+the tension but left it open). Decision: `SELECT path p FROM
+blame` keeps raising `ParseError`. `_docs/spec.md` §1's
+grammar line, `<expr> [AS alias]`, already says this and is
+unchanged - only the reasoning was missing.
+
+This is a syntactic narrowing, the same category as rejecting
+`INSERT` or a subquery, not a semantic disagreement with
+SQLite about what a query means. AGENTS.md's "where historian
+and SQLite disagree, SQLite is right" and spec §1's "semantics
+follow SQLite exactly" are the oracle for three-valued logic,
+coercion and NULL handling - they were never a mandate to
+accept every surface SQLite accepts, and reading them that way
+would also require `INSERT` and subqueries, which §1's
+non-goals rule out deliberately. So the oracle does not settle
+this by itself; two confirmed findings tip it toward keeping
+`AS` mandatory:
+
+1. The dropped-comma ambiguity is real, not hypothetical.
+   Confirmed against sqlite3 3.51.0: `create table t(a
+   integer, b integer); insert into t values(1,99); select a
+   b from t;` returns one row, `99`, headed `b` - no error.
+   `a`'s value (`1`) never appears and nothing is reported. A
+   user who meant `SELECT a, b` and dropped the comma is
+   silently handed `SELECT a AS b` instead. historian's
+   mandatory `AS` turns that exact typo into a `ParseError`
+   rather than a silent wrong answer - a real safety property
+   the bare form would trade away.
+2. SQLite's own bare-alias keyword list is arbitrary from
+   historian's point of view. Checked all 30 of historian's
+   lexer keywords (`src/historian/sql/lexer.py`'s
+   `KEYWORD_TYPES`) as a bare alias against sqlite3: 25 are
+   rejected (`select`, `distinct`, `as`, `from`, `inner`,
+   `join`, `on`, `using`, `where`, `group`, `having`, `order`,
+   `limit`, `and`, `or`, `not`, `like`, `in`, `between`, `is`,
+   `null`, `case`, `when`, `then`, `else`) and exactly 5 are
+   accepted (`by`, `asc`, `desc`, `offset`, `end`) - and
+   `where` still errors even written explicitly as `select
+   path as where from t`. That split is SQLite's own internal
+   reserved-word table, not a rule derivable from historian's
+   grammar; matching it would mean hardcoding a 5-keyword
+   allowlist with no organic justification here.
+
+The fuzzer (spec §4, not yet built) cannot arbitrate either:
+once it exists it only ever emits what its grammar declares,
+so it will only ever generate `<expr> AS alias` regardless of
+which way this is decided. Neither side gets fuzzer coverage
+for the bare form either way, so that cost/benefit is a wash.
+
+Net: mandatory `AS` keeps a verified footgun closed and avoids
+importing an arbitrary slice of SQLite's reserved-word table
+for no reason a reader of this grammar could reconstruct.
+
+Changed alongside this: the parser's `expected FROM, found
+identifier 'p'` message for the bare-alias/dropped-comma shape
+now says so explicitly - `expected ',' or FROM, found
+identifier 'p' - a select-list alias requires AS before it` -
+so the rejection points at what to add instead of just naming
+the token it did not expect.

@@ -625,3 +625,54 @@ numeric `0`, correctly dropping all of them. This is the same kind
 of predicate #34's original QA finding was about - one where a
 wrong implementation and a right one visibly disagree - reapplied
 to the new shape of the gap #38 closes.
+
+2026-09-18 - coerce_to_bool3 also called from inside evaluate()'s
+own And/Or/Not branches, not only by Filter
+
+#38's first round called coerce_to_bool3 exactly twice - once from
+Filter, once (coerce_to_value) from Project - on the reasoning,
+stated in the issue's own Design recommendation section, that the
+Value/Bool3 ambiguity "only ever exists at exactly two points: the
+root of a WHERE/HAVING predicate, and each select-list item's
+root." QA's round-1 review found that premise false against
+sqlite3 3.51.0: SQLite applies the identical leading-prefix
+truthiness independently to *each operand* of AND, OR and NOT, not
+only at those two roots - confirmed with plain arithmetic and no
+comparison anywhere in the query (`select (3-3) and 1;` -> `0`;
+`select not(3-3);` -> `1`). A value-shaped operand nested under
+AND/OR/NOT reached values.and3/or3/not3 raw and raised TypeError.
+
+Fixed by having evaluate()'s own And/Or/Not branches wrap each
+operand's result in coerce_to_bool3 before calling
+values.and3/or3/not3 - still no `position` parameter on evaluate(),
+per the issue's own constraint. And/Or/Not's operands are predicate
+positions unconditionally, a property of the node evaluate() is
+already dispatching on when it reaches that branch, not something a
+caller has to pass in. coerce_to_bool3 itself needed no change -
+only a second call site, one recursion level deeper than before.
+
+Audited the rest of evaluate() for the same hole while in there, in
+both directions:
+
+- Every other predicate-shaped node (Is, Like, In, Between) already
+  builds its Bool3 result from values.py's own comparison functions
+  (values.eq/ge/le/is_/is_not), never from a raw evaluate() result
+  fed straight to a Bool3-only function - so none of them had this
+  gap, and none needed a change.
+- The reverse direction - a Bool3-shaped node (a comparison,
+  And/Or/Not, Is, Like, In, Between) nested where a Value is
+  required - is a real, separate gap, confirmed live: `SELECT
+  (1 = 1) = 1 FROM blame`, `SELECT (1 = 1) || 'x' FROM blame`,
+  `... WHERE path LIKE (1 = 1)`, `... WHERE line_no IN (1 = 1, 2)`
+  and `... WHERE line_no BETWEEN (1 = 1) AND 5` each raise
+  TypeError from values.py's or exec/expression.py's own bool
+  guards, where sqlite3 returns real answers. Arithmetic (+ - * /
+  and unary +/-) happens not to hit this, only because Python's
+  `bool` already behaves as 0/1 under its own arithmetic operators -
+  an accident of the host language, not a coercion this codebase
+  chose. This is not #38's hole reopened in a new place; it is a
+  materially larger change (every Value-consuming node in the
+  grammar, not three), it was not named in #38 or its QA FAIL, and
+  fixing it here would be exactly the scope creep AGENTS.md and the
+  software-engineer role warn against. Left unfixed, reported on
+  the issue for a follow-up to pick up.

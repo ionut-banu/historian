@@ -22,7 +22,7 @@ from collections.abc import Iterator, Sequence
 
 from historian.exec.operators import Filter, Project, Scan
 from historian.schema import Column, ColumnType, Row, Schema
-from historian.sql.ast import BinaryOp, Literal, Operator as Op
+from historian.sql.ast import And, BinaryOp, Literal, Not, Operator as Op
 from historian.sql.binder import BoundColumnRef, BoundSelectItem
 from historian.sql.lexer import Position
 
@@ -309,6 +309,33 @@ def test_filter_no_longer_raises_on_a_value_shaped_predicate():
     assert tuple(result.rows()) == _ROWS
 
 
+def test_filter_coerces_a_value_shaped_operand_nested_inside_and():
+    """Issue #38 round 2 (QA FAIL): `coerce_to_bool3` was only called
+    at `Filter`'s own root call site, so a value-shaped operand
+    *nested* inside `AND` - not the predicate root itself - reached
+    `values.and3` raw and raised `TypeError`. QA's own reproduction:
+    `WHERE line_no - line_no AND path = 'a.py'`.
+    `line_no - line_no` is `0` (falsy) for every row here, so `AND`
+    drops every row regardless of the right operand - `sqlite3`:
+    `select p from t where n-n and p='a.py';` -> no rows."""
+    value_falsy = _bin(Op.SUB, _col("line_no"), _col("line_no"))
+    predicate = And(value_falsy, _bin(Op.EQ, _col("path"), _lit("a.py")), _POS)
+    result = Filter(_child(), predicate)
+
+    assert tuple(result.rows()) == ()
+
+
+def test_filter_coerces_a_value_shaped_operand_nested_inside_not():
+    """Same hole, `NOT` instead of `AND`: `NOT (line_no - line_no)` is
+    `NOT (0)`, truthy, for every row - `sqlite3`: `select not(5-5);`
+    -> `1`."""
+    value_falsy = _bin(Op.SUB, _col("line_no"), _col("line_no"))
+    predicate = Not(value_falsy, _POS)
+    result = Filter(_child(), predicate)
+
+    assert tuple(result.rows()) == _ROWS
+
+
 # --- Project --------------------------------------------------------------
 
 
@@ -419,6 +446,25 @@ def test_project_coerces_a_bool3_shaped_item_to_sqlites_own_int_spelling():
     assert type(row[0]) is int
     assert type(row[1]) is int
     assert row[2] is None
+
+
+def test_project_coerces_a_value_shaped_operand_nested_inside_and():
+    """Issue #38 round 2 (QA FAIL), select-list side: `(line_no -
+    line_no) AND 1` - `AND`'s own result is coerced to SQLite's int
+    spelling by `Project`'s root-level `coerce_to_value` (already
+    covered above), but the *left operand* of that `AND` is itself
+    value-shaped and was never coerced before reaching `values.and3`,
+    raising `TypeError` before this issue's fix. `sqlite3`: `select
+    typeof((n-n) and 1), (n-n) and 1 from t;` -> `integer|0` for every
+    row. QA's own reproduction case for this issue, select-list side."""
+    value_falsy = _bin(Op.SUB, _col("line_no"), _col("line_no"))
+    select_list = (_item(And(value_falsy, _lit(1), _POS), alias=None, output_name=None),)
+    result = Project(_child(rows=(("a.py", 2, "ana@x.com"),)), select_list)
+
+    (row,) = tuple(result.rows())
+
+    assert row == (0,)
+    assert type(row[0]) is int
 
 
 def test_project_streams_rather_than_materializing():

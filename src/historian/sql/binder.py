@@ -22,16 +22,46 @@ here; whether `'5'` needs coercing to compare against an `INTEGER`
 column is `exec/expression.py`'s job (#12), per spec §3's explicit
 split. **Function name/arity validation** - no registry of built-ins
 exists yet; `SELECT nonexistent_fn(path) FROM blame` binds
-successfully. **`WHERE` resolving a select-list alias** - real,
-verified SQLite behaviour (`select path as p, line_no from blame
-where p = 'a.py'` succeeds via the alias) that needs expression
-substitution, not plain offset resolution, because `WHERE` runs before
-`Project` computes any alias. Deferred to #32; until it lands, `WHERE
-<alias>` conservatively raises "no such column" - a query SQLite
-accepts gets wrongly rejected, which is the safe direction. **The
-rendered `error: ...` / caret / "blame has: ..." box from spec §5** -
-milestone item 18; `BindError` here carries structured fields
-(message, position, available names), not text to print.
+successfully. **The rendered `error: ...` / caret / "blame has: ..."
+box from spec §5** - milestone item 18; `BindError` here carries
+structured fields (message, position, available names), not text to
+print.
+
+`WHERE` resolving a select-list alias
+--------------------------------------
+
+Issue #32. SQLite falls back to a select-list alias for any name no
+real column claims, in every clause except the select list itself
+(`select path as p, line_no from blame where p = 'a.py'` succeeds via
+the alias) - with the real column always winning when a name is both,
+*except* in `ORDER BY`, where the alias wins instead. `_resolve_name`
+below implements this as one function taking a precedence-direction
+flag (`alias_first`), rather than a `WHERE`-specific helper, because
+`GROUP BY`/`HAVING` (#60) and `ORDER BY` (#61) need the same rule with
+their own direction - `alias_first=False` for the former two,
+`alias_first=True` for `ORDER BY`. Only `WHERE` has a live caller
+today (`bind()` passes `alias_first=False`); `GROUP BY`, `HAVING` and
+`ORDER BY` have no grammar yet (#60, #61 add it) and are expected to
+call `_resolve_name` rather than reinvent it.
+
+The match is a substitution, not a value lookup: a `ColumnRef` that
+resolves to an alias is replaced by a reference to that select-list
+item's own already-bound expression (`BoundSelectItem.expr`), the same
+`dataclasses.replace`-based tree it already went through - never a
+computed value. Confirmed why this must be a substitution and not a
+cached value: `select random() as r from t where r = r` returns zero
+rows in `sqlite3`, meaning `r` is evaluated fresh at each reference: a
+cached value would make `r = r` trivially true for every row.
+historian has no non-deterministic scalar function yet to make this a
+differential case, but the design carries the same property - the
+substituted subtree is evaluated by `exec/expression.py` per reference,
+with no memoization by this module.
+
+A table-qualified reference (`t.x`) is never a candidate for the
+fallback - confirmed against `sqlite3` (`select b as x from t where
+t.x = 10` still raises "no such column: t.x") - aliases have no table
+qualifier to match against, so a qualified `ColumnRef` goes straight to
+`_bind_column_ref` exactly as before.
 
 Bound tree shape
 -----------------
@@ -244,11 +274,17 @@ def _same_name(a: str, b: str) -> bool:
 # --- Binding context -------------------------------------------------------
 #
 # A plain, immutable bundle of what every resolution needs: the FROM
-# table's own schema and declared name (v1 has exactly one), and the
+# table's own schema and declared name (v1 has exactly one), the
 # catalog's full set of table names for a "no such table" error's
-# `available` data. Not global state and not a class with behaviour -
-# just the three things every helper below would otherwise need as
-# separate parameters.
+# `available` data, and (issue #32) the select-list alias fallback
+# settings a particular clause binds with. Not global state and not a
+# class with behaviour - just the parameters every helper below would
+# otherwise need threaded through separately. `select_items`/
+# `alias_fallback`/`alias_first` default to "no fallback", which is
+# what `_bind_select_item` binds every select-list item with (so
+# aliases stay invisible to each other - finding 3); `bind()` builds a
+# second `_Context`, via `dataclasses.replace`, with the fallback
+# turned on for `WHERE`.
 
 
 @dataclass(frozen=True)
@@ -256,6 +292,9 @@ class _Context:
     schema: Schema
     table_name: str
     catalog_names: tuple[str, ...]
+    select_items: tuple[BoundSelectItem, ...] = ()
+    alias_fallback: bool = False
+    alias_first: bool = False
 
 
 # --- FROM-table resolution -------------------------------------------------
@@ -282,23 +321,96 @@ def _resolve_table(stmt: SelectStatement, catalog: dict[str, Schema]) -> _Contex
 # --- Column and Star resolution --------------------------------------------
 
 
-def _bind_column_ref(ref: ColumnRef, ctx: _Context) -> BoundColumnRef:
-    """Resolve a bare or table-qualified `ColumnRef`.
+def _lookup_column(ref: ColumnRef, ctx: _Context) -> BoundColumnRef | None:
+    """Look up `ref` against `ctx.schema` alone; `None` if no real
+    column matches by name.
 
     A qualifier that does not match the FROM table - whether a real,
-    unrelated table or an unknown name - raises "no such column:
-    <qualifier>.<name>", the whole dotted reference verbatim, never
-    "no such table". This is the opposite of `_bind_star`'s qualifier
-    check below; both are separately confirmed against `sqlite3` and
-    must not be unified.
+    unrelated table or an unknown name - still raises immediately
+    rather than returning `None`: "no such column: <qualifier>.<name>",
+    the whole dotted reference verbatim, never "no such table". This is
+    the opposite of `_bind_star`'s qualifier check below; both are
+    separately confirmed against `sqlite3` and must not be unified.
+    Factored out of `_bind_column_ref` so `_resolve_name` can try the
+    real-column candidate without a raise-and-catch dance.
     """
     if ref.table is not None and not _same_name(ref.table, ctx.table_name):
         raise BindError(f"no such column: {ref.table}.{ref.name}", ref.position, ctx.schema.names)
     for offset, column in enumerate(ctx.schema.columns):
         if _same_name(column.name, ref.name):
             return BoundColumnRef(offset=offset, name=column.name, position=ref.position)
+    return None
+
+
+def _bind_column_ref(ref: ColumnRef, ctx: _Context) -> BoundColumnRef:
+    """Resolve a bare or table-qualified `ColumnRef` against the FROM
+    table's schema only - no select-list alias fallback. Used directly
+    wherever alias fallback does not apply (select-list items, a
+    qualified reference anywhere) and as the schema-only half of
+    `_resolve_name`'s fallback below."""
+    bound = _lookup_column(ref, ctx)
+    if bound is not None:
+        return bound
     display = f"{ref.table}.{ref.name}" if ref.table is not None else ref.name
     raise BindError(f"no such column: {display}", ref.position, ctx.schema.names)
+
+
+def _find_alias_expr(name: str, ctx: _Context) -> Expr | None:
+    """The first item in `ctx.select_items` (declaration order) whose
+    explicit alias matches `name`, ASCII case-insensitively via
+    `_same_name` - `select b as x, c as x from t where x > ...`
+    resolves `x` to `b`, the first occurrence, confirmed against
+    `sqlite3` (issue #32 finding 4). An item with no explicit `alias`
+    is never a candidate: only names written with `AS` participate in
+    the fallback, per the issue's design recommendation ("select-list's
+    aliases").
+
+    Returns the item's own bound expression (`BoundSelectItem.expr`),
+    to be spliced into the caller's tree in place of the reference -
+    not a copy, since these are frozen, side-effect-free AST nodes and
+    sharing one instance across two positions in a tree carries no
+    caching risk: each occurrence is walked and evaluated independently
+    by `exec/expression.py`, never memoized by node identity.
+    """
+    for item in ctx.select_items:
+        if item.alias is not None and _same_name(item.alias, name):
+            return item.expr
+    return None
+
+
+def _resolve_name(ref: ColumnRef, ctx: _Context) -> Expr:
+    """Resolve `ref`, falling back to a select-list alias of the same
+    name when no real column claims it - see the module docstring's
+    "`WHERE` resolving a select-list alias" section for the full
+    rationale (issue #32). Only called when `ctx.alias_fallback` is
+    set; `_bind_expr` calls `_bind_column_ref` directly otherwise.
+
+    A table-qualified `ref` skips the fallback entirely and resolves
+    exactly as `_bind_column_ref` always has. For an unqualified name,
+    both a real-column match and an alias match are looked up, and
+    `ctx.alias_first` decides which one wins when both exist: `False`
+    for `WHERE`/`GROUP BY`/`HAVING` (the real column wins), `True` for
+    `ORDER BY` (#61; the alias wins instead - confirmed against
+    `sqlite3`, the one clause where the four are not uniform). Only
+    `alias_first=False` has a reachable caller today, from `bind()`'s
+    `WHERE` handling.
+    """
+    if ref.table is not None:
+        return _bind_column_ref(ref, ctx)
+
+    column_match = _lookup_column(ref, ctx)
+    alias_match = _find_alias_expr(ref.name, ctx)
+
+    if ctx.alias_first:
+        first, second = alias_match, column_match
+    else:
+        first, second = column_match, alias_match
+    if first is not None:
+        return first
+    if second is not None:
+        return second
+
+    raise BindError(f"no such column: {ref.name}", ref.position, ctx.schema.names)
 
 
 def _bind_star(star: Star, ctx: _Context) -> list[BoundColumnRef]:
@@ -328,9 +440,20 @@ def _bind_star(star: Star, ctx: _Context) -> list[BoundColumnRef]:
 
 
 def _bind_expr(expr: Expr, ctx: _Context) -> Expr:
+    """Bind every `ColumnRef` in `expr`'s tree against `ctx.schema`,
+    with select-list alias fallback (issue #32) when `ctx.alias_fallback`
+    is set - off by default on the `_Context` every select-list item
+    binds with (`_bind_select_item`), which is how aliases stay
+    invisible to each other (finding 3); on for the `_Context` `bind()`
+    builds for `WHERE`. `ctx` carries the setting through every
+    recursive call below unchanged, so the fallback applies to a
+    `ColumnRef` at any depth in the tree, not only at the top.
+    """
     if isinstance(expr, Literal):
         return expr
     if isinstance(expr, ColumnRef):
+        if ctx.alias_fallback:
+            return _resolve_name(expr, ctx)
         return _bind_column_ref(expr, ctx)
     if isinstance(expr, Star):
         # A whole, alias-less select-list item and count(*)'s sole
@@ -440,7 +563,13 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema] = TABLES) -> BoundSel
     bound_items: list[BoundSelectItem] = []
     for item in stmt.select_list:
         bound_items.extend(_bind_select_item(item, ctx))
-    bound_where = _bind_expr(stmt.where, ctx) if stmt.where is not None else None
+    # WHERE binds with the select-list alias fallback on (issue #32),
+    # column-first (`alias_first=False`) - a fresh `_Context` rather
+    # than mutating `ctx`, since `_Context` is frozen and select-list
+    # items must keep binding against the plain `ctx` above, with no
+    # fallback, so aliases stay invisible to each other (finding 3).
+    where_ctx = dataclasses.replace(ctx, select_items=tuple(bound_items), alias_fallback=True, alias_first=False)
+    bound_where = _bind_expr(stmt.where, where_ctx) if stmt.where is not None else None
     return BoundSelectStatement(
         select_list=tuple(bound_items),
         from_table=ctx.table_name,

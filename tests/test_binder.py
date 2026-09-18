@@ -366,29 +366,108 @@ def test_select_list_resolved_before_where():
     assert str(exc_info.value) == "no such column: ghost_select"
 
 
-# --- Aliases: no cross-item namespace, no WHERE fallback (deferred) ----------
+# --- Aliases: no cross-item namespace, WHERE fallback (#32) ------------------
 
 
 def test_alias_not_visible_to_next_select_item():
     """`sqlite3`: `select path as p, p as p2 from blame;` errors "no
     such column: p" on the second item - SQLite evaluates every
     select-list expression against FROM alone, none see each other's
-    aliases."""
+    aliases. Unchanged by #32: the fallback below applies only to
+    `WHERE`, never within the select list itself."""
     with pytest.raises(BindError) as exc_info:
         _bind("SELECT path AS p, p AS p2 FROM blame")
     assert str(exc_info.value) == "no such column: p"
 
 
-def test_where_referencing_select_list_alias_conservatively_rejected():
-    """Real SQLite behaviour (`select path as p, line_no from blame
-    where p = 'a.py'` succeeds) that this issue deliberately does not
-    implement - see #32. Until that lands, `WHERE p` raises "no such
-    column: p", the safe direction: a query SQLite accepts is wrongly
-    rejected, never a silently wrong row. Pinned here so the gap is
-    deliberate rather than an untested accident."""
+def test_select_list_cannot_see_its_own_alias_shape_from_acceptance_criteria():
+    """The exact shape #32's acceptance criteria name: `SELECT a AS x,
+    x + 1 FROM blame` (`a` standing in for one of `blame`'s own
+    columns) - confirmed unchanged against `sqlite3` (`select a as x,
+    x + 1 from t` still errors "no such column: x"; the binder does not
+    type-check at bind time, so `x + 1` against a `TEXT` column binds
+    the same way arithmetic against any column would). A regression
+    guard distinct from the test above: this one exercises `x` nested
+    inside an arithmetic-shaped expression rather than as a whole
+    second select-list item."""
     with pytest.raises(BindError) as exc_info:
-        _bind("SELECT path AS p FROM blame WHERE p = 'x'")
-    assert str(exc_info.value) == "no such column: p"
+        _bind("SELECT path AS x, x + 1 FROM blame")
+    assert str(exc_info.value) == "no such column: x"
+
+
+def test_where_resolves_select_list_alias_as_fallback():
+    """#32: `select path as p, line_no from blame where p = 'a.py'`
+    succeeds in `sqlite3`, resolving `p` to the alias since no real
+    `blame` column is named `p`. The alias's own bound expression
+    (`path`, offset 0) is spliced into `WHERE` in place of the
+    `ColumnRef` - confirmed by checking the substituted node is a
+    `BoundColumnRef` for `path`, not a new kind of reference."""
+    bound = _bind("SELECT path AS p FROM blame WHERE p = 'src/utils.py'")
+    ref = bound.where.left
+    assert isinstance(ref, BoundColumnRef)
+    assert ref.name == "path"
+    assert ref.offset == BLAME_SCHEMA.index_of("path")
+
+
+def test_where_real_column_wins_over_alias_of_a_different_column():
+    """#32 finding 1: `create table t(a integer, b integer); insert
+    into t values(1,10),(2,20); select b as a from t where a = 1;`
+    returns `10` - the real column `a` governs the predicate, not the
+    alias `a` (which names `b`). Reproduced here against `blame`:
+    aliasing `line_no` to `path` must not let `WHERE path = ...`
+    resolve to the alias; the real `path` column wins, confirmed by
+    checking the bound `WHERE` tree references `path`'s own offset,
+    not `line_no`'s."""
+    bound = _bind("SELECT line_no AS path FROM blame WHERE path = 'src/utils.py'")
+    ref = bound.where.left
+    assert isinstance(ref, BoundColumnRef)
+    assert ref.name == "path"
+    assert ref.offset == BLAME_SCHEMA.index_of("path")
+
+
+def test_where_duplicate_alias_resolves_to_first_occurrence():
+    """#32 finding 4: `select b as x, c as x from t where x > 50`
+    resolves `x` to the first item, `b` - confirmed against `sqlite3`
+    with discriminating data. Reproduced against `blame`: two items
+    both aliased `x`, `WHERE x` must bind to the first (`path`), not
+    the second (`author_email`)."""
+    bound = _bind("SELECT path AS x, author_email AS x FROM blame WHERE x = 'src/utils.py'")
+    ref = bound.where.left
+    assert isinstance(ref, BoundColumnRef)
+    assert ref.name == "path"
+    assert ref.offset == BLAME_SCHEMA.index_of("path")
+
+
+def test_where_unmatched_name_still_raises_no_such_column():
+    """The regression guard for the "safe direction" #9 pinned: a name
+    that matches neither a real column nor any select-list alias still
+    raises `BindError`, unchanged, now that the alias fallback exists
+    alongside real-column resolution."""
+    with pytest.raises(BindError) as exc_info:
+        _bind("SELECT path AS p FROM blame WHERE ghost = 1")
+    assert str(exc_info.value) == "no such column: ghost"
+
+
+def test_where_alias_reference_is_ascii_case_insensitive():
+    """#32 finding 5: `select b as MyAlias from t where MYALIAS = 10`
+    succeeds in `sqlite3` - alias matching reuses `_same_name`, the
+    same ASCII-only fold the binder already uses for columns and
+    tables, no second case-folding implementation."""
+    bound = _bind("SELECT path AS MyAlias FROM blame WHERE MYALIAS = 'src/utils.py'")
+    ref = bound.where.left
+    assert isinstance(ref, BoundColumnRef)
+    assert ref.name == "path"
+
+
+def test_where_qualified_reference_never_falls_back_to_alias():
+    """#32: a table-qualified reference is never an alias candidate -
+    confirmed against `sqlite3` (`select b as x from t where t.x = 10`
+    still raises "no such column: t.x" even though an alias `x`
+    exists). `blame.p`, with `p` an alias and no real column of that
+    name, must still raise, not silently resolve to the alias."""
+    with pytest.raises(BindError) as exc_info:
+        _bind("SELECT path AS p FROM blame WHERE blame.p = 'x'")
+    assert str(exc_info.value) == "no such column: blame.p"
 
 
 # --- Star in the wrong position: defensive backstop ---------------------------

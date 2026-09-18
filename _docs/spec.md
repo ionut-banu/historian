@@ -823,7 +823,8 @@ error: window functions are not supported
 ```
 
 Exit codes: `0` success, `1` bad query, `2` bad usage, `3` the
-repository could not be read.
+repository could not be read, `4` an internal error - a bug in
+historian, not a mistake in the query.
 
 ### REPL
 

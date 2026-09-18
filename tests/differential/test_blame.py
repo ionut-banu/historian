@@ -759,9 +759,24 @@ def test_bare_alias_without_as_is_a_parse_error(tiny_repo):
     insert into blame values ('a.py'),('b.py'); select path p from
     blame;"` -> `a.py` / `b.py`. historian's grammar makes `AS`
     mandatory (spec §1) and rejects the bare form with a
-    `ParseError`."""
+    `ParseError`. This is a settled decision, not an open question -
+    see `_docs/decisions.md`, 2026-09-18, for the full reasoning."""
     with pytest.raises(ParseError):
         run_historian("SELECT path p FROM blame", tiny_repo)
+
+
+def test_missing_comma_between_two_columns_is_a_parse_error(tiny_repo):
+    """#25: the concrete typo mandatory-`AS` exists to catch. Confirmed
+    `sqlite3 :memory: "create table t(a integer, b integer); insert
+    into t values(1,99); select a b from t;"` -> a single row, `99`,
+    under the header `b` - SQLite does not error on a dropped comma
+    between two real column names; it silently reinterprets `a b` as
+    `a AS b` and column `a`'s value (`1`) is never reported at all.
+    historian's mandatory `AS` turns that same input into a
+    `ParseError` instead of a silent wrong answer - see
+    `_docs/decisions.md`, 2026-09-18."""
+    with pytest.raises(ParseError):
+        run_historian("SELECT path line_no FROM blame", tiny_repo)
 
 
 def test_where_resolves_a_select_list_alias(tiny_repo):

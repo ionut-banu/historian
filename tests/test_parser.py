@@ -681,6 +681,16 @@ def test_parse_error_message_names_what_was_expected():
     assert "FROM" in str(excinfo.value)
 
 
+def test_bare_alias_error_names_as():
+    """#25 (`_docs/decisions.md`, 2026-09-18): AS stays mandatory, but
+    the message for the bare form must say so - `expected FROM, found
+    identifier 'p'` never mentioned AS, so a user hit a generic error
+    with no hint that `AS p` was what was missing."""
+    with pytest.raises(ParseError) as excinfo:
+        _parse("SELECT path p FROM blame")
+    assert "AS" in str(excinfo.value)
+
+
 def test_trailing_garbage_after_statement_is_a_parse_error():
     with pytest.raises(ParseError):
         _parse("SELECT path FROM blame EXTRA")

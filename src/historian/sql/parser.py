@@ -297,6 +297,20 @@ class _Parser:
     def parse_select_statement(self) -> SelectStatement:
         start = self._expect(TokenType.SELECT, "SELECT").position
         select_list = self._parse_select_list()
+        if self._check(TokenType.IDENTIFIER):
+            # An identifier here, instead of `,` or `FROM`, is almost
+            # always a bare select-list alias - `SELECT path p FROM
+            # blame` - since `AS` is mandatory (spec §1; see
+            # `_docs/decisions.md`, 2026-09-18, for why it stays that
+            # way). The plain `_expect(FROM, ...)` below would report
+            # this as "expected FROM, found identifier 'p'", which
+            # never mentions AS and leaves a reader of that message no
+            # closer to knowing what to add.
+            raise self._error(
+                "expected ',' or FROM, found "
+                f"{_describe(self._peek())} - a select-list alias "
+                "requires AS before it"
+            )
         self._expect(TokenType.FROM, "FROM")
         from_table = self._expect(TokenType.IDENTIFIER, "a table name").text
         where: Expr | None = None

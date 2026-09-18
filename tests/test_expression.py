@@ -878,6 +878,96 @@ def test_not_three_valued_logic():
     assert evaluate(Not(_FALSE, _POS), _ROW, _SCHEMA) is True
 
 
+# --- AND / OR / NOT: a value-shaped operand nested anywhere in the tree -
+#
+# Issue #38 round 2 (QA FAIL on the first round). `coerce_to_bool3` was
+# only ever called at Filter's and Project's own root call sites, so a
+# value-shaped operand *nested* under AND/OR/NOT - not sitting at the
+# WHERE/select-list root - reached `values.and3`/`or3`/`not3` raw and
+# raised `TypeError` instead of being coerced. Confirmed live:
+# `historian "SELECT path FROM blame WHERE line_no - line_no AND path
+# = 'AGENTS.md'"` raised `TypeError: not a Bool3: 0 of type int`.
+#
+# The orchestrator's correction comment on #38 settles the fix: AND,
+# OR and NOT's operands are predicate positions *unconditionally* -
+# that is a property of the node's own shape, exactly what
+# `evaluate()`'s recursive dispatch already knows at every level, per
+# this module's own "Value or Bool3, decided by node shape" design.
+# So `evaluate()`'s own `And`/`Or`/`Not` branches now wrap each
+# operand's result in `coerce_to_bool3` before handing it to
+# `values.and3`/`or3`/`not3` - still no `position` parameter, still a
+# caller-side coercion, just called one level deeper too.
+#
+# `n - n` (a computed value-shaped `BinaryOp`, never a bare column) is
+# `0` for `_ROW`'s `n = 5` - falsy. Confirmed against `sqlite3`:
+# `select (5-5) and 1;` -> `0`; `select 1 and (5-5);` -> `0`;
+# `select 0 or 5;` -> `1`; `select not(5-5);` -> `1`; `select '0abc'
+# or 0;` -> `0`.
+
+_VALUE_FALSY = _bin(Operator.SUB, _col("n"), _col("n"))
+_VALUE_TRUTHY = _col("n")
+
+
+def test_and_coerces_a_value_shaped_left_operand_nested_in_the_tree():
+    """`(n - n) AND (1 = 1)` - the left operand is value-shaped and
+    falsy (`0`); pre-fix this raised `TypeError` reaching `and3`
+    directly. `sqlite3`: `select (5-5) and 1;` -> `0`."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(And(_VALUE_FALSY, _TRUE, _POS), _ROW, _SCHEMA) is False
+
+
+def test_and_coerces_a_value_shaped_right_operand_nested_in_the_tree():
+    """`(1 = 1) AND (n - n)` - same coercion, right operand this time.
+    `sqlite3`: `select 1 and (5-5);` -> `0`."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(And(_TRUE, _VALUE_FALSY, _POS), _ROW, _SCHEMA) is False
+
+
+def test_or_coerces_a_value_shaped_operand_nested_in_the_tree():
+    """`(1 = 2) OR n` - `n` is a bare, value-shaped column (`5`,
+    truthy). `sqlite3`: `select 0 or 5;` -> `1`."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(Or(_FALSE, _VALUE_TRUTHY, _POS), _ROW, _SCHEMA) is True
+
+
+def test_not_coerces_a_value_shaped_operand_nested_in_the_tree():
+    """`NOT (n - n)` - `sqlite3`: `select not(5-5);` -> `1`."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(Not(_VALUE_FALSY, _POS), _ROW, _SCHEMA) is True
+
+
+def test_or_discriminates_leading_prefix_truthiness_not_bare_python_truthiness_when_nested():
+    """`'0abc' OR (1 = 2)` - a bare Python string `'0abc'` is truthy
+    (nonempty), so a fix that fell back to `bool(evaluate(...))`
+    instead of `coerce_to_bool3`'s leading-prefix numeric rule would
+    wrongly keep this `TRUE`. `sqlite3`: `select '0abc' or 0;` ->
+    `0`."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(Or(_lit("0abc"), _FALSE, _POS), _ROW, _SCHEMA) is False
+
+
+def test_and_still_raises_on_a_genuinely_invalid_bool3_from_values_py():
+    """`coerce_to_bool3` only ever produces a `bool`/`None` - it cannot
+    itself manufacture an invalid `Bool3` - so `values.py`'s own
+    `_check_bool3` guard stays the last line of defense, exactly as
+    the issue's Constraints section requires (`values.py` untouched).
+    Not a new behaviour; pinned here so a future change to
+    `coerce_to_bool3` that started returning something else would be
+    caught by `and3` the same way it always has been."""
+    from historian import values
+    from historian.exec.expression import coerce_to_bool3
+
+    assert coerce_to_bool3(0) is False
+    assert coerce_to_bool3(3) is True
+    with pytest.raises(TypeError):
+        values.and3(1, True)  # SQLite's own int spelling, never a Bool3
+
+
 # --- LIKE: unconditional text coercion, no affinity, ASCII-only fold ----
 
 

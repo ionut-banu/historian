@@ -686,6 +686,64 @@ def test_where_null_valued_expression_drops_rows_without_raising(tiny_repo):
     _assert_differential(tiny_repo, "SELECT path FROM blame WHERE NULL + line_no")
 
 
+# --- #38 round 2 (QA FAIL): a value-shaped operand nested inside AND/OR/NOT
+#
+# `coerce_to_bool3` was only ever called at Filter's and Project's own
+# root call sites - every case directly above sits at exactly one of
+# those two roots. A value-shaped operand *nested* under AND, OR or
+# NOT - not the root itself - reached `values.and3`/`or3`/`not3` raw
+# and raised `TypeError`, confirmed live: `historian "SELECT path FROM
+# blame WHERE line_no - line_no AND path = 'AGENTS.md'"` raised
+# `TypeError: not a Bool3: 0 of type int`. `tiny_repo`'s `blame` table
+# has 3 rows - `('feature/thing.py', 1), ('src/utils.py', 1),
+# ('src/utils.py', 2)` - `line_no` is never `0`, so `line_no - line_no`
+# is always the falsy value `0` and `line_no` alone is always truthy.
+
+
+def test_where_and_coerces_a_nested_value_shaped_left_operand(tiny_repo):
+    """`sqlite3 :memory: "create table t(n integer, p text); insert
+    into t values(1,'a'); select p from t where n-n and p='a';"` -> no
+    rows: the falsy left operand drops every row regardless of the
+    right operand. QA's own reproduction case for this issue."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE line_no - line_no AND path = 'src/utils.py'")
+
+
+def test_where_or_coerces_a_nested_value_shaped_operand(tiny_repo):
+    """`line_no` alone is always truthy here, so every row survives
+    regardless of the right operand. `sqlite3`: `select n or p='zzz'
+    from t where true;`-shaped, confirmed via `select 3 or 0;` -> `1`.
+    """
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE line_no OR path = 'zzz'")
+
+
+def test_where_not_coerces_a_nested_value_shaped_operand(tiny_repo):
+    """`NOT (line_no - line_no)` is `NOT (0)` - truthy - for every row.
+    `sqlite3`: `select not(5-5);` -> `1`."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE NOT (line_no - line_no)")
+
+
+def test_where_or_nested_leading_prefix_falsy_text_literal_discriminates_truthiness(tiny_repo):
+    """`'0abc'` nested inside `OR`, not at the `WHERE` root: as a bare
+    Python string it is truthy (nonempty), so this discriminates a
+    real per-operand coercion from bare Python truthiness the same way
+    `test_where_leading_digit_text_literal_is_falsy_not_merely_nonempty`
+    does at the root - only here the falsy operand is the left side of
+    an `OR`, so the result still depends on the right operand.
+    `sqlite3`: `select '0abc' or 0;` -> `0`; confirmed the two
+    `line_no = 1` rows still match on their own merits."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE '0abc' OR line_no = 1")
+
+
+def test_select_list_and_coerces_a_nested_value_shaped_operand(tiny_repo):
+    """The same hole, in select-list position: `(line_no - line_no)
+    AND 1` - the left operand of `AND` is value-shaped and falsy for
+    every row, so the whole expression is SQLite's `0` for every row.
+    `sqlite3`: `select typeof((n-n) and 1), (n-n) and 1 from t;` ->
+    `integer|0` for every row. This is also QA's own reproduction case
+    for this issue, in the other root position."""
+    _assert_differential(tiny_repo, "SELECT (line_no - line_no) AND 1 FROM blame")
+
+
 # --- Known disagreements that raise before producing rows --------------
 #
 # #25, #32 and #51 are open design questions ("whether it should stay

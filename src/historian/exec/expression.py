@@ -28,25 +28,39 @@ node's own shape, not an external mode the caller passes in:
 and return `Bool3`. Composition follows that split exactly: a
 comparison's operands are evaluated as `Value` (they must be, to reach
 `values.eq` et al.), and `And`/`Or`/`Not`'s operands are evaluated as
-`Bool3`.
+`Bool3` - unconditionally, because that is a property of the `And`/
+`Or`/`Not` node itself, not of where the whole expression sits in the
+query. `evaluate()`'s own `And`/`Or`/`Not` branches enforce this
+directly, each wrapping its operand's `evaluate()` result in
+`coerce_to_bool3` before handing it to `values.and3`/`or3`/`not3` -
+see that section below for why this still needs no `position`
+parameter.
 
 A predicate-shaped node used where a value is expected
 (`SELECT 1 = 1`) or a value-shaped node used where a predicate is
-expected (`WHERE line_no`, SQLite's C-style truthiness) is each a
+expected (`WHERE line_no`, SQLite's C-style truthiness, at the
+`WHERE`/`HAVING` root or nested under `AND`/`OR`/`NOT`) is each a
 real, grammar-reachable shape - real SQLite accepts both, since
 booleans have no storage class of their own (`_docs/decisions.md`,
 2026-08-27: "`typeof(true)` is `integer`"). `evaluate()` itself still
-does not handle either: per the split above, it stays structural,
-deciding `Value` vs `Bool3` from the node's own shape alone, with no
-notion of "the position this node's result is about to be used in".
-Issue #38 adds the two coercions as caller-side helpers instead,
-immediately below `evaluate()` but outside its recursive dispatch:
+does not carry a notion of "the position this whole call's result is
+about to be used in" - it stays structural throughout, deciding
+`Value` vs `Bool3` from each node's own shape alone. Issue #38 adds
 `coerce_to_value` (`Bool3 -> Value`, `True`/`False`/`None` becoming
-SQLite's own `1`/`0`/`NULL` spelling) for `Project`'s select-list
-items, and `coerce_to_bool3` (`Value -> Bool3`, via the same leading-
-prefix numeric coercion arithmetic uses, then `!= 0`) for `Filter`'s
-predicate. Both are pure functions of `evaluate()`'s return value
-alone - see their own docstrings for why no case needs the AST back.
+SQLite's own `1`/`0`/`NULL` spelling) and `coerce_to_bool3` (`Value ->
+Bool3`, via the same leading-prefix numeric coercion arithmetic uses,
+then `!= 0`) immediately below `evaluate()`, as pure functions of a
+single `evaluate()` result. `Project` calls `coerce_to_value` on every
+select-list item's root result; `Filter` calls `coerce_to_bool3` on
+the `WHERE`/`HAVING` predicate's root result. Both call sites are
+outside `evaluate()`'s own recursive dispatch. `coerce_to_bool3` has a
+second caller *inside* that dispatch, though: `evaluate()`'s `And`,
+`Or` and `Not` branches call it on each operand's result before
+`values.and3`/`or3`/`not3` ever sees it - round 2 of #38, below. That
+still is not a `position` parameter: `evaluate()` reaches those calls
+because the node it is currently dispatching on is itself `And`/`Or`/
+`Not`, exactly the same structural knowledge every other branch here
+already uses, never because a caller told it what position it is in.
 
 Column affinity
 ----------------
@@ -213,11 +227,17 @@ def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
     if isinstance(expr, Is):
         return _eval_is(expr, row, schema)
     if isinstance(expr, And):
-        return values.and3(evaluate(expr.left, row, schema), evaluate(expr.right, row, schema))
+        return values.and3(
+            coerce_to_bool3(evaluate(expr.left, row, schema)),
+            coerce_to_bool3(evaluate(expr.right, row, schema)),
+        )
     if isinstance(expr, Or):
-        return values.or3(evaluate(expr.left, row, schema), evaluate(expr.right, row, schema))
+        return values.or3(
+            coerce_to_bool3(evaluate(expr.left, row, schema)),
+            coerce_to_bool3(evaluate(expr.right, row, schema)),
+        )
     if isinstance(expr, Not):
-        return values.not3(evaluate(expr.operand, row, schema))
+        return values.not3(coerce_to_bool3(evaluate(expr.operand, row, schema)))
     if isinstance(expr, Like):
         return _eval_like(expr, row, schema)
     if isinstance(expr, In):
@@ -229,23 +249,44 @@ def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
 
 # --- The Value/Bool3 coercion boundary (issue #38) ------------------------
 #
-# Two small, caller-side, pure functions of evaluate()'s own return value -
-# deliberately not part of evaluate()'s recursive dispatch and not a
-# `position` parameter threaded through it. See the module docstring's
-# "Value or Bool3, decided by node shape, not calling context" section for
-# why: the ambiguity these two functions resolve only ever exists at two
-# points in the whole tree - the root of a WHERE/HAVING predicate, and each
-# select-list item's root - never at any recursive call evaluate() makes
-# internally, so plumbing a parameter through every level of the recursion
-# would buy nothing no caller here needs.
+# Two small, pure functions of evaluate()'s own return value - deliberately
+# not a `position` parameter threaded through evaluate()'s recursive
+# dispatch. See the module docstring's "Value or Bool3, decided by node
+# shape, not calling context" section for why: `evaluate()` never needs to
+# know what position its *own* result is about to be used in - each of its
+# branches already knows, structurally, what position its *children's*
+# results are in, purely from which node it is currently dispatching on.
 #
-# Both are sound as functions of the return value alone, with no need to
-# re-inspect the AST: values.py's own module docstring excludes `bool` from
-# `Value` by construction, so a Python `bool` coming back from evaluate() is
-# unambiguous proof a predicate-shaped subexpression was just evaluated -
-# and `None` already means the same thing, "NULL", in both a `Value` and a
-# `Bool3` position (values.py's "Two representations, both using None"),
-# so it needs no direction-specific handling at all.
+# `coerce_to_value` is called only from outside evaluate()'s own recursion:
+# by `Project` (`exec/operators.py`), on a select-list item's root result.
+#
+# `coerce_to_bool3` has two kinds of caller. `Filter` (`exec/operators.py`)
+# calls it from outside the recursion too, on a WHERE/HAVING predicate's
+# root result - both of these are the two call sites #38's first round
+# implemented. Round 2 (QA FAIL, confirmed against sqlite3 3.51.0) found a
+# false premise in this section's original text: it claimed the Value/Bool3
+# ambiguity "only ever exists at exactly two points... never at any
+# recursive call evaluate() makes internally." That is wrong - SQLite
+# applies the same leading-prefix truthiness independently to *each operand*
+# of AND/OR/NOT, confirmed with plain arithmetic and no comparison anywhere
+# in the query (`select (3-3) and 1;` -> `0`; `select not(3-3);` -> `1`).
+# So `evaluate()`'s own `And`/`Or`/`Not` branches, above, are themselves
+# callers of `coerce_to_bool3`, one per operand, before handing the result
+# to `values.and3`/`or3`/`not3`. This still needs no `position` parameter:
+# `And`/`Or`/`Not`'s operands are predicate positions unconditionally, a
+# property of the node evaluate() is already dispatching on, not something
+# a caller has to tell it. Between, In and Like never need this - each
+# already builds its own Bool3 result from values.py's own comparison
+# functions (`values.eq`/`ge`/`le`/...), never from a raw, uncoerced
+# evaluate() result, so there is nothing left to coerce there.
+#
+# Both coercions are sound as functions of the return value alone, with no
+# need to re-inspect the AST: values.py's own module docstring excludes
+# `bool` from `Value` by construction, so a Python `bool` coming back from
+# evaluate() is unambiguous proof a predicate-shaped subexpression was just
+# evaluated - and `None` already means the same thing, "NULL", in both a
+# `Value` and a `Bool3` position (values.py's "Two representations, both
+# using None"), so it needs no direction-specific handling at all.
 
 
 def coerce_to_value(result: Value | Bool3) -> Value:
@@ -274,15 +315,24 @@ def coerce_to_value(result: Value | Bool3) -> Value:
 
 
 def coerce_to_bool3(result: Value | Bool3) -> Bool3:
-    """`Value -> Bool3`, for a `WHERE`/`HAVING` predicate
-    (`exec/operators.py`'s `Filter`), ahead of `values.is_true`:
-    SQLite's C-style truthiness for a value-shaped predicate (`WHERE
-    line_no`, `WHERE path`), confirmed case by case against `sqlite3`
-    in issue #38's own body - not "nonempty string is truthy", but the
-    exact leading-prefix numeric coercion `_arithmetic_operand` already
-    implements for arithmetic (`'0abc'` -> `0`, falsy; `'1abc'` -> `1`,
-    truthy; `'  1  '` -> `1`, truthy; `''`/`'abc'`, no digit anywhere,
-    -> `0`, falsy), followed by `!= 0`.
+    """`Value -> Bool3`: SQLite's C-style truthiness for a value-shaped
+    predicate (`WHERE line_no`, `WHERE path`), confirmed case by case
+    against `sqlite3` in issue #38's own body - not "nonempty string is
+    truthy", but the exact leading-prefix numeric coercion
+    `_arithmetic_operand` already implements for arithmetic (`'0abc'`
+    -> `0`, falsy; `'1abc'` -> `1`, truthy; `'  1  '` -> `1`, truthy;
+    `''`/`'abc'`, no digit anywhere, -> `0`, falsy), followed by
+    `!= 0`.
+
+    Two call sites, both confirmed against `sqlite3` 3.51.0.
+    `exec/operators.py`'s `Filter` calls this on a `WHERE`/`HAVING`
+    predicate's *root* result, ahead of `values.is_true`. `evaluate()`
+    itself, above, calls this a second way: on each operand of `And`,
+    `Or` and `Not` before handing it to `values.and3`/`or3`/`not3` -
+    SQLite applies the identical truthiness independently per operand,
+    not only at a predicate's root (`select (3-3) and 1;` -> `0`;
+    `select not(3-3);` -> `1`; issue #38 round 2, QA FAIL on the first
+    round's narrower "two call sites only" design).
 
     A `bool` or `None` is already a `Bool3` - a predicate-shaped
     `evaluate()` result - and passes through unchanged; `None` again

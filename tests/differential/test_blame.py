@@ -764,15 +764,71 @@ def test_bare_alias_without_as_is_a_parse_error(tiny_repo):
         run_historian("SELECT path p FROM blame", tiny_repo)
 
 
-def test_where_cannot_reference_a_select_list_alias(tiny_repo):
+def test_where_resolves_a_select_list_alias(tiny_repo):
     """#32: SQLite lets `WHERE` reference a select-list alias as a
-    fallback - confirmed: `sqlite3 :memory: "create table blame(path
-    text); insert into blame values('a.py'); select path as p from
-    blame where p = 'a.py';"` -> `a.py`. historian's binder resolves
-    `WHERE` before `Project` computes any alias and raises `BindError`
-    ("no such column: p") instead."""
+    fallback when no real column claims the name - confirmed:
+    `sqlite3 :memory: "create table blame(path text); insert into
+    blame values('a.py'); select path as p from blame where p =
+    'a.py';"` -> `a.py`. `p` names no real `blame` column, so it falls
+    back to the alias, and `WHERE p = 'src/utils.py'` returns exactly
+    the rows for that path - this replaces the previous version of
+    this test, which pinned the opposite (`BindError`) as a deliberate,
+    documented gap; #32 closes it."""
+    _assert_differential(tiny_repo, "SELECT path AS p FROM blame WHERE p = 'src/utils.py'")
+
+
+def test_where_real_column_wins_over_alias_of_a_different_column(tiny_repo):
+    """#32 finding 1: a real column always wins over a same-named
+    alias of a *different* column - confirmed: `sqlite3 :memory:
+    "create table t(a integer, b integer); insert into t
+    values(1,10),(2,20); select b as a from t where a = 1;"` -> `10`,
+    not empty (which is what it would be if `a` resolved to the alias,
+    testing `b = 1`). Reproduced against `blame`: `commit_hash` is
+    aliased to `path`'s name, and `WHERE path = ...` must still resolve
+    to the real `path` column, not the alias - a wrong-direction
+    resolution would test `commit_hash = 'src/utils.py'`, which never
+    matches, and silently return zero rows instead of the real matches."""
+    _assert_differential(
+        tiny_repo, "SELECT commit_hash AS path FROM blame WHERE path = 'src/utils.py'"
+    )
+
+
+def test_where_unmatched_name_raises_bind_error(tiny_repo):
+    """The regression guard for the "safe direction" #9 pinned: a name
+    matching neither a real column nor any select-list alias still
+    raises `BindError`, now that the alias fallback exists alongside
+    real-column resolution - confirmed `sqlite3` also rejects it
+    (`no such column: ghost`), so there is nothing to diff a row
+    result against; both engines error before producing any rows."""
     with pytest.raises(BindError):
-        run_historian("SELECT path AS p FROM blame WHERE p = 'src/utils.py'", tiny_repo)
+        run_historian("SELECT path AS p FROM blame WHERE ghost = 1", tiny_repo)
+
+
+def test_where_duplicate_alias_resolves_to_first_occurrence(tiny_repo):
+    """#32 finding 4: two select-list items sharing an alias resolve to
+    the *first* occurrence - confirmed: `sqlite3 :memory: "create table
+    t(a integer, b integer, c integer); insert into t values(1,60,5);
+    select b as x, c as x from t where x > 50;"` returns the row
+    (`b`=60 satisfies `x > 50`), not empty (which `c`=5 would give).
+    Reproduced against `blame`: `path` and `author_email` both aliased
+    `x`; `WHERE x = 'src/utils.py'` must resolve to the first, `path`,
+    not the second, `author_email` (which never equals a path string,
+    so a last-wins bug would silently return zero rows)."""
+    _assert_differential(
+        tiny_repo,
+        "SELECT path AS x, author_email AS x FROM blame WHERE x = 'src/utils.py'",
+    )
+
+
+def test_where_select_list_still_cannot_see_its_own_alias(tiny_repo):
+    """#32 finding 3: adding the `WHERE` fallback must not make an
+    alias visible to *other select-list items* - confirmed unchanged:
+    `sqlite3 :memory: "create table t(a integer); select a as x, x + 1
+    from t;"` -> `no such column: x`. Reproduced against `blame`: the
+    second select-list item referencing the first item's alias still
+    raises `BindError`, the same as before this issue."""
+    with pytest.raises(BindError):
+        run_historian("SELECT path AS x, x FROM blame", tiny_repo)
 
 
 def test_like_escape_is_a_parse_error(tiny_repo):

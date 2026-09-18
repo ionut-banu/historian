@@ -676,3 +676,39 @@ both directions:
   fixing it here would be exactly the scope creep AGENTS.md and the
   software-engineer role warn against. Left unfixed, reported on
   the issue for a follow-up to pick up.
+
+2026-09-18 - WHERE's alias fallback is one resolution function
+with a precedence-direction parameter, not a WHERE-specific helper
+
+Issue #32. `sql/binder.py` gains `_resolve_name(ref, ctx,
+select_items, alias_first)`: for an unqualified `ColumnRef` that
+fails ordinary schema lookup, it also tries the select list's own
+aliases (first-occurrence-wins on a duplicate, matched via the
+existing `_same_name` ASCII fold) and splices in that item's
+already-bound expression - `BoundSelectItem.expr` - in place of the
+reference, via the same `dataclasses.replace` rebuild `_bind_expr`
+already used for every other node type. Confirmed against sqlite3
+3.51.0 that a real column always wins over a same-named alias in
+WHERE (`select b as a from t where a = 1` returns the real column's
+row), so `bind()` passes `alias_first=False` for WHERE. Also
+confirmed ORDER BY is the one clause where this is reversed - the
+alias wins there - so the direction is a parameter rather than
+hardcoded, for #60 (GROUP BY, HAVING - column-first, same as WHERE)
+and #61 (ORDER BY - alias-first) to call without redeciding the
+rule. `_bind_expr` grew matching `select_items`/`alias_fallback`/
+`alias_first` parameters, defaulted off, threaded through every
+recursive call so the fallback reaches a ColumnRef at any depth in
+WHERE's tree, not only at the top; `_bind_select_item` still calls
+`_bind_expr` with the defaults, so select-list items continue to
+not see each other's aliases (unchanged, per #32's own finding 3).
+A table-qualified reference (`t.x`) never falls back to an alias,
+confirmed against sqlite3 - aliases have no table qualifier - so a
+qualified ColumnRef skips straight to schema-only resolution as
+before. No new AST node; `_docs/spec.md` needed no change since it
+already left this as a binder-level SQLite-conformance rule rather
+than a separately specified grammar feature.
+
+`tests/test_binder.py`'s and `tests/differential/test_blame.py`'s
+prior pinning tests for the old "conservatively rejected" behaviour
+are rewritten to assert the new, correct resolution rather than
+deleted - the gap they documented is what this issue closes.

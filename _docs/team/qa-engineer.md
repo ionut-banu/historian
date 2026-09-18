@@ -65,6 +65,16 @@ Before you start, record the commit you are reviewing with
 2 the two did not match, and noticing that was the difference between a
 sound verdict and one nobody could trust.
 
+Before you start, also run `uv run python3 -c "import historian;
+print(historian.__file__)"` and check that the path it prints is
+under this worktree's directory, not the main checkout's - a bare
+`python3` resolves to the main checkout's interpreter no matter
+where you are standing (see "One worktree per subagent" in
+`_docs/process.md`). This carries the same weight as the commit
+check above: on issue #25, QA's probe with a bare interpreter
+printed the main checkout's stale output, and comparing
+`historian.__file__` was the only thing that caught it.
+
 Break it and watch it fail
 
 A test that passes proves nothing on its own - it might pass because it

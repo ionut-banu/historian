@@ -602,3 +602,26 @@ but it would not fail loudly for two conftest.py files that
 happened to share a name. Fixed by importing it as
 `from differential.conftest import ...`, its real dotted name now
 that the package exists.
+
+2026-09-18 - The two #38 coercion helpers are named coerce_to_value
+and coerce_to_bool3
+
+Issue #38 settled that these live as two caller-side functions in
+exec/expression.py but left their names open. Named for the
+direction they coerce *into*, matching the two type aliases
+values.py already exports: `coerce_to_value` (Bool3 -> Value, called
+by Project) and `coerce_to_bool3` (Value -> Bool3, called by
+Filter, ahead of values.is_true).
+
+Also recorded here since #38 asked for it explicitly: with
+`WHERE line_no` now legal, tests/test_operators.py's old
+TypeError-pinning test for Filter's three-valued-logic invariant
+(added after #34's QA FAIL) is replaced by a predicate where
+SQLite's leading-prefix truthiness and Python's own truthiness
+disagree - `WHERE '0abc'`. As a bare Python string it is truthy
+(nonempty), so a Filter that fell back to bare `if evaluate(...):`
+on the raw Value would keep every row; the coercion reads it as
+numeric `0`, correctly dropping all of them. This is the same kind
+of predicate #34's original QA finding was about - one where a
+wrong implementation and a right one visibly disagree - reapplied
+to the new shape of the gap #38 closes.

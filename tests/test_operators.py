@@ -20,8 +20,6 @@ from __future__ import annotations
 import itertools
 from collections.abc import Iterator, Sequence
 
-import pytest
-
 from historian.exec.operators import Filter, Project, Scan
 from historian.schema import Column, ColumnType, Row, Schema
 from historian.sql.ast import BinaryOp, Literal, Operator as Op
@@ -255,38 +253,60 @@ def test_filter_streams_rather_than_materializing():
     assert source.pulled == 1
 
 
-def test_filter_raises_rather_than_silently_coercing_a_value_shaped_predicate():
-    """Pins the `Filter` -> `values.is_true` call, not just its result.
+def test_filter_coerces_a_value_shaped_predicate_with_c_style_truthiness_not_bare_python_truthiness():
+    """Pins `Filter` -> `coerce_to_bool3` -> `values.is_true`, not a
+    bare `if evaluate(...):` - the same invariant
+    `test_filter_raises_rather_than_silently_coercing_a_value_shaped_
+    predicate` pinned before #38, rewritten because that test's own
+    premise (`WHERE line_no` raises `TypeError`) is exactly what #38
+    is chartered to remove: `WHERE line_no` is legal SQL now, and
+    `Filter` must return a *result*, not an exception, for it.
 
-    QA's FAIL on this issue found that the three tests above cannot
-    tell `values.is_true(evaluate(...))` apart from a bare
-    `if evaluate(...):` - every predicate they construct is
-    comparison-shaped, so `evaluate()` only ever hands back a `Bool3`
-    (`True`/`False`/`None`), and Python's `bool(None) == bool(False) ==
-    False` makes the two implementations agree on every one of those
-    inputs. `is_true`'s only actual behavioural difference from bare
-    truthiness is that it rejects anything that isn't exactly `True`,
-    `False`, or `None` - and no predicate above ever produces such a
-    value to exercise that rejection.
+    QA's FAIL on the original #34 found that three comparison-shaped
+    predicates alone cannot tell `values.is_true(evaluate(...))` apart
+    from a bare `if evaluate(...):`, because `evaluate()` only ever
+    hands back a `Bool3` for those and `bool(None) == bool(False)` in
+    Python. #38 reopens the same trap in a new shape: once `Filter`
+    coerces a `Value`-shaped predicate into a `Bool3` at all, a
+    *correct* coercion and a bare `if evaluate(...):` on the
+    *uncoerced* `Value` can still disagree - and only a predicate where
+    SQLite's own truthiness rule and Python's built-in truthiness give
+    different answers can catch a `Filter` that skips the coercion
+    step and falls back to testing `evaluate()`'s raw result directly.
 
-    `WHERE line_no` does: a bare `BoundColumnRef` is value-shaped (see
-    `exec/expression.py`'s module docstring), so `evaluate()` returns
-    the row's plain `line_no` integer, never a `Bool3`. Every row here
-    has a nonzero `line_no` (2, 5, 1, 4), so bare truthiness would keep
-    all four rows silently - `is_true` instead raises `TypeError` per
-    the module's own documented Value/Bool3 boundary (#38, not
-    implemented by this issue). Asserting the raise, rather than a
-    result, is what makes this test go red if `Filter.rows()` is ever
-    changed back to bare truthiness - confirmed by hand: substituting
-    `if evaluate(...):` for the `is_true` call and rerunning the suite
-    turns exactly this test red (no exception raised, all rows kept)
-    while every other `Filter` test keeps passing.
+    `'0abc'` is exactly that predicate (confirmed against `sqlite3`,
+    also pinned as a differential case in `tests/differential/
+    test_blame.py`: `create table t(s text); insert into t
+    values('0abc'); select 'kept' from t where s;` -> no rows). As a
+    bare Python string, `'0abc'` is truthy (nonempty) - a `Filter`
+    that tested `evaluate()`'s result directly with `if ...:` would
+    keep every row. SQLite's leading-prefix numeric coercion reads
+    `'0abc'` as `0`, falsy, and drops every row instead - which is
+    what `coerce_to_bool3` computes and what `values.is_true` then
+    rejects. Confirmed by hand: substituting
+    `if evaluate(self._predicate, row, child_schema):` for the
+    `coerce_to_bool3`/`is_true` pair and rerunning the suite turns
+    exactly this test red (all four rows kept instead of none) while
+    every comparison-shaped `Filter` test above keeps passing.
     """
+    predicate = _lit("0abc")
+    result = Filter(_child(), predicate)
+
+    assert tuple(result.rows()) == ()
+
+
+def test_filter_no_longer_raises_on_a_value_shaped_predicate():
+    """`WHERE line_no` (#38's own headline case) used to raise
+    `TypeError` - `evaluate()` returns the row's plain `line_no`
+    integer, a `Value`, and `values.is_true` rejected it outright. It
+    is legal now: `coerce_to_bool3` gives it SQLite's C-style
+    truthiness first. Every row here has a nonzero `line_no` (2, 5, 1,
+    4), so every row is kept - matching `sqlite3`'s own
+    `select x from t where x` behaviour for a nonzero numeric column."""
     predicate = _col("line_no")
     result = Filter(_child(), predicate)
 
-    with pytest.raises(TypeError):
-        list(result.rows())
+    assert tuple(result.rows()) == _ROWS
 
 
 # --- Project --------------------------------------------------------------
@@ -376,6 +396,31 @@ def test_project_row_order_matches_child_row_order():
     assert tuple(result.rows()) == ((2,), (5,), (1,), (4,))
 
 
+def test_project_coerces_a_bool3_shaped_item_to_sqlites_own_int_spelling():
+    """`SELECT 1 = 1, 1 = 2, 1 = NULL` - a comparison is predicate-
+    shaped, so `evaluate()` returns a `Bool3` (`True`/`False`/`None`)
+    for each. `Project` must store SQLite's own `1`/`0`/`NULL`
+    spelling instead (confirmed against `sqlite3`: `select 1 = 1,
+    typeof(1 = 1), 1 = 2, typeof(1 = 2), 1 = null, typeof(1 = null);`
+    -> `1|integer|0|integer||null`). Checked with `type(cell) is int`,
+    never `bool` - `True == 1` in Python, so a bare `==` assertion
+    would be blind to a `Filter`/`Project` that stored the raw
+    `Bool3` unchanged, per this issue's own criteria."""
+    select_list = (
+        _item(_bin(Op.EQ, _lit(1), _lit(1)), alias=None, output_name=None),
+        _item(_bin(Op.EQ, _lit(1), _lit(2)), alias=None, output_name=None),
+        _item(_bin(Op.EQ, _lit(1), _lit(None)), alias=None, output_name=None),
+    )
+    result = Project(_child(rows=(("a.py", 2, "ana@x.com"),)), select_list)
+
+    (row,) = tuple(result.rows())
+
+    assert row == (1, 0, None)
+    assert type(row[0]) is int
+    assert type(row[1]) is int
+    assert row[2] is None
+
+
 def test_project_streams_rather_than_materializing():
     source = _CountingSource(_ROWS)
     scan = Scan(source)
@@ -429,14 +474,16 @@ def test_scan_filter_project_all_expose_the_same_operator_shape():
         list(itertools.islice(produced, 1))
 
 
-# --- Documented Value/Bool3 boundary (#38, out of scope here) -------------
+# --- Documented Value/Bool3 boundary (#38, handled here) ------------------
 
 
 def test_operators_module_documents_the_value_bool3_boundary():
-    """This issue does not implement #38 (see its own Out of scope
-    section) - it must document the boundary instead, so whoever hits
-    it finds an explanation rather than a mystery. Checked here as a
-    real assertion, not a comment nobody enforces."""
+    """#38 handles the `Value`/`Bool3` coercion boundary this module's
+    docstrings used to describe as out of scope - they must describe
+    it as handled now, naming the two `exec/expression.py` coercion
+    helpers each operator actually calls, rather than still reading
+    like an open gap. Checked here as a real assertion, not a comment
+    nobody enforces."""
     import historian.exec.operators as operators_module
 
     combined_text = "\n".join(
@@ -453,3 +500,5 @@ def test_operators_module_documents_the_value_bool3_boundary():
     assert "Bool3" in combined_text
     assert "WHERE line_no" in combined_text or "line_no" in combined_text
     assert "1 = 1" in combined_text or "SELECT 1" in combined_text
+    assert "coerce_to_bool3" in combined_text
+    assert "coerce_to_value" in combined_text

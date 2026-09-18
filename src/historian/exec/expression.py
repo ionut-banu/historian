@@ -30,18 +30,23 @@ comparison's operands are evaluated as `Value` (they must be, to reach
 `values.eq` et al.), and `And`/`Or`/`Not`'s operands are evaluated as
 `Bool3`.
 
-Not handled: a predicate-shaped node used where a value is expected
-(`SELECT (1 = 1)`) or a value-shaped node used where a predicate is
-expected (`WHERE line_no`, relying on C-style truthiness). Real
-SQLite accepts both - booleans have no storage class of their own
-(`_docs/decisions.md`, 2026-08-27: "`typeof(true)` is `integer`") - but
-neither shape appears in any of this issue's acceptance criteria, and
-building the coercion either direction is a real, separate design
-question (truthiness for `WHERE line_no` needs its own affinity-like
-rule for text, which no criterion specifies or verifies against
-`sqlite3`). Left to whichever of #34 (`Filter`/`Project`) or a future
-issue actually needs it - noted in this issue's closing report rather
-than guessed at here.
+A predicate-shaped node used where a value is expected
+(`SELECT 1 = 1`) or a value-shaped node used where a predicate is
+expected (`WHERE line_no`, SQLite's C-style truthiness) is each a
+real, grammar-reachable shape - real SQLite accepts both, since
+booleans have no storage class of their own (`_docs/decisions.md`,
+2026-08-27: "`typeof(true)` is `integer`"). `evaluate()` itself still
+does not handle either: per the split above, it stays structural,
+deciding `Value` vs `Bool3` from the node's own shape alone, with no
+notion of "the position this node's result is about to be used in".
+Issue #38 adds the two coercions as caller-side helpers instead,
+immediately below `evaluate()` but outside its recursive dispatch:
+`coerce_to_value` (`Bool3 -> Value`, `True`/`False`/`None` becoming
+SQLite's own `1`/`0`/`NULL` spelling) for `Project`'s select-list
+items, and `coerce_to_bool3` (`Value -> Bool3`, via the same leading-
+prefix numeric coercion arithmetic uses, then `!= 0`) for `Filter`'s
+predicate. Both are pure functions of `evaluate()`'s return value
+alone - see their own docstrings for why no case needs the AST back.
 
 Column affinity
 ----------------
@@ -128,7 +133,7 @@ from historian.values import Bool3, Value
 # behaviour, even though the import graph is not literally free of the
 # word `subprocess`.
 
-__all__ = ["EvalError", "evaluate"]
+__all__ = ["EvalError", "coerce_to_bool3", "coerce_to_value", "evaluate"]
 
 #: SQLite's `int64` bounds. This module's own constants - not imported
 #: from `sql/parser.py`'s private `_INT64_MAX`, which is off-limits for
@@ -220,6 +225,77 @@ def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
     if isinstance(expr, Between):
         return _eval_between(expr, row, schema)
     raise AssertionError(f"exec/expression.py: unhandled expression node type {type(expr).__name__}")
+
+
+# --- The Value/Bool3 coercion boundary (issue #38) ------------------------
+#
+# Two small, caller-side, pure functions of evaluate()'s own return value -
+# deliberately not part of evaluate()'s recursive dispatch and not a
+# `position` parameter threaded through it. See the module docstring's
+# "Value or Bool3, decided by node shape, not calling context" section for
+# why: the ambiguity these two functions resolve only ever exists at two
+# points in the whole tree - the root of a WHERE/HAVING predicate, and each
+# select-list item's root - never at any recursive call evaluate() makes
+# internally, so plumbing a parameter through every level of the recursion
+# would buy nothing no caller here needs.
+#
+# Both are sound as functions of the return value alone, with no need to
+# re-inspect the AST: values.py's own module docstring excludes `bool` from
+# `Value` by construction, so a Python `bool` coming back from evaluate() is
+# unambiguous proof a predicate-shaped subexpression was just evaluated -
+# and `None` already means the same thing, "NULL", in both a `Value` and a
+# `Bool3` position (values.py's "Two representations, both using None"),
+# so it needs no direction-specific handling at all.
+
+
+def coerce_to_value(result: Value | Bool3) -> Value:
+    """`Bool3 -> Value`, for a select-list item (`exec/operators.py`'s
+    `Project`): SQLite's own `1`/`0`/`NULL` spelling of a predicate
+    result, never Python's `True`/`False`/`None`. Confirmed against
+    `sqlite3`: `select 1 = 1, typeof(1 = 1), 1 = 2, typeof(1 = 2),
+    1 = null, typeof(1 = null);` -> `1|integer|0|integer||null`.
+
+    `result is True`/`result is False` rather than `result == True` or
+    `isinstance(result, bool)`: identity, not equality, so an ordinary
+    `Value` that merely compares equal to a bool (nothing in `Value`
+    ever does, by `values.py`'s own construction, but this function
+    should not rely on that invariant holding two modules away to stay
+    correct) can never be mistaken for one. Anything that is not
+    exactly the `True`/`False` singleton - including `None`, which
+    means NULL identically on both sides of this boundary - passes
+    through unchanged: a value-shaped `evaluate()` result was already
+    the right SQLite value and needs no conversion at all.
+    """
+    if result is True:
+        return 1
+    if result is False:
+        return 0
+    return result
+
+
+def coerce_to_bool3(result: Value | Bool3) -> Bool3:
+    """`Value -> Bool3`, for a `WHERE`/`HAVING` predicate
+    (`exec/operators.py`'s `Filter`), ahead of `values.is_true`:
+    SQLite's C-style truthiness for a value-shaped predicate (`WHERE
+    line_no`, `WHERE path`), confirmed case by case against `sqlite3`
+    in issue #38's own body - not "nonempty string is truthy", but the
+    exact leading-prefix numeric coercion `_arithmetic_operand` already
+    implements for arithmetic (`'0abc'` -> `0`, falsy; `'1abc'` -> `1`,
+    truthy; `'  1  '` -> `1`, truthy; `''`/`'abc'`, no digit anywhere,
+    -> `0`, falsy), followed by `!= 0`.
+
+    A `bool` or `None` is already a `Bool3` - a predicate-shaped
+    `evaluate()` result - and passes through unchanged; `None` again
+    needs no direction-specific handling, since NULL propagates as
+    "the predicate is unknown, the row is dropped" whether it arrived
+    as a `Value` or a `Bool3`, per `values.py`'s own "Two
+    representations" section (confirmed: `create table t(n); insert
+    into t values(null); select 'kept' from t where n;` -> no rows,
+    exactly like any other NULL predicate, not a new rule).
+    """
+    if isinstance(result, bool) or result is None:
+        return result
+    return _arithmetic_operand(result) != 0
 
 
 def _eval_between(expr: Between, row: Row, schema: Schema) -> Bool3:

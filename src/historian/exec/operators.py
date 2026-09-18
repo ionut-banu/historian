@@ -42,42 +42,36 @@ in order, with no `set`, no `dict`-keyed grouping, and no sort of any
 kind - row order in is row order out, restricted (`Filter`) or
 transformed per-row (`Project`), never rearranged.
 
-The `Value`/`Bool3` coercion boundary - out of scope here, #38
-------------------------------------------------------------------
+The `Value`/`Bool3` coercion boundary (#38)
+--------------------------------------------
 
 `exec/expression.py`'s `evaluate()` returns a `historian.values.Value`
 for a value-shaped node (`Literal`, a bare column, arithmetic,
 concatenation) and a `historian.values.Bool3` for a predicate-shaped
 one (a comparison, `AND`/`OR`/`NOT`, `IS`, `LIKE`, `IN`, `BETWEEN`),
-decided by the node's own shape. Two grammar-reachable shapes fall on
+decided by the node's own shape. Two grammar-reachable shapes land on
 the "wrong" side of that split for the operator that has to consume
-them, and neither is handled by this issue:
+them, and both are handled here, by calling one of
+`exec/expression.py`'s two caller-side coercion helpers on
+`evaluate()`'s result before doing anything else with it:
 
-- `Project` never coerces a `Bool3`-shaped select-list expression
-  (`SELECT 1 = 1 FROM blame`, or any bare predicate in select-list
-  position) into a stored `Value`. Real SQLite stores its own
-  storage-class answer instead (`sqlite3`: `select 1 = 1, typeof(1 =
-  1)` -> `1|integer`). `Project` here evaluates every select-list
-  item's `.expr` as if it were value-shaped; a `Bool3`-shaped one
-  simply produces a Python `True`/`False`/`None` in the output row,
-  not SQLite's `1`/`0`/`NULL` spelling.
-- `Filter` never coerces a `Value`-shaped predicate (`WHERE line_no`, a
-  bare column with no comparison) into a three-valued result via
-  SQLite's C-style truthiness (`sqlite3`: `select x from t where x`
-  keeps nonzero numeric rows, drops `0`, `NULL`, and non-numeric text).
-  `evaluate()` returns a plain `Value` for such a node, and
-  `values.is_true` raises `TypeError` on anything that is not
-  `True`/`False`/`None` - so this shape fails loudly here, not
-  silently.
+- `Project` calls `coerce_to_value` on every select-list item's
+  `evaluate()` result before storing it in the output row, so a
+  `Bool3`-shaped select-list expression (`SELECT 1 = 1 FROM blame`, or
+  any bare predicate in select-list position) stores SQLite's own
+  storage-class answer (`sqlite3`: `select 1 = 1, typeof(1 = 1)` ->
+  `1|integer`) rather than a Python `True`/`False`/`None`.
+- `Filter` calls `coerce_to_bool3` on `evaluate()`'s result before
+  handing it to `values.is_true`, so a `Value`-shaped predicate
+  (`WHERE line_no`, a bare column with no comparison) gets SQLite's
+  C-style truthiness (`sqlite3`: `select x from t where x` keeps
+  nonzero numeric rows, drops `0`, `NULL`, and non-numeric text)
+  instead of `values.is_true` raising `TypeError` on a raw `Value`.
 
 Both directions were named explicitly in #12's own closing comment as
-belonging to "whoever builds #34," and both are filed as #38, blocked
-on this issue - see this issue's own Out of scope section for why a
-correct fix cannot live in this file (the natural coercion helper
-belongs next to `evaluate()` in `exec/expression.py`, closed and
-outside this issue's file scope, and the truthiness direction needs
-its own `sqlite3`-verified rule for text that no criterion here
-specifies). This paragraph is that documentation.
+belonging to "whoever builds #34," landed as #38 rather than in #34
+itself: the coercion helpers live next to `evaluate()` in
+`exec/expression.py`, and this module only calls them.
 """
 
 from __future__ import annotations
@@ -86,7 +80,7 @@ from collections.abc import Iterator, Sequence
 from typing import Protocol
 
 from historian import values
-from historian.exec.expression import evaluate
+from historian.exec.expression import coerce_to_bool3, coerce_to_value, evaluate
 from historian.schema import Column, ColumnType, Row, Schema
 from historian.sql.ast import Expr
 from historian.sql.binder import BoundColumnRef, BoundSelectItem
@@ -151,24 +145,27 @@ class Filter:
     """`WHERE` / `HAVING` (spec §3): yields exactly the rows of `child`
     for which `predicate` evaluates to `TRUE`.
 
-    `evaluate(predicate, row, child.schema)` returns a `Bool3`:
-    `True`, `False`, or `None`, meaning SQL `TRUE`, `FALSE`, or `NULL`.
-    This routes that result through `values.is_true` rather than
-    testing it with a bare `if evaluate(...):` - the two look
-    equivalent and are not. Python truthiness treats `False` and `None`
-    identically (both falsy), which happens to give the right answer
-    for a `FALSE`-producing predicate and the *wrong* answer for
-    nothing - but only because both cases drop the row. The bug it
-    hides is real: `values.is_true` additionally rejects anything that
-    is not exactly `True`, `False`, or `None` (SQLite's own integer
-    `1`/`0` spelling of a predicate result, in particular), which a
-    bare Python truth test would silently accept. §3 names conflating
+    `evaluate(predicate, row, child.schema)` returns a `Value` for a
+    value-shaped predicate (`WHERE line_no`, a bare column with no
+    comparison) or a `Bool3` - `True`, `False`, or `None`, meaning SQL
+    `TRUE`, `FALSE`, or `NULL` - for a predicate-shaped one.
+    `coerce_to_bool3` (`exec/expression.py`, #38) turns the former into
+    the latter: a `bool`/`None` result passes through unchanged, and
+    anything else gets SQLite's C-style truthiness. The `Bool3` that
+    comes out is then routed through `values.is_true` rather than
+    tested with a bare `if ...:` - the two look equivalent and are
+    not. Python truthiness treats `False` and `None` identically (both
+    falsy), which happens to give the right answer for a
+    `FALSE`-producing predicate and the *wrong* answer for nothing -
+    but only because both cases drop the row. The bug it hides is
+    real: `values.is_true` additionally rejects anything that is not
+    exactly `True`, `False`, or `None` (SQLite's own integer `1`/`0`
+    spelling of a predicate result, in particular), which a bare
+    Python truth test would silently accept. §3 names conflating
     `FALSE` and `NULL` "the classic bug"; routing through `is_true` is
-    what keeps this operator from being an instance of it.
-
-    Not handled: a `Value`-shaped predicate (`WHERE line_no`, a bare
-    column with no comparison) - see the module docstring's "Value/
-    Bool3 boundary" section and #38.
+    what keeps this operator from being an instance of it - and
+    `coerce_to_bool3` is what keeps a `Value`-shaped predicate from
+    reaching `is_true` at all, rather than tripping its `TypeError`.
     """
 
     def __init__(self, child: Operator, predicate: Expr) -> None:
@@ -181,7 +178,7 @@ class Filter:
     def rows(self) -> Iterator[Row]:
         child_schema = self._child.schema
         for row in self._child.rows():
-            if values.is_true(evaluate(self._predicate, row, child_schema)):
+            if values.is_true(coerce_to_bool3(evaluate(self._predicate, row, child_schema))):
                 yield row
 
 
@@ -224,11 +221,12 @@ class Project:
     Every item's `.expr` is evaluated with
     `evaluate(item.expr, row, child.schema)` (#12): a `Value` for a
     value-shaped expression (`Literal`, `BoundColumnRef`, arithmetic,
-    concatenation, unary +/-). Not handled: a `Bool3`-shaped item
-    (`SELECT 1 = 1`) - see the module docstring's "Value/Bool3
-    boundary" section and #38; such an item is still evaluated and
-    still lands in the output row, just as the Python `True`/`False`/
-    `None` `evaluate()` itself returns, not SQLite's `1`/`0`/`NULL`.
+    concatenation, unary +/-) or a `Bool3` for a predicate-shaped one
+    (`SELECT 1 = 1`). `coerce_to_value` (`exec/expression.py`, #38)
+    turns the latter into the former before it lands in the output
+    row - SQLite's own `1`/`0`/`NULL` spelling of a predicate result,
+    not the Python `True`/`False`/`None` `evaluate()` itself returns;
+    a value-shaped result passes through `coerce_to_value` unchanged.
 
     The output `Schema` is computed once, at construction, from
     `select_list` and `child.schema` - see `_project_column` for the
@@ -250,4 +248,6 @@ class Project:
         child_schema = self._child.schema
         select_list = self._select_list
         for row in self._child.rows():
-            yield tuple(evaluate(item.expr, row, child_schema) for item in select_list)
+            yield tuple(
+                coerce_to_value(evaluate(item.expr, row, child_schema)) for item in select_list
+            )

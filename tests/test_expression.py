@@ -1136,6 +1136,169 @@ def test_not_between_is_not3_of_the_unnegated_result():
     assert evaluate(_between(_lit(50), _lit(1), _lit(10), negated=True), _ROW, _SCHEMA) is True
 
 
+# --- coerce_to_value: Bool3 -> Value, Project's own coercion (#38) -------
+#
+# sqlite3: `select 1 = 1, typeof(1 = 1), 1 = 2, typeof(1 = 2), 1 = null,
+# typeof(1 = null);` -> `1|integer|0|integer||null`.
+
+
+def test_coerce_to_value_converts_true_to_the_int_one():
+    from historian.exec.expression import coerce_to_value
+
+    result = coerce_to_value(True)
+    assert result == 1
+    assert type(result) is int
+
+
+def test_coerce_to_value_converts_false_to_the_int_zero():
+    from historian.exec.expression import coerce_to_value
+
+    result = coerce_to_value(False)
+    assert result == 0
+    assert type(result) is int
+
+
+def test_coerce_to_value_passes_none_through_unchanged():
+    """NULL means the same thing on both sides of this boundary -
+    `values.py`'s own "Two representations, both using None" design -
+    so it needs no direction-specific handling at all."""
+    from historian.exec.expression import coerce_to_value
+
+    assert coerce_to_value(None) is None
+
+
+def test_coerce_to_value_passes_a_value_shaped_result_through_unchanged():
+    """An `int`/`float`/`str` `evaluate()` result is already the right
+    SQLite value and needs no conversion - only a `Bool3` does."""
+    from historian.exec.expression import coerce_to_value
+
+    assert coerce_to_value(5) == 5 and type(coerce_to_value(5)) is int
+    assert coerce_to_value(5.0) == 5.0 and type(coerce_to_value(5.0)) is float
+    assert coerce_to_value("x") == "x"
+
+
+def test_coerce_to_value_applied_to_a_real_comparison_evaluate_result():
+    """End to end through `evaluate()`: `1 = 1`, `1 = 2`, `1 = NULL` -
+    `coerce_to_value(evaluate(...))` matches `sqlite3`'s own
+    `1`/`0`/`NULL`, not Python's `True`/`False`/`None`. Checked with
+    `type(...) is int`, not merely `== 1`/`== 0` - `True == 1` in
+    Python, so a bare `==` assertion would be blind to this issue's
+    own bug (per this issue's own acceptance criteria)."""
+    from historian.exec.expression import coerce_to_value, evaluate
+
+    eq_true = _bin(Operator.EQ, _lit(1), _lit(1))
+    eq_false = _bin(Operator.EQ, _lit(1), _lit(2))
+    eq_null = _bin(Operator.EQ, _lit(1), _lit(None))
+
+    true_result = coerce_to_value(evaluate(eq_true, _ROW, _SCHEMA))
+    false_result = coerce_to_value(evaluate(eq_false, _ROW, _SCHEMA))
+    null_result = coerce_to_value(evaluate(eq_null, _ROW, _SCHEMA))
+
+    assert (true_result, type(true_result)) == (1, int)
+    assert (false_result, type(false_result)) == (0, int)
+    assert null_result is None
+
+
+# --- coerce_to_bool3: Value -> Bool3, Filter's own coercion (#38) --------
+#
+# Leading-prefix numeric coercion (the same rule `_arithmetic_operand`
+# already implements for arithmetic), then `!= 0` - confirmed case by
+# case against `sqlite3` in issue #38's own body, not "nonempty string
+# is truthy".
+
+
+def test_coerce_to_bool3_passes_true_and_false_through_unchanged():
+    from historian.exec.expression import coerce_to_bool3
+
+    assert coerce_to_bool3(True) is True
+    assert coerce_to_bool3(False) is False
+
+
+def test_coerce_to_bool3_passes_none_through_unchanged():
+    """NULL needs no direction-specific handling - see
+    `test_coerce_to_value_passes_none_through_unchanged`'s docstring,
+    same reasoning in the other direction."""
+    from historian.exec.expression import coerce_to_bool3
+
+    assert coerce_to_bool3(None) is None
+
+
+def test_coerce_to_bool3_nonzero_and_zero_integer():
+    from historian.exec.expression import coerce_to_bool3
+
+    assert coerce_to_bool3(3) is True
+    assert coerce_to_bool3(-3) is True
+    assert coerce_to_bool3(0) is False
+
+
+def test_coerce_to_bool3_real_zero_and_underflowed_real_are_falsy():
+    """sqlite3: `create table t(r real); insert into t values(0.0);
+    select 'kept' from t where r;` -> no rows. Same for `1e-400`,
+    which underflows to `0.0` in a double before this function ever
+    sees it - `typeof(r)` is still `real`, not `integer`."""
+    from historian.exec.expression import coerce_to_bool3
+
+    assert coerce_to_bool3(0.0) is False
+    assert coerce_to_bool3(1e-400) is False
+
+
+def test_coerce_to_bool3_nonzero_real_is_truthy():
+    """sqlite3: `create table t(r real); insert into t values
+    (0.4),(-0.4),(0.5); select r,'kept' from t where r;` -> all three
+    kept, negative included."""
+    from historian.exec.expression import coerce_to_bool3
+
+    assert coerce_to_bool3(0.4) is True
+    assert coerce_to_bool3(-0.4) is True
+    assert coerce_to_bool3(0.5) is True
+
+
+def test_coerce_to_bool3_text_uses_leading_prefix_rule_not_nonempty_string_rule():
+    """sqlite3, case by case (issue #38's own body):
+    `'0.0'` -> falsy (the whole string parses to numeric `0.0`);
+    `'  1  '` -> truthy (whitespace-trimmed leading-prefix parse gives
+    `1`); `'1abc'` -> truthy (leading-prefix parse gives `1` - proves
+    this is arithmetic's leading-prefix rule, not affinity's stricter
+    whole-string rule, which would leave `'1abc'` as unconverted text);
+    `'0abc'` -> falsy, the case that actually distinguishes the
+    leading-prefix rule from a wrong "any nonempty string is truthy"
+    hypothesis, under which `'0abc'` would wrongly be kept; `''` and
+    `'abc'` -> falsy, no digit anywhere, coerce to `0` (the same rule
+    arithmetic uses: `'abc'+1` is `1`)."""
+    from historian.exec.expression import coerce_to_bool3
+
+    assert coerce_to_bool3("0.0") is False
+    assert coerce_to_bool3("  1  ") is True
+    assert coerce_to_bool3("1abc") is True
+    assert coerce_to_bool3("0abc") is False
+    assert coerce_to_bool3("") is False
+    assert coerce_to_bool3("abc") is False
+
+
+def test_coerce_to_bool3_applied_to_a_real_bare_column_evaluate_result():
+    """End to end through `evaluate()`: a bare `BoundColumnRef` is
+    value-shaped, so `evaluate()` returns the row's raw `n=5`, never a
+    `Bool3` - `coerce_to_bool3` gives it truthiness (`5 != 0`,
+    `True`), matching `sqlite3`'s `select x from t where x` keeping a
+    nonzero numeric column."""
+    from historian.exec.expression import coerce_to_bool3, evaluate
+
+    assert coerce_to_bool3(evaluate(_col("n"), _ROW, _SCHEMA)) is True
+
+
+def test_coerce_to_bool3_applied_to_a_computed_null_valued_expression():
+    """A `NULL`-valued *value-shaped* expression, not a comparison:
+    `NULL + n` is `NULL` for every row (arithmetic propagates NULL).
+    `coerce_to_bool3` passes the `None` through unchanged, and
+    `values.is_true` then drops the row exactly like any other `NULL`
+    predicate - no crash, no special-casing needed here."""
+    from historian.exec.expression import coerce_to_bool3, evaluate
+
+    null_plus_n = _bin(Operator.ADD, _lit(None), _col("n"))
+
+    assert coerce_to_bool3(evaluate(null_plus_n, _ROW, _SCHEMA)) is None
+
+
 # --- Code-level enforcement: no stray float() outside named exceptions --
 
 

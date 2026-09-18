@@ -592,20 +592,98 @@ def test_binary_file_blamed_line(awkward_repo):
     _assert_differential(awkward_repo, "SELECT path, line FROM blame WHERE path = 'binary.bin'")
 
 
-# --- #48: SELECT 1 = 1 prints Python True, not SQLite's 1 --------------
+# --- #38/#48: SELECT 1 = 1 prints SQLite's 1, not Python's True --------
 #
 # The case demonstrating the oracle catches a genuine disagreement -
 # and the reason the comparator above has to be strict-typed rather
-# than bare `==`. strict=True so the suite breaks loudly (XPASS) the
-# moment #48 is fixed and this marker is left behind.
+# than bare `==`. Was `xfail(strict=True)` for #48; #38's
+# `Project`-side `coerce_to_value` call (`exec/expression.py`,
+# `exec/operators.py`) fixes it, so this is now a normal passing case
+# - leaving the marker in place would fail the suite on XPASS.
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="#48: Project stores the raw Bool3, CLI/row output is Python True/False, not SQLite's 1/0",
-)
 def test_select_list_comparison_prints_python_bool_not_sqlite_int(tiny_repo):
     _assert_differential(tiny_repo, "SELECT 1 = 1 FROM blame")
+
+
+# --- #38: every predicate-shaped node reaching a select-list position --
+#
+# One case per predicate-shaped node kind: a comparison is covered
+# above; this covers IS/IS NOT, LIKE, IN, BETWEEN, AND/OR, and NOT.
+# Each goes through the same `coerce_to_value` call, so `type(cell) is
+# int` for every row, never `bool` - `assert_rows_match`'s strict-typed
+# comparator is what actually checks that, against `sqlite3` directly.
+
+
+def test_select_list_is_null_prints_sqlite_int(tiny_repo):
+    _assert_differential(tiny_repo, "SELECT line_no IS NULL FROM blame")
+
+
+def test_select_list_in_prints_sqlite_int(tiny_repo):
+    _assert_differential(tiny_repo, "SELECT line_no IN (1, 2) FROM blame")
+
+
+def test_select_list_like_prints_sqlite_int(tiny_repo):
+    _assert_differential(tiny_repo, "SELECT path LIKE 'a%' FROM blame")
+
+
+def test_select_list_between_prints_sqlite_int(tiny_repo):
+    _assert_differential(tiny_repo, "SELECT line_no BETWEEN 1 AND 3 FROM blame")
+
+
+def test_select_list_and_prints_sqlite_int(tiny_repo):
+    _assert_differential(tiny_repo, "SELECT line_no > 1 AND path = 'a.py' FROM blame")
+
+
+def test_select_list_not_prints_sqlite_int(tiny_repo):
+    _assert_differential(tiny_repo, "SELECT NOT (line_no = 1) FROM blame")
+
+
+# --- #38: WHERE over a value-shaped predicate -------------------------
+#
+# `evaluate()` returns a plain `Value` for these, not a `Bool3` -
+# `Filter`'s `coerce_to_bool3` call gives it SQLite's C-style
+# truthiness (leading-prefix numeric coercion, `!= 0`) before
+# `values.is_true` ever sees it, rather than raising `TypeError`.
+
+
+def test_where_bare_numeric_column_uses_c_style_truthiness(tiny_repo):
+    """`line_no` is 1-based and never `0` in any fixture row, so every
+    row is kept - the point is no crash and the right predicate, not
+    that anything gets filtered here (issue #38's own acceptance
+    criterion for this case)."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE line_no")
+
+
+def test_where_bare_text_column_uses_leading_prefix_numeric_truthiness(tiny_repo):
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE path")
+
+
+def test_where_leading_digit_text_literal_is_falsy_not_merely_nonempty(tiny_repo):
+    """Pins the leading-prefix numeric-coercion rule against the
+    "nonempty string is truthy" alternative: confirmed against
+    `sqlite3`, `create table t(s text); insert into t values('0abc');
+    select 'kept' from t where s;` -> no rows. `'0abc'` is digit-
+    leading but not purely numeric - the leading-prefix rule reads it
+    as `0`, falsy, dropping every row; "nonempty string is truthy"
+    would wrongly keep them all."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE '0abc'")
+
+
+def test_where_computed_value_expression_uses_same_truthiness(tiny_repo):
+    """Not a bare column - `line_no - line_no` is always `0`, so every
+    row is dropped, confirming the coercion applies to a computed
+    value-shaped expression too, not only a `BoundColumnRef`."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE line_no - line_no")
+
+
+def test_where_null_valued_expression_drops_rows_without_raising(tiny_repo):
+    """`author_email` has no `blame` equivalent, so a `NULL`-valued
+    value-shaped expression is built from a literal instead:
+    `NULL + line_no` is `NULL` for every row (arithmetic propagates
+    NULL), and a `NULL` predicate in value position drops the row
+    without raising, exactly like any other `NULL` predicate."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE NULL + line_no")
 
 
 # --- Known disagreements that raise before producing rows --------------

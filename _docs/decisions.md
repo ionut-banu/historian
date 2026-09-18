@@ -819,3 +819,57 @@ now says so explicitly - `expected ',' or FROM, found
 identifier 'p' - a select-list alias requires AS before it` -
 so the rejection points at what to add instead of just naming
 the token it did not expect.
+
+2026-09-19 - A digit run glued to an identifier character is
+one bad token, `LexError`, not two good ones (issue #22).
+`sqlite3` 3.51.0 rejects `3abc`, `1²`, `3café`, `0y`, `3from`
+and `1select` as "unrecognized token"; historian's lexer used
+to split each into `INTEGER` then `IDENTIFIER`, which let
+`SELECT 3abc FROM blame` reach #25's bare-alias `ParseError`
+and be told to add `AS` - a fix SQLite also rejects. The rule:
+`_read_number` now checks the character immediately after a
+completed digit run against `_is_identifier_start`, and raises
+if it matches.
+
+Excluded from that check: `e`, `E`, `x`, `X` and `_`. The first
+four are scientific-notation and hex-integer markers (`1e10`,
+`0x1f`) - real SQLite literals `_read_number` does not parse
+yet, deferred to #6; rejecting them here would be a step
+backward; treating a suffix as a marker without knowing where
+it ends would need most of #6's own analysis. `_` was added
+during this issue's grooming: `sqlite3` 3.51.0 accepts `_` as a
+digit-group separator (`3_1` -> `31`, `1_000_000` -> `1000000`,
+added upstream in 3.46.0), a feature named nowhere in this
+repo before now and not implemented here - filed as #70. `_`
+satisfies `_is_identifier_start`, so the unqualified version of
+this rule would have turned `3_1` from "masked by #25" into
+"rejects input SQLite accepts" - a regression the whole point
+of this fix was to avoid introducing. Excluding these five
+leaves `3e`, `3x`, `3_` and `3_abc` exactly as they were before
+this issue (still wrong against SQLite, still not this issue's
+problem to fix) rather than fixing them into a different wrong
+answer.
+
+The message - `"3abc is not a valid token: a number cannot be
+directly followed by an identifier character, at line L,
+column C"` - is historian's own wording, matching the
+convention the lexer's other two multi-character-literal
+messages already use rather than echoing `sqlite3`'s generic
+"unrecognized token". It deliberately contains neither "AS"
+nor "alias", so it can never be mistaken for #25's message even
+though both are triggered by a digit run followed by letters -
+confirmed by grep, and by the two call sites staying different
+exception types (`LexError` in `cli.py`'s lexer branch,
+`ParseError` in its parser branch). The position it carries is
+the start of the digit run, matching where `sqlite3`'s own
+`^--- error here` caret lands and the position convention the
+lexer's other `LexError`s already use.
+
+No change to `sql/parser.py`: #25's bare-alias branch fires on
+any `IDENTIFIER` immediately after a select-list expression,
+and still does, unchanged, for every shape that isn't a digit
+run glued to an identifier (`SELECT path p FROM blame`, the
+dropped-comma case). `tokenize("3abc")` now raises before
+`parse()` is ever called, so that one input shape simply stops
+arriving at the parser's branch at all - confirmed by running
+both, not assumed from reading the branch condition.

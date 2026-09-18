@@ -37,12 +37,23 @@ away before the parser gets a say.
 Which errors are the lexer's
 -----------------------------
 
-`LexError` is raised for exactly three things, each confirmed against
+`LexError` is raised for exactly four things, each confirmed against
 `sqlite3` rather than assumed: an unterminated single-quoted string, an
-unterminated double-quoted identifier, and a character that starts no
-valid v1 token. An identifier that is not a keyword, or is not a real
-column, is not a lexer error - that is `sql/binder.py`'s job, and it
-needs schema context this module never has.
+unterminated double-quoted identifier, a character that starts no valid
+v1 token, and - issue #22 - a completed digit run immediately followed,
+with no separator, by a character that would otherwise start an
+identifier (`3abc`, `1²`, `3café`). An identifier that is not a
+keyword, or is not a real column, is not a lexer error - that is
+`sql/binder.py`'s job, and it needs schema context this module never
+has.
+
+The fourth case carves out `e`, `E`, `x`, `X` and `_` - a digit run
+followed by one of those five still lexes as two tokens, unchanged.
+Telling a bad glue (`3abc`) from a legitimate numeric literal (`1e10`,
+`0x1f`, SQLite's 3.46+ `3_1` digit-group separator) needs knowing which
+suffixes continue a number, which `_read_number` does not implement
+yet - that is issues #6 (scientific notation, hex) and #70 (digit-group
+separators), not this one. See `_read_number`'s `_GLUE_EXCLUDED`.
 
 Not in this module
 -------------------
@@ -50,9 +61,10 @@ Not in this module
 Parsing, precedence, and any tree structure (`sql/parser.py`).
 Scientific notation (`1e10`), hex integers (`0x1F`), `==` as an alias
 for `=`, and `/* */` block comments are real SQLite syntax but are not
-part of the v1 grammar in §1 - deferred to issue #6. Boolean literals
-are deferred too; `historian.values.Value` deliberately excludes `bool`
-(see its module docstring).
+part of the v1 grammar in §1 - deferred to issue #6. Digit-group
+separators (`3_1`, SQLite 3.46+) are deferred to issue #70. Boolean
+literals are deferred too; `historian.values.Value` deliberately
+excludes `bool` (see its module docstring).
 """
 
 from __future__ import annotations
@@ -424,6 +436,16 @@ class _Lexer:
 
     # -- numeric literals ------------------------------------------------
 
+    #: Characters excluded from the glued-identifier check below, kept
+    #: lexing as two separate tokens exactly as before issue #22. Not
+    #: "these can never be a bug" - `3e`, `3x`, `3_`, `3_abc` are all
+    #: confirmed-bad in SQLite too - but telling those apart from a
+    #: legitimate continuation (`1e10`, `0x1f`, `3_1`) needs numeric-
+    #: literal knowledge `_read_number` does not have yet: issue #6 for
+    #: `e`/`E`/`x`/`X` (scientific notation, hex), issue #70 for `_`
+    #: (SQLite 3.46+'s digit-group separator). See the module docstring.
+    _GLUE_EXCLUDED = frozenset({"e", "E", "x", "X", "_"})
+
     def _read_number(self, start: Position) -> Token:
         chars: list[str] = []
         is_real = False
@@ -434,6 +456,28 @@ class _Lexer:
             chars.append(self._advance())
             while _is_ascii_digit(self._peek()):
                 chars.append(self._advance())
+
+        glue = self._peek()
+        if (
+            glue not in self._GLUE_EXCLUDED
+            and glue != ""
+            and _is_identifier_start(glue)
+        ):
+            # A completed digit run directly glued to an identifier
+            # character is one bad token to SQLite, not a number
+            # followed by a name - issue #22. Consume the rest of the
+            # glued run so the message can echo the whole offending
+            # token, the way sqlite3's own "unrecognized token" does.
+            while _is_identifier_char(self._peek()):
+                chars.append(self._advance())
+            text = "".join(chars)
+            raise LexError(
+                f"{text} is not a valid token: a number cannot be "
+                "directly followed by an identifier character, at "
+                f"line {start.line}, column {start.column}",
+                start,
+            )
+
         token_type = TokenType.REAL if is_real else TokenType.INTEGER
         return Token(token_type, "".join(chars), start)
 

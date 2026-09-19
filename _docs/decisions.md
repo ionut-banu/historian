@@ -873,3 +873,60 @@ dropped-comma case). `tokenize("3abc")` now raises before
 `parse()` is ever called, so that one input shape simply stops
 arriving at the parser's branch at all - confirmed by running
 both, not assumed from reading the branch condition.
+2026-09-19 - a bare column mixed with an aggregate, no GROUP
+BY, is a BindError - not SQLite's arbitrary row
+
+Issue #60. `SELECT path, count(*) FROM blame` (no `GROUP BY`)
+raises `BindError` in historian. Confirmed against `sqlite3
+3.51.0` that this is legal there: `select a, count(*) from t`
+(three rows, `a` = 1,1,2) returns one row, `a=1` - sqlite3's own
+documentation calls this "an arbitrarily chosen row of the
+group." historian does not adopt that behaviour.
+
+This is not the usual "where historian and SQLite disagree,
+SQLite is right" case (AGENTS.md; spec §1's "semantics follow
+SQLite exactly"). That rule arbitrates a *disagreement about
+what a query means*. Here there is nothing to arbitrate:
+SQLite's own choice of row is undocumented and implementation-
+defined, so there is no rule to copy in the first place - the
+same category #25's AS-mandatory decision used ("SQLite is
+permissive but the permissiveness has no principled shape to
+copy").
+
+Two findings make this more than a stylistic preference:
+
+1. Adopting SQLite's behaviour would contradict AGENTS.md's own
+   determinism rule: "the same repository and the same query
+   always produce the same rows in the same order." A query
+   whose answer depends on whichever row an engine happened to
+   visit last cannot satisfy that guarantee - historian could
+   not adopt SQLite's behaviour even if SQLite's own choice
+   were documented and stable, because determinism is a
+   property historian promises independently of what SQLite
+   does.
+2. It would also degrade the oracle rather than merely fail to
+   help it. §4 compares historian against SQLite over the same
+   rows. If historian picked one arbitrary row and SQLite
+   picked a different arbitrary row, the differential harness
+   would report a mismatch that is not a bug - and the natural
+   response to a red differential test is to keep changing
+   historian until it agrees, which is not possible here since
+   neither engine's choice is principled. That is a false
+   signal the suite has no way to tell apart from a real one.
+   Rejecting the query at bind time removes the shape from the
+   comparison entirely, rather than leaving a permanent,
+   unfixable source of noise in it.
+
+Net: this is the one case so far where matching SQLite is
+incompatible with a rule the project already holds (determinism)
+and where matching it would actively harm the machinery that
+checks everything else (the oracle). Implemented in
+`sql/binder.py`, after the whole select list is bound: when any
+select-list item contains an aggregate call anywhere, every
+item is walked for a bare column reference sitting outside every
+aggregate call's own arguments, and the first one found raises,
+naming the column. `count(path)` is unaffected - `path` there is
+inside the aggregate's own argument, not bare. `GROUP BY` (#69)
+will extend this rule rather than replace it: a bare column that
+*is* one of the grouping keys becomes legal again once grouping
+exists, but that is out of this decision's scope.

@@ -573,17 +573,126 @@ def test_type_affinity_is_not_checked_at_bind_time():
     assert bound.where is not None
 
 
-def test_function_name_and_arity_are_not_validated():
-    """`SELECT nonexistent_fn(path) FROM blame` binds successfully -
-    the `path` reference inside resolves normally, and whether
-    `nonexistent_fn` is real is left to a future function registry."""
-    bound = _bind("SELECT nonexistent_fn(path) FROM blame")
+#: Superseded by issue #60's aggregate registry - see the "Aggregate
+#: calls (issue #60)" section below. `nonexistent_fn(path)` used to
+#: bind successfully (the whole point of #45's complaint: the failure
+#: only ever surfaced later, generically, in `exec/expression.py`);
+#: it is a `BindError` now, checked directly below.
+
+
+# --- Aggregate calls (issue #60) ----------------------------------------
+#
+# `sql/binder.py`'s new function-name/arity registry, the WHERE-rejects-
+# aggregates rule, and the bare-column-mixed-with-aggregate narrowing
+# (`_docs/decisions.md`, 2026-09-19). Every expected shape below was
+# checked against `sqlite3` 3.51.0 during this issue's own grooming -
+# see the issue body's "Aggregate edge cases" section.
+
+
+def test_unknown_function_name_is_a_bind_error():
+    """`SELECT nonexistent_fn(path) FROM blame` - confirmed `sqlite3`
+    rejects this too (`no such function: nonexistent_fn`, a parse-time
+    error there). Historian's message does not need to match sqlite3's
+    wording (spec §3's Errors section only requires naming what is
+    unknown), but this must be a real, non-generic `BindError` - not
+    the old generic `EvalError` `exec/expression.py` used to raise
+    (#45's complaint) once evaluation actually reached the call."""
+    with pytest.raises(BindError) as exc_info:
+        _bind("SELECT nonexistent_fn(path) FROM blame")
+    assert "nonexistent_fn" in str(exc_info.value)
+
+
+def test_sum_with_no_arguments_is_an_arity_error():
+    """`SELECT sum() FROM blame` - confirmed a `Parse error` in
+    `sqlite3` ("wrong number of arguments to function sum()"); `sum`
+    (unlike `count`) always takes exactly one argument."""
+    with pytest.raises(BindError):
+        _bind("SELECT sum() FROM blame")
+
+
+def test_count_with_two_arguments_is_an_arity_error():
+    """`SELECT count(path, line_no) FROM blame` - confirmed a `Parse
+    error` in `sqlite3`; `count` takes zero, one bare expression, or
+    `*`, never two."""
+    with pytest.raises(BindError):
+        _bind("SELECT count(path, line_no) FROM blame")
+
+
+def test_sum_of_star_is_not_valid():
+    """`sum(*)` is not `sum(<every column>)` - `*` has no meaning for
+    any aggregate but `count`."""
+    with pytest.raises(BindError):
+        _bind("SELECT sum(*) FROM blame")
+
+
+def test_count_with_no_arguments_binds_like_count_star():
+    """`SELECT count() FROM blame` - confirmed legal in `sqlite3` and
+    identical to `count(*)`. Binds successfully; `plan/planner.py`
+    (issue #60) is what actually gives the two the same runtime
+    meaning, checked there."""
+    bound = _bind("SELECT count() FROM blame")
     call = bound.select_list[0].expr
     assert isinstance(call, FunctionCall)
-    assert call.name == "nonexistent_fn"
-    arg = call.args[0]
-    assert isinstance(arg, BoundColumnRef)
-    assert arg.name == "path"
+    assert call.args == ()
+
+
+def test_aggregate_call_in_where_is_a_bind_error():
+    """`SELECT * FROM blame WHERE count(*) > 1` - confirmed `sqlite3`
+    rejects this too ("misuse of aggregate function count()"). An
+    aggregate call is never legal in `WHERE` in v1's grammar (no
+    `HAVING` yet for it to belong to - #69)."""
+    with pytest.raises(BindError) as exc_info:
+        _bind("SELECT * FROM blame WHERE count(*) > 1")
+    assert "count" in str(exc_info.value)
+
+
+def test_aggregate_nested_inside_where_predicate_is_still_a_bind_error():
+    """The WHERE-rejection applies at any depth, not only at the
+    predicate's root - `ctx.reject_aggregates` threads through every
+    recursive `_bind_expr` call unchanged."""
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame WHERE (count(*) > 1) AND path = 'a.py'")
+
+
+def test_bare_column_mixed_with_aggregate_is_a_bind_error():
+    """`SELECT path, count(*) FROM blame` - the narrowing decision
+    (`_docs/decisions.md`, 2026-09-19): a bare, non-aggregated column
+    alongside an aggregate call, no `GROUP BY`, is a `BindError` naming
+    the offending column - not sqlite3's arbitrary-row answer."""
+    with pytest.raises(BindError) as exc_info:
+        _bind("SELECT path, count(*) FROM blame")
+    assert "path" in str(exc_info.value)
+
+
+def test_bare_column_inside_an_aggregate_argument_is_not_flagged():
+    """`count(path)` is fine: `path` there is the aggregate's own
+    argument, not a bare column sitting outside it."""
+    bound = _bind("SELECT count(path) FROM blame")
+    assert bound.select_list[0].expr is not None
+
+
+def test_aggregate_free_query_is_unaffected_by_the_narrowing():
+    """`SELECT path FROM blame` has no aggregate anywhere in its
+    select list, so the narrowing rule never applies - this must keep
+    binding exactly as it always has."""
+    bound = _bind("SELECT path FROM blame")
+    assert isinstance(bound.select_list[0].expr, BoundColumnRef)
+
+
+def test_count_star_plus_literal_is_not_flagged():
+    """`SELECT count(*) + 1 FROM blame` - the surrounding arithmetic
+    references no bare column at all, so nothing is flagged."""
+    bound = _bind("SELECT count(*) + 1 FROM blame")
+    assert bound.select_list[0].expr is not None
+
+
+def test_two_aggregate_calls_in_one_query_bind_successfully():
+    """`SELECT count(*) + sum(line_no) FROM blame` - proves the
+    registry and the narrowing check both handle more than one
+    aggregate call in a single select list, not only a bare
+    `count(*)`."""
+    bound = _bind("SELECT count(*) + sum(line_no) FROM blame")
+    assert bound.select_list[0].expr is not None
 
 
 # --- No git, no subprocess needed to exercise this module --------------------

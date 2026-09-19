@@ -1,6 +1,7 @@
-"""Tests for historian.exec.operators: Scan, Filter, Project.
+"""Tests for historian.exec.operators: Scan, Filter, Project, Aggregate.
 
-Issue #34 (spec §6 M2 item 8b). Unit-style per spec §4's test-
+Issue #34 (spec §6 M2 item 8b) for Scan/Filter/Project; issue #60 adds
+the `Aggregate` section near the end. Unit-style per spec §4's test-
 architecture table ("`tests/test_operators.py` ... against in-memory
 rows, no repository") and `AGENTS.md`'s "no git and no subprocess" rule
 for everything above the scan layer: every fixture below is a hand-
@@ -13,6 +14,18 @@ against spec §2, without being `blame` itself: `path` (TEXT), `line_no`
 file's predicates and select lists actually exercise. Expected values
 for every predicate below were checked against the `sqlite3` command-
 line tool (3.51.0), matching `tests/test_expression.py`'s convention.
+
+The `Aggregate` section exists because real `blame` data cannot
+exercise several of its edge cases at all: `tables/blame.py` asserts
+every blame column is non-`NULL` before a row is ever emitted, and
+`CASE` does not exist yet (no AST node), so no expression built over
+real `blame` columns can ever be `NULL` for some rows and a real value
+for others in the same column - the exact shape `count(x)`'s and
+`sum`/`min`/`max`'s NULL-skipping behaviour needs to be seen actually
+skipping something. Those cases are unit tests against `Aggregate`
+with synthetic rows here, not differential tests - see
+`tests/differential/test_blame.py`'s own "Aggregate (issue #60)"
+section for what *is* covered differentially and why.
 """
 
 from __future__ import annotations
@@ -20,7 +33,10 @@ from __future__ import annotations
 import itertools
 from collections.abc import Iterator, Sequence
 
-from historian.exec.operators import Filter, Project, Scan
+import pytest
+
+from historian.exec.expression import EvalError
+from historian.exec.operators import Aggregate, AggregateCall, Filter, Project, Scan
 from historian.schema import Column, ColumnType, Row, Schema
 from historian.sql.ast import And, BinaryOp, Literal, Not, Operator as Op
 from historian.sql.binder import BoundColumnRef, BoundSelectItem
@@ -548,3 +564,232 @@ def test_operators_module_documents_the_value_bool3_boundary():
     assert "1 = 1" in combined_text or "SELECT 1" in combined_text
     assert "coerce_to_bool3" in combined_text
     assert "coerce_to_value" in combined_text
+
+
+# --- Aggregate (issue #60): the whole-table path only -----------------------
+#
+# See the module docstring's own note on why these are unit tests
+# against synthetic rows rather than differential cases: real `blame`
+# data cannot produce a column that is NULL for some rows and not
+# others, and several of these cases exist specifically to prove
+# NULL-skipping and mixed-storage-class ordering.
+
+
+def _agg_child(rows: Sequence[Row]) -> Scan:
+    return Scan(_FakeSource(rows))
+
+
+def _call(kind: str, arg=None) -> AggregateCall:
+    return AggregateCall(kind=kind, arg=arg, position=_POS)
+
+
+def test_aggregate_over_zero_rows_still_yields_exactly_one_row():
+    """Spec §3's named "classic mistake": an ungrouped `count(*)` over
+    zero input rows is `0`, not zero output rows - confirmed against
+    `sqlite3`: `create table e(n integer); select count(*) from e;` ->
+    one row, `0`."""
+    result = Aggregate(_agg_child([]), [_call("count")])
+
+    assert tuple(result.rows()) == ((0,),)
+
+
+def test_aggregate_sum_avg_min_max_over_zero_rows_are_all_null():
+    """`create table e(n integer); select count(*), sum(n), avg(n),
+    min(n), max(n) from e;` -> `0||||` (one row): `count(*)` is `0`,
+    every other aggregate is `NULL` over zero rows - the same input,
+    different answers, per the issue's own edge-case table."""
+    calls = [_call("count"), _call("sum", _col("line_no")), _call("avg", _col("line_no")),
+             _call("min", _col("line_no")), _call("max", _col("line_no"))]
+    result = Aggregate(_agg_child([]), calls)
+
+    assert tuple(result.rows()) == ((0, None, None, None, None),)
+
+
+def test_count_star_counts_every_row_including_null_valued_ones():
+    """`count(*)` counts rows regardless of `NULL` - confirmed against
+    `sqlite3`: `insert into t values (1,NULL),(1,NULL),(1,NULL); select
+    count(*), count(b) from t;` -> `count(*)=3`. Every row here has a
+    `NULL` `author_email`, and all three are still counted."""
+    rows = [("a.py", 1, None), ("a.py", 2, None), ("a.py", 3, None)]
+    result = Aggregate(_agg_child(rows), [_call("count")])
+
+    assert tuple(result.rows()) == ((3,),)
+
+
+def test_count_of_column_skips_null_values_unlike_count_star():
+    """`count(*)` vs `count(x)` vs `count(x)` over `(1),(2),(NULL),(2),
+    (NULL)`: confirmed against `sqlite3`, `count(*)=5`, `count(x)=3` -
+    `count(x)` counts only the rows where `x` is not `NULL`. Not
+    reachable differentially - see the module docstring."""
+    rows = [
+        ("a.py", 1, "x"),
+        ("a.py", 1, "y"),
+        ("a.py", 1, None),
+        ("a.py", 1, "z"),
+        ("a.py", 1, None),
+    ]
+    result = Aggregate(_agg_child(rows), [_call("count"), _call("count", _col("author_email"))])
+
+    assert tuple(result.rows()) == ((5, 3),)
+
+
+def test_sum_avg_min_max_ignore_null_valued_rows():
+    """A group where every value is `NULL`: `count(*)=3`, `count(b)=0`,
+    `sum(b)`/`avg(b)`/`min(b)`/`max(b)` all `NULL` - confirmed against
+    `sqlite3`. Uses `path` (TEXT) as the nullable argument here since
+    `_SCHEMA`'s only other nullable column, `author_email`, is also
+    TEXT - either works for this case, which is about NULL-skipping,
+    not type."""
+    rows = [(None, 1, "a"), (None, 2, "b"), (None, 3, "c")]
+    calls = [
+        _call("count"),
+        _call("count", _col("path")),
+        _call("sum", _col("path")),
+        _call("avg", _col("path")),
+        _call("min", _col("path")),
+        _call("max", _col("path")),
+    ]
+    result = Aggregate(_agg_child(rows), calls)
+
+    assert tuple(result.rows()) == ((3, 0, None, None, None, None),)
+
+
+def test_sum_avg_min_max_skip_only_the_null_rows_among_a_mix():
+    """Not every row is NULL this time: `sum`/`avg`/`min`/`max` must
+    ignore exactly the NULL rows and use only the rest (`1` and `5`,
+    skipping the middle row's NULL `line_no`), not treat a partially-
+    NULL column as entirely NULL or entirely non-NULL."""
+    calls = [
+        _call("sum", _col("line_no")),
+        _call("avg", _col("line_no")),
+        _call("min", _col("line_no")),
+        _call("max", _col("line_no")),
+    ]
+    mixed_rows: list[Row] = [("a.py", 1, "x"), ("a.py", None, "y"), ("a.py", 5, "z")]
+    result = Aggregate(_agg_child(mixed_rows), calls)
+
+    assert tuple(result.rows()) == ((6, 3.0, 1, 5),)
+
+
+def test_min_max_order_by_storage_class_then_by_value():
+    """`min`/`max` across mixed storage classes (`5` int, `'abc'` text,
+    `2.5` real, `NULL`, `'10'` text) - confirmed against `sqlite3`:
+    `min` is `2.5` (`typeof` real, the smallest *numeric* value -
+    `NULL` excluded first, then numeric ranks below text regardless of
+    magnitude), `max` is `'abc'` (`typeof` text - text ranks above
+    numeric, and `'abc' > '10'` bytewise since `'a'` (0x61) > `'1'`
+    (0x31))."""
+    rows: list[Row] = [("a.py", 5, "e1"), ("a.py", "abc", "e2"), ("a.py", 2.5, "e3"),
+                        ("a.py", None, "e4"), ("a.py", "10", "e5")]
+    result = Aggregate(
+        _agg_child(rows), [_call("min", _col("line_no")), _call("max", _col("line_no"))]
+    )
+
+    (row,) = tuple(result.rows())
+    assert row == (2.5, "abc")
+    assert type(row[0]) is float
+    assert type(row[1]) is str
+
+
+def test_sum_of_mixed_integer_and_real_promotes_to_real():
+    """`sum` of `(1, 2.5)` -> `3.5`, `typeof` real - confirmed against
+    `sqlite3`. `sum` switches to a floating accumulator the instant a
+    REAL value is seen."""
+    rows: list[Row] = [("a.py", 1, "e"), ("a.py", 2.5, "e")]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+    assert row == (3.5,)
+    assert type(row[0]) is float
+
+
+def test_sum_of_all_integers_stays_an_integer():
+    """The other half of the pair above: `sum` of purely-integer values
+    is not force-promoted to real just because it could be - confirmed
+    against `sqlite3`: `select sum(n), typeof(sum(n)) from (select 1
+    as n union all select 2);` -> `3|integer`."""
+    rows: list[Row] = [("a.py", 1, "e"), ("a.py", 2, "e")]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+    assert row == (3,)
+    assert type(row[0]) is int
+
+
+def test_avg_is_always_real_even_when_the_division_is_exact():
+    """`avg(2,4,6)` -> `4.0`, `typeof` real - confirmed against
+    `sqlite3`: `avg` never falls back to an integer result even when
+    the division has no remainder."""
+    rows: list[Row] = [("a.py", 2, "e"), ("a.py", 4, "e"), ("a.py", 6, "e")]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("avg", _col("line_no"))]).rows())
+
+    assert row == (4.0,)
+    assert type(row[0]) is float
+
+
+def test_sum_integer_overflow_raises_eval_error_not_wrap_or_promote():
+    """`create table o(n integer); insert into o values
+    (9223372036854775807),(1); select sum(n) from o;` -> `Runtime
+    error: integer overflow` in `sqlite3` - it does not wrap and does
+    not silently promote to REAL. historian's `sum` must raise too,
+    not return a wrong number."""
+    rows: list[Row] = [("a.py", 9223372036854775807, "e"), ("a.py", 1, "e")]
+    result = Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))])
+
+    with pytest.raises(EvalError):
+        list(result.rows())
+
+
+def test_sum_overflow_does_not_raise_once_a_real_value_has_been_seen():
+    """Confirmed against `sqlite3` (issue #60's own grooming: "two
+    copies of 9223372036854775807... and with one real added to force
+    promotion first - all three overflow attempts error the same
+    way")... except this specific ordering (REAL *first*, then a huge
+    integer) is exactly the case where sqlite3's own accumulator has
+    already switched to floating-point and stops checking for integer
+    overflow at all - confirmed directly: `select sum(n) from (select
+    1.0 as n union all select 9223372036854775807 union all select
+    9223372036854775807);` does not error. This is the asymmetric half
+    of `_sum_add`'s own docstring ("never raises again from that point
+    on") that the overflow test above cannot exercise by itself."""
+    rows: list[Row] = [
+        ("a.py", 1.0, "e"),
+        ("a.py", 9223372036854775807, "e"),
+        ("a.py", 9223372036854775807, "e"),
+    ]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+    assert type(row[0]) is float
+
+
+def test_count_star_and_count_paren_are_identical():
+    """`count()` (no arguments at all) means the same thing as
+    `count(*)` - confirmed against `sqlite3`. At the `Aggregate` level
+    both are simply `AggregateCall(kind="count", arg=None)`; the
+    planner (issue #60) is what makes the two parse to the same call,
+    checked there."""
+    rows: list[Row] = [("a.py", 1, "e"), ("b.py", 2, "e")]
+    result = Aggregate(_agg_child(rows), [_call("count", arg=None)])
+
+    assert tuple(result.rows()) == ((2,),)
+
+
+def test_aggregate_schema_declares_count_integer_and_avg_real():
+    """Not load-bearing (no `HAVING` yet to compare against it - #69),
+    but documented rather than arbitrary: `count`'s output column is
+    declared `INTEGER`, `avg`'s is declared `REAL`."""
+    result = Aggregate(_agg_child([]), [_call("count"), _call("avg", _col("line_no"))])
+
+    assert result.schema.columns[0].type is ColumnType.INTEGER
+    assert result.schema.columns[1].type is ColumnType.REAL
+
+
+def test_aggregate_consumes_child_rows_exactly_once():
+    """`Aggregate` cannot stream its own output (it needs every row
+    before it can produce the one row it emits), but it must still
+    pull each child row exactly once - not once per call, even with
+    several calls sharing the same child."""
+    source = _CountingSource([("a.py", 1, "e"), ("a.py", 2, "e"), ("a.py", 3, "e")])
+    scan = Scan(source)
+    result = Aggregate(scan, [_call("count"), _call("sum", _col("line_no")), _call("max", _col("line_no"))])
+
+    assert tuple(result.rows()) == ((3, 6, 3),)
+    assert source.pulled == 3

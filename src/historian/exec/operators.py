@@ -77,15 +77,17 @@ itself: the coercion helpers live next to `evaluate()` in
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from typing import Protocol
 
 from historian import values
-from historian.exec.expression import coerce_to_bool3, coerce_to_value, evaluate
+from historian.exec.expression import EvalError, coerce_to_bool3, coerce_to_value, evaluate
 from historian.schema import Column, ColumnType, Row, Schema
 from historian.sql.ast import Expr
 from historian.sql.binder import BoundColumnRef, BoundSelectItem
+from historian.sql.lexer import Position
 
-__all__ = ["Filter", "Operator", "Project", "Scan", "ScanSource"]
+__all__ = ["Aggregate", "AggregateCall", "Filter", "Operator", "Project", "Scan", "ScanSource"]
 
 
 class Operator(Protocol):
@@ -180,6 +182,206 @@ class Filter:
         for row in self._child.rows():
             if values.is_true(coerce_to_bool3(evaluate(self._predicate, row, child_schema))):
                 yield row
+
+
+# --- Aggregate (issue #60): the whole-table path only -----------------------
+#
+# `_docs/spec.md` §3's `Aggregate` operator, piece 1 (#60): count/sum/
+# avg/min/max, no GROUP BY, no HAVING (#69). Sits between Filter (or
+# Scan, when there is no WHERE) and Project - `plan/planner.py` is the
+# one place that decides whether to insert it at all, only when the
+# SELECT list has at least one aggregate call; an aggregate-free query
+# never builds one. "Whole-table" means exactly one output row, always
+# - even over zero input rows (spec §3's own named "classic mistake":
+# `count(*)` over zero rows is `0`, not zero output rows) - which is
+# why `rows()` below is a single pass over `child.rows()` followed by
+# exactly one `yield`, never zero and never more than one.
+
+
+@dataclass(frozen=True)
+class AggregateCall:
+    """One aggregate call `plan/planner.py` split out of a `SELECT`-
+    list expression: which of the five v1 aggregates (already
+    validated by `sql/binder.py` - nothing else can ever reach this
+    far), and its single bound argument expression, evaluated against
+    the *child's* schema (the row shape below `Aggregate`, before
+    aggregation) - `None` for `count(*)`/`count()`, which take no
+    argument at all and mean the same thing (confirmed against
+    `sqlite3`). `position` is the call's own position, used only if
+    `sum`'s running total overflows int64 (`_eval_sum_step` below) -
+    the one way this operator raises.
+    """
+
+    kind: str
+    arg: Expr | None
+    position: Position
+
+
+#: SQLite's `int64` bounds - `sum`'s own overflow check. Kept separate
+#: from `exec/expression.py`'s `_int64_bounded` (arithmetic's int64
+#: rule *promotes to REAL* on overflow, `_docs/decisions.md`,
+#: 2026-09-01) because `sum`'s rule is different and confirmed against
+#: `sqlite3` directly (issue #60's own grooming): a purely-integer
+#: running total that overflows int64 raises - it does not wrap and it
+#: does not silently promote to a float the way ordinary arithmetic
+#: does.
+_SUM_INT64_MIN = -9223372036854775808
+_SUM_INT64_MAX = 9223372036854775807
+
+
+def _sum_add(total: values.Value, value: values.Value, position: Position) -> values.Value:
+    """One running-total step for `sum` only (never `avg` - see
+    `_Accumulator.step`'s own `avg` branch, which accumulates
+    independently and never raises). Both operands are already
+    non-NULL `Value`s.
+
+    While both `total` and `value` are `int`, the addition is exact
+    Python `int` arithmetic, checked against int64 bounds afterward -
+    confirmed against `sqlite3`: `sum` over two copies of int64's own
+    max raises `integer overflow`, it does not wrap and does not
+    promote. The moment either operand is a `float`, this switches to
+    float addition permanently (a later `int` value added to an
+    already-`float` total promotes through Python's own `int + float`)
+    and never raises again from that point on - `sqlite3`'s own `sum()`
+    switches to a floating accumulator the instant a REAL value is
+    seen and stops checking for integer overflow, matching #60's own
+    "sum of a mix of integer and real returns real" edge case.
+    """
+    if isinstance(total, int) and isinstance(value, int):
+        result = total + value
+        if not (_SUM_INT64_MIN <= result <= _SUM_INT64_MAX):
+            raise EvalError(
+                "integer overflow computing sum(...) - sqlite3 raises here too, "
+                "rather than wrapping or promoting to REAL",
+                position,
+            )
+        return result
+    return float(total) + float(value)
+
+
+class _Accumulator:
+    """Per-call running state for one whole-table aggregate. `Aggregate.
+    rows()` builds one instance per `AggregateCall`, steps every one of
+    them with every child row exactly once, then reads `finish()` -
+    never a second pass over the child's rows.
+
+    `step`/`finish` dispatch on `self._call.kind` with a plain `if`/
+    `elif` chain - not a per-kind subclass and not a dispatch table
+    keyed by function (`AGENTS.md`: no dynamic dispatch tricks), the
+    same style `exec/expression.py`'s own `evaluate()` already uses for
+    its node-type dispatch. This is meant to port to Rust later, where
+    an enum match is the direct idiom for exactly this shape.
+    """
+
+    def __init__(self, call: AggregateCall) -> None:
+        self._call = call
+        self._count = 0  # count(*)/count(): every row, NULL or not
+        self._non_null_count = 0  # count(<expr>), and avg's denominator
+        self._sum: values.Value = None  # sum's running total; None until the first non-NULL value
+        self._avg_total = 0.0  # avg's own running total - always float, never raises
+        self._extreme: values.Value = None  # min/max's running extreme; None until the first non-NULL value
+
+    def step(self, row: Row, schema: Schema) -> None:
+        call = self._call
+        if call.kind == "count":
+            # Every row counts for count(*)/count() (call.arg is None) -
+            # confirmed against sqlite3: count(*) counts rows
+            # regardless of NULL. count(<expr>) counts only the rows
+            # where the expression is non-NULL instead.
+            self._count += 1
+            if call.arg is None:
+                return
+            if coerce_to_value(evaluate(call.arg, row, schema)) is not None:
+                self._non_null_count += 1
+            return
+
+        # sum/avg/min/max all ignore a NULL argument value entirely -
+        # confirmed against sqlite3 (spec §3's aggregate edge-case
+        # table: "sum/avg/min/max with some NULLs: NULLs ignored").
+        value = coerce_to_value(evaluate(call.arg, row, schema))
+        if value is None:
+            return
+        self._non_null_count += 1
+        if call.kind == "sum":
+            self._sum = value if self._sum is None else _sum_add(self._sum, value, call.position)
+        elif call.kind == "avg":
+            self._avg_total += value
+        elif call.kind == "min":
+            if self._extreme is None or values.order_key(value) < values.order_key(self._extreme):
+                self._extreme = value
+        elif call.kind == "max":
+            if self._extreme is None or values.order_key(value) > values.order_key(self._extreme):
+                self._extreme = value
+        else:
+            raise AssertionError(f"exec/operators.py: unhandled aggregate kind {call.kind!r}")
+
+    def finish(self) -> values.Value:
+        call = self._call
+        if call.kind == "count":
+            return self._count if call.arg is None else self._non_null_count
+        if call.kind == "sum":
+            return self._sum  # None (NULL) if no non-NULL value was ever seen
+        if call.kind == "avg":
+            # Real-typed unconditionally, even when the division is
+            # exact (confirmed against sqlite3: avg(2,4,6) is 4.0, not
+            # 4) - Python's `/` already returns a float here since
+            # self._avg_total starts at 0.0, so no explicit cast is
+            # needed for that; the NULL-over-zero-rows case still needs
+            # its own check, since 0/0 would otherwise raise.
+            return None if self._non_null_count == 0 else self._avg_total / self._non_null_count
+        if call.kind in ("min", "max"):
+            return self._extreme  # None (NULL) if no non-NULL value was ever seen
+        raise AssertionError(f"exec/operators.py: unhandled aggregate kind {call.kind!r}")
+
+
+def _aggregate_output_type(kind: str) -> ColumnType:
+    """The declared type `Aggregate`'s own output schema gives one
+    call's column. Not load-bearing the way a real table column's type
+    is - nothing compares against an `Aggregate` output column in this
+    issue's scope (no `HAVING` until #69) - documented rather than
+    arbitrary: `count` is always `INTEGER`, `avg` is always `REAL`
+    (confirmed above), and `sum`/`min`/`max` are whatever the actual
+    computed value turns out to be at runtime, which this schema cannot
+    know in advance - `TEXT` is `exec/operators.py`'s own existing
+    placeholder for exactly this situation (`_project_column`, below)."""
+    if kind == "count":
+        return ColumnType.INTEGER
+    if kind == "avg":
+        return ColumnType.REAL
+    return ColumnType.TEXT
+
+
+class Aggregate:
+    """`_docs/spec.md` §3's `Aggregate` operator, whole-table path only
+    (#60; `GROUP BY`/`HAVING` are #69). `calls` is the ordered list of
+    aggregate calls `plan/planner.py` split out of the `SELECT` list -
+    each gets one output column, in the same order, computed by
+    streaming `child.rows()` through this operator exactly once.
+
+    Every call's argument is evaluated against `child`'s schema (the
+    row shape *below* aggregation), never against this operator's own
+    output schema - `Project`, above this operator, is what evaluates
+    the surrounding scalar expression against *this* operator's output
+    row instead, per spec §3's "Expression evaluation" split.
+    """
+
+    def __init__(self, child: Operator, calls: Sequence[AggregateCall]) -> None:
+        self._child = child
+        self._calls = tuple(calls)
+        self.schema = Schema(
+            columns=tuple(
+                Column(f"{call.kind}_{index + 1}", _aggregate_output_type(call.kind))
+                for index, call in enumerate(self._calls)
+            )
+        )
+
+    def rows(self) -> Iterator[Row]:
+        child_schema = self._child.schema
+        accumulators = [_Accumulator(call) for call in self._calls]
+        for row in self._child.rows():
+            for accumulator in accumulators:
+                accumulator.step(row, child_schema)
+        yield tuple(accumulator.finish() for accumulator in accumulators)
 
 
 #: The positional placeholder used for a `Project` output column whose

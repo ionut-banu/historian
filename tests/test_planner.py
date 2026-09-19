@@ -19,10 +19,10 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
-from historian.exec.operators import Filter, Project, Scan
+from historian.exec.operators import Aggregate, Filter, Project, Scan
 from historian.plan.planner import TABLES, plan
 from historian.schema import Column, ColumnType, Row, Schema
-from historian.sql.ast import BinaryOp, Literal, Operator as Op
+from historian.sql.ast import BinaryOp, FunctionCall, Literal, Operator as Op, Star
 from historian.sql.binder import BoundColumnRef, BoundSelectItem, BoundSelectStatement
 from historian.sql.lexer import Position
 from historian.tables.blame import BlameScan
@@ -216,3 +216,145 @@ def test_plan_uses_default_tables_catalog_when_none_given():
     assert isinstance(tree._child, Scan)
     assert isinstance(tree._child._source, BlameScan)
     assert tree._child._source._repo == repo
+
+
+# --- The aggregate/scalar split and the Aggregate operator (issue #60) -----
+#
+# `_stmt`'s select-list items are `BoundSelectItem`s built directly
+# (not through `sql/binder.py`), so a `FunctionCall` here stands in for
+# whatever the binder would have already validated - these tests trust
+# `tests/test_binder.py`'s own coverage of validation and exercise only
+# the planner's own job: the split and the tree shape.
+
+
+def _count_star() -> FunctionCall:
+    return FunctionCall(name="count", args=(Star(table=None, position=_POS),), position=_POS)
+
+
+def _func(name: str, *args) -> FunctionCall:
+    return FunctionCall(name=name, args=tuple(args), position=_POS)
+
+
+def test_plan_with_aggregate_inserts_aggregate_below_project_above_scan():
+    """`SELECT count(*) FROM widgets`, no `WHERE`: `Project(Aggregate(
+    Scan(...), calls), select_list)` - `Aggregate` sits directly below
+    `Project` and above `Scan`, per the issue's own acceptance
+    criterion for the tree shape."""
+    source = _FakeSource([("a.py", 1, "ana@x.com")])
+    stmt = _stmt([_select_item(_count_star())], where=None)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Project)
+    assert isinstance(tree._child, Aggregate)
+    assert isinstance(tree._child._child, Scan)
+
+
+def test_plan_with_aggregate_and_where_inserts_aggregate_below_project_above_filter():
+    """`SELECT count(*) FROM widgets WHERE path = 'a.py'`: `Project(
+    Aggregate(Filter(Scan(...), predicate), calls), select_list)` -
+    the full `Scan -> Filter -> Aggregate -> Project` shape the issue
+    names explicitly, with `Filter` still consuming `Scan`'s output and
+    `Aggregate` consuming `Filter`'s."""
+    source = _FakeSource([("a.py", 1, "ana@x.com")])
+    predicate = _bin(Op.EQ, _col("path"), _lit("a.py"))
+    stmt = _stmt([_select_item(_count_star())], where=predicate)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Project)
+    assert isinstance(tree._child, Aggregate)
+    assert isinstance(tree._child._child, Filter)
+    assert isinstance(tree._child._child._child, Scan)
+    assert tree._child._child._predicate is predicate
+
+
+def test_plan_without_any_aggregate_call_never_builds_aggregate():
+    """An ordinary, aggregate-free query keeps issue #13's original two
+    shapes exactly - `Aggregate` must never appear for
+    `SELECT path FROM widgets`, a regression guard for every planner
+    test that predates this issue."""
+    source = _FakeSource([("a.py", 1, "ana@x.com")])
+    stmt = _stmt([_select_item(_col("path"))], where=None)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Project)
+    assert isinstance(tree._child, Scan)
+
+
+def test_plan_splits_a_bare_aggregate_call_into_one_slot():
+    """`SELECT count(*) FROM widgets`: `Aggregate` gets exactly one
+    `AggregateCall` (`kind="count"`, `arg=None`), and the select-list
+    item `Project` evaluates is rewritten to a bare reference into
+    `Aggregate`'s output row, not the original `FunctionCall`."""
+    source = _FakeSource([])
+    stmt = _stmt([_select_item(_count_star())], where=None)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert len(tree._child._calls) == 1
+    call = tree._child._calls[0]
+    assert call.kind == "count"
+    assert call.arg is None
+    rewritten = tree._select_list[0].expr
+    assert isinstance(rewritten, BoundColumnRef)
+    assert rewritten.offset == 0
+
+
+def test_plan_splits_two_aggregate_calls_in_one_expression_in_order():
+    """`SELECT count(*) + sum(line_no) FROM widgets`: two distinct
+    `AggregateCall`s, in left-to-right order, and the surrounding `+`
+    survives as a `BinaryOp` over the two rewritten references -
+    proving the split handles more than a bare aggregate as the whole
+    select-list item."""
+    source = _FakeSource([])
+    expr = _bin(Op.ADD, _count_star(), _func("sum", _col("line_no")))
+    stmt = _stmt([_select_item(expr)], where=None)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert [call.kind for call in tree._child._calls] == ["count", "sum"]
+    assert tree._child._calls[0].arg is None
+    assert tree._child._calls[1].arg is not None
+
+    rewritten = tree._select_list[0].expr
+    assert isinstance(rewritten, BinaryOp)
+    assert rewritten.op is Op.ADD
+    assert isinstance(rewritten.left, BoundColumnRef) and rewritten.left.offset == 0
+    assert isinstance(rewritten.right, BoundColumnRef) and rewritten.right.offset == 1
+
+
+def test_plan_count_with_bare_column_argument_keeps_its_bound_expression():
+    """`SELECT count(line_no) FROM widgets`: the `AggregateCall`'s
+    `arg` is the original bound `line_no` reference (evaluated against
+    the *source* schema, below `Aggregate`), not `None` - `None` is
+    reserved for `count(*)`/`count()` alone."""
+    source = _FakeSource([])
+    stmt = _stmt([_select_item(_func("count", _col("line_no")))], where=None)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    call = tree._child._calls[0]
+    assert call.kind == "count"
+    assert isinstance(call.arg, BoundColumnRef)
+    assert call.arg.offset == _SCHEMA.index_of("line_no")
+
+
+def test_plan_aggregate_query_produces_correct_row_end_to_end():
+    """`SELECT count(*) FROM widgets WHERE line_no > 1` against three
+    fake rows, two of which survive the filter: the whole tree,
+    assembled purely by `plan()`, must actually produce `(2,)` when
+    pulled - not just have the right shape."""
+    rows = [
+        ("a.py", 1, "ana@x.com"),
+        ("b.py", 2, "bo@x.com"),
+        ("c.py", 3, "cara@x.com"),
+    ]
+    source = _FakeSource(rows)
+    predicate = _bin(Op.GT, _col("line_no"), _lit(1))
+    stmt = _stmt([_select_item(_count_star())], where=predicate)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert list(tree.rows()) == [(2,)]

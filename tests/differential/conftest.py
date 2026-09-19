@@ -174,11 +174,15 @@ def run_historian(
     catches `LexError`, `ParseError`, `BindError` or `EvalError` -
     an uncaught one fails the test exactly like any other exception,
     which is what lets `test_blame.py` assert on them directly for
-    #25/#32/#51/#60. `run_historian("SELECT count(*) FROM blame", repo)`
+    #25/#32/#51 and, now, #60's own `BindError` cases (an aggregate call
+    in `WHERE`, a bare column mixed with an aggregate, arity/unknown-
+    function errors - see that file's "Aggregate (issue #60): BindError
+    cases" section). `run_historian("SELECT count(*) FROM blame", repo)`
     used to raise `EvalError` uncaught before issue #60 (no aggregate
     registry existed yet); it now runs to completion like any other
-    query, and #60's own aggregate-shaped differential cases go through
-    this same function unchanged.
+    query, and #60's own aggregate-shaped differential cases (that
+    file's "Aggregate (issue #60)" section) go through this same
+    function, unchanged, exactly like every other case in it.
     """
     tokens = tokenize(query)
     stmt = parse(tokens)

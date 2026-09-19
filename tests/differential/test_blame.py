@@ -745,6 +745,187 @@ def test_select_list_and_coerces_a_nested_value_shaped_operand(tiny_repo):
     _assert_differential(tiny_repo, "SELECT (line_no - line_no) AND 1 FROM blame")
 
 
+# --- Aggregate (issue #60): count/sum/avg/min/max, whole table only ----
+#
+# `tables/blame.py` asserts every blame column is non-NULL before a row
+# is ever emitted, and `CASE` does not exist yet (no AST node), so a
+# real `blame`-backed expression is either NULL for every row (a bare
+# NULL literal, tested below) or NULL for no row (any real column) -
+# never a mix in the same column. That covers the "all inputs NULL"
+# and "zero rows" edge cases below, but not "some NULLs, some real
+# values in the same column" (`count(x)`'s and `sum`/`min`/`max`'s core
+# NULL-skipping behaviour, or mixed-storage-class `min`/`max`
+# ordering) - those are direct unit tests against the `Aggregate`
+# operator with synthetic rows instead, in `tests/test_operators.py`'s
+# own "Aggregate" section, not differential cases here, because this
+# fixture genuinely cannot produce the shape needed.
+
+
+def test_aggregate_count_star(tiny_repo):
+    _assert_differential(tiny_repo, "SELECT count(*) FROM blame")
+
+
+def test_aggregate_count_star_over_where_matching_some_rows(tiny_repo):
+    _assert_differential(tiny_repo, "SELECT count(*) FROM blame WHERE path = 'src/utils.py'")
+
+
+def test_aggregate_count_star_over_where_matching_zero_rows(tiny_repo):
+    """`count(*)` over zero matching rows is `0`, not an empty result -
+    an explicit acceptance criterion, distinct from the zero-rows-
+    entirely case (`test_aggregate_sum_avg_min_max_over_where_matching_
+    zero_rows` below), which needs every other aggregate to answer
+    `NULL` for the very same empty input."""
+    _assert_differential(tiny_repo, "SELECT count(*) FROM blame WHERE path = 'no-such-file.py'")
+
+
+def test_aggregate_sum_avg_min_max_over_line_no(tiny_repo):
+    """`sum`/`avg`/`min`/`max` over the whole table's `line_no` -
+    real, non-NULL INTEGER data, matching some rows implicitly (every
+    row, since there is no `WHERE`). historian has no `typeof()` (no
+    scalar functions exist yet - spec §1), but `assert_rows_match`'s
+    own strict `type(sqlite_cell) is type(historian_cell)` check
+    already proves `sum(line_no)` stays a Python `int` here rather
+    than being force-promoted to `float`, with no `typeof()` needed."""
+    _assert_differential(
+        tiny_repo, "SELECT sum(line_no), avg(line_no), min(line_no), max(line_no) FROM blame"
+    )
+
+
+def test_aggregate_sum_avg_min_max_over_where_matching_some_rows(tiny_repo):
+    _assert_differential(
+        tiny_repo,
+        "SELECT sum(line_no), avg(line_no), min(line_no), max(line_no) "
+        "FROM blame WHERE path = 'src/utils.py'",
+    )
+
+
+def test_aggregate_sum_avg_min_max_over_where_matching_zero_rows(tiny_repo):
+    """The whole-table-with-zero-rows case (spec §3's named "classic
+    mistake") still emits exactly one row: `count` is `0`, the other
+    four are `NULL` - a different answer than `count(*)` alone gives
+    for the same empty input, which is exactly why both cases are
+    pinned separately."""
+    _assert_differential(
+        tiny_repo,
+        "SELECT count(line_no), sum(line_no), avg(line_no), min(line_no), max(line_no) "
+        "FROM blame WHERE path = 'no-such-file.py'",
+    )
+
+
+def test_aggregate_min_max_over_a_text_column(tiny_repo):
+    """`min`/`max` over `path` (TEXT), not `line_no` - a separate case
+    from the INTEGER cases above since `min`/`max`'s storage-class
+    ordering rule only has one class to exercise there; a TEXT column
+    exercises SQLite's bytewise text comparison instead."""
+    _assert_differential(tiny_repo, "SELECT min(path), max(path) FROM blame")
+
+
+def test_aggregate_count_star_vs_count_column_over_non_null_data(tiny_repo):
+    """`count(*)` and `count(path)` agree over `blame`, since `path` is
+    never NULL in real blame data - this fixture cannot by itself tell
+    `count(*)` and `count(<col>)` apart (that needs the synthetic unit
+    test in `tests/test_operators.py`), but it does confirm both
+    compute the fixture's real row count correctly through the whole
+    pipeline, planner split included."""
+    _assert_differential(tiny_repo, "SELECT count(*), count(path) FROM blame")
+
+
+def test_aggregate_of_null_literal_over_non_empty_result(tiny_repo):
+    """A single non-empty group where every aggregated value is NULL
+    (a bare `NULL` literal, not a real column - see the section's own
+    note on why): `count(NULL)` is `0`, the other four are `NULL` -
+    distinct from the zero-*rows* case above, since `blame` itself has
+    rows here, they just all evaluate the argument to NULL."""
+    _assert_differential(
+        tiny_repo, "SELECT count(NULL), sum(NULL), avg(NULL), min(NULL), max(NULL) FROM blame"
+    )
+
+
+def test_aggregate_call_plus_literal(tiny_repo):
+    """`count(*) + 1`: the planner's aggregate/scalar split handles an
+    aggregate call embedded in a larger expression, not only a bare
+    aggregate as the entire select-list item."""
+    _assert_differential(tiny_repo, "SELECT count(*) + 1 FROM blame")
+
+
+def test_two_aggregate_calls_in_one_expression(tiny_repo):
+    """`count(*) + sum(line_no)`: the split handles more than one
+    aggregate call in a single select-list expression."""
+    _assert_differential(tiny_repo, "SELECT count(*) + sum(line_no) FROM blame")
+
+
+def test_multiple_aggregate_calls_in_one_select_list(tiny_repo):
+    """Several separate select-list items, each its own aggregate call
+    - not one expression combining two, the case directly above -
+    proving the split's flat, ordered call list lines back up with the
+    right select-list item."""
+    _assert_differential(tiny_repo, "SELECT count(*), sum(line_no), max(line_no) FROM blame")
+
+
+def test_count_with_no_parens_content_equals_count_star(tiny_repo):
+    """`count()` (no arguments at all, not even `*`) means the same
+    thing as `count(*)` - confirmed against `sqlite3`."""
+    _assert_differential(tiny_repo, "SELECT count() FROM blame")
+
+
+# --- Aggregate (issue #60): BindError cases, asserted directly ---------
+#
+# Unlike the section above, these never reach SQLite at all - historian
+# raises `BindError` before either engine would produce a row, the same
+# style `test_where_unmatched_name_raises_bind_error` and the "Known
+# disagreements" section below already use. `test_where_count_star_
+# raises_bind_error` and `test_select_bare_column_with_aggregate_raises_
+# bind_error` are genuine SQLite disagreements (deliberate narrowings,
+# per `_docs/decisions.md`); the other three are cases where SQLite
+# itself also rejects the query (as a `Parse error`), just not with a
+# `BindError` historian's oracle comparison could diff against - there
+# is nothing to diff either way, since both engines refuse to run it.
+
+
+def test_where_count_star_raises_bind_error(tiny_repo):
+    """`SELECT * FROM blame WHERE count(*) > 1` - confirmed `sqlite3`
+    also rejects this ("misuse of aggregate function count()"), so this
+    is not a disagreement about semantics - it is one of §3's Errors
+    categories (unsupported grammar in this position), asserted
+    directly rather than diffed."""
+    with pytest.raises(BindError):
+        run_historian("SELECT * FROM blame WHERE count(*) > 1", tiny_repo)
+
+
+def test_select_bare_column_with_aggregate_raises_bind_error(tiny_repo):
+    """`SELECT path, count(*) FROM blame` (no `GROUP BY`) - the
+    narrowing decision, `_docs/decisions.md` 2026-09-19: SQLite returns
+    an arbitrary row's `path` here; historian raises `BindError`
+    instead, deliberately, so there is nothing to diff a row result
+    against."""
+    with pytest.raises(BindError):
+        run_historian("SELECT path, count(*) FROM blame", tiny_repo)
+
+
+def test_sum_with_no_arguments_raises_bind_error(tiny_repo):
+    """`SELECT sum() FROM blame` - confirmed a `Parse error` in
+    `sqlite3` too (wrong arity), just not one either engine can
+    diff a row result for."""
+    with pytest.raises(BindError):
+        run_historian("SELECT sum() FROM blame", tiny_repo)
+
+
+def test_count_with_two_arguments_raises_bind_error(tiny_repo):
+    """`SELECT count(path, line_no) FROM blame` - confirmed a `Parse
+    error` in `sqlite3` too (wrong arity for `count`)."""
+    with pytest.raises(BindError):
+        run_historian("SELECT count(path, line_no) FROM blame", tiny_repo)
+
+
+def test_nonexistent_function_raises_bind_error(tiny_repo):
+    """`SELECT nonexistent_fn(path) FROM blame` - confirmed a `Parse
+    error` in `sqlite3` too (`no such function: nonexistent_fn`). This
+    is #60's fix for #45's other half: the message is a real, specific
+    `BindError`, not `exec/expression.py`'s old generic `EvalError`."""
+    with pytest.raises(BindError):
+        run_historian("SELECT nonexistent_fn(path) FROM blame", tiny_repo)
+
+
 # --- Known disagreements that raise before producing rows --------------
 #
 # #25, #32 and #51 are open design questions ("whether it should stay

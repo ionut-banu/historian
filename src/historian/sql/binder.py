@@ -20,12 +20,53 @@ Not in this module
 **Type/affinity checking** - `WHERE line_no = '5'` binds successfully
 here; whether `'5'` needs coercing to compare against an `INTEGER`
 column is `exec/expression.py`'s job (#12), per spec §3's explicit
-split. **Function name/arity validation** - no registry of built-ins
-exists yet; `SELECT nonexistent_fn(path) FROM blame` binds
-successfully. **The rendered `error: ...` / caret / "blame has: ..."
+split. **The rendered `error: ...` / caret / "blame has: ..."
 box from spec §5** - milestone item 18; `BindError` here carries
 structured fields (message, position, available names), not text to
 print.
+
+Aggregate calls (issue #60)
+-----------------------------
+
+v1's grammar has no scalar functions at all (`_docs/spec.md` §1:
+"Scalar functions: a deliberately small set, chosen when the queries
+need them rather than up front" - none chosen yet), so `_AGGREGATE_NAMES`
+below (`count`/`sum`/`avg`/`min`/`max`) is not a partial registry
+alongside some other kind of function - it is every `FunctionCall`
+name this grammar can ever legally bind. `_validate_function_call`
+checks a call's name (ASCII-fold, same rule as every other identifier
+in this module) against that set before anything else in the
+`FunctionCall` branch of `_bind_expr` runs: an unrecognised name is
+`BindError("no such function: ...")` immediately, closing the gap
+#45 complained about (`SELECT nonexistent_fn(path) FROM blame` used
+to bind successfully and only fail later, generically, in
+`exec/expression.py`). A recognised name still gets its arity checked
+(`count` takes zero or one argument, `*` counts as one; `sum`/`avg`/
+`min`/`max` take exactly one, and never `*`) and, when `ctx.
+reject_aggregates` is set (`bind()` turns this on for `WHERE`, the
+one clause this issue's grammar can put an aggregate call in), is
+rejected outright - `WHERE count(*) > 1` is `BindError`, matching
+`sqlite3`'s own "misuse of aggregate function" rejection, though not
+its wording (§3's Errors section does not require that).
+
+A second, separate check lives in `bind()` itself, after the whole
+select list is bound: when any select-list item's expression contains
+an aggregate call anywhere, every item is walked for a bare column
+reference that sits outside every aggregate call's own arguments
+(`_split_for_aggregate_check`) - `SELECT path, count(*) FROM blame`
+raises, naming `path`, because there is no `GROUP BY` (not built until
+#69) for a bare, non-aggregated column to be grouped by. This is a
+deliberate narrowing of what `sqlite3` itself accepts (it silently
+picks a value from an arbitrary row) - see `_docs/decisions.md`,
+2026-09-19, for the full reasoning; §1's "SQLite is right" rule does
+not apply here because SQLite has no principled answer to copy, only
+an unspecified internal choice.
+
+Splitting an aggregate call out of its surrounding scalar expression
+(`count(*) + 1`) and building the `Aggregate` operator itself are not
+this module's job - `plan/planner.py` and `exec/operators.py` own
+those, per `_docs/spec.md` §3's "Expression evaluation" split. This
+module only decides whether the query is legal to run at all.
 
 `WHERE` resolving a select-list alias
 --------------------------------------
@@ -164,6 +205,14 @@ __all__ = [
 #: not revisited here.
 TABLES: dict[str, Schema] = {"blame": BLAME_SCHEMA}
 
+#: The v1 aggregate registry (issue #60): every `FunctionCall` name
+#: this grammar can legally bind, ASCII-folded. v1 has no scalar
+#: functions (`_docs/spec.md` §1), so this is not a partial list
+#: alongside some other kind of function - anything not in it is
+#: unconditionally unknown. See the module docstring's "Aggregate
+#: calls" section.
+_AGGREGATE_NAMES = frozenset({"count", "sum", "avg", "min", "max"})
+
 
 # --- Errors ------------------------------------------------------------
 #
@@ -295,6 +344,12 @@ class _Context:
     select_items: tuple[BoundSelectItem, ...] = ()
     alias_fallback: bool = False
     alias_first: bool = False
+    #: Issue #60: `True` while binding `WHERE` - the one clause a
+    #: `FunctionCall` can appear in today where an aggregate call is
+    #: never legal, regardless of name or arity. `False` (the default)
+    #: for the select list, where an aggregate call is exactly what
+    #: this issue exists to allow.
+    reject_aggregates: bool = False
 
 
 # --- FROM-table resolution -------------------------------------------------
@@ -430,6 +485,57 @@ def _bind_star(star: Star, ctx: _Context) -> list[BoundColumnRef]:
     ]
 
 
+# --- Aggregate-call validation (issue #60) ----------------------------------
+
+
+def _validate_function_call(call: FunctionCall, ctx: _Context) -> None:
+    """Name and arity for one `FunctionCall`, plus the WHERE-rejects-
+    aggregates rule - see the module docstring's "Aggregate calls"
+    section. Raises `BindError`; never returns a value, mirroring
+    `_bind_column_ref`'s own "raise or fall through" shape.
+
+    Order matters: an unrecognised name is rejected before
+    `ctx.reject_aggregates` is even consulted, so `WHERE foo(x) > 1`
+    (an unknown function, not a real aggregate) reports "no such
+    function", never "aggregate functions are not allowed in WHERE" -
+    the latter message would be actively misleading about what is
+    actually wrong.
+    """
+    name = _ascii_fold(call.name)
+    if name not in _AGGREGATE_NAMES:
+        raise BindError(
+            f"no such function: {call.name}", call.position, tuple(sorted(_AGGREGATE_NAMES))
+        )
+    if ctx.reject_aggregates:
+        raise BindError(
+            f"misuse of aggregate function {call.name}(): aggregate calls are not allowed in WHERE",
+            call.position,
+            (),
+        )
+    if name == "count":
+        # count() and count(*) are both zero-column forms (`*` is one
+        # AST node, not zero); count(<expr>) is the one-argument form.
+        # Never more than one - `count(path, line_no)` is exactly
+        # sqlite3's own arity error, differently worded (§3's Errors
+        # section does not require matching text).
+        if len(call.args) > 1:
+            raise BindError(
+                f"wrong number of arguments to function {call.name}()", call.position, ()
+            )
+        return
+    # sum/avg/min/max: exactly one argument, and never `*` - `sum(*)`
+    # is not `sum(<every column>)`; SQLite itself rejects it, and this
+    # grammar has no meaning to give it either.
+    if len(call.args) != 1:
+        raise BindError(f"wrong number of arguments to function {call.name}()", call.position, ())
+    if isinstance(call.args[0], Star):
+        raise BindError(
+            f"{call.name}(*) is not valid: {call.name} takes a single expression, not *",
+            call.position,
+            (),
+        )
+
+
 # --- General expression binding --------------------------------------------
 #
 # One case per `sql/ast.py` node type. Every type other than
@@ -471,12 +577,17 @@ def _bind_expr(expr: Expr, ctx: _Context) -> Expr:
             (),
         )
     if isinstance(expr, FunctionCall):
+        # Issue #60: name/arity/WHERE-rejection, before anything else -
+        # see _validate_function_call and the module docstring's
+        # "Aggregate calls" section. Every FunctionCall past this point
+        # is a real, correctly-arity aggregate call.
+        _validate_function_call(expr, ctx)
         if len(expr.args) == 1 and isinstance(expr.args[0], Star) and expr.args[0].table is None:
-            # count(*): passed through unexpanded and unvalidated. `*`
-            # here means "no columns", not "all columns" - see the
-            # module docstring. A *qualified* sole argument
-            # (count(blame.*)) does not take this path and falls
-            # through to the general Star rejection above.
+            # count(*): passed through unexpanded. `*` here means "no
+            # columns", not "all columns" - see the module docstring.
+            # A *qualified* sole argument (count(blame.*)) does not
+            # take this path and falls through to the general Star
+            # rejection above.
             return expr
         return dataclasses.replace(expr, args=tuple(_bind_expr(arg, ctx) for arg in expr.args))
     if isinstance(expr, UnaryOp):
@@ -505,6 +616,110 @@ def _bind_expr(expr: Expr, ctx: _Context) -> Expr:
             high=_bind_expr(expr.high, ctx),
         )
     raise AssertionError(f"sql/binder.py: unhandled expression node type {type(expr).__name__}")
+
+
+# --- The bare-column-mixed-with-aggregate narrowing (issue #60) ------------
+#
+# `_docs/decisions.md`, 2026-09-19: `SELECT path, count(*) FROM blame`
+# (no GROUP BY) is a BindError in historian, where sqlite3 silently
+# picks a value from an arbitrary row. Implemented as one walk per
+# select-list item, over the already-bound tree (so every remaining
+# ColumnRef is a BoundColumnRef and every remaining FunctionCall is a
+# real, validated aggregate call - _validate_function_call above
+# guarantees the latter): does this item's expression contain an
+# aggregate call anywhere, and what is the first bare column reference
+# in it that sits outside every aggregate call's own arguments (a
+# FunctionCall subtree is never walked into for this purpose - its
+# arguments are exactly the columns this rule exists to leave alone,
+# `count(path)` is fine, only a *bare* `path` is not). `bind()` below
+# only raises when the *query* has an aggregate call somewhere in its
+# select list; an ordinary, aggregate-free query is entirely unaffected
+# regardless of what this function reports for it.
+#
+# One isinstance branch per sql/ast.py node type, mirroring
+# `_bind_expr`'s own structure exactly (AGENTS.md: no dynamic dispatch)
+# rather than a generic "walk children" abstraction - kept as separate,
+# boring branches even where two node types share an identical body,
+# matching this module's existing convention (`_bind_expr`'s own
+# BinaryOp/And/Or/Is branches are equally identical and equally
+# separate). `left_bad or right_bad` is safe because a `BoundColumnRef`
+# is a dataclass instance, always truthy - this is "the first non-None
+# of the two", not a boolean test of either column's contents.
+
+
+def _split_for_aggregate_check(expr: Expr) -> tuple[bool, BoundColumnRef | None]:
+    """`(does expr contain an aggregate call anywhere, the first bare
+    BoundColumnRef found outside every aggregate call's own arguments -
+    or None)`."""
+    if isinstance(expr, FunctionCall):
+        return True, None
+    if isinstance(expr, BoundColumnRef):
+        return False, expr
+    if isinstance(expr, Literal):
+        return False, None
+    if isinstance(expr, Star):
+        # Unreachable in practice: the only Star that survives binding
+        # is count(*)'s own sole argument, already consumed by the
+        # FunctionCall branch above before this function ever sees it.
+        # Kept for the same defensive reason evaluate() keeps its own
+        # Star guard.
+        return False, None
+    if isinstance(expr, UnaryOp):
+        return _split_for_aggregate_check(expr.operand)
+    if isinstance(expr, Not):
+        return _split_for_aggregate_check(expr.operand)
+    if isinstance(expr, BinaryOp):
+        left_has, left_bad = _split_for_aggregate_check(expr.left)
+        right_has, right_bad = _split_for_aggregate_check(expr.right)
+        return left_has or right_has, left_bad or right_bad
+    if isinstance(expr, And):
+        left_has, left_bad = _split_for_aggregate_check(expr.left)
+        right_has, right_bad = _split_for_aggregate_check(expr.right)
+        return left_has or right_has, left_bad or right_bad
+    if isinstance(expr, Or):
+        left_has, left_bad = _split_for_aggregate_check(expr.left)
+        right_has, right_bad = _split_for_aggregate_check(expr.right)
+        return left_has or right_has, left_bad or right_bad
+    if isinstance(expr, Is):
+        left_has, left_bad = _split_for_aggregate_check(expr.left)
+        right_has, right_bad = _split_for_aggregate_check(expr.right)
+        return left_has or right_has, left_bad or right_bad
+    if isinstance(expr, Like):
+        left_has, left_bad = _split_for_aggregate_check(expr.left)
+        pattern_has, pattern_bad = _split_for_aggregate_check(expr.pattern)
+        return left_has or pattern_has, left_bad or pattern_bad
+    if isinstance(expr, In):
+        has, bad = _split_for_aggregate_check(expr.left)
+        for value in expr.values:
+            value_has, value_bad = _split_for_aggregate_check(value)
+            has = has or value_has
+            bad = bad or value_bad
+        return has, bad
+    if isinstance(expr, Between):
+        op_has, op_bad = _split_for_aggregate_check(expr.operand)
+        low_has, low_bad = _split_for_aggregate_check(expr.low)
+        high_has, high_bad = _split_for_aggregate_check(expr.high)
+        return op_has or low_has or high_has, op_bad or low_bad or high_bad
+    raise AssertionError(f"sql/binder.py: unhandled expression node type {type(expr).__name__}")
+
+
+def _check_bare_columns_against_aggregates(bound_items: list[BoundSelectItem]) -> None:
+    """Raise `BindError` for the first bare, non-aggregated column
+    found in any select-list item, but only when the select list has
+    an aggregate call *somewhere* - an aggregate-free query is not
+    this rule's business at all, per the module docstring's "Aggregate
+    calls" section."""
+    splits = [(item, *_split_for_aggregate_check(item.expr)) for item in bound_items]
+    if not any(has_aggregate for _item, has_aggregate, _bad in splits):
+        return
+    for _item, _has_aggregate, bad_column in splits:
+        if bad_column is not None:
+            raise BindError(
+                f"column {bad_column.name} must appear in an aggregate function since "
+                "this query has no GROUP BY",
+                bad_column.position,
+                (),
+            )
 
 
 # --- Select-list binding ----------------------------------------------------
@@ -563,12 +778,24 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema] = TABLES) -> BoundSel
     bound_items: list[BoundSelectItem] = []
     for item in stmt.select_list:
         bound_items.extend(_bind_select_item(item, ctx))
+    # Issue #60: the bare-column-mixed-with-aggregate narrowing, after
+    # the whole select list is bound and before WHERE - the select list
+    # resolves before WHERE per the module docstring's resolution-order
+    # section, and this check is squarely part of resolving it.
+    _check_bare_columns_against_aggregates(bound_items)
     # WHERE binds with the select-list alias fallback on (issue #32),
-    # column-first (`alias_first=False`) - a fresh `_Context` rather
-    # than mutating `ctx`, since `_Context` is frozen and select-list
-    # items must keep binding against the plain `ctx` above, with no
-    # fallback, so aliases stay invisible to each other (finding 3).
-    where_ctx = dataclasses.replace(ctx, select_items=tuple(bound_items), alias_fallback=True, alias_first=False)
+    # column-first (`alias_first=False`), and aggregate calls rejected
+    # outright (issue #60) - a fresh `_Context` rather than mutating
+    # `ctx`, since `_Context` is frozen and select-list items must keep
+    # binding against the plain `ctx` above, with no fallback, so
+    # aliases stay invisible to each other (finding 3).
+    where_ctx = dataclasses.replace(
+        ctx,
+        select_items=tuple(bound_items),
+        alias_fallback=True,
+        alias_first=False,
+        reject_aggregates=True,
+    )
     bound_where = _bind_expr(stmt.where, where_ctx) if stmt.where is not None else None
     return BoundSelectStatement(
         select_list=tuple(bound_items),

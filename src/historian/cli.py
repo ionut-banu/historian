@@ -36,13 +36,19 @@ Per §3's "Errors" and this issue's own constraints, exactly four
 exception types are caught at this boundary and no others: `LexError`
 (`sql/lexer.py`), `ParseError` (`sql/parser.py`), `BindError`
 (`sql/binder.py`), and `EvalError` (`exec/expression.py`) - the last
-one easy to miss, because a query can parse and bind cleanly and only
-fail once evaluation actually reaches unsupported grammar
-(`SELECT count(*) FROM blame`: no aggregate registry exists yet to
-reject it earlier, per `sql/binder.py`'s and `exec/expression.py`'s
-own documented scope). Each prints `error: <message>` to stderr - the
-exception's own message text, with no position/caret/"blame has: ..."
-rendering (that box is M6 item 18) - and the process exits 1.
+one easy to miss, since most of what used to reach it as a generic
+"unsupported grammar" failure is caught earlier now. Issue #60 closed
+the biggest gap: `SELECT count(*) FROM blame` used to parse and bind
+cleanly and only fail once evaluation reached the unhandled
+`FunctionCall` (`sql/binder.py` had no aggregate registry yet); it now
+either runs (a real aggregate, correct arity) or raises `BindError` at
+bind time (an unknown function, wrong arity, or an aggregate call in
+`WHERE`) - `sql/binder.py`'s own docstring has the details. `EvalError`
+remains reachable for other reasons, `exec/operators.py`'s `Aggregate`
+among them (`sum`'s int64-overflow check). Each of the four prints
+`error: <message>` to stderr - the exception's own message text, with
+no position/caret/"blame has: ..." rendering (that box is M6 item 18)
+- and the process exits 1.
 
 A fifth failure mode is not one of the four: the repository itself
 could not be read - `-C` pointing at a path that does not exist

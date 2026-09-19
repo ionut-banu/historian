@@ -231,18 +231,35 @@ def test_unimplemented_grammar_exits_1(tiny_repo, capsys):
     assert "traceback" not in captured.err.lower()
 
 
-def test_function_call_exits_1_via_eval_error(tiny_repo, capsys):
-    """`SELECT count(*) FROM blame` parses and binds cleanly (no
-    aggregate registry exists yet to reject it earlier) and fails only
-    at evaluation - the `EvalError` path, a distinct failure point
-    from parse and bind errors above."""
-    ret = cli.main(["-C", str(tiny_repo), "SELECT count(*) FROM blame"])
+def test_unknown_function_name_exits_1(tiny_repo, capsys):
+    """`BindError` path, issue #60: `SELECT nonexistent_fn(path) FROM
+    blame` is rejected at bind time now, not the old generic `EvalError`
+    this test used to pin (`test_function_call_exits_1_via_eval_error`,
+    superseded - #60 closes that half of #45's gap in `sql/binder.py`
+    itself, so a real query can no longer reach that path this way)."""
+    ret = cli.main(["-C", str(tiny_repo), "SELECT nonexistent_fn(path) FROM blame"])
 
     assert ret == 1
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err.startswith("error: ")
     assert "traceback" not in captured.err.lower()
+
+
+def test_aggregate_query_succeeds_via_cli(tiny_repo, capsys):
+    """Issue #60, superseding the old `EvalError` pin above:
+    `SELECT count(*) FROM blame` now runs end to end through the real
+    CLI pipeline and prints a real answer - `tiny_repo`'s `blame` table
+    has exactly 3 rows (see `tests/differential/test_blame.py`'s own
+    note on this fixture)."""
+    ret = cli.main(["-C", str(tiny_repo), "SELECT count(*) FROM blame"])
+
+    assert ret == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    lines = captured.out.splitlines()
+    assert len(lines) == 2
+    assert lines[1] == "3"
 
 
 # --- usage errors: exit 2, argparse's own handling -------------------------

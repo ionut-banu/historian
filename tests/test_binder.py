@@ -491,6 +491,7 @@ def test_star_with_alias_raises_defensive_error():
         where=None,
         group_by=(),
         having=None,
+        order_by=(),
         position=_POS,
     )
     with pytest.raises(BindError):
@@ -509,6 +510,7 @@ def test_star_in_general_expression_position_raises_defensive_error():
         where=where,
         group_by=(),
         having=None,
+        order_by=(),
         position=_POS,
     )
     with pytest.raises(BindError):
@@ -528,6 +530,7 @@ def test_qualified_star_as_function_argument_raises_defensive_error():
         where=None,
         group_by=(),
         having=None,
+        order_by=(),
         position=_POS,
     )
     with pytest.raises(BindError):
@@ -551,6 +554,7 @@ def test_star_as_non_sole_function_argument_raises_defensive_error():
         where=None,
         group_by=(),
         having=None,
+        order_by=(),
         position=_POS,
     )
     with pytest.raises(BindError):

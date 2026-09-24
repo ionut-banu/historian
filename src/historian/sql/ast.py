@@ -26,17 +26,23 @@ deliberately never imports.
 What v1's grammar does not need yet
 ------------------------------------
 
-`DISTINCT`, `ORDER BY`, `LIMIT`, `OFFSET` and any `JOIN` have no node
-here - see issue #8's grooming. Adding a field to a frozen dataclass
-later is additive, not a rewrite, so there is nothing to pre-declare.
-`CASE` is deferred the same way, for a different reason: it is an
-independent keyword-delimited primary expression form that does not
-interact with precedence, so building it earlier than it is needed
-would buy nothing. `GROUP BY` and `HAVING` (issue #69) add
-`SelectStatement.group_by` (a possibly-empty `tuple[Expr, ...]`) and
-`SelectStatement.having` (`Expr | None`) - no new node types, since
-both clauses are plain expression lists/an expression against the
-grammar this module already has.
+`DISTINCT`, `LIMIT`, `OFFSET` and any `JOIN` have no node here - see
+issue #8's grooming. Adding a field to a frozen dataclass later is
+additive, not a rewrite, so there is nothing to pre-declare. `CASE` is
+deferred the same way, for a different reason: it is an independent
+keyword-delimited primary expression form that does not interact with
+precedence, so building it earlier than it is needed would buy
+nothing. `GROUP BY` and `HAVING` (issue #69) add `SelectStatement.
+group_by` (a possibly-empty `tuple[Expr, ...]`) and `SelectStatement.
+having` (`Expr | None`) - no new node types, since both clauses are
+plain expression lists/an expression against the grammar this module
+already has. `ORDER BY` (issue #61) adds `SelectStatement.order_by`, a
+possibly-empty `tuple[OrderByItem, ...]` - one new, small node type
+(`OrderByItem`, paired with `OrderDirection`) is needed here, unlike
+`GROUP BY`, because each key carries its own optional `ASC`/`DESC`
+direction alongside its expression - the same reason `SelectItem` (an
+expression plus an optional alias) is its own node rather than a bare
+`Expr`.
 
 `IS NULL` / `IS NOT NULL` are not their own node types
 --------------------------------------------------------
@@ -72,6 +78,8 @@ __all__ = [
     "Literal",
     "Not",
     "Operator",
+    "OrderByItem",
+    "OrderDirection",
     "Or",
     "SelectItem",
     "SelectStatement",
@@ -138,6 +146,15 @@ class UnaryOperator(Enum):
 
     POS = auto()  # +x
     NEG = auto()  # -x
+
+
+class OrderDirection(Enum):
+    """`ASC` or `DESC` on one `ORDER BY` key. Not reused from anywhere
+    else - `Operator`/`UnaryOperator` are expression operators, and a
+    sort direction is not one."""
+
+    ASC = auto()
+    DESC = auto()
 
 
 # --- Expression nodes --------------------------------------------------
@@ -333,9 +350,32 @@ class SelectItem:
 
 
 @dataclass(frozen=True)
+class OrderByItem:
+    """One entry in an `ORDER BY` list: a key expression and its
+    direction. Not part of the `Expr` hierarchy, the same reasoning as
+    `SelectItem` - it pairs an expression with something that is not
+    an expression (the direction).
+
+    `expr` may be an ordinary expression or a bare integer `Literal`
+    ordinal (`ORDER BY 2`) - indistinguishable from any other integer
+    literal at this stage, exactly like `GROUP BY`'s own ordinal;
+    resolving it to a select-list position is `sql/binder.py`'s job
+    (issue #61), not this module's. `direction` is `OrderDirection.ASC`
+    whether the query wrote `ASC` explicitly or wrote neither - v1's
+    grammar (`_docs/spec.md` §1) makes `ASC` the default, and nothing
+    downstream needs to tell "explicit ASC" from "no direction
+    written" apart.
+    """
+
+    expr: Expr
+    direction: OrderDirection
+    position: Position
+
+
+@dataclass(frozen=True)
 class SelectStatement(Stmt):
     """`SELECT <select_list> FROM <from_table> [WHERE <where>]
-    [GROUP BY <group_by>] [HAVING <having>]`.
+    [GROUP BY <group_by>] [HAVING <having>] [ORDER BY <order_by>]`.
 
     `from_table` is a bare, unresolved table name - not a node of its
     own - and `where`/`having` are `None` when their clause is absent.
@@ -345,9 +385,13 @@ class SelectStatement(Stmt):
     here, indistinguishable at this stage from a literal written in
     any other clause; resolving an ordinal to a select-list position
     is `sql/binder.py`'s job (issue #69), not this module's, per the
-    module docstring's schema-blind design. Neither `from_table` nor
-    any `ColumnRef` inside this tree is checked against a catalog; see
-    the module docstring.
+    module docstring's schema-blind design. `order_by` (issue #61) is
+    `()` when the clause is absent, else the comma-separated
+    `OrderByItem` list `ORDER BY` names verbatim, in clause order - see
+    `OrderByItem`'s own docstring for its ordinal handling, the same
+    shape as `group_by`'s. Neither `from_table` nor any `ColumnRef`
+    inside this tree is checked against a catalog; see the module
+    docstring.
     """
 
     select_list: tuple[SelectItem, ...]
@@ -355,4 +399,5 @@ class SelectStatement(Stmt):
     where: Expr | None
     group_by: tuple[Expr, ...]
     having: Expr | None
+    order_by: tuple[OrderByItem, ...]
     position: Position

@@ -8,14 +8,15 @@ module is not the operator layer, but the rule not to lean on Python's
 dynamism applies just as much to the piece meant to translate to a
 Rust `match` later).
 
-Scope: issue #8, Part A; `GROUP BY`/`HAVING` added by #69
+Scope: issue #8, Part A; `GROUP BY`/`HAVING` added by #69;
+`ORDER BY` added by #61
 -------------------------------------------------------------
 
-`DISTINCT`, `ORDER BY`, `LIMIT`, `OFFSET`, any `JOIN`, and `CASE` are
-not implemented - see `sql/ast.py`'s module docstring. Ordinary SQL
-that uses them fails with a generic `ParseError` ("expected end of
-query" or similar), which is correct for now: naming the six §1
-non-goals specifically (subqueries, CTEs, window functions,
+`DISTINCT`, `LIMIT`, `OFFSET`, any `JOIN`, and `CASE` are not
+implemented - see `sql/ast.py`'s module docstring. Ordinary SQL that
+uses them fails with a generic `ParseError` ("expected end of query"
+or similar), which is correct for now: naming the six §1 non-goals
+specifically (subqueries, CTEs, window functions,
 `UNION`/`INTERSECT`/`EXCEPT`, outer/cross joins, and would-be UDFs) by
 their own dedicated error is issue #24, not this module. This parser
 only ever raises `ParseError`.
@@ -26,6 +27,16 @@ ordinary comma-separated expressions (an ordinal like `GROUP BY 2`
 is just an `INTEGER` literal here; resolving it to a select-list
 position is the binder's job), and `HAVING` is one expression at the
 same precedence as `WHERE`'s.
+
+`ORDER BY <expr | ordinal> [ASC | DESC], ...` (issue #61) parses after
+`HAVING` and before end-of-statement - a comma-separated list of
+`OrderByItem`s, each one ordinary-expression-or-ordinal (an ordinal
+like `ORDER BY 2` is, again, just an `INTEGER` literal here - and
+`ORDER BY -1` is `UnaryOp(NEG, Literal(1, ...))`, since the lexer
+never emits a signed `INTEGER` token; telling a negative ordinal from
+a negative-valued expression is the binder's job, not this module's)
+followed by an optional `ASC`/`DESC`, defaulting to `ASC` when
+neither is written.
 
 The precedence table
 ---------------------
@@ -118,6 +129,8 @@ from historian.sql.ast import (
     Literal,
     Not,
     Operator,
+    OrderByItem,
+    OrderDirection,
     Or,
     SelectItem,
     SelectStatement,
@@ -330,12 +343,17 @@ class _Parser:
         having: Expr | None = None
         if self._match(TokenType.HAVING):
             having = self._parse_expr()
+        order_by: tuple[OrderByItem, ...] = ()
+        if self._match(TokenType.ORDER):
+            self._expect(TokenType.BY, "BY")
+            order_by = self._parse_order_by_list()
         return SelectStatement(
             select_list=select_list,
             from_table=from_table,
             where=where,
             group_by=group_by,
             having=having,
+            order_by=order_by,
             position=start,
         )
 
@@ -344,6 +362,25 @@ class _Parser:
         while self._match(TokenType.COMMA):
             exprs.append(self._parse_expr())
         return tuple(exprs)
+
+    def _parse_order_by_list(self) -> tuple[OrderByItem, ...]:
+        items = [self._parse_order_by_item()]
+        while self._match(TokenType.COMMA):
+            items.append(self._parse_order_by_item())
+        return tuple(items)
+
+    def _parse_order_by_item(self) -> OrderByItem:
+        """One `ORDER BY` key: an expression or ordinal, then an
+        optional `ASC`/`DESC` - `ASC` when neither is written, matching
+        `sql/ast.py`'s `OrderByItem` docstring."""
+        start = self._peek().position
+        expr = self._parse_expr()
+        direction = OrderDirection.ASC
+        if self._match(TokenType.ASC):
+            direction = OrderDirection.ASC
+        elif self._match(TokenType.DESC):
+            direction = OrderDirection.DESC
+        return OrderByItem(expr=expr, direction=direction, position=start)
 
     def _parse_select_list(self) -> tuple[SelectItem, ...]:
         items = [self._parse_select_item()]

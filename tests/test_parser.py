@@ -26,6 +26,7 @@ from historian.sql.ast import (
     Literal,
     Not,
     Operator,
+    OrderDirection,
     Or,
     SelectStatement,
     Star,
@@ -1022,4 +1023,86 @@ def test_where_group_by_having_all_together():
     )
     assert stmt.where is not None
     assert len(stmt.group_by) == 1
+
+
+# --- ORDER BY (issue #61) ---------------------------------------------
+
+
+def test_no_order_by_defaults_to_empty():
+    stmt = _parse("SELECT path FROM blame")
+    assert stmt.order_by == ()
+
+
+def test_order_by_single_column_defaults_to_ascending():
+    stmt = _parse("SELECT path FROM blame ORDER BY path")
+    assert len(stmt.order_by) == 1
+    item = stmt.order_by[0]
+    assert item.expr == ColumnRef(table=None, name="path", position=item.expr.position)
+    assert item.direction is OrderDirection.ASC
+
+
+def test_order_by_explicit_asc():
+    stmt = _parse("SELECT path FROM blame ORDER BY path ASC")
+    assert stmt.order_by[0].direction is OrderDirection.ASC
+
+
+def test_order_by_desc():
+    stmt = _parse("SELECT path FROM blame ORDER BY path DESC")
+    assert stmt.order_by[0].direction is OrderDirection.DESC
+
+
+def test_order_by_multiple_keys_mixed_direction():
+    stmt = _parse("SELECT path, line_no FROM blame ORDER BY path ASC, line_no DESC")
+    assert len(stmt.order_by) == 2
+    assert stmt.order_by[0].direction is OrderDirection.ASC
+    assert stmt.order_by[1].direction is OrderDirection.DESC
+
+
+def test_order_by_ordinal_is_a_plain_integer_literal():
+    """`ORDER BY 2` parses the ordinal as an ordinary `INTEGER`
+    `Literal`, exactly like `GROUP BY`'s own ordinal - resolving it to
+    a select-list position is the binder's job (issue #61's own
+    grooming), not the parser's."""
+    stmt = _parse("SELECT path, line_no FROM blame ORDER BY 2")
+    item = stmt.order_by[0]
+    assert item.expr == Literal(value=2, position=item.expr.position)
+    assert item.direction is OrderDirection.ASC
+
+
+def test_order_by_negative_ordinal_parses_as_unary_minus():
+    """`ORDER BY -1` parses via the ordinary unary-minus path - the
+    lexer never emits a signed `INTEGER` token - so it is `UnaryOp(NEG,
+    Literal(1, ...))` here, not a negative `Literal`. Recognising this
+    shape as an ordinal (confirmed against `sqlite3`: `ORDER BY -1` is
+    "1st ORDER BY term out of range") is the binder's job."""
+    stmt = _parse("SELECT path FROM blame ORDER BY -1")
+    assert isinstance(stmt.order_by[0].expr, UnaryOp)
+    assert stmt.order_by[0].expr.op is UnaryOperator.NEG
+
+
+def test_order_by_expression_not_a_bare_column():
+    stmt = _parse("SELECT line_no FROM blame ORDER BY line_no + 1")
+    assert isinstance(stmt.order_by[0].expr, BinaryOp)
+    assert stmt.order_by[0].expr.op is Operator.ADD
+
+
+def test_order_by_after_where_group_by_having():
+    stmt = _parse(
+        "SELECT author_name, count(*) FROM blame WHERE line_no > 0 "
+        "GROUP BY author_name HAVING count(*) > 1 ORDER BY count(*) DESC"
+    )
+    assert stmt.where is not None
+    assert len(stmt.group_by) == 1
     assert stmt.having is not None
+    assert len(stmt.order_by) == 1
+    assert isinstance(stmt.order_by[0].expr, FunctionCall)
+
+
+def test_order_by_missing_by_is_a_parse_error():
+    with pytest.raises(ParseError):
+        _parse("SELECT path FROM blame ORDER path")
+
+
+def test_order_by_trailing_comma_is_a_parse_error():
+    with pytest.raises(ParseError):
+        _parse("SELECT path FROM blame ORDER BY path,")

@@ -926,6 +926,137 @@ def test_nonexistent_function_raises_bind_error(tiny_repo):
         run_historian("SELECT nonexistent_fn(path) FROM blame", tiny_repo)
 
 
+# --- GROUP BY / HAVING (issue #69) --------------------------------------
+#
+# `NULL`-valued group keys and mixed-storage-class key merging are
+# unit-only (`tests/test_operators.py`'s own "Aggregate (issue #69)"
+# section) - `tables/blame.py` asserts every column is non-NULL, and
+# `CASE` does not exist, so no real blame-backed expression can be
+# NULL for some rows and not others. Everything below is reachable
+# through `fixtures.build.get_tiny_repo()` and real `blame` data.
+
+
+def test_group_by_single_real_column(tiny_repo):
+    _assert_differential(tiny_repo, "SELECT author_name, count(*) FROM blame GROUP BY author_name")
+
+
+def test_group_by_a_second_differently_shaped_column(tiny_repo):
+    _assert_differential(tiny_repo, "SELECT path, count(*) FROM blame GROUP BY path")
+
+
+def test_group_by_two_columns_together(tiny_repo):
+    _assert_differential(
+        tiny_repo,
+        "SELECT author_name, path, count(*) FROM blame GROUP BY author_name, path",
+    )
+
+
+def test_group_by_an_expression_not_a_bare_column(tiny_repo):
+    """historian has no `%` operator yet (not built by any prior
+    issue, and out of this issue's own file list) - `line_no + 1`
+    stands in for the same "GROUP BY on an expression" shape the
+    issue's own grooming used `line_no % 2` for."""
+    _assert_differential(
+        tiny_repo, "SELECT line_no + 1, count(*) FROM blame GROUP BY line_no + 1"
+    )
+
+
+def test_group_by_ordinal_matches_the_named_column_form(tiny_repo):
+    _assert_differential(tiny_repo, "SELECT author_name, count(*) FROM blame GROUP BY 1")
+
+
+def test_group_by_ordinal_pointing_at_a_non_aggregate_expression(tiny_repo):
+    """Ordinal resolution is positional, not name-based - `GROUP BY 1`
+    here groups by the first select-list item's own expression
+    (`line_no + 1`), the non-aggregate-expression analogue of the
+    bare-column ordinal case above."""
+    _assert_differential(
+        tiny_repo, "SELECT line_no + 1, count(*) FROM blame GROUP BY 1"
+    )
+
+
+def test_having_filters_a_grouped_result_true(tiny_repo):
+    _assert_differential(
+        tiny_repo,
+        "SELECT author_name, count(*) FROM blame GROUP BY author_name HAVING count(*) > 1",
+    )
+
+
+def test_having_filters_a_grouped_result_to_zero_rows(tiny_repo):
+    _assert_differential(
+        tiny_repo,
+        "SELECT author_name, count(*) FROM blame GROUP BY author_name HAVING count(*) > 1000000",
+    )
+
+
+def test_having_references_a_select_list_alias(tiny_repo):
+    """The direct analogue of #32's confirmed `sqlite3` transcript for
+    this issue."""
+    _assert_differential(
+        tiny_repo,
+        "SELECT author_name, count(*) AS c FROM blame GROUP BY author_name HAVING c > 1",
+    )
+
+
+def test_having_references_an_aggregate_not_in_the_select_list(tiny_repo):
+    """`HAVING`'s own aggregate/scalar split is not limited to
+    aggregates the select list already introduced."""
+    _assert_differential(
+        tiny_repo, "SELECT author_name FROM blame GROUP BY author_name HAVING sum(line_no) > 0"
+    )
+
+
+def test_group_by_after_where_matching_zero_rows_is_zero_groups(tiny_repo):
+    """A different answer than the ungrouped `WHERE`-matches-nothing
+    case (#60: one row, `count(*) = 0`) - grouping zero input rows
+    produces zero groups, not one row with a zero count."""
+    _assert_differential(
+        tiny_repo,
+        "SELECT count(*) FROM blame WHERE path = 'no-such-file.py' GROUP BY author_name",
+    )
+
+
+# --- GROUP BY / HAVING (issue #69): BindError cases, asserted directly -
+
+
+def test_group_by_ordinal_pointing_at_an_aggregate_raises_bind_error(tiny_repo):
+    """Orchestrator's correction: confirmed against `sqlite3 3.51.0`
+    that an ordinal resolving to an aggregate call is rejected
+    identically to the direct and aliased forms below, not "ludicrous
+    but legal"."""
+    with pytest.raises(BindError):
+        run_historian("SELECT path, count(*) FROM blame GROUP BY 2", tiny_repo)
+
+
+def test_group_by_direct_aggregate_call_raises_bind_error(tiny_repo):
+    with pytest.raises(BindError):
+        run_historian("SELECT path FROM blame GROUP BY count(*)", tiny_repo)
+
+
+def test_group_by_aggregate_via_alias_raises_bind_error(tiny_repo):
+    with pytest.raises(BindError):
+        run_historian("SELECT count(*) AS c FROM blame GROUP BY c", tiny_repo)
+
+
+def test_group_by_ordinal_out_of_range_raises_bind_error(tiny_repo):
+    with pytest.raises(BindError):
+        run_historian("SELECT path FROM blame GROUP BY 2", tiny_repo)
+
+
+def test_group_by_ordinal_zero_raises_bind_error(tiny_repo):
+    with pytest.raises(BindError):
+        run_historian("SELECT path FROM blame GROUP BY 0", tiny_repo)
+
+
+def test_grouped_select_item_not_a_key_or_aggregate_raises_bind_error(tiny_repo):
+    """Extends #60's narrowing to the grouped case: `path` is neither
+    the `GROUP BY` key (`author_name`) nor an aggregate call."""
+    with pytest.raises(BindError):
+        run_historian(
+            "SELECT path, author_name, count(*) FROM blame GROUP BY author_name", tiny_repo
+        )
+
+
 # --- Known disagreements that raise before producing rows --------------
 #
 # #25, #32 and #51 are open design questions ("whether it should stay

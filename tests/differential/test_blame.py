@@ -1082,6 +1082,45 @@ def test_having_legal_with_aggregate_only_in_the_select_list(tiny_repo):
     _assert_differential(tiny_repo, "SELECT count(*) FROM blame HAVING 1")
 
 
+def test_having_bare_column_with_no_group_by_raises_bind_error(tiny_repo):
+    """Orchestrator correction: `select count(*) from t having
+    path = 'x'` returns a row in `sqlite3` (evaluating `path` against
+    an arbitrary row) - historian raises `BindError` instead, the
+    same "grouped but not a key" narrowing #69's own decisions.md
+    entry already gives for the select list, extended to HAVING."""
+    with pytest.raises(BindError):
+        run_historian("SELECT count(*) FROM blame HAVING path = 'src/utils.py'", tiny_repo)
+
+
+def test_having_bare_column_not_a_group_key_raises_bind_error(tiny_repo):
+    """`select a, count(*) from t group by a having path = 'z'`
+    returns a row in `sqlite3`; historian raises `BindError` - `path`
+    is neither the `GROUP BY` key (`line_no`) nor inside an aggregate
+    call."""
+    with pytest.raises(BindError):
+        run_historian(
+            "SELECT line_no, count(*) FROM blame GROUP BY line_no "
+            "HAVING path = 'src/utils.py'",
+            tiny_repo,
+        )
+
+
+def test_having_expression_matching_an_expression_group_key(tiny_repo):
+    """`GROUP BY line_no + 1 HAVING line_no + 1 > 2` - an expression
+    key matched by shape, confirmed legal against `sqlite3` before
+    implementing."""
+    _assert_differential(
+        tiny_repo,
+        "SELECT line_no + 1, count(*) FROM blame GROUP BY line_no + 1 HAVING line_no + 1 > 2",
+    )
+
+
+def test_having_bare_column_matching_a_group_key(tiny_repo):
+    _assert_differential(
+        tiny_repo, "SELECT path, count(*) FROM blame GROUP BY path HAVING path = 'src/utils.py'"
+    )
+
+
 # --- Known disagreements that raise before producing rows --------------
 #
 # #25, #32 and #51 are open design questions ("whether it should stay

@@ -930,3 +930,52 @@ inside the aggregate's own argument, not bare. `GROUP BY` (#69)
 will extend this rule rather than replace it: a bare column that
 *is* one of the grouping keys becomes legal again once grouping
 exists, but that is out of this decision's scope.
+
+2026-09-24 - follow-on to 2026-09-19: the grouped-but-not-a-key
+narrowing, and an aggregate can never be a GROUP BY key
+
+Issue #69. Two additions to the 2026-09-19 entry above, not a
+new decision from scratch - the same reasoning transfers rather
+than being re-derived.
+
+First, the narrowing now also covers "grouped but not a group
+key". `select a, b, count(*) from t group by a` is legal in
+sqlite3 (`create table t(a,b); insert into t values
+(1,5),(1,6),(2,7),(2,8),(2,9);` gives `1|5|2`, `2|7|3` - `b`
+takes some row's value per group, undocumented which, confirmed
+live against sqlite3 3.51.0). historian raises BindError instead:
+a select-list expression must be an aggregate call, a GROUP BY
+key, or built purely from GROUP BY keys (an expression whose
+every bare column matches some key, e.g. `a + 1` when `a` is a
+key). The risk is identical to 2026-09-19's own case, just
+triggered by GROUP BY grammar rather than a bare aggregate: a
+non-key, non-aggregate column's value within a group is still
+whichever row sqlite3 happened to visit last, so both findings
+that entry gives (breaks AGENTS.md's determinism guarantee;
+would feed the oracle two independently-arbitrary answers and
+manufacture an unfixable false differential mismatch) apply here
+without modification.
+
+Second, an aggregate call can never be a GROUP BY key, however it
+is named - direct, via a select-list alias, or by ordinal.
+Confirmed live against sqlite3 3.51.0 during this issue's
+dispatch, correcting an earlier grooming draft that had ordinal
+resolution to an aggregate as "ludicrous but legal":
+
+    sqlite> create table t(a,b); insert into t values(1,5),(1,6),(2,7);
+    sqlite> select a from t group by count(*);
+    Parse error: aggregate functions are not allowed in the GROUP BY clause
+    sqlite> select count(*) as c from t group by c;
+    Parse error: aggregate functions are not allowed in the GROUP BY clause
+    sqlite> select b, count(*) from t group by 2;
+    Error: in prepare, aggregate functions are not allowed in the GROUP BY clause
+
+Unlike the two narrowings above, this is not a case of
+historian refusing something sqlite3 permits - sqlite3 rejects
+all three routes itself, identically. historian's `BindError`
+for each is simply the same rule sqlite3 already enforces,
+implemented once in `sql/binder.py` and applied uniformly
+regardless of how the aggregate call is reached. An ordinal
+resolving to a non-aggregate expression remains legal, and an
+out-of-range ordinal (`select b from t group by 3` -> "1st GROUP
+BY term out of range") is its own, separate BindError.

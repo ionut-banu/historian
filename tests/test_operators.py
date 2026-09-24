@@ -1126,6 +1126,17 @@ def test_negative_offset_is_clamped_to_zero():
     assert tuple(result.rows()) == _LIMIT_ROWS[:2]
 
 
+def test_negative_offset_is_clamped_on_the_operator_itself():
+    """The clamp is applied once, at construction (`__init__`), not
+    merely an incidental consequence of how `rows()` happens to
+    iterate - checked directly on the stored attribute rather than
+    only through behaviour, so a future rewrite of `rows()` (e.g. via
+    `itertools.islice`, which raises on a negative start) cannot
+    silently reintroduce a negative offset."""
+    result = Limit(_child(_LIMIT_ROWS), limit=2, offset=-5)
+    assert result._offset == 0
+
+
 def test_negative_limit_with_positive_offset_still_skips():
     """Confirmed against sqlite3: a negative `LIMIT` does not suppress
     `OFFSET` - only the truncation is skipped."""

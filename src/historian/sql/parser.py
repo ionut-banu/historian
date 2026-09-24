@@ -8,17 +8,24 @@ module is not the operator layer, but the rule not to lean on Python's
 dynamism applies just as much to the piece meant to translate to a
 Rust `match` later).
 
-Scope: issue #8, Part A only
------------------------------
+Scope: issue #8, Part A; `GROUP BY`/`HAVING` added by #69
+-------------------------------------------------------------
 
-`DISTINCT`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, any
-`JOIN`, and `CASE` are not implemented - see `sql/ast.py`'s module
-docstring. Ordinary SQL that uses them fails with a generic
-`ParseError` ("expected end of query" or similar), which is correct
-for now: naming the six §1 non-goals specifically (subqueries, CTEs,
-window functions, `UNION`/`INTERSECT`/`EXCEPT`, outer/cross joins, and
-would-be UDFs) by their own dedicated error is issue #24, not this
-module. This parser only ever raises `ParseError`.
+`DISTINCT`, `ORDER BY`, `LIMIT`, `OFFSET`, any `JOIN`, and `CASE` are
+not implemented - see `sql/ast.py`'s module docstring. Ordinary SQL
+that uses them fails with a generic `ParseError` ("expected end of
+query" or similar), which is correct for now: naming the six §1
+non-goals specifically (subqueries, CTEs, window functions,
+`UNION`/`INTERSECT`/`EXCEPT`, outer/cross joins, and would-be UDFs) by
+their own dedicated error is issue #24, not this module. This parser
+only ever raises `ParseError`.
+
+`GROUP BY <expr>, ...` and `HAVING <predicate>` (issue #69) parse
+after `WHERE` and before end-of-statement - `GROUP BY`'s list is
+ordinary comma-separated expressions (an ordinal like `GROUP BY 2`
+is just an `INTEGER` literal here; resolving it to a select-list
+position is the binder's job), and `HAVING` is one expression at the
+same precedence as `WHERE`'s.
 
 The precedence table
 ---------------------
@@ -316,12 +323,27 @@ class _Parser:
         where: Expr | None = None
         if self._match(TokenType.WHERE):
             where = self._parse_expr()
+        group_by: tuple[Expr, ...] = ()
+        if self._match(TokenType.GROUP):
+            self._expect(TokenType.BY, "BY")
+            group_by = self._parse_expr_list()
+        having: Expr | None = None
+        if self._match(TokenType.HAVING):
+            having = self._parse_expr()
         return SelectStatement(
             select_list=select_list,
             from_table=from_table,
             where=where,
+            group_by=group_by,
+            having=having,
             position=start,
         )
+
+    def _parse_expr_list(self) -> tuple[Expr, ...]:
+        exprs = [self._parse_expr()]
+        while self._match(TokenType.COMMA):
+            exprs.append(self._parse_expr())
+        return tuple(exprs)
 
     def _parse_select_list(self) -> tuple[SelectItem, ...]:
         items = [self._parse_select_item()]

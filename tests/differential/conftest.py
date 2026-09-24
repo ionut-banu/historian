@@ -297,10 +297,11 @@ def assert_rows_match(
     *,
     ordered: bool = False,
     key_positions: Sequence[int] | None = None,
+    tie_free_proof: tuple[int, int] | None = None,
 ) -> None:
     """Step 5, "Comparison follows §3": sorted multisets by default,
     or - when the query has an `ORDER BY` (`ordered=True`) - a
-    tie-tolerant exact-order comparison (issue #61).
+    tie-tolerant exact-order comparison (issue #61, hardened by #80).
 
     `AGENTS.md` guarantees historian's own row order is deterministic,
     but SQLite makes no such promise for rows that tie on every
@@ -311,13 +312,14 @@ def assert_rows_match(
     named the shape a positional-*or*-grouped comparison alone cannot
     handle: an `ORDER BY` key that is not itself selected (`SELECT p
     FROM u ORDER BY n`) has no column in the output rows to group by
-    at all. So this function takes two independent, keyword-only
-    parameters rather than inferring either from the rows themselves -
-    it never parses or rewrites the query to recover a hidden key,
-    which would put a second SQL front end in the oracle:
+    at all. So this function takes three independent, keyword-only
+    parameters rather than inferring any of them from the rows
+    themselves - it never parses or rewrites the query to recover a
+    hidden key, which would put a second SQL front end in the oracle:
 
     - `ordered=False` (the default): sorted-multiset comparison, via
-      `_assert_multiset_match` - unaffected by `key_positions`.
+      `_assert_multiset_match` - unaffected by `key_positions` and
+      `tie_free_proof`.
     - `ordered=True, key_positions=(<0-based output column index>, ...)`:
       every `ORDER BY` key is selected. Rows are grouped into
       consecutive runs by their values at `key_positions`
@@ -328,18 +330,44 @@ def assert_rows_match(
       to that group) rather than requiring one specific sub-order -
       stricter than a plain multiset comparison (it still catches a
       key-ordering bug) and no stricter than what either engine
-      actually promises (it never fails over a tie).
-    - `ordered=True, key_positions=None`: at least one `ORDER BY` key
-      is not selected, so the harness cannot see ties at all. The
-      calling test must make the case tie-free *by construction* and
-      prove it on the SQLite side (see `tests/differential/
-      test_blame.py`'s own "ORDER BY" section for the pattern: compare
-      `count(*)` against `count(DISTINCT <key>)` over the same FROM/
-      WHERE), so a fixture change that later introduces a tie fails
-      loudly as a broken test rather than as a false historian bug.
-      Comparison is then a plain positional `_assert_row_sequences_match`,
-      no grouping possible or needed.
+      actually promises (it never fails over a tie). `tie_free_proof`
+      is ignored in this mode.
+    - `ordered=True, key_positions=None, tie_free_proof=(total_rows,
+      distinct_key_tuples)`: at least one `ORDER BY` key is not
+      selected, so the harness cannot see ties in the output rows at
+      all (issue #80, closing a gap #61's own `key_positions=None`
+      mode left open: nothing forced the calling test to actually
+      prove tie-freedom, so a silently-tied case could reach a
+      positional comparison unproven). The harness itself asserts
+      `total_rows == distinct_key_tuples` - naming both numbers on
+      failure - *before* comparing a single row, and only then falls
+      back to plain positional `_assert_row_sequences_match`; no
+      grouping is possible or needed once the proof holds, since a
+      tie-free result has nothing left to tolerate. **`tie_free_proof`
+      must be computed from a real SQL query run over the same FROM
+      and WHERE as the query under test (`count(*)` vs `count(DISTINCT
+      <key>)`, the pattern `tests/differential/test_blame.py`'s own
+      "ORDER BY" section uses) - never written by hand as literal
+      integers, which would make the proof merely decorative.**
+    - `ordered=True` with neither `key_positions` nor `tie_free_proof`:
+      raises immediately, before comparing anything - the harness
+      never trusts an exact-order comparison it has no way to know is
+      sound.
+
+    The harness never parses or runs the test's own SQL anywhere in
+    this function, including the `tie_free_proof` path: it only ever
+    receives two integers the caller computed elsewhere.
     """
+    if ordered and key_positions is None and tie_free_proof is None:
+        raise ValueError(
+            "assert_rows_match(ordered=True) needs either key_positions "
+            "(every ORDER BY key is selected - grouped, tie-tolerant "
+            "comparison) or tie_free_proof=(total_rows, distinct_key_tuples) "
+            "proving this case has no ties by construction, computed from a "
+            "real SQL query over the same FROM/WHERE - see this function's "
+            "own docstring."
+        )
+
     assert len(sqlite_rows) == len(historian_rows), (
         f"row count mismatch: sqlite produced {len(sqlite_rows)}, "
         f"historian produced {len(historian_rows)}\n"
@@ -352,6 +380,14 @@ def assert_rows_match(
         return
 
     if key_positions is None:
+        total, distinct = tie_free_proof
+        assert total == distinct, (
+            f"tie_free_proof claims this case is tie-free but total_rows="
+            f"{total} != distinct_key_tuples={distinct} - a positional "
+            "comparison would be unsound here, since neither engine "
+            "promises how it breaks a tie; add key_positions instead, or "
+            "fix the case (or the fixture) so it is genuinely tie-free"
+        )
         _assert_row_sequences_match(sqlite_rows, historian_rows)
         return
 

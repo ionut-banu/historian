@@ -34,12 +34,15 @@ from historian.sql.ast import (
     SelectItem,
     SelectStatement,
     Star,
+    UnaryOp,
+    UnaryOperator,
 )
 from historian.sql.binder import (
     TABLES,
     BindError,
     BoundColumnRef,
     BoundSelectStatement,
+    _ordinal_value,
     bind,
 )
 from historian.sql.lexer import Position, tokenize
@@ -1145,6 +1148,110 @@ def test_order_by_explicit_positive_ordinal_still_resolves():
     item = bound.order_by[0]
     assert isinstance(item.expr, BoundColumnRef)
     assert item.expr.offset == BLAME_SCHEMA.index_of("path")
+
+
+# --- Ordinal detection: arbitrary unary nesting (orchestrator correction) --
+#
+# SQLite treats any nesting of unary `+`/`-` (and parentheses, which
+# vanish at parse time - `sql/parser.py`'s `_parse_primary`) around an
+# integer literal as an ordinal, in both GROUP BY and ORDER BY - not
+# just a bare `Literal` or one level of unary. `_ordinal_value` is the
+# one shared helper both `_bind_group_by_item` and `_bind_order_by_item`
+# now use. A direct unit test on the helper itself, plus both clauses
+# through `bind()`, since the helper is unreachable via `bind()` alone
+# for the "not an ordinal" shapes (a `BinaryOp` binds as an ordinary
+# expression well before `_ordinal_value` would matter to the caller).
+
+
+def test_ordinal_value_unwraps_arbitrarily_nested_unary_signs():
+    literal_one = Literal(value=1, position=_POS)
+    single_neg = UnaryOp(op=UnaryOperator.NEG, operand=literal_one, position=_POS)
+    single_pos = UnaryOp(op=UnaryOperator.POS, operand=literal_one, position=_POS)
+    double_neg = UnaryOp(op=UnaryOperator.NEG, operand=single_neg, position=_POS)
+    double_pos = UnaryOp(op=UnaryOperator.POS, operand=single_pos, position=_POS)
+
+    assert _ordinal_value(literal_one) == 1
+    assert _ordinal_value(single_neg) == -1
+    assert _ordinal_value(double_neg) == 1
+    assert _ordinal_value(double_pos) == 1
+
+
+def test_ordinal_value_is_none_for_a_binary_expression():
+    expr = BinaryOp(op=Operator.ADD, left=Literal(1, _POS), right=Literal(0, _POS), position=_POS)
+    assert _ordinal_value(expr) is None
+
+
+def test_ordinal_value_is_none_for_a_binary_expression_nested_inside_unary():
+    """A unary sign wrapping something that is *not* itself an ordinal
+    stays not-an-ordinal, whatever is inside it - `-(1+0)` is a
+    computed expression, not `-1`."""
+    inner = BinaryOp(op=Operator.ADD, left=Literal(1, _POS), right=Literal(0, _POS), position=_POS)
+    expr = UnaryOp(op=UnaryOperator.NEG, operand=inner, position=_POS)
+    assert _ordinal_value(expr) is None
+
+
+def test_order_by_double_negative_ordinal_resolves_to_the_positive_position():
+    """`ORDER BY -(-1)` - confirmed against sqlite3: ordinal 1, not a
+    range error and not a computed constant. Parentheses vanish at
+    parse time, so this is `UnaryOp(NEG, UnaryOp(NEG, Literal(1)))`."""
+    bound = _bind("SELECT path FROM blame ORDER BY -(-1)")
+    item = bound.order_by[0]
+    assert isinstance(item.expr, BoundColumnRef)
+    assert item.expr.offset == BLAME_SCHEMA.index_of("path")
+
+
+def test_order_by_double_positive_ordinal_resolves():
+    bound = _bind("SELECT path FROM blame ORDER BY +(+1)")
+    item = bound.order_by[0]
+    assert isinstance(item.expr, BoundColumnRef)
+    assert item.expr.offset == BLAME_SCHEMA.index_of("path")
+
+
+def test_order_by_unary_chain_without_parens_still_an_ordinal():
+    """`ORDER BY - -1` - two `MINUS` tokens with no parentheses at
+    all - confirmed against sqlite3: ordinal 1."""
+    bound = _bind("SELECT path FROM blame ORDER BY - -1")
+    item = bound.order_by[0]
+    assert isinstance(item.expr, BoundColumnRef)
+    assert item.expr.offset == BLAME_SCHEMA.index_of("path")
+
+
+def test_order_by_constant_expression_is_not_an_ordinal():
+    """`ORDER BY 1+0` - confirmed against sqlite3: a constant
+    expression, not ordinal 1 - binds as an ordinary (if useless)
+    sort key, not a positional reference."""
+    bound = _bind("SELECT path FROM blame ORDER BY 1+0")
+    item = bound.order_by[0]
+    assert isinstance(item.expr, BinaryOp)
+    assert item.expr.op is Operator.ADD
+
+
+def test_group_by_double_negative_ordinal_resolves_to_the_positive_position():
+    """`GROUP BY -(-1)` - confirmed against sqlite3: ordinal 1."""
+    bound = _bind("SELECT path, count(*) FROM blame GROUP BY -(-1)")
+    assert bound.group_by == (
+        BoundColumnRef(offset=BLAME_SCHEMA.index_of("path"), name="path", position=bound.group_by[0].position),
+    )
+
+
+def test_group_by_double_positive_ordinal_resolves():
+    bound = _bind("SELECT path, count(*) FROM blame GROUP BY +(+1)")
+    assert isinstance(bound.group_by[0], BoundColumnRef)
+    assert bound.group_by[0].offset == BLAME_SCHEMA.index_of("path")
+
+
+def test_group_by_bare_positive_ordinal_still_resolves():
+    bound = _bind("SELECT path, count(*) FROM blame GROUP BY +1")
+    assert isinstance(bound.group_by[0], BoundColumnRef)
+    assert bound.group_by[0].offset == BLAME_SCHEMA.index_of("path")
+
+
+def test_group_by_constant_expression_still_raises_bind_error():
+    """`GROUP BY 1+0` must stay a `BindError` - a constant key, so the
+    select list's non-key, non-aggregate column stays ungrouped, the
+    intended narrowing this fix must not disturb."""
+    with pytest.raises(BindError):
+        _bind("SELECT path, count(*) FROM blame GROUP BY 1+0")
 
 
 # --- ORDER BY and aggregate legality (issue #61) -------------------------

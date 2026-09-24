@@ -1127,3 +1127,49 @@ py`'s `test_sort_is_stable_among_rows_tied_on_every_key` and
 `tests/differential/test_blame.py`'s `test_order_by_same_query_
 twice_gives_identical_order` both check this directly, not
 through the oracle.
+
+2026-09-24 - ordinal detection widened to any nesting of unary
++/- (and parentheses) around an integer literal, in both GROUP BY
+and ORDER BY - amends #69
+
+Issue #61, orchestrator review after this issue's first pass
+landed. `#69`'s original `GROUP BY` ordinal check (`_bind_group_
+by_item`) recognised only a bare integer `Literal`, and this
+issue's own `ORDER BY` ordinal check (`_bind_order_by_item`)
+copied that shape plus one level of unary unwrapping - both too
+narrow. Confirmed live against sqlite3 3.51.0: *any* nesting of
+unary `+`/`-` around an integer literal is an ordinal in both
+clauses, not just zero or one levels:
+
+    sqlite> create table u(p,n); insert into u values('x',3),('y',1),('z',2);
+    sqlite> select p from u order by +(+1);   -- ordinal 1
+    sqlite> select p from u order by -(-1);   -- ordinal 1
+    sqlite> select p from u order by -(-(1)); -- ordinal 1
+    sqlite> select p from u order by - -1;    -- ordinal 1 (no parens at all)
+    sqlite> select p, count(*) from u group by +1;     -- ordinal 1
+    sqlite> select p, count(*) from u group by -(-1);  -- ordinal 1
+    sqlite> select p, count(*) from u group by +(+1);  -- ordinal 1
+
+A binary operator anywhere in the tree is never an ordinal, in
+either clause - confirmed `GROUP BY 1+0` and `ORDER BY 1+0` are
+both a constant expression, not ordinal 1 (the latter leaves rows
+in scan order rather than resorting - a stable sort over a key
+that ties on every row, since `1+0` evaluates the same for every
+row). `GROUP BY 1+0` staying a `BindError` (the select list's
+non-key, non-aggregate column has no group to belong to, since a
+constant key groups the whole table into one implicit group with
+no real key to match by shape) is **unaffected by this fix and
+must stay** - `1+0` was never an ordinal before this fix and still
+is not after it; the fix only widens which *unary-wrapped*
+literals count, not which binary expressions do.
+
+Fixed with one shared helper, `_ordinal_value` (`sql/binder.py`),
+recursing through arbitrarily many `UnaryOp` layers down to a
+bare integer `Literal` and applying each layer's sign, used by
+both `_bind_group_by_item` and `_bind_order_by_item` in place of
+their own previous, narrower checks - parentheses need no
+handling of their own, since `sql/parser.py`'s `_parse_primary`
+already strips them at parse time and they never reach the binder
+as a node. `-(-1)` unwraps to `1` (a legal ordinal); `-1` and
+`-(1)` both unwrap to `-1` (out of range, `BindError`, matching
+sqlite3's identical rejection there).

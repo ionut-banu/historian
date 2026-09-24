@@ -1173,3 +1173,194 @@ already strips them at parse time and they never reach the binder
 as a node. `-(-1)` unwraps to `1` (a legal ordinal); `-1` and
 `-(1)` both unwrap to `-1` (out of range, `BindError`, matching
 sqlite3's identical rejection there).
+
+2026-09-25 - LIMIT/OFFSET's <n> narrows to a literal integer,
+reusing _ordinal_value - not a general constant expression
+
+Issue #77. `LIMIT`/`OFFSET` accept exactly what `_ordinal_value`
+(`sql/binder.py`, built for #61's `GROUP BY`/`ORDER BY` ordinals)
+already recognises: a bare integer `Literal`, optionally wrapped
+in any nesting of unary `+`/`-`. Everything else sqlite3 3.51.0
+itself accepts in this position - confirmed live this session,
+not carried over from #61's own grooming notes - is a `BindError`:
+
+    sqlite> create table t(a integer, b text);
+    sqlite> insert into t values (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+    sqlite> select * from t limit 1+1;            -- 2 rows, legal
+    sqlite> select * from t limit case when 1=1 then 2 else 3 end;  -- legal
+    sqlite> select * from t limit (1=1);           -- 1 row, legal
+    sqlite> select * from t limit abs(-2);         -- legal (scalar fn)
+    sqlite> select * from t limit max(2,3);        -- legal (2-arg scalar max)
+    sqlite> select * from t limit count(*);        -- misuse of aggregate function count()
+    sqlite> select * from t limit a;               -- no such column: a
+    sqlite> select a as n from t order by a limit n;  -- no such column: n (no alias fallback)
+    sqlite> select * from t limit '2';             -- 2 rows (numeric-affinity TEXT)
+    sqlite> select * from t limit '2.5';           -- datatype mismatch
+    sqlite> select * from t limit 2.5;             -- datatype mismatch
+    sqlite> select * from t limit 2.0;             -- 2 rows (MustBeInt's zero-fraction rule)
+    sqlite> select * from t limit NULL;            -- datatype mismatch
+
+This is a syntactic narrowing, the same category as #25's
+AS-mandatory decision and #61's own ordinal precedent, not a
+semantic disagreement with SQLite about what a query means -
+AGENTS.md's "where historian and SQLite disagree, SQLite is
+right" arbitrates the grammar historian does accept, not a
+mandate to accept every surface SQLite accepts (§1's non-goals
+already carve out subqueries and more on exactly this basis).
+Three things tip this toward the narrow reading: (1) it is
+architecturally free - `_ordinal_value` already exists, already
+shared by two clauses, and needs no new evaluation machinery in
+`sql/binder.py`/`plan/planner.py`, both of which otherwise only
+ever assemble or reshape `Expr` trees and leave value computation
+to `exec/expression.py`'s per-row `evaluate()` - `LIMIT`/`OFFSET`
+have no row to evaluate against; (2) replicating sqlite3's own
+accepted grammar in full means replicating `MustBeInt`'s exact-
+zero-fractional-part REAL rule and numeric-affinity TEXT
+coercion, genuine SQLite-internals trivia nobody archaeology-
+querying a git repo would type by hand; (3) it matches the
+ordinal precedent this project already committed to twice
+(`GROUP BY`/`ORDER BY`, most recently widened above), for a
+clause that is if anything *stricter* than either in sqlite3
+itself (no alias fallback, no column reference at all). No range
+check, unlike an ordinal: 0 and any negative resolved value bind
+successfully - see the runtime-semantics entry below.
+
+Rejected via `LIMIT`/`OFFSET`'s own `BindError`
+(`"LIMIT/OFFSET must be a literal integer, optionally wrapped in
+unary +/- and parentheses"`), not a `ParseError` - `sql/parser.py`
+parses `LIMIT <expr>`/`OFFSET <expr>` generically via the same
+`_parse_expr()` `ORDER BY`'s own item uses, deferring the
+literal-integer-vs-anything-else decision to the binder exactly
+as `ORDER BY`'s ordinal does.
+
+2026-09-25 - the LIMIT comma form (LIMIT m, n) is out of scope,
+rejected by name rather than falling through to a bare token error
+
+Issue #77. `_docs/spec.md` §1's grammar line, `LIMIT <n> [OFFSET
+<n>]`, has no comma in it. Confirmed live that the comma form
+means `LIMIT n OFFSET m` - the *reverse* argument order from the
+`OFFSET` spelling already in scope:
+
+    sqlite> select * from t limit 3, 2;         -- rows 4,5
+    sqlite> select * from t limit 2 offset 3;   -- rows 4,5 (same)
+
+Not implemented, for the same reason #61's own grooming gave for
+declining other SQLite surface syntax: it is a second, differently-
+ordered spelling of a clause historian can already express in full
+via `OFFSET`, and the swapped argument order is a well-known
+footgun (inherited by SQLite for MySQL compatibility) rather than
+a capability query authors would otherwise lack. `sql/parser.py`
+recognises the shape explicitly - a comma immediately following a
+bound `LIMIT` expression - and raises `ParseError` naming the
+comma form and pointing at `OFFSET` instead, rather than letting
+it fall through to `expect_end()`'s generic "expected end of
+query, found ','", matching §3's "Unsupported grammar" rule
+("point at the non-goal, don't just report a stray token").
+
+2026-09-25 - LIMIT/OFFSET runtime semantics: negative LIMIT means
+no limit, negative OFFSET clamps to zero, OFFSET past the end is
+zero rows not an error
+
+Issue #77. Confirmed live against sqlite3 3.51.0 (`create table
+t(a integer, b text); insert into t values (1,'a'),(2,'b'),(3,'c'),
+(4,'d'),(5,'e');`, `select * from t order by a ...`):
+
+    limit 0                    -> 0 rows
+    limit -1                   -> all 5 rows (negative LIMIT = no limit)
+    limit 2 offset -1          -> rows 1-2 (negative OFFSET = OFFSET 0)
+    limit -5 offset -5         -> all 5 rows (both defaults at once)
+    limit -1 offset 2          -> rows 3-5 (OFFSET still applies)
+    limit 5 offset 100         -> 0 rows, not an error
+
+`exec/operators.py`'s new `Limit` operator implements all five
+directly: `offset` is clamped to `max(0, offset)` once, at
+construction, rather than left as an incidental consequence of
+how `rows()` iterates (`range()` over a negative count is
+silently empty in CPython, which would have made the clamp
+appear to work without actually happening - caught by a
+deliberate mutation check during this issue's own testing, see
+`tests/test_operators.py`'s `test_negative_offset_is_clamped_on_
+the_operator_itself`); a negative `limit` skips the truncation
+branch entirely and yields every remaining child row after
+`OFFSET`; `LIMIT 0` returns before pulling even one row from
+`child`.
+
+2026-09-25 - Limit's tree position (above Project) and its own
+laziness are two independent choices, both settled without a
+harness or scan change
+
+Issue #77. `plan()` inserts `Limit` as the new outermost operator,
+wrapping `Project` unconditionally, whenever `stmt.limit is not
+None` - `Scan -> Filter (WHERE) -> [Aggregate -> Filter (HAVING)]
+-> Sort -> Project -> Limit`. `LIMIT` cannot change *which*
+columns a row has or what its values are (`Project` is a 1-in-1-
+out, order- and count-preserving generator), so its position
+relative to `Project` is undetermined by row-correctness alone;
+what does force the choice is `SELECT DISTINCT` ("12c", #61's own
+unfiled follow-on), which SQLite applies before `LIMIT` (`SELECT
+DISTINCT x ... LIMIT n` limits the deduped set) - so `Distinct`
+must land strictly between `Project` and `Limit` once it exists,
+and placing `Limit` outermost now is the one choice that leaves
+that slot free without a second tree-shape change later.
+
+`Limit.rows()` is a plain generator, never `list(child.rows())
+[offset:offset+limit]` - it pulls at most `offset + limit` rows
+from `child` (fewer if `child` itself runs out first), stopping
+the instant the requested count is yielded. This is the ordinary
+Volcano-model property every operator in this codebase already
+has except `Sort`/`Aggregate` (which must consume their child
+fully before producing anything) - `Limit` merely has to not
+throw it away by materializing up front. It is *not* the `LIMIT`
+pushdown `_docs/spec.md` §3/§6 describe (M4: a scan stopping
+`git log`/`git blame` itself) - that is a planner/scan
+capability negotiation this operator knows nothing about;
+`exec/operators.py`'s `Scan` still calls `source.scan(pushed=())`
+unconditionally, unchanged by this issue. Proved directly with a
+spy `ScanSource` (`tests/test_operators.py`, mirroring `Sort`'s
+own `test_sort_reads_child_rows_exactly_once` pattern): `Limit`
+over `Scan` with 20 rows available, no `ORDER BY`/`GROUP BY`
+between them, pulls at most `offset + limit` rows, and `LIMIT 0`
+pulls none at all.
+
+2026-09-25 - the LIMIT/OFFSET oracle: row count only without
+ORDER BY, self-consistency instead of a second SQL front end,
+boundary-tie freedom proved from a query rather than hard-coded
+
+Issue #77. Without `ORDER BY`, "the first n rows" is engine-
+defined on both sides at once - SQLite promises no row order at
+all (§3), and historian's own order for a `LIMIT`-free query is
+merely *deterministic*, not the same sequence SQLite happens to
+produce - so neither a sorted-multiset nor an exact-order
+comparison means anything for a truncated result. Row **count**
+is still comparable (`min(n, matching rows)` after `OFFSET`, on
+both sides) and is checked directly in
+`tests/differential/test_blame.py`'s own test bodies, bypassing
+`assert_rows_match` entirely rather than adding a fourth mode to
+it - `conftest.py` needed no change, avoiding any conflict with
+#80's concurrent work there.
+
+Row *content* without `ORDER BY` is checked the non-oracle way
+instead, mirroring #61's own determinism pattern: historian's
+`LIMIT n [OFFSET m]` result must equal the plain Python slice
+`[m:m+n]` of historian's own result for the same query with the
+clause removed - both are already deterministic (`AGENTS.md`),
+and this catches an off-by-one or a double-counted `OFFSET`
+without needing a second engine to agree with at all.
+
+With `ORDER BY`, `assert_rows_match(ordered=True,
+key_positions=...)` is reused exactly as #61 left it - but only
+once the cut is proved boundary-tie-free: the row immediately
+before the cut and the row immediately after it (on the full,
+unfiltered, sorted result) must not share an `ORDER BY` key
+tuple, or SQLite and historian could each legitimately keep a
+different member of a group `LIMIT`/`OFFSET` splits apart, which
+the tie-tolerant comparison (built for a *complete* result) would
+misread as a mismatch. The proof is computed from a query against
+the unfiltered SQLite side inside the test body itself
+(`_order_with_limit`, `tests/differential/test_blame.py`) - never
+hard-coded - the same discipline `#61`/`#80` already established
+for the "`ORDER BY` key not in the select list" case: a fixture
+change that later introduces a boundary tie fails the proof
+loudly, as a broken test, rather than silently passing on a false
+historian bug. No new parameter on `assert_rows_match` and no
+change to `conftest.py` was needed for this either.

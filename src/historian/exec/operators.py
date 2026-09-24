@@ -184,18 +184,20 @@ class Filter:
                 yield row
 
 
-# --- Aggregate (issue #60): the whole-table path only -----------------------
+# --- Aggregate (issue #60, grouped path added by #69) -----------------------
 #
-# `_docs/spec.md` §3's `Aggregate` operator, piece 1 (#60): count/sum/
-# avg/min/max, no GROUP BY, no HAVING (#69). Sits between Filter (or
-# Scan, when there is no WHERE) and Project - `plan/planner.py` is the
-# one place that decides whether to insert it at all, only when the
-# SELECT list has at least one aggregate call; an aggregate-free query
-# never builds one. "Whole-table" means exactly one output row, always
-# - even over zero input rows (spec §3's own named "classic mistake":
-# `count(*)` over zero rows is `0`, not zero output rows) - which is
-# why `rows()` below is a single pass over `child.rows()` followed by
-# exactly one `yield`, never zero and never more than one.
+# `_docs/spec.md` §3's `Aggregate` operator: count/sum/avg/min/max,
+# whole-table (#60) and grouped (#69). Sits between Filter (or Scan,
+# when there is no WHERE) and Project, with `HAVING`'s own `Filter`
+# (issue #69, `plan/planner.py`) between `Aggregate` and `Project` when
+# the query has one. "Whole-table" (`group_by` empty) means exactly
+# one output row, always - even over zero input rows (spec §3's own
+# named "classic mistake": `count(*)` over zero rows is `0`, not zero
+# output rows). Grouped (`group_by` non-empty) is the opposite over an
+# empty table: zero groups in, zero rows out - there is nothing to
+# group. This is the one place the two paths diverge on purpose; both
+# are implemented by the same `rows()` below, which special-cases the
+# empty-`group_by` case exactly once, at the very end.
 
 
 @dataclass(frozen=True)
@@ -351,37 +353,119 @@ def _aggregate_output_type(kind: str) -> ColumnType:
     return ColumnType.TEXT
 
 
-class Aggregate:
-    """`_docs/spec.md` §3's `Aggregate` operator, whole-table path only
-    (#60; `GROUP BY`/`HAVING` are #69). `calls` is the ordered list of
-    aggregate calls `plan/planner.py` split out of the `SELECT` list -
-    each gets one output column, in the same order, computed by
-    streaming `child.rows()` through this operator exactly once.
+def _group_key_output_type(expr: Expr, child_schema: Schema) -> ColumnType:
+    """The declared type `Aggregate`'s own output schema gives one
+    `group_by` key column - the same rule `_project_column` (below)
+    already uses for a `Project` output column: a bare
+    `BoundColumnRef` keeps its source column's declared type, and
+    every other expression shape gets the same documented `TEXT`
+    placeholder."""
+    if isinstance(expr, BoundColumnRef):
+        return child_schema.columns[expr.offset].type
+    return ColumnType.TEXT
 
-    Every call's argument is evaluated against `child`'s schema (the
-    row shape *below* aggregation), never against this operator's own
-    output schema - `Project`, above this operator, is what evaluates
-    the surrounding scalar expression against *this* operator's output
-    row instead, per spec §3's "Expression evaluation" split.
+
+def _group_key_name(index: int, expr: Expr) -> str:
+    """The header `Aggregate`'s own output schema gives one `group_by`
+    key column - a bare `BoundColumnRef` keeps its declared name (so
+    `GROUP BY author_name` produces a column literally named
+    `author_name`), and every other expression shape falls back to a
+    positional placeholder, mirroring `_PLACEHOLDER_COLUMN_NAME`
+    below. 1-based, matching that convention."""
+    if isinstance(expr, BoundColumnRef):
+        return expr.name
+    return f"group_{index + 1}"
+
+
+class Aggregate:
+    """`_docs/spec.md` §3's `Aggregate` operator: `calls` is the
+    ordered list of aggregate calls `plan/planner.py` split out of the
+    `SELECT`/`HAVING` expressions - each gets one output column, after
+    every `group_by` key column, in that order. `group_by` is `()` for
+    the whole-table path (#60, unchanged): exactly one output row,
+    always, computed by streaming `child.rows()` through one shared
+    set of accumulators. A non-empty `group_by` (#69) instead computes
+    one key tuple per child row (evaluated against `child`'s schema,
+    same as every aggregate call's own argument), steps that key's own
+    accumulator set, and - at the end - yields one row per distinct
+    key, key columns first: zero groups, zero rows, over an empty
+    table, the one place the two paths genuinely diverge.
+
+    Two key tuples are the same group under SQL equality, not Python
+    `==` - `values.order_key(value)` is used as the per-column
+    dictionary key component, which already normalizes storage-class-
+    insensitive numeric equality (`1`/`1.0` share a key; `'1'` does
+    not, since it carries a different storage-class rank) - see
+    `values.py`'s own docstring. Groups are emitted in
+    **first-row-encountered order**: a plain `dict` preserves
+    insertion order, and no key is ever re-inserted once seen, so this
+    falls out of the implementation rather than needing a separate
+    sort - the concrete, checkable determinism rule this issue commits
+    to (`_docs/spec.md`'s "Determinism and row order", AGENTS.md).
+
+    Every call's and every `group_by` expression's argument is
+    evaluated against `child`'s schema (the row shape *below*
+    aggregation), never against this operator's own output schema -
+    `Project`, above this operator (and `HAVING`'s own `Filter`, #69,
+    directly above `Aggregate`), is what evaluates the surrounding
+    scalar expression against *this* operator's output row instead,
+    per spec §3's "Expression evaluation" split.
     """
 
-    def __init__(self, child: Operator, calls: Sequence[AggregateCall]) -> None:
+    def __init__(
+        self,
+        child: Operator,
+        calls: Sequence[AggregateCall],
+        group_by: Sequence[Expr] = (),
+    ) -> None:
         self._child = child
         self._calls = tuple(calls)
-        self.schema = Schema(
-            columns=tuple(
-                Column(f"{call.kind}_{index + 1}", _aggregate_output_type(call.kind))
-                for index, call in enumerate(self._calls)
-            )
+        self._group_by = tuple(group_by)
+        child_schema = child.schema
+        group_columns = tuple(
+            Column(_group_key_name(index, expr), _group_key_output_type(expr, child_schema))
+            for index, expr in enumerate(self._group_by)
         )
+        call_columns = tuple(
+            Column(f"{call.kind}_{index + 1}", _aggregate_output_type(call.kind))
+            for index, call in enumerate(self._calls)
+        )
+        self.schema = Schema(columns=group_columns + call_columns)
 
     def rows(self) -> Iterator[Row]:
         child_schema = self._child.schema
-        accumulators = [_Accumulator(call) for call in self._calls]
+        if not self._group_by:
+            # Whole-table path (#60, unchanged): one shared accumulator
+            # set, exactly one output row, even over zero child rows.
+            accumulators = [_Accumulator(call) for call in self._calls]
+            for row in self._child.rows():
+                for accumulator in accumulators:
+                    accumulator.step(row, child_schema)
+            yield tuple(accumulator.finish() for accumulator in accumulators)
+            return
+
+        # Grouped path (#69): one accumulator set per distinct key,
+        # keyed by `values.order_key` per column so grouping uses SQL
+        # equality rather than Python's - see the class docstring.
+        # `groups` maps that key to `(key_values, accumulators)`; a
+        # plain dict's insertion order is what gives first-row-
+        # encountered emission order, with no extra bookkeeping.
+        groups: dict[tuple[object, ...], tuple[Row, list[_Accumulator]]] = {}
         for row in self._child.rows():
+            key_values = tuple(
+                coerce_to_value(evaluate(expr, row, child_schema)) for expr in self._group_by
+            )
+            key = tuple(values.order_key(value) for value in key_values)
+            entry = groups.get(key)
+            if entry is None:
+                entry = (key_values, [_Accumulator(call) for call in self._calls])
+                groups[key] = entry
+            _key_values, accumulators = entry
             for accumulator in accumulators:
                 accumulator.step(row, child_schema)
-        yield tuple(accumulator.finish() for accumulator in accumulators)
+
+        for key_values, accumulators in groups.values():
+            yield key_values + tuple(accumulator.finish() for accumulator in accumulators)
 
 
 #: The positional placeholder used for a `Project` output column whose

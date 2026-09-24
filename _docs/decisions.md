@@ -1024,3 +1024,106 @@ the select list, HAVING's own predicate has none) while
 identical error (an aggregate call written in HAVING itself does
 not by itself make the query aggregate). Implemented in
 `sql/binder.py`, checked once after HAVING is bound.
+
+2026-09-24 - ORDER BY resolves alias-first, the reverse of every
+other clause, and gets the same grouped narrowing HAVING has
+
+Issue #61. `sql/binder.py`'s `_resolve_name` (issue #32) has
+carried an `alias_first` parameter since #32 landed, but nothing
+called it with `True` until now - #32 deliberately scoped its own
+testing to `alias_first=False` only, since no clause could
+construct the other direction yet. Confirmed live against
+sqlite3 3.51.0, independently of #32's own grooming:
+
+    sqlite> create table t(a integer, b integer);
+    sqlite> insert into t values(1,20),(2,10);
+    sqlite> select a as real_a, b as a from t order by a;
+    2|10
+    1|20
+
+Ordering by the alias `a` (= column `b`) puts `(2,10)` first;
+ordering by the real column `a` would put `(1,20)` first - the
+two disagree, which is what makes the data discriminating. Every
+other clause with alias fallback (WHERE, GROUP BY, HAVING) has
+the real column win; ORDER BY is the one exception. Confirmed by
+mutation on this issue's own branch before implementing: with
+`alias_first=True` reachable nowhere, a discriminating test
+written against the intended behaviour failed exactly as
+expected (`AttributeError`, no ORDER BY support at all, then a
+wrong-offset assertion failure once grammar/binding existed but
+the call site was still wired `False`); flipping the call site to
+`True` made it pass, and flipping it back to `False` after
+implementation reproduced the original failure - see `tests/
+test_binder.py`'s `test_order_by_alias_wins_over_real_column_of_
+the_same_name` and its own docstring for the mutation record.
+
+Separately, ORDER BY gets the same "grouped but not a key"
+narrowing the 2026-09-19/2026-09-24 entries above already give
+the select list and HAVING, for the identical reason: once a
+query aggregates (GROUP BY present, or an aggregate call in the
+select list), a bare ORDER BY column that is neither an aggregate
+call nor a GROUP BY key (nor built purely from GROUP BY keys) has
+no principled value to sort by - confirmed live, `select k,
+count(*) from g group by k order by v` succeeds in sqlite3 and
+sorts by an arbitrary row's `v` per group, exactly the shape the
+select list and HAVING already refuse. historian raises
+`BindError` instead, reusing `_split_for_grouped_check` unchanged.
+An aggregate call in ORDER BY is otherwise legal only once the
+query already aggregates - confirmed live, `select p from u order
+by count(*)` (no GROUP BY, no select-list aggregate) is "misuse
+of aggregate: count()" in sqlite3, the same rejection WHERE gets,
+while `select count(*) from u order by count(*)` succeeds. An
+ordinal pointing at an aggregate is legal in ORDER BY, unlike in
+GROUP BY - confirmed live, `select k, count(*) from g group by k
+order by 2 desc` succeeds in sqlite3 while the identically-shaped
+`GROUP BY 2` pointing at an aggregate is rejected.
+
+2026-09-24 - the differential harness's `ORDER BY` comparison is
+tie-tolerant, and the key it groups by is supplied, never inferred
+
+Issue #61. `AGENTS.md` guarantees historian's own row order is
+deterministic even among rows that tie on every ORDER BY key, but
+SQLite makes no such promise - a naive positional comparison in
+the differential harness would then report a false mismatch
+whenever the two engines break an identical tie differently,
+which neither engine's own contract calls a bug (the same
+"oracle gives a false signal" shape #60 hit, per the orchestrator's
+comment on this issue).
+
+The grooming's original design grouped tied rows by their ORDER
+BY key tuple, read back out of the output row. The orchestrator's
+own correction caught the hole in that: the key is not always in
+the output at all - `select p from u order by n` is legal SQL,
+and the result rows carry only `p`, not `n`. `assert_rows_match`
+(`tests/differential/conftest.py`) therefore takes the key's
+position(s) as an explicit, caller-supplied parameter rather than
+inferring it from the rows or parsing the query to recover it -
+a second SQL front end in the oracle is exactly the complexity
+the harness exists to avoid:
+
+- `ordered=True, key_positions=(<output column>, ...)`: the key
+  is selected. Rows are split into consecutive runs by their
+  values at those positions; the sequence of distinct key tuples
+  must match exactly, in position, and rows within a corresponding
+  tied group compare as a multiset.
+- `ordered=True, key_positions=None`: the key is not selected, so
+  the harness cannot see ties at all. The calling test must make
+  the case tie-free by construction and prove it on the SQLite
+  side - `tests/differential/test_blame.py`'s `test_order_by_
+  aggregate_not_in_the_select_list` checks `count(*)` is distinct
+  across `author_name`'s groups before trusting exact-order
+  comparison, so a fixture change that later introduces a tie
+  fails loudly as a broken test rather than as a false historian
+  bug.
+
+historian's own tie order is deterministic by construction, not
+merely as an aspiration: `Scan`/`Filter`/`Aggregate` already never
+reorder rows, so the row order reaching `Sort` is already fixed
+for a given repository and query, and `Sort`'s own stable,
+per-key sort (applied per `values.py`'s existing multi-key
+contract) preserves that original relative order among ties
+rather than needing separate bookkeeping - `tests/test_operators.
+py`'s `test_sort_is_stable_among_rows_tied_on_every_key` and
+`tests/differential/test_blame.py`'s `test_order_by_same_query_
+twice_gives_identical_order` both check this directly, not
+through the oracle.

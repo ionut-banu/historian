@@ -62,6 +62,25 @@ because the node it is currently dispatching on is itself `And`/`Or`/
 `Not`, exactly the same structural knowledge every other branch here
 already uses, never because a caller told it what position it is in.
 
+#38's two root call sites (a select-list root, a `WHERE`/`HAVING`
+predicate root) left one direction incomplete: a predicate-shaped
+result reaching a **nested** `Value`-requiring operand - a comparison
+operand, `IS`'s two sides, `BETWEEN`'s operand/low/high, `IN`'s left
+operand and each list element, `||`'s two sides, `LIKE`'s two sides,
+and arithmetic/unary-minus's operand - still raised a bare `TypeError`
+one level deeper than either root. Issue #63 closes that gap the same
+structural way: `coerce_to_value` gains callers *inside* `evaluate()`'s
+own recursive dispatch, exactly mirroring how `coerce_to_bool3` already
+had one for `And`/`Or`/`Not` - `_evaluate_affinity_pair` wraps both of
+its `evaluate()` calls in `coerce_to_value` before affinity is applied
+(fixing comparison, `IS`, `BETWEEN`, and `IN` in one shared chokepoint,
+since all four route their operands through it), and `_eval_binary`'s
+`||`/arithmetic branches, `_eval_like`, and `_eval_unary`'s `-` branch
+each do the same at their own call site. Still no `position` parameter:
+each of these already knows, structurally, that the operand it is about
+to hand to `values.eq`/`_coerce_to_text`/`_arithmetic_operand` must be a
+`Value`, from its own node shape alone.
+
 Column affinity
 ----------------
 
@@ -247,7 +266,7 @@ def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
     raise AssertionError(f"exec/expression.py: unhandled expression node type {type(expr).__name__}")
 
 
-# --- The Value/Bool3 coercion boundary (issue #38) ------------------------
+# --- The Value/Bool3 coercion boundary (issues #38, #63) -------------------
 #
 # Two small, pure functions of evaluate()'s own return value - deliberately
 # not a `position` parameter threaded through evaluate()'s recursive
@@ -257,8 +276,24 @@ def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
 # branches already knows, structurally, what position its *children's*
 # results are in, purely from which node it is currently dispatching on.
 #
-# `coerce_to_value` is called only from outside evaluate()'s own recursion:
-# by `Project` (`exec/operators.py`), on a select-list item's root result.
+# `coerce_to_value` originally (#38) had exactly one caller, from outside
+# evaluate()'s own recursion: `Project` (`exec/operators.py`), on a
+# select-list item's root result. Issue #63 found the same gap #38 round 2
+# already found for `coerce_to_bool3` below, one recursion level deeper for
+# the opposite direction: a predicate-shaped result reaching a *nested*
+# Value-requiring operand - a comparison operand, `IS`'s two sides,
+# `BETWEEN`'s operand/low/high, `IN`'s left operand and each list element,
+# `||`'s two sides, `LIKE`'s two sides, and arithmetic/unary-minus's operand
+# - still raised a bare TypeError. `coerce_to_value` now has callers
+# *inside* evaluate()'s own recursive dispatch too: `_evaluate_affinity_pair`
+# wraps both its `evaluate()` calls in `coerce_to_value` before affinity is
+# applied (one shared chokepoint fixing comparison, `IS`, `BETWEEN`, and
+# `IN`, since all four route their operands through it), and `_eval_binary`'s
+# `||`/arithmetic branches, `_eval_like`, and `_eval_unary`'s `-` branch each
+# add their own call, equally small. Same non-`position` reasoning as
+# `coerce_to_bool3`'s second caller below: each of these already knows,
+# structurally, that its own operand must be a `Value`, from the node it is
+# currently dispatching on, never from an external mode passed in.
 #
 # `coerce_to_bool3` has two kinds of caller. `Filter` (`exec/operators.py`)
 # calls it from outside the recursion too, on a WHERE/HAVING predicate's
@@ -275,10 +310,11 @@ def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
 # to `values.and3`/`or3`/`not3`. This still needs no `position` parameter:
 # `And`/`Or`/`Not`'s operands are predicate positions unconditionally, a
 # property of the node evaluate() is already dispatching on, not something
-# a caller has to tell it. Between, In and Like never need this - each
-# already builds its own Bool3 result from values.py's own comparison
+# a caller has to tell it. Between, In and Like never need `coerce_to_bool3`
+# - each already builds its own Bool3 result from values.py's own comparison
 # functions (`values.eq`/`ge`/`le`/...), never from a raw, uncoerced
-# evaluate() result, so there is nothing left to coerce there.
+# evaluate() result, so there is nothing left to coerce in that direction;
+# #63 above is what fixes their *operands*, the opposite direction, instead.
 #
 # Both coercions are sound as functions of the return value alone, with no
 # need to re-inspect the AST: values.py's own module docstring excludes
@@ -463,8 +499,8 @@ def _eval_like(expr: Like, row: Row, schema: Schema) -> Bool3:
     separately reasoned-out negation - which is what keeps `NULL`
     propagation correct through the negation for free.
     """
-    left = evaluate(expr.left, row, schema)
-    pattern = evaluate(expr.pattern, row, schema)
+    left = coerce_to_value(evaluate(expr.left, row, schema))
+    pattern = coerce_to_value(evaluate(expr.pattern, row, schema))
     if left is None or pattern is None:
         result: Bool3 = None
     else:
@@ -597,7 +633,7 @@ def _eval_unary(expr: UnaryOp, row: Row, schema: Schema) -> Value:
         and expr.operand.value == _INT64_MIN_MAGNITUDE_AS_FLOAT
     ):
         return _INT64_MIN
-    operand = evaluate(expr.operand, row, schema)
+    operand = coerce_to_value(evaluate(expr.operand, row, schema))
     if operand is None:
         return None
     numeric = _arithmetic_operand(operand)
@@ -624,12 +660,12 @@ _COMPARISON_FNS = {
 
 def _eval_binary(expr: BinaryOp, row: Row, schema: Schema) -> Value | Bool3:
     if expr.op in _ARITHMETIC_OPS:
-        left = evaluate(expr.left, row, schema)
-        right = evaluate(expr.right, row, schema)
+        left = coerce_to_value(evaluate(expr.left, row, schema))
+        right = coerce_to_value(evaluate(expr.right, row, schema))
         return _arithmetic(expr.op, left, right)
     if expr.op is Operator.CONCAT:
-        left = evaluate(expr.left, row, schema)
-        right = evaluate(expr.right, row, schema)
+        left = coerce_to_value(evaluate(expr.left, row, schema))
+        right = coerce_to_value(evaluate(expr.right, row, schema))
         if left is None or right is None:
             return None
         return _coerce_to_text(left) + _coerce_to_text(right)
@@ -661,8 +697,8 @@ def _evaluate_affinity_pair(
     affinity independently - see `_eval_in`'s docstring for the
     evidence that the two operators, though structurally identical
     here, are not supposed to behave alike."""
-    left = evaluate(left_expr, row, schema)
-    right = evaluate(right_expr, row, schema)
+    left = coerce_to_value(evaluate(left_expr, row, schema))
+    right = coerce_to_value(evaluate(right_expr, row, schema))
     right_affinity = _affinity_of(right_expr, schema) if right_has_affinity else None
     return _apply_affinity(left, _affinity_of(left_expr, schema), right, right_affinity)
 
@@ -833,7 +869,26 @@ def _arithmetic_operand(value: Value) -> int | float:
     unchanged, text goes through the leading-prefix coercion above.
     Never called with `None` - the caller checks for NULL first, since
     NULL's propagation through arithmetic is "the whole expression is
-    NULL", not "NULL contributes 0"."""
+    NULL", not "NULL contributes 0".
+
+    Defensive `bool` guard, mirroring the exact pattern `values.py`'s
+    own `_rank` and this module's own `_coerce_to_text` already use for
+    the identical reason (issue #63): a raw Python `bool` must never
+    reach arithmetic. Not reachable through `evaluate()` itself once
+    `_eval_binary`'s arithmetic branch and `_eval_unary`'s `-` branch
+    both call `coerce_to_value()` on their operand first - this guard
+    exists so a future regression that removes either call-site
+    coercion fails loudly (a `TypeError` here) rather than silently
+    keeping today's `bool`-subclasses-`int` accident. See the module
+    docstring's arithmetic section for why no black-box test on
+    `evaluate()`'s return value alone can tell the deliberate fix from
+    the accident - this guard, paired with the call-site coercion, is
+    what makes it possible."""
+    if isinstance(value, bool):
+        raise TypeError(
+            "bool is not a SQL Value; a Bool3 predicate result has leaked "
+            f"into an arithmetic operand position (got {value!r})"
+        )
     if isinstance(value, str):
         return _coerce_arithmetic_text(value)
     return value

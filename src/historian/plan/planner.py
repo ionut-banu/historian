@@ -67,6 +67,8 @@ import dataclasses
 from collections.abc import Callable
 from pathlib import Path
 
+from collections.abc import Sequence
+
 from historian.exec.operators import Aggregate, AggregateCall, Filter, Operator, Project, Scan, ScanSource
 from historian.sql.ast import (
     And,
@@ -103,33 +105,122 @@ ScanFactory = Callable[[Path], ScanSource]
 TABLES: dict[str, ScanFactory] = {"blame": BlameScan}
 
 
-# --- The aggregate/scalar split (issue #60) ---------------------------------
+# --- The aggregate/scalar split (issue #60, extended by #69) ----------------
 #
 # `_docs/spec.md` §3's "Expression evaluation": "The planner splits
 # each SELECT and HAVING expression into aggregate calls, computed by
 # the Aggregate operator, and the surrounding scalar expression,
 # computed here [exec/expression.py] over the aggregate's output row."
-# HAVING is #69's; this issue only needs the SELECT half.
+# #60 built the SELECT half; #69 reuses the same split for HAVING
+# (see `plan()`) and extends it for GROUP BY: a select-list or HAVING
+# subexpression that matches a GROUP BY key by shape is *also*
+# rewritten into a reference into `Aggregate`'s output row, at that
+# key's own column offset - the group-key columns `Aggregate` now puts
+# first, ahead of every aggregate call's column (`exec/operators.py`'s
+# own `Aggregate.__init__`).
 #
-# `_split_expr` walks one already-bound select-list expression left to
-# right. Every `FunctionCall` it finds - by `sql/binder.py`'s own
-# guarantee, always a real, correctly-arity aggregate call, since
-# nothing else can survive binding - is replaced with a
-# `BoundColumnRef` into `Aggregate`'s own output row, at the offset its
-# `AggregateCall` occupies once appended to `calls`; every other node
-# type is walked and rebuilt via `dataclasses.replace`, mirroring
-# `sql/binder.py`'s own `_bind_expr` structure exactly (one boring,
-# explicit isinstance branch per `sql/ast.py` node type - AGENTS.md: no
-# dynamic dispatch). `calls` accumulates across the *entire* select
-# list, in one flat, ordered, undeduplicated list - `count(*)` written
-# twice gets two slots, not one shared one; `Aggregate` computing the
-# same thing twice is cheap for one output row, and correctness needs
-# no identity/equality bookkeeping to get that just as right.
+# `_split_expr` walks one already-bound expression left to right.
+# Any subtree matching a `group_by` key by shape (`_expr_shape_equal`,
+# ignoring position - the same rule `sql/binder.py` already used to
+# decide the expression was legal at bind time) is replaced wholesale
+# with a `BoundColumnRef` into that key's own slot in `Aggregate`'s
+# output row - `dataclasses.replace` structural equality, not `==` on
+# the raw AST node, because the two occurrences (SELECT/HAVING vs.
+# GROUP BY) were bound independently and never share `position`.
+# Every `FunctionCall` still found after that check - by
+# `sql/binder.py`'s own guarantee, always a real, correctly-arity
+# aggregate call - is replaced with a `BoundColumnRef` into `Aggregate`'s
+# own output row, at `len(group_by) + len(calls)` (group-key columns
+# come first), the offset its `AggregateCall` occupies once appended
+# to `calls`; every other node type is walked and rebuilt via
+# `dataclasses.replace`, mirroring `sql/binder.py`'s own `_bind_expr`
+# structure exactly (one boring, explicit isinstance branch per
+# `sql/ast.py` node type - AGENTS.md: no dynamic dispatch). `calls`
+# accumulates across the *entire* select list and then HAVING, in one
+# flat, ordered, undeduplicated list, shared between the two so their
+# offsets never collide - `count(*)` written twice gets two slots, not
+# one shared one; `Aggregate` computing the same thing twice is cheap,
+# and correctness needs no identity/equality bookkeeping to get that
+# just as right.
 #
 # `evaluate()` needs no change for this: a `BoundColumnRef` it reads
 # `row[offset]` from works identically whether `row` came from a table
 # scan or from `Aggregate`'s own output - `exec/expression.py` has no
 # reason to know which.
+
+
+def _expr_shape_equal(a: Expr, b: Expr) -> bool:
+    """Structural equality between two already-bound expressions,
+    ignoring `position` - mirrors `sql/binder.py`'s own
+    `_expr_shape_equal` exactly (the same question, asked again here
+    because a `GROUP BY` key and its matching `SELECT`/`HAVING`
+    occurrence are bound independently and never share a `position`).
+    Kept as this module's own copy rather than importing a private
+    name across modules - `sql/binder.py`'s `_bind_expr`/`plan/
+    planner.py`'s `_split_expr` are already two independent, mirrored
+    walks of the same shape for the same reason."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, Literal):
+        return type(a.value) is type(b.value) and a.value == b.value
+    if isinstance(a, BoundColumnRef):
+        return a.offset == b.offset
+    if isinstance(a, Star):
+        return a.table == b.table
+    if isinstance(a, FunctionCall):
+        return (
+            a.name == b.name
+            and len(a.args) == len(b.args)
+            and all(_expr_shape_equal(x, y) for x, y in zip(a.args, b.args))
+        )
+    if isinstance(a, UnaryOp):
+        return a.op == b.op and _expr_shape_equal(a.operand, b.operand)
+    if isinstance(a, Not):
+        return _expr_shape_equal(a.operand, b.operand)
+    if isinstance(a, BinaryOp):
+        return a.op == b.op and _expr_shape_equal(a.left, b.left) and _expr_shape_equal(a.right, b.right)
+    if isinstance(a, And):
+        return _expr_shape_equal(a.left, b.left) and _expr_shape_equal(a.right, b.right)
+    if isinstance(a, Or):
+        return _expr_shape_equal(a.left, b.left) and _expr_shape_equal(a.right, b.right)
+    if isinstance(a, Is):
+        return (
+            a.negated == b.negated
+            and _expr_shape_equal(a.left, b.left)
+            and _expr_shape_equal(a.right, b.right)
+        )
+    if isinstance(a, Like):
+        return (
+            a.negated == b.negated
+            and _expr_shape_equal(a.left, b.left)
+            and _expr_shape_equal(a.pattern, b.pattern)
+        )
+    if isinstance(a, In):
+        return (
+            a.negated == b.negated
+            and len(a.values) == len(b.values)
+            and _expr_shape_equal(a.left, b.left)
+            and all(_expr_shape_equal(x, y) for x, y in zip(a.values, b.values))
+        )
+    if isinstance(a, Between):
+        return (
+            a.negated == b.negated
+            and _expr_shape_equal(a.operand, b.operand)
+            and _expr_shape_equal(a.low, b.low)
+            and _expr_shape_equal(a.high, b.high)
+        )
+    raise AssertionError(f"plan/planner.py: unhandled expression node type {type(a).__name__}")
+
+
+def _group_key_index(expr: Expr, group_by: Sequence[Expr]) -> int | None:
+    """The offset of *expr* among `Aggregate`'s group-key columns, if
+    it matches one of `group_by`'s keys by shape - `None` otherwise.
+    The first match wins, matching `group_by`'s own declared order
+    (which is also `Aggregate`'s own output column order)."""
+    for index, key in enumerate(group_by):
+        if _expr_shape_equal(expr, key):
+            return index
+    return None
 
 
 def _build_aggregate_call(call: FunctionCall) -> AggregateCall:
@@ -153,9 +244,12 @@ def _build_aggregate_call(call: FunctionCall) -> AggregateCall:
     return AggregateCall(kind=kind, arg=arg, position=call.position)
 
 
-def _split_expr(expr: Expr, calls: list[AggregateCall]) -> Expr:
+def _split_expr(expr: Expr, calls: list[AggregateCall], group_by: Sequence[Expr]) -> Expr:
+    key_index = _group_key_index(expr, group_by)
+    if key_index is not None:
+        return BoundColumnRef(offset=key_index, name=f"group_{key_index + 1}", position=expr.position)
     if isinstance(expr, FunctionCall):
-        slot = len(calls)
+        slot = len(group_by) + len(calls)
         calls.append(_build_aggregate_call(expr))
         return BoundColumnRef(offset=slot, name=expr.name, position=expr.position)
     if isinstance(expr, Literal):
@@ -163,57 +257,66 @@ def _split_expr(expr: Expr, calls: list[AggregateCall]) -> Expr:
     if isinstance(expr, BoundColumnRef):
         return expr
     if isinstance(expr, UnaryOp):
-        return dataclasses.replace(expr, operand=_split_expr(expr.operand, calls))
+        return dataclasses.replace(expr, operand=_split_expr(expr.operand, calls, group_by))
     if isinstance(expr, Not):
-        return dataclasses.replace(expr, operand=_split_expr(expr.operand, calls))
+        return dataclasses.replace(expr, operand=_split_expr(expr.operand, calls, group_by))
     if isinstance(expr, BinaryOp):
         return dataclasses.replace(
-            expr, left=_split_expr(expr.left, calls), right=_split_expr(expr.right, calls)
+            expr,
+            left=_split_expr(expr.left, calls, group_by),
+            right=_split_expr(expr.right, calls, group_by),
         )
     if isinstance(expr, And):
         return dataclasses.replace(
-            expr, left=_split_expr(expr.left, calls), right=_split_expr(expr.right, calls)
+            expr,
+            left=_split_expr(expr.left, calls, group_by),
+            right=_split_expr(expr.right, calls, group_by),
         )
     if isinstance(expr, Or):
         return dataclasses.replace(
-            expr, left=_split_expr(expr.left, calls), right=_split_expr(expr.right, calls)
+            expr,
+            left=_split_expr(expr.left, calls, group_by),
+            right=_split_expr(expr.right, calls, group_by),
         )
     if isinstance(expr, Is):
         return dataclasses.replace(
-            expr, left=_split_expr(expr.left, calls), right=_split_expr(expr.right, calls)
+            expr,
+            left=_split_expr(expr.left, calls, group_by),
+            right=_split_expr(expr.right, calls, group_by),
         )
     if isinstance(expr, Like):
         return dataclasses.replace(
-            expr, left=_split_expr(expr.left, calls), pattern=_split_expr(expr.pattern, calls)
+            expr,
+            left=_split_expr(expr.left, calls, group_by),
+            pattern=_split_expr(expr.pattern, calls, group_by),
         )
     if isinstance(expr, In):
         return dataclasses.replace(
             expr,
-            left=_split_expr(expr.left, calls),
-            values=tuple(_split_expr(v, calls) for v in expr.values),
+            left=_split_expr(expr.left, calls, group_by),
+            values=tuple(_split_expr(v, calls, group_by) for v in expr.values),
         )
     if isinstance(expr, Between):
         return dataclasses.replace(
             expr,
-            operand=_split_expr(expr.operand, calls),
-            low=_split_expr(expr.low, calls),
-            high=_split_expr(expr.high, calls),
+            operand=_split_expr(expr.operand, calls, group_by),
+            low=_split_expr(expr.low, calls, group_by),
+            high=_split_expr(expr.high, calls, group_by),
         )
     raise AssertionError(f"plan/planner.py: unhandled expression node type {type(expr).__name__}")
 
 
 def _split_select_list(
-    select_list: tuple[BoundSelectItem, ...],
-) -> tuple[tuple[BoundSelectItem, ...], list[AggregateCall]]:
+    select_list: tuple[BoundSelectItem, ...], calls: list[AggregateCall], group_by: Sequence[Expr]
+) -> tuple[BoundSelectItem, ...]:
     """Split every item in *select_list*, in order, into a rewritten
-    select list (every aggregate call replaced by a reference into
-    `Aggregate`'s output row) and the flat, ordered list of
-    `AggregateCall`s that reference points at."""
-    calls: list[AggregateCall] = []
-    split_items = tuple(
-        dataclasses.replace(item, expr=_split_expr(item.expr, calls)) for item in select_list
+    select list (every aggregate call and every `GROUP BY`-key match
+    replaced by a reference into `Aggregate`'s output row), appending
+    to the shared, flat, ordered *calls* list every `AggregateCall`
+    found along the way."""
+    return tuple(
+        dataclasses.replace(item, expr=_split_expr(item.expr, calls, group_by)) for item in select_list
     )
-    return split_items, calls
 
 
 def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory] = TABLES) -> Operator:
@@ -227,24 +330,36 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory] 
     swapped for a fake in tests with no repository and no git
     subprocess, per this module's own docstring.
 
-    Returns `Project(Filter(Scan(source), stmt.where), stmt.select_list)`
-    when `stmt.where` is present, or `Project(Scan(source),
-    stmt.select_list)` when it is `None`, exactly as issue #13 built it
-    - and, new in #60, `Aggregate` inserted directly below `Project`
-    (`Project(Aggregate(<Filter or Scan>, calls), split_select_list)`)
-    whenever the select list contains at least one aggregate call.
-    Every other query - and every query as issue #13 already built it -
-    gets neither `Aggregate` nor a rewritten select list:
-    `_split_select_list` returns each item's expression unchanged in
-    shape whenever it contains no `FunctionCall`, and `calls` comes
-    back empty, so the `if calls:` check below never inserts
-    `Aggregate` where issue #13's two original shapes still apply.
+    Tree shape, per `_docs/spec.md` §3 and issue #69's own acceptance
+    criteria: `Scan -> Filter (WHERE) -> Aggregate (grouped or
+    whole-table) -> Filter (HAVING) -> Project`. `Aggregate` (and,
+    above it, `HAVING`'s `Filter`) is inserted only when the query
+    needs it - `stmt.group_by` is non-empty, or the aggregate/scalar
+    split (`_split_select_list`/`_split_expr`, run over the select
+    list and then `HAVING`, sharing one flat `calls` list so their
+    offsets never collide) found at least one aggregate call anywhere
+    in either. A `GROUP BY`-free, aggregate-free query keeps issue
+    #13's original two shapes exactly - neither `Aggregate` nor
+    `HAVING`'s `Filter` ever appears for it. A `HAVING` with no
+    aggregate call and no `GROUP BY` is *not* routed through
+    `Aggregate` at all - it behaves like an ordinary predicate over
+    the `Scan`/`Filter(WHERE)` row shape instead, since there is
+    nothing for `Aggregate` to compute or group in that case.
     """
     source = tables[stmt.from_table](repo)
     tree: Operator = Scan(source)
     if stmt.where is not None:
         tree = Filter(tree, stmt.where)
-    select_list, calls = _split_select_list(stmt.select_list)
-    if calls:
-        tree = Aggregate(tree, calls)
+
+    calls: list[AggregateCall] = []
+    select_list = _split_select_list(stmt.select_list, calls, stmt.group_by)
+    having = _split_expr(stmt.having, calls, stmt.group_by) if stmt.having is not None else None
+
+    if calls or stmt.group_by:
+        tree = Aggregate(tree, calls, group_by=stmt.group_by)
+        if having is not None:
+            tree = Filter(tree, having)
+    elif having is not None:
+        tree = Filter(tree, having)
+
     return Project(tree, select_list)

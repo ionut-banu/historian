@@ -1287,6 +1287,77 @@ def test_order_by_ordinal_pointing_at_a_sum_aggregate(awkward_repo):
     )
 
 
+# --- Ordinal detection: arbitrary unary nesting (orchestrator correction) --
+#
+# `_ordinal_value` (`sql/binder.py`) now unwraps any nesting of unary
+# `+`/`-` down to an integer literal in both GROUP BY and ORDER BY,
+# not just a bare literal or one level of unary - confirmed against
+# sqlite3 3.51.0 (see `_docs/decisions.md` for the full evidence).
+
+
+def test_order_by_bare_positive_ordinal_matches_named_column(awkward_repo):
+    _order(awkward_repo, "SELECT path FROM blame ORDER BY +1", key_positions=(0,))
+
+
+def test_order_by_double_negative_ordinal_matches_named_column(awkward_repo):
+    """`ORDER BY -(-1)` - confirmed against sqlite3: ordinal 1, sorts
+    by `path` exactly as `ORDER BY path`/`ORDER BY 1` would."""
+    _order(awkward_repo, "SELECT path FROM blame ORDER BY -(-1)", key_positions=(0,))
+
+
+def test_order_by_double_positive_ordinal_matches_named_column(awkward_repo):
+    _order(awkward_repo, "SELECT path FROM blame ORDER BY +(+1)", key_positions=(0,))
+
+
+def test_group_by_bare_positive_ordinal_matches_named_column(awkward_repo):
+    _assert_differential(awkward_repo, "SELECT path, count(*) FROM blame GROUP BY +1")
+
+
+def test_group_by_double_negative_ordinal_matches_named_column(awkward_repo):
+    _assert_differential(awkward_repo, "SELECT path, count(*) FROM blame GROUP BY -(-1)")
+
+
+def test_group_by_double_positive_ordinal_matches_named_column(awkward_repo):
+    _assert_differential(awkward_repo, "SELECT path, count(*) FROM blame GROUP BY +(+1)")
+
+
+def test_order_by_constant_expression_leaves_rows_in_scan_order(awkward_repo):
+    """`ORDER BY 1+0` is a constant expression, not an ordinal -
+    confirmed against sqlite3 directly (`_docs/decisions.md`): the
+    result comes back in the same order as no `ORDER BY` at all, not
+    resorted. `author_name` is the discriminating column - `awkward_
+    repo`'s natural (path-ordered) scan interleaves the two authors
+    (Zoë's lines, then Sam's two `café.py` lines, then more of Zoë's,
+    then Sam's `phoenix.txt` line last), which is neither alphabetical
+    order (`Sam` before `Zoë`) nor its reverse, so a query that
+    actually sorted by `author_name` would visibly differ from this
+    one - checked below, not merely asserted, so this test cannot pass
+    by coincidence.
+
+    A direct (non-oracle) comparison against historian's own unsorted
+    query, not a differential one against sqlite3: neither engine's
+    own contract defines a tie order for a key that ties on every row
+    (a constant sorts every row into a single group), so encoding
+    sqlite3's specific choice here as a permanent oracle assertion
+    would pin an implementation accident rather than a semantic
+    guarantee - `assert_rows_match`'s own tie-tolerant mode exists
+    precisely to avoid exactly that trap. sqlite3 was still confirmed
+    live to behave identically before writing this (`_docs/
+    decisions.md`), so the property is real, just checked the
+    direct way.
+    """
+    _, unsorted = run_historian("SELECT author_name FROM blame", awkward_repo)
+    _, constant_ordered = run_historian(
+        "SELECT author_name FROM blame ORDER BY 1+0", awkward_repo
+    )
+    _, actually_sorted = run_historian(
+        "SELECT author_name FROM blame ORDER BY author_name", awkward_repo
+    )
+
+    assert constant_ordered == unsorted
+    assert constant_ordered != actually_sorted
+
+
 def test_order_by_a_group_by_key(awkward_repo):
     _order(
         awkward_repo,
@@ -1379,6 +1450,17 @@ def test_order_by_aggregate_call_illegal_without_group_by_or_select_aggregate(ti
     aggregate: count()"."""
     with pytest.raises(BindError):
         run_historian("SELECT path FROM blame ORDER BY count(*)", tiny_repo)
+
+
+def test_group_by_constant_expression_still_raises_bind_error(tiny_repo):
+    """`GROUP BY 1+0` must stay a `BindError` even after widening
+    ordinal detection - legal in sqlite3 (one group, an arbitrary
+    row's `path` per SQLite's own unspecified per-group choice), but
+    `1+0` is a constant expression, not an ordinal, so `path` in the
+    select list is neither the (nonexistent) group key nor an
+    aggregate - the intended narrowing this fix must not disturb."""
+    with pytest.raises(BindError):
+        run_historian("SELECT path, count(*) FROM blame GROUP BY 1+0", tiny_repo)
 
 
 # --- Known disagreements that raise before producing rows --------------

@@ -768,29 +768,73 @@ def _expr_shape_equal(a: Expr, b: Expr) -> bool:
     raise AssertionError(f"sql/binder.py: unhandled expression node type {type(a).__name__}")
 
 
+# --- Ordinal detection, shared by GROUP BY and ORDER BY (issue #61) --------
+#
+# Orchestrator correction: SQLite treats *any* nesting of unary `+`/`-`
+# and parentheses around an integer literal as an ordinal, in both
+# clauses - not just a bare `Literal` (`GROUP BY 2`) or one level of
+# unary (`ORDER BY -1`). Confirmed live against sqlite3 3.51.0:
+#
+#     order by +(+1) / -(-1) / -(-(1)) / (-(-1)) / - -1   -> ordinal 1
+#     order by 1+0                                         -> constant, no sort
+#     group by +1 / -(-1) / +(+1) / (1)                    -> ordinal 1
+#     group by 1+0                                         -> constant expression
+#
+# A binary operator anywhere in the tree is never an ordinal - `1+0`
+# falls straight through to the ordinary expression-binding path in
+# both clauses, unaffected by this section: for `GROUP BY` that is
+# exactly what keeps `GROUP BY 1+0` a `BindError` (a constant key, so a
+# bare non-key select-list column stays ungrouped - the narrowing this
+# issue's own `_docs/decisions.md` follow-on records must stay), and
+# for `ORDER BY` it is what makes `1+0` sort by a same-valued constant
+# for every row, which a stable sort leaves in original order.
+#
+# Parentheses never reach this module as their own node - `sql/
+# parser.py`'s `_parse_primary` strips them at parse time - so only
+# `UnaryOp` nesting needs unwrapping here.
+
+
+def _ordinal_value(expr: Expr) -> int | None:
+    """The integer value of *expr* if it is a `GROUP BY`/`ORDER BY`
+    ordinal - `None` for anything else, including any expression
+    containing a binary operator. Recurses through arbitrarily many
+    layers of unary `+`/`-` down to a bare integer `Literal`, applying
+    each layer's sign to the inner result - `-(-1)` unwraps as
+    `-(-(1))` = `-(-1)` = `1`, matching sqlite3's own ordinal reading,
+    not the arithmetic value of a doubly-negated *expression* (which
+    would also be `1` here, coincidentally; the point is this function
+    never evaluates arithmetic, it only walks node shapes)."""
+    if isinstance(expr, Literal) and isinstance(expr.value, int) and not isinstance(expr.value, bool):
+        return expr.value
+    if isinstance(expr, UnaryOp):
+        inner = _ordinal_value(expr.operand)
+        if inner is None:
+            return None
+        return inner if expr.op is UnaryOperator.POS else -inner
+    return None
+
+
 def _bind_group_by_item(
     raw_expr: Expr, ctx: _Context, bound_items: tuple[BoundSelectItem, ...]
 ) -> Expr:
-    """Resolve one `GROUP BY` entry: an integer `Literal` is a
-    positional ordinal into `bound_items` (the select list *after*
-    `Star` expansion, matching `sqlite3`'s own "1st GROUP BY term"
-    counting), resolved purely by position and never through
-    `_resolve_name`'s alias-vs-column logic at all (an ordinal is not
-    a name) - confirmed against `sqlite3` during this issue's grooming
-    (orchestrator's correction comment). Anything else binds as an
-    ordinary expression, with select-list alias fallback
-    (`alias_first=False`, per #32/#60's precedent for `GROUP BY`/
-    `HAVING`).
+    """Resolve one `GROUP BY` entry: an ordinal (`_ordinal_value`,
+    shared with `ORDER BY`) is a positional reference into
+    `bound_items` (the select list *after* `Star` expansion, matching
+    `sqlite3`'s own "1st GROUP BY term" counting), resolved purely by
+    position and never through `_resolve_name`'s alias-vs-column logic
+    at all (an ordinal is not a name) - confirmed against `sqlite3`
+    during this issue's grooming (orchestrator's correction comment).
+    Anything else binds as an ordinary expression, with select-list
+    alias fallback (`alias_first=False`, per #32/#60's precedent for
+    `GROUP BY`/`HAVING`).
 
     Either route can turn out to reference an aggregate call - a bare
     `count(*)` written directly, an alias of one, or an ordinal
     pointing at one - and all three are rejected identically here,
     the uniform rule the orchestrator's correction states explicitly.
     """
-    if isinstance(raw_expr, Literal) and isinstance(raw_expr.value, int) and not isinstance(
-        raw_expr.value, bool
-    ):
-        ordinal = raw_expr.value
+    ordinal = _ordinal_value(raw_expr)
+    if ordinal is not None:
         if ordinal < 1 or ordinal > len(bound_items):
             raise BindError(
                 f"1st GROUP BY term out of range - should be between 1 and {len(bound_items)}",
@@ -851,32 +895,6 @@ def _bind_group_by(
 # aggregates) succeeds. `reject_aggregates` below is exactly this
 # question, inverted - the existing WHERE-rejection mechanism (#60),
 # reused rather than reimplemented.
-
-
-def _ordinal_value(expr: Expr) -> int | None:
-    """The integer value of *expr* if it is an `ORDER BY` ordinal -
-    `None` for anything else. A bare `INTEGER` `Literal` (`ORDER BY 2`)
-    is one; so is a single leading unary `+`/`-` wrapping one (`ORDER
-    BY -1`) - the lexer never emits a signed `INTEGER` token (see `sql/
-    parser.py`'s own docstring), so a negative ordinal is `UnaryOp(NEG,
-    Literal(1, ...))` here, not a negative `Literal`, and confirmed
-    against sqlite3 as still an ordinal, not a computed expression:
-    `select k from g order by -1` is "1st ORDER BY term out of range",
-    the identical shape `0` gets, not a value-based sort. `GROUP BY`'s
-    own ordinal handling (`_bind_group_by_item`) does not do this
-    unwrapping - out of this issue's file list to revisit - so this is
-    `ORDER BY`'s own helper, not a shared one."""
-    if isinstance(expr, Literal) and isinstance(expr.value, int) and not isinstance(expr.value, bool):
-        return expr.value
-    if (
-        isinstance(expr, UnaryOp)
-        and isinstance(expr.operand, Literal)
-        and isinstance(expr.operand.value, int)
-        and not isinstance(expr.operand.value, bool)
-    ):
-        magnitude = expr.operand.value
-        return magnitude if expr.op is UnaryOperator.POS else -magnitude
-    return None
 
 
 def _bind_order_by_item(

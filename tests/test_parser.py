@@ -1106,3 +1106,114 @@ def test_order_by_missing_by_is_a_parse_error():
 def test_order_by_trailing_comma_is_a_parse_error():
     with pytest.raises(ParseError):
         _parse("SELECT path FROM blame ORDER BY path,")
+
+
+# --- LIMIT / OFFSET (issue #77) ------------------------------------------
+#
+# `<n>` parses generically via `_parse_expr()`, exactly like `ORDER
+# BY`'s own item - the literal-integer-vs-anything-else decision is
+# `sql/binder.py`'s job (issue #77's own design), not this module's.
+# The one thing this module does decide is the comma form (`LIMIT m,
+# n`), out of scope per issue #77 and rejected with a named message
+# rather than falling through to a generic "expected end of query".
+
+
+def test_no_limit_defaults_to_none():
+    stmt = _parse("SELECT path FROM blame")
+    assert stmt.limit is None
+    assert stmt.offset is None
+
+
+def test_limit_bare_integer_literal():
+    stmt = _parse("SELECT path FROM blame LIMIT 3")
+    assert stmt.limit == Literal(value=3, position=stmt.limit.position)
+    assert stmt.offset is None
+
+
+def test_limit_with_offset():
+    stmt = _parse("SELECT path FROM blame LIMIT 3 OFFSET 2")
+    assert stmt.limit == Literal(value=3, position=stmt.limit.position)
+    assert stmt.offset == Literal(value=2, position=stmt.offset.position)
+
+
+def test_limit_after_order_by():
+    stmt = _parse("SELECT path FROM blame ORDER BY path LIMIT 1")
+    assert len(stmt.order_by) == 1
+    assert stmt.limit == Literal(value=1, position=stmt.limit.position)
+
+
+def test_limit_negative_parses_as_unary_minus():
+    """`LIMIT -1` - the lexer never emits a signed `INTEGER` token, so
+    this is `UnaryOp(NEG, Literal(1, ...))`, not a negative `Literal` -
+    exactly `ORDER BY -1`'s own shape. Recognising this as a legal,
+    negative `LIMIT` value (meaning "no limit", per issue #77's design)
+    is the binder's job."""
+    stmt = _parse("SELECT path FROM blame LIMIT -1")
+    assert isinstance(stmt.limit, UnaryOp)
+    assert stmt.limit.op is UnaryOperator.NEG
+
+
+def test_limit_unary_paren_nested_literal_parses_generically():
+    """`LIMIT -(-2)` parses as an ordinary expression tree - the
+    parser does not special-case this shape any more than it does for
+    `ORDER BY`; unwrapping it to an integer is `_ordinal_value`'s job
+    (`sql/binder.py`, issue #77, reusing #61's own helper)."""
+    stmt = _parse("SELECT path FROM blame LIMIT -(-2)")
+    assert isinstance(stmt.limit, UnaryOp)
+    assert stmt.limit.op is UnaryOperator.NEG
+    assert isinstance(stmt.limit.operand, UnaryOp)
+
+
+def test_limit_arithmetic_expression_parses_generically():
+    """`LIMIT 1+1` parses fine here - confirmed against sqlite3 during
+    this issue's own grooming, it is legal SQL there. Rejecting it as
+    not a literal integer is `sql/binder.py`'s job (issue #77's
+    narrowing decision), not this module's."""
+    stmt = _parse("SELECT path FROM blame LIMIT 1+1")
+    assert isinstance(stmt.limit, BinaryOp)
+    assert stmt.limit.op is Operator.ADD
+
+
+def test_offset_arithmetic_expression_parses_generically():
+    stmt = _parse("SELECT path FROM blame LIMIT 5 OFFSET 1+1")
+    assert isinstance(stmt.offset, BinaryOp)
+    assert stmt.offset.op is Operator.ADD
+
+
+def test_offset_without_limit_is_a_parse_error():
+    """§1's grammar has no bare `OFFSET` clause - `OFFSET` with no
+    preceding `LIMIT` is simply unconsumed trailing input, caught by
+    `expect_end()` exactly like any other unsupported clause."""
+    with pytest.raises(ParseError):
+        _parse("SELECT path FROM blame OFFSET 2")
+
+
+def test_limit_missing_expression_is_a_parse_error():
+    with pytest.raises(ParseError):
+        _parse("SELECT path FROM blame LIMIT")
+
+
+def test_limit_offset_missing_expression_is_a_parse_error():
+    with pytest.raises(ParseError):
+        _parse("SELECT path FROM blame LIMIT 3 OFFSET")
+
+
+def test_limit_comma_form_is_rejected_with_a_named_message_not_a_bare_token_error():
+    """`LIMIT m, n` (issue #77's own out-of-scope decision) is
+    recognised - a bound `LIMIT` expression immediately followed by a
+    comma - and rejected with a message naming the comma form and
+    pointing at `OFFSET` instead, not a generic "expected end of
+    query, found ','"."""
+    with pytest.raises(ParseError) as exc_info:
+        _parse("SELECT path FROM blame LIMIT 3, 2")
+    message = str(exc_info.value)
+    assert "LIMIT" in message
+    assert "OFFSET" in message
+
+
+def test_limit_comma_form_error_position_is_the_comma():
+    stmt_tokens_query = "SELECT path FROM blame LIMIT 3, 2"
+    with pytest.raises(ParseError) as exc_info:
+        _parse(stmt_tokens_query)
+    # The comma sits right after "LIMIT 3 " - column 33 (1-based).
+    assert exc_info.value.position.column == stmt_tokens_query.index(",") + 1

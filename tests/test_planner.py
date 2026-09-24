@@ -61,7 +61,14 @@ def _select_item(expr) -> BoundSelectItem:
 
 
 def _stmt(
-    select_list, where=None, from_table="widgets", group_by=(), having=None, order_by=()
+    select_list,
+    where=None,
+    from_table="widgets",
+    group_by=(),
+    having=None,
+    order_by=(),
+    limit=None,
+    offset=None,
 ) -> BoundSelectStatement:
     return BoundSelectStatement(
         select_list=tuple(select_list),
@@ -70,6 +77,8 @@ def _stmt(
         group_by=tuple(group_by),
         having=having,
         order_by=tuple(order_by),
+        limit=limit,
+        offset=offset,
         position=_POS,
     )
 

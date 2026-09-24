@@ -36,7 +36,7 @@ from collections.abc import Iterator, Sequence
 import pytest
 
 from historian.exec.expression import EvalError
-from historian.exec.operators import Aggregate, AggregateCall, Filter, Project, Scan, Sort, SortKey
+from historian.exec.operators import Aggregate, AggregateCall, Filter, Limit, Project, Scan, Sort, SortKey
 from historian.schema import Column, ColumnType, Row, Schema
 from historian.sql.ast import And, BinaryOp, Literal, Not, Operator as Op
 from historian.sql.binder import BoundColumnRef, BoundSelectItem
@@ -1069,3 +1069,155 @@ def test_sort_key_expression_may_be_a_computed_value_not_a_bare_column():
     result = Sort(_agg_child(rows), [_key(key_expr)])
 
     assert [row[1] for row in result.rows()] == [1, 2, 3]
+
+
+# --- Limit (issue #77) ----------------------------------------------------
+#
+# `_docs/spec.md` §3's `Limit` operator: `LIMIT`/`OFFSET`. Outermost in
+# the tree (`plan/planner.py`'s job to place it there), above
+# `Project` - see issue #77's own design, which leaves `DISTINCT`'s
+# future slot (#78) between `Project` and `Limit`. Semantics verified
+# against sqlite3 3.51.0 during this issue's own grooming (see
+# `_docs/decisions.md`): `LIMIT 0` is zero rows, a negative `LIMIT`
+# means "no limit" (`OFFSET` still applies), a negative `OFFSET` is
+# clamped to 0, and an `OFFSET` past the end of the child's rows is
+# zero rows, not an error.
+
+_LIMIT_ROWS = (
+    ("a.py", 1, "ana@x.com"),
+    ("a.py", 2, "ana@x.com"),
+    ("a.py", 3, "ana@x.com"),
+    ("a.py", 4, "ana@x.com"),
+    ("a.py", 5, "ana@x.com"),
+)
+
+
+def test_limit_truncates_to_the_first_n_rows():
+    result = Limit(_child(_LIMIT_ROWS), limit=2)
+    assert tuple(result.rows()) == _LIMIT_ROWS[:2]
+
+
+def test_limit_zero_yields_no_rows():
+    result = Limit(_child(_LIMIT_ROWS), limit=0)
+    assert tuple(result.rows()) == ()
+
+
+def test_negative_limit_means_no_limit():
+    """Confirmed against sqlite3: a negative `LIMIT` is "no limit", not
+    zero rows and not an error - every row of the child, unbounded."""
+    result = Limit(_child(_LIMIT_ROWS), limit=-1)
+    assert tuple(result.rows()) == _LIMIT_ROWS
+
+
+def test_offset_skips_the_first_m_rows():
+    result = Limit(_child(_LIMIT_ROWS), limit=10, offset=2)
+    assert tuple(result.rows()) == _LIMIT_ROWS[2:]
+
+
+def test_limit_and_offset_combined():
+    result = Limit(_child(_LIMIT_ROWS), limit=2, offset=1)
+    assert tuple(result.rows()) == _LIMIT_ROWS[1:3]
+
+
+def test_negative_offset_is_clamped_to_zero():
+    """Confirmed against sqlite3: a negative `OFFSET` behaves exactly
+    like `OFFSET 0`."""
+    result = Limit(_child(_LIMIT_ROWS), limit=2, offset=-1)
+    assert tuple(result.rows()) == _LIMIT_ROWS[:2]
+
+
+def test_negative_limit_with_positive_offset_still_skips():
+    """Confirmed against sqlite3: a negative `LIMIT` does not suppress
+    `OFFSET` - only the truncation is skipped."""
+    result = Limit(_child(_LIMIT_ROWS), limit=-1, offset=2)
+    assert tuple(result.rows()) == _LIMIT_ROWS[2:]
+
+
+def test_offset_past_the_end_yields_no_rows():
+    result = Limit(_child(_LIMIT_ROWS), limit=5, offset=100)
+    assert tuple(result.rows()) == ()
+
+
+def test_limit_past_the_end_yields_only_what_the_child_has():
+    result = Limit(_child(_LIMIT_ROWS), limit=100)
+    assert tuple(result.rows()) == _LIMIT_ROWS
+
+
+def test_offset_defaults_to_zero():
+    result = Limit(_child(_LIMIT_ROWS), limit=2)
+    assert tuple(result.rows()) == _LIMIT_ROWS[:2]
+
+
+def test_limit_over_empty_child_yields_no_rows():
+    result = Limit(_child(()), limit=3)
+    assert tuple(result.rows()) == ()
+
+
+def test_limit_schema_is_exactly_the_child_schema():
+    result = Limit(_child(_LIMIT_ROWS), limit=2)
+    assert result.schema is _SCHEMA
+
+
+def test_limit_preserves_child_row_order():
+    """`Limit` never reorders - the rows it yields are exactly the
+    child's own prefix, in the child's own order."""
+    rows = (("c.py", 1, None), ("a.py", 1, None), ("b.py", 1, None))
+    result = Limit(_child(rows), limit=2)
+    assert tuple(result.rows()) == rows[:2]
+
+
+def test_limit_streams_rather_than_pulling_more_than_offset_plus_limit_rows():
+    """The laziness criterion (issue #77's own acceptance criteria): a
+    plain generator that stops pulling from `child` once it has
+    produced `offset + limit` rows - never `list(child.rows())[offset:
+    offset+limit]`. Built directly on `Scan` over a `_CountingSource`
+    with 20 rows available (mirroring `test_sort_reads_child_rows_
+    exactly_once`'s own pattern, one layer further down the tree, with
+    no `ORDER BY`/`GROUP BY` so nothing between `Scan` and `Limit`
+    consumes the child eagerly either)."""
+    rows = tuple(("a.py", n, None) for n in range(20))
+    source = _CountingSource(rows)
+    result = Limit(Scan(source), limit=3)
+
+    pulled = tuple(result.rows())
+
+    assert pulled == rows[:3]
+    assert source.pulled <= 3
+
+
+def test_limit_offset_streams_rather_than_pulling_more_than_offset_plus_limit_rows():
+    """Same laziness property, with a nonzero `OFFSET`: at most
+    `offset + limit` rows pulled from the spy source, never all 20."""
+    rows = tuple(("a.py", n, None) for n in range(20))
+    source = _CountingSource(rows)
+    result = Limit(Scan(source), limit=3, offset=5)
+
+    pulled = tuple(result.rows())
+
+    assert pulled == rows[5:8]
+    assert source.pulled <= 8
+
+
+def test_limit_zero_pulls_nothing_from_the_child():
+    """`LIMIT 0` needs no row at all from `child` - not even one pulled
+    and discarded."""
+    rows = tuple(("a.py", n, None) for n in range(20))
+    source = _CountingSource(rows)
+    result = Limit(Scan(source), limit=0)
+
+    assert tuple(result.rows()) == ()
+    assert source.pulled == 0
+
+
+def test_negative_limit_over_a_spy_source_still_pulls_every_row_eventually():
+    """"No limit" is still lazy in the sense that matters (a plain
+    generator, no upfront materialization via `list(...)`) but it is
+    necessarily unbounded in how much of `child` it eventually pulls,
+    since every row must be yielded - this is the one shape where
+    pulling all of `child` is correct, not a laziness bug."""
+    rows = tuple(("a.py", n, None) for n in range(5))
+    source = _CountingSource(rows)
+    result = Limit(Scan(source), limit=-1)
+
+    assert tuple(result.rows()) == rows
+    assert source.pulled == 5

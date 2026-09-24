@@ -855,3 +855,31 @@ def test_having_without_group_by_binds():
 def test_having_unknown_column_raises_no_such_column():
     with pytest.raises(BindError):
         _bind("SELECT count(*) FROM blame HAVING ghost_column > 1")
+
+
+def test_having_with_no_group_by_and_no_aggregate_anywhere_is_a_bind_error():
+    """Confirmed against `sqlite3 3.51.0`: `select path from t having
+    path = 'x'` -> "HAVING clause on a non-aggregate query". Neither
+    `GROUP BY` nor an aggregate call anywhere (select list or HAVING
+    itself) is present here, so historian rejects it the same way."""
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame HAVING path = 'src/utils.py'")
+
+
+def test_having_legal_with_aggregate_only_in_the_select_list():
+    """Confirmed against `sqlite3`: `select count(*) from t having 1`
+    succeeds - the select list's own `count(*)` is enough to make this
+    an aggregate query, even though HAVING's own predicate (`1`) has
+    no aggregate call in it at all."""
+    stmt = _bind("SELECT count(*) FROM blame HAVING 1")
+    assert stmt.having is not None
+
+
+def test_having_with_aggregate_only_in_having_itself_is_still_a_bind_error():
+    """Confirmed against `sqlite3`: an aggregate call written in
+    HAVING itself does *not* by itself make the query an aggregate
+    query - `select path from t having count(*) > 1` still raises
+    "HAVING clause on a non-aggregate query". Only `GROUP BY` or an
+    aggregate call in the select list decides that."""
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame HAVING count(*) > 1")

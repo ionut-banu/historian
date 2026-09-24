@@ -989,9 +989,9 @@ def test_group_by_ordinal_is_a_plain_integer_literal():
 
 def test_group_by_expression():
     """`GROUP BY` on an expression, not just a bare column - historian
-    has no `%` operator (no prior issue lexes or parses it, and this
-    issue's own file list does not touch `lexer.py`), so `line_no + 1`
-    stands in for the same "not a bare column" shape."""
+    has no `%` operator (issue #75; no prior issue lexes or parses it,
+    and this issue's own file list does not touch `lexer.py`), so
+    `line_no + 1` stands in for the same "not a bare column" shape."""
     stmt = _parse("SELECT line_no FROM blame GROUP BY line_no + 1")
     assert isinstance(stmt.group_by[0], BinaryOp)
     assert stmt.group_by[0].op is Operator.ADD

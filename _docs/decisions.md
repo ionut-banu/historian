@@ -979,3 +979,24 @@ regardless of how the aggregate call is reached. An ordinal
 resolving to a non-aggregate expression remains legal, and an
 out-of-range ordinal (`select b from t group by 3` -> "1st GROUP
 BY term out of range") is its own, separate BindError.
+
+2026-09-24 - HAVING on a non-aggregate query is a BindError
+
+Issue #69, caught in QA/orchestrator review of the first pass
+(the draft had HAVING with no GROUP BY and no aggregate call
+anywhere fall through as an ordinary Filter - never recorded here
+as a deliberate decision, only implemented, and wrong). Confirmed
+live against sqlite3 3.51.0:
+
+    sqlite> select path from t having path = 'x';
+    Error: in prepare, HAVING clause on a non-aggregate query
+
+historian now raises BindError for the same shape. Whether the
+query is an aggregate query is decided by GROUP BY's presence or
+an aggregate call in the select list alone - confirmed
+`select count(*) from t having 1` succeeds (aggregate only in
+the select list, HAVING's own predicate has none) while
+`select path from t having count(*) > 1` still raises the
+identical error (an aggregate call written in HAVING itself does
+not by itself make the query aggregate). Implemented in
+`sql/binder.py`, checked once after HAVING is bound.

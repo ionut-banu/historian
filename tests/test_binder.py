@@ -498,6 +498,8 @@ def test_star_with_alias_raises_defensive_error():
         group_by=(),
         having=None,
         order_by=(),
+        limit=None,
+        offset=None,
         position=_POS,
     )
     with pytest.raises(BindError):
@@ -517,6 +519,8 @@ def test_star_in_general_expression_position_raises_defensive_error():
         group_by=(),
         having=None,
         order_by=(),
+        limit=None,
+        offset=None,
         position=_POS,
     )
     with pytest.raises(BindError):
@@ -537,6 +541,8 @@ def test_qualified_star_as_function_argument_raises_defensive_error():
         group_by=(),
         having=None,
         order_by=(),
+        limit=None,
+        offset=None,
         position=_POS,
     )
     with pytest.raises(BindError):
@@ -561,6 +567,8 @@ def test_star_as_non_sole_function_argument_raises_defensive_error():
         group_by=(),
         having=None,
         order_by=(),
+        limit=None,
+        offset=None,
         position=_POS,
     )
     with pytest.raises(BindError):
@@ -1343,3 +1351,128 @@ def test_order_by_real_column_wins_over_alias_of_a_different_column_when_grouped
     item = bound.order_by[0]
     assert isinstance(item.expr, BoundColumnRef)
     assert item.expr.offset == BLAME_SCHEMA.index_of("line_no")
+
+
+# --- LIMIT / OFFSET (issue #77) ------------------------------------------
+#
+# `<n>` narrows to exactly what `_ordinal_value` recognises - a literal
+# integer, arbitrarily wrapped in unary +/- - reusing that helper
+# rather than a third copy of the same recursive unwrap (issue #77's
+# own design, justified in `_docs/decisions.md`). No range check
+# (unlike GROUP BY/ORDER BY ordinals): 0 and any negative value bind
+# successfully and carry their own runtime meaning, which is
+# `plan/planner.py`/`exec/operators.py`'s concern, not this module's.
+
+
+def test_no_limit_defaults_to_none():
+    bound = _bind("SELECT path FROM blame")
+    assert bound.limit is None
+    assert bound.offset is None
+
+
+def test_limit_bare_integer_resolves():
+    bound = _bind("SELECT path FROM blame LIMIT 3")
+    assert bound.limit == 3
+    assert bound.offset is None
+
+
+def test_limit_and_offset_both_resolve():
+    bound = _bind("SELECT path FROM blame LIMIT 3 OFFSET 2")
+    assert bound.limit == 3
+    assert bound.offset == 2
+
+
+def test_limit_zero_resolves_to_zero_not_an_error():
+    bound = _bind("SELECT path FROM blame LIMIT 0")
+    assert bound.limit == 0
+
+
+def test_limit_negative_literal_resolves_to_a_negative_int():
+    """`LIMIT -1` - confirmed against sqlite3: a negative LIMIT is
+    legal and means "no limit" (issue #77's own design, implemented by
+    `exec/operators.py`'s `Limit`, not this module) - the binder's own
+    job is only to resolve the literal value, -1, without raising."""
+    bound = _bind("SELECT path FROM blame LIMIT -1")
+    assert bound.limit == -1
+
+
+def test_offset_negative_literal_resolves_to_a_negative_int():
+    """The clamp-to-zero happens in `exec/operators.py`'s `Limit`, not
+    here - the binder resolves the literal value verbatim."""
+    bound = _bind("SELECT path FROM blame LIMIT 5 OFFSET -1")
+    assert bound.offset == -1
+
+
+def test_limit_unary_paren_nested_literal_resolves():
+    """`LIMIT -(-2)` - the same arbitrary unary/paren nesting
+    `_ordinal_value` already handles for `GROUP BY`/`ORDER BY`
+    (`2f25756`), reused unchanged here."""
+    bound = _bind("SELECT path FROM blame LIMIT -(-2)")
+    assert bound.limit == 2
+
+
+def test_offset_unary_paren_nested_literal_resolves():
+    bound = _bind("SELECT path FROM blame LIMIT 5 OFFSET +(+2)")
+    assert bound.offset == 2
+
+
+def test_limit_rejects_arithmetic_expression():
+    """`LIMIT 1+1` - legal in sqlite3 (confirmed during this issue's
+    grooming), but a `BinaryOp` is never an ordinal shape - deliberate
+    narrowing, see `_docs/decisions.md`."""
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame LIMIT 1+1")
+
+
+def test_limit_rejects_column_reference():
+    """`LIMIT line_no` - "no such column: a" in sqlite3 too (LIMIT's
+    expression has zero visible columns there), but for a different
+    reason: historian rejects every non-ordinal shape uniformly,
+    sqlite3 rejects a column reference specifically."""
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame LIMIT line_no")
+
+
+def test_limit_rejects_select_list_alias():
+    """Confirmed against sqlite3: `select a as n from t order by a
+    limit n` still raises "no such column: n" - LIMIT gets no alias
+    fallback there either. historian rejects it too, for the uniform
+    narrowing reason rather than by replicating that specific rule."""
+    with pytest.raises(BindError):
+        _bind("SELECT path AS n FROM blame LIMIT n")
+
+
+def test_limit_rejects_text_literal():
+    """`LIMIT '2'` - legal in sqlite3 (numeric-affinity TEXT
+    coercion), deliberately not adopted here - see `_docs/
+    decisions.md`."""
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame LIMIT '2'")
+
+
+def test_limit_rejects_real_literal_even_with_zero_fractional_part():
+    """`LIMIT 2.0` - legal in sqlite3 (`MustBeInt`'s exact-zero-
+    fractional-part rule), deliberately not adopted - a REAL `Literal`
+    is never an ordinal shape regardless of its value."""
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame LIMIT 2.0")
+
+
+def test_limit_rejects_null():
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame LIMIT NULL")
+
+
+def test_limit_rejects_function_call():
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame LIMIT abs(-2)")
+
+
+def test_offset_rejects_arithmetic_expression():
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame LIMIT 5 OFFSET 1+1")
+
+
+def test_offset_rejects_text_literal():
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame LIMIT 5 OFFSET '2'")

@@ -26,10 +26,10 @@ deliberately never imports.
 What v1's grammar does not need yet
 ------------------------------------
 
-`DISTINCT`, `LIMIT`, `OFFSET` and any `JOIN` have no node here - see
-issue #8's grooming. Adding a field to a frozen dataclass later is
-additive, not a rewrite, so there is nothing to pre-declare. `CASE` is
-deferred the same way, for a different reason: it is an independent
+`DISTINCT` and any `JOIN` have no node here - see issue #8's
+grooming. Adding a field to a frozen dataclass later is additive, not
+a rewrite, so there is nothing to pre-declare. `CASE` is deferred the
+same way, for a different reason: it is an independent
 keyword-delimited primary expression form that does not interact with
 precedence, so building it earlier than it is needed would buy
 nothing. `GROUP BY` and `HAVING` (issue #69) add `SelectStatement.
@@ -42,7 +42,14 @@ possibly-empty `tuple[OrderByItem, ...]` - one new, small node type
 `GROUP BY`, because each key carries its own optional `ASC`/`DESC`
 direction alongside its expression - the same reason `SelectItem` (an
 expression plus an optional alias) is its own node rather than a bare
-`Expr`.
+`Expr`. `LIMIT`/`OFFSET` (issue #77) add `SelectStatement.limit` and
+`SelectStatement.offset`, both `Expr | None` - no new node type,
+since each clause is exactly one expression against the grammar this
+module already has (the same shape `where`/`having` already use).
+`offset` is `None` whenever `limit` is `None` - §1's grammar has no
+bare `OFFSET` - but the reverse is not required: `limit` may be set
+with `offset` still `None`, meaning "no `OFFSET` clause was written",
+resolved to 0 downstream (`sql/binder.py`'s job, not this module's).
 
 `IS NULL` / `IS NOT NULL` are not their own node types
 --------------------------------------------------------
@@ -375,7 +382,8 @@ class OrderByItem:
 @dataclass(frozen=True)
 class SelectStatement(Stmt):
     """`SELECT <select_list> FROM <from_table> [WHERE <where>]
-    [GROUP BY <group_by>] [HAVING <having>] [ORDER BY <order_by>]`.
+    [GROUP BY <group_by>] [HAVING <having>] [ORDER BY <order_by>]
+    [LIMIT <limit> [OFFSET <offset>]]`.
 
     `from_table` is a bare, unresolved table name - not a node of its
     own - and `where`/`having` are `None` when their clause is absent.
@@ -389,9 +397,14 @@ class SelectStatement(Stmt):
     `()` when the clause is absent, else the comma-separated
     `OrderByItem` list `ORDER BY` names verbatim, in clause order - see
     `OrderByItem`'s own docstring for its ordinal handling, the same
-    shape as `group_by`'s. Neither `from_table` nor any `ColumnRef`
-    inside this tree is checked against a catalog; see the module
-    docstring.
+    shape as `group_by`'s. `limit`/`offset` (issue #77) are `Expr |
+    None`, `None` when their clause is absent - the same shape as
+    `where`/`having`, holding whatever expression the query wrote
+    verbatim; deciding whether it is a legal literal integer is `sql/
+    binder.py`'s job (issue #77), not this module's. `offset` is never
+    set while `limit` is `None` - §1's grammar has no bare `OFFSET`
+    clause. Neither `from_table` nor any `ColumnRef` inside this tree
+    is checked against a catalog; see the module docstring.
     """
 
     select_list: tuple[SelectItem, ...]
@@ -400,4 +413,6 @@ class SelectStatement(Stmt):
     group_by: tuple[Expr, ...]
     having: Expr | None
     order_by: tuple[OrderByItem, ...]
+    limit: Expr | None
+    offset: Expr | None
     position: Position

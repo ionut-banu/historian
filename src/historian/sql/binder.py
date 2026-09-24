@@ -330,7 +330,15 @@ class BoundSelectStatement:
     clause order - see that class's own docstring, and the module
     docstring's "`WHERE` resolving a select-list alias" section for
     why `ORDER BY`'s own resolution is alias-first, the reverse of
-    every other clause here.
+    every other clause here. `limit`/`offset` (issue #77) are `int |
+    None`, already resolved to a plain Python `int` - never an `Expr`
+    - by `_bind_limit_offset` below, reusing `_ordinal_value`'s
+    literal-integer recognition (arbitrary unary +/- nesting) with no
+    range restriction: 0 and any negative value resolve successfully,
+    carrying the runtime meaning `exec/operators.py`'s `Limit` gives
+    them. `None` when the corresponding clause is absent - `offset` is
+    never set while `limit` is `None`, since §1's grammar has no bare
+    `OFFSET`.
     """
 
     select_list: tuple[BoundSelectItem, ...]
@@ -339,6 +347,8 @@ class BoundSelectStatement:
     group_by: tuple[Expr, ...]
     having: Expr | None
     order_by: tuple[BoundOrderByItem, ...]
+    limit: int | None
+    offset: int | None
     position: Position
 
 
@@ -814,6 +824,39 @@ def _ordinal_value(expr: Expr) -> int | None:
     return None
 
 
+# --- LIMIT / OFFSET (issue #77) ---------------------------------------------
+#
+# `<n>` narrows to exactly what `_ordinal_value` above recognises for
+# `GROUP BY`/`ORDER BY` ordinals - reused unchanged rather than a third
+# copy of the same recursive unwrap (issue #77's own design, justified
+# in `_docs/decisions.md` the way the 2026-09-18 entry justified
+# keeping `AS` mandatory: a deliberate syntactic narrowing of what
+# sqlite3 itself accepts here, not a semantic disagreement with it).
+# Unlike an ordinal, there is no range check: 0 and any negative
+# resolved value are legal, carrying their own runtime meaning
+# (`exec/operators.py`'s `Limit`) rather than being rejected or
+# reinterpreted here.
+
+
+def _bind_limit_offset(expr: Expr, clause: str) -> int:
+    """Resolve one `LIMIT`/`OFFSET` expression (`clause` is `"LIMIT"`
+    or `"OFFSET"`, used only for the error message) to its literal
+    integer value via `_ordinal_value` - `BindError` for every other
+    shape sqlite3 itself accepts here (arithmetic, `CASE`, a
+    predicate, any scalar or aggregate function call, a TEXT/REAL/
+    `NULL` literal, a column reference, a select-list alias, a
+    subquery)."""
+    value = _ordinal_value(expr)
+    if value is None:
+        raise BindError(
+            f"{clause} must be a literal integer, optionally wrapped in "
+            "unary +/- and parentheses",
+            expr.position,
+            (),
+        )
+    return value
+
+
 def _bind_group_by_item(
     raw_expr: Expr, ctx: _Context, bound_items: tuple[BoundSelectItem, ...]
 ) -> Expr:
@@ -1207,6 +1250,16 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema] = TABLES) -> BoundSel
                     bad_column.position,
                     (),
                 )
+    # LIMIT / OFFSET (issue #77): each is bound independently of
+    # everything above - no interaction with GROUP BY/aggregation, no
+    # select-list alias fallback (sqlite3 itself gives LIMIT/OFFSET
+    # zero visible columns and no alias fallback either, confirmed
+    # live during this issue's grooming) - see `_bind_limit_offset`.
+    # `stmt.offset` is never set while `stmt.limit` is `None` (the
+    # parser's own guarantee, `sql/ast.py`'s docstring), so
+    # `bound_offset` is correspondingly `None` in that case too.
+    bound_limit = _bind_limit_offset(stmt.limit, "LIMIT") if stmt.limit is not None else None
+    bound_offset = _bind_limit_offset(stmt.offset, "OFFSET") if stmt.offset is not None else None
     return BoundSelectStatement(
         select_list=tuple(bound_items),
         from_table=ctx.table_name,
@@ -1214,5 +1267,7 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema] = TABLES) -> BoundSel
         group_by=bound_group_by,
         having=bound_having,
         order_by=bound_order_by,
+        limit=bound_limit,
+        offset=bound_offset,
         position=stmt.position,
     )

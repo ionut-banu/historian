@@ -220,12 +220,14 @@ def test_unknown_column_exits_1(tiny_repo, capsys):
 
 
 def test_unimplemented_grammar_exits_1(tiny_repo, capsys):
-    """Grammar the parser already rejects outright (`LIMIT` is not yet
-    implemented - out of scope for #61, filed as its own follow-on
-    issue; `GROUP BY`/`HAVING` were this test's own example until
-    issue #69 built them, and `ORDER BY` until issue #61 built it) is
-    a `ParseError`, not a traceback."""
-    ret = cli.main(["-C", str(tiny_repo), "SELECT path FROM blame LIMIT 1"])
+    """Grammar the parser already rejects outright (`DISTINCT` is not
+    yet implemented - #61's own follow-on, "12c", not this issue;
+    `GROUP BY`/`HAVING` were this test's own example until issue #69
+    built them, `ORDER BY` until issue #61 built it, and `LIMIT` until
+    issue #77 built it - see `tests/differential/test_blame.py`'s own
+    `LIMIT`/`OFFSET` section for that grammar's coverage now) is a
+    `ParseError`, not a traceback."""
+    ret = cli.main(["-C", str(tiny_repo), "SELECT DISTINCT path FROM blame"])
 
     assert ret == 1
     captured = capsys.readouterr()

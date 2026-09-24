@@ -38,6 +38,22 @@ a negative-valued expression is the binder's job, not this module's)
 followed by an optional `ASC`/`DESC`, defaulting to `ASC` when
 neither is written.
 
+`LIMIT <expr> [OFFSET <expr>]` (issue #77) parses after `ORDER BY` and
+before end-of-statement - `<expr>` is parsed generically via
+`_parse_expr()`, exactly like `ORDER BY`'s own item, deferring the
+literal-integer-vs-anything-else decision to the binder (`sql/
+binder.py`'s `_ordinal_value`, reused unchanged - see that module's
+own docstring). The one thing this module *does* decide is the comma
+form (`LIMIT m, n`): §1's grammar has no comma in it, it is a
+deliberate v2 non-goal (issue #77's own grooming), and a bound `LIMIT`
+expression immediately followed by `,` is recognised and rejected here
+with a message naming the comma form and pointing at `OFFSET` instead
+- not the generic "expected end of query" a stray comma would
+otherwise produce via `expect_end()`. `OFFSET` with no preceding
+`LIMIT` is not a grammar this module recognises at all (§1 has no bare
+`OFFSET`) - it is simply unconsumed trailing input, caught the same
+generic way any other unsupported clause is.
+
 The precedence table
 ---------------------
 
@@ -347,6 +363,16 @@ class _Parser:
         if self._match(TokenType.ORDER):
             self._expect(TokenType.BY, "BY")
             order_by = self._parse_order_by_list()
+        limit: Expr | None = None
+        offset: Expr | None = None
+        if self._match(TokenType.LIMIT):
+            limit = self._parse_expr()
+            if self._check(TokenType.COMMA):
+                raise self._error(
+                    "LIMIT m, n is not supported - write LIMIT n OFFSET m instead"
+                )
+            if self._match(TokenType.OFFSET):
+                offset = self._parse_expr()
         return SelectStatement(
             select_list=select_list,
             from_table=from_table,
@@ -354,6 +380,8 @@ class _Parser:
             group_by=group_by,
             having=having,
             order_by=order_by,
+            limit=limit,
+            offset=offset,
             position=start,
         )
 

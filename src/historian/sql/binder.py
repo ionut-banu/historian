@@ -53,9 +53,10 @@ A second, separate check lives in `bind()` itself, after the whole
 select list is bound: when any select-list item's expression contains
 an aggregate call anywhere, every item is walked for a bare column
 reference that sits outside every aggregate call's own arguments
-(`_split_for_aggregate_check`) - `SELECT path, count(*) FROM blame`
-raises, naming `path`, because there is no `GROUP BY` (not built until
-#69) for a bare, non-aggregated column to be grouped by. This is a
+(`_split_for_grouped_check`, extended by issue #69 for `GROUP BY` -
+see that section below) - `SELECT path, count(*) FROM blame` raises,
+naming `path`, when there is no `GROUP BY` for a bare, non-aggregated
+column to be grouped by. This is a
 deliberate narrowing of what `sqlite3` itself accepts (it silently
 picks a value from an arbitrary row) - see `_docs/decisions.md`,
 2026-09-19, for the full reasoning; §1's "SQLite is right" rule does
@@ -293,11 +294,24 @@ class BoundSelectStatement:
     """A `SelectStatement` with every table and column reference
     resolved. `from_table` is the catalog's own key for the FROM
     table (its declared spelling), not necessarily the casing the
-    query used."""
+    query used.
+
+    `group_by` (issue #69) is `()` when the query has no `GROUP BY`,
+    else the resolved key expressions in clause order - an ordinal is
+    already resolved to the referenced select-list item's own bound
+    expression, not carried as a `Literal` any more. `having` is
+    `None` when absent, else the bound predicate - still containing
+    real `FunctionCall` aggregate nodes, since splitting those out
+    into `Aggregate` slots is `plan/planner.py`'s job (the same split
+    it already applies to `select_list`, per `_docs/spec.md` §3's
+    "Expression evaluation").
+    """
 
     select_list: tuple[BoundSelectItem, ...]
     from_table: str
     where: Expr | None
+    group_by: tuple[Expr, ...]
+    having: Expr | None
     position: Position
 
 
@@ -618,39 +632,199 @@ def _bind_expr(expr: Expr, ctx: _Context) -> Expr:
     raise AssertionError(f"sql/binder.py: unhandled expression node type {type(expr).__name__}")
 
 
-# --- The bare-column-mixed-with-aggregate narrowing (issue #60) ------------
+# --- GROUP BY / HAVING (issue #69) ------------------------------------------
 #
-# `_docs/decisions.md`, 2026-09-19: `SELECT path, count(*) FROM blame`
-# (no GROUP BY) is a BindError in historian, where sqlite3 silently
-# picks a value from an arbitrary row. Implemented as one walk per
-# select-list item, over the already-bound tree (so every remaining
-# ColumnRef is a BoundColumnRef and every remaining FunctionCall is a
-# real, validated aggregate call - _validate_function_call above
-# guarantees the latter): does this item's expression contain an
-# aggregate call anywhere, and what is the first bare column reference
-# in it that sits outside every aggregate call's own arguments (a
-# FunctionCall subtree is never walked into for this purpose - its
-# arguments are exactly the columns this rule exists to leave alone,
-# `count(path)` is fine, only a *bare* `path` is not). `bind()` below
-# only raises when the *query* has an aggregate call somewhere in its
-# select list; an ordinary, aggregate-free query is entirely unaffected
-# regardless of what this function reports for it.
-#
-# One isinstance branch per sql/ast.py node type, mirroring
-# `_bind_expr`'s own structure exactly (AGENTS.md: no dynamic dispatch)
-# rather than a generic "walk children" abstraction - kept as separate,
-# boring branches even where two node types share an identical body,
-# matching this module's existing convention (`_bind_expr`'s own
-# BinaryOp/And/Or/Is branches are equally identical and equally
-# separate). `left_bad or right_bad` is safe because a `BoundColumnRef`
-# is a dataclass instance, always truthy - this is "the first non-None
-# of the two", not a boolean test of either column's contents.
+# An aggregate call cannot be a grouping key, however it is named -
+# direct, via a select-list alias, or by ordinal (orchestrator
+# correction on this issue: `select b, count(*) from t group by 2`
+# raises the identical "aggregate functions are not allowed in the
+# GROUP BY clause" sqlite3 gives for the direct and alias forms, not
+# "ludicrous but legal"). `_contains_aggregate` is the one predicate
+# every one of those three routes checks against, after binding.
 
 
-def _split_for_aggregate_check(expr: Expr) -> tuple[bool, BoundColumnRef | None]:
-    """`(does expr contain an aggregate call anywhere, the first bare
-    BoundColumnRef found outside every aggregate call's own arguments -
-    or None)`."""
+def _contains_aggregate(expr: Expr) -> bool:
+    """Whether *expr* (already bound - every surviving `FunctionCall`
+    is a real, validated aggregate call) contains an aggregate call
+    anywhere in its tree. Mirrors `_split_for_aggregate_check`'s own
+    node-type walk, boring and explicit rather than shared, since the
+    two ask different questions (that one also needs the first bad
+    bare column; this one only needs a boolean)."""
+    if isinstance(expr, FunctionCall):
+        return True
+    if isinstance(expr, (Literal, BoundColumnRef, Star)):
+        return False
+    if isinstance(expr, UnaryOp):
+        return _contains_aggregate(expr.operand)
+    if isinstance(expr, Not):
+        return _contains_aggregate(expr.operand)
+    if isinstance(expr, BinaryOp):
+        return _contains_aggregate(expr.left) or _contains_aggregate(expr.right)
+    if isinstance(expr, And):
+        return _contains_aggregate(expr.left) or _contains_aggregate(expr.right)
+    if isinstance(expr, Or):
+        return _contains_aggregate(expr.left) or _contains_aggregate(expr.right)
+    if isinstance(expr, Is):
+        return _contains_aggregate(expr.left) or _contains_aggregate(expr.right)
+    if isinstance(expr, Like):
+        return _contains_aggregate(expr.left) or _contains_aggregate(expr.pattern)
+    if isinstance(expr, In):
+        return _contains_aggregate(expr.left) or any(_contains_aggregate(v) for v in expr.values)
+    if isinstance(expr, Between):
+        return (
+            _contains_aggregate(expr.operand)
+            or _contains_aggregate(expr.low)
+            or _contains_aggregate(expr.high)
+        )
+    raise AssertionError(f"sql/binder.py: unhandled expression node type {type(expr).__name__}")
+
+
+def _expr_shape_equal(a: Expr, b: Expr) -> bool:
+    """Structural equality between two already-bound expressions,
+    ignoring `position` - two occurrences of the same `GROUP BY` key
+    written at different points in the query text (the `SELECT` list
+    and the `GROUP BY` clause, say) must compare equal even though
+    every node's `position` differs. One boring `isinstance` branch
+    per `sql/ast.py`/binder node type, matching this module's existing
+    walk style; `type(a) is not type(b)` up front so two different
+    node shapes are never accidentally treated as equal."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, Literal):
+        return type(a.value) is type(b.value) and a.value == b.value
+    if isinstance(a, BoundColumnRef):
+        return a.offset == b.offset
+    if isinstance(a, Star):
+        return a.table == b.table
+    if isinstance(a, FunctionCall):
+        return (
+            a.name == b.name
+            and len(a.args) == len(b.args)
+            and all(_expr_shape_equal(x, y) for x, y in zip(a.args, b.args))
+        )
+    if isinstance(a, UnaryOp):
+        return a.op == b.op and _expr_shape_equal(a.operand, b.operand)
+    if isinstance(a, Not):
+        return _expr_shape_equal(a.operand, b.operand)
+    if isinstance(a, BinaryOp):
+        return a.op == b.op and _expr_shape_equal(a.left, b.left) and _expr_shape_equal(a.right, b.right)
+    if isinstance(a, And):
+        return _expr_shape_equal(a.left, b.left) and _expr_shape_equal(a.right, b.right)
+    if isinstance(a, Or):
+        return _expr_shape_equal(a.left, b.left) and _expr_shape_equal(a.right, b.right)
+    if isinstance(a, Is):
+        return (
+            a.negated == b.negated
+            and _expr_shape_equal(a.left, b.left)
+            and _expr_shape_equal(a.right, b.right)
+        )
+    if isinstance(a, Like):
+        return (
+            a.negated == b.negated
+            and _expr_shape_equal(a.left, b.left)
+            and _expr_shape_equal(a.pattern, b.pattern)
+        )
+    if isinstance(a, In):
+        return (
+            a.negated == b.negated
+            and len(a.values) == len(b.values)
+            and _expr_shape_equal(a.left, b.left)
+            and all(_expr_shape_equal(x, y) for x, y in zip(a.values, b.values))
+        )
+    if isinstance(a, Between):
+        return (
+            a.negated == b.negated
+            and _expr_shape_equal(a.operand, b.operand)
+            and _expr_shape_equal(a.low, b.low)
+            and _expr_shape_equal(a.high, b.high)
+        )
+    raise AssertionError(f"sql/binder.py: unhandled expression node type {type(a).__name__}")
+
+
+def _bind_group_by_item(
+    raw_expr: Expr, ctx: _Context, bound_items: tuple[BoundSelectItem, ...]
+) -> Expr:
+    """Resolve one `GROUP BY` entry: an integer `Literal` is a
+    positional ordinal into `bound_items` (the select list *after*
+    `Star` expansion, matching `sqlite3`'s own "1st GROUP BY term"
+    counting), resolved purely by position and never through
+    `_resolve_name`'s alias-vs-column logic at all (an ordinal is not
+    a name) - confirmed against `sqlite3` during this issue's grooming
+    (orchestrator's correction comment). Anything else binds as an
+    ordinary expression, with select-list alias fallback
+    (`alias_first=False`, per #32/#60's precedent for `GROUP BY`/
+    `HAVING`).
+
+    Either route can turn out to reference an aggregate call - a bare
+    `count(*)` written directly, an alias of one, or an ordinal
+    pointing at one - and all three are rejected identically here,
+    the uniform rule the orchestrator's correction states explicitly.
+    """
+    if isinstance(raw_expr, Literal) and isinstance(raw_expr.value, int) and not isinstance(
+        raw_expr.value, bool
+    ):
+        ordinal = raw_expr.value
+        if ordinal < 1 or ordinal > len(bound_items):
+            raise BindError(
+                f"1st GROUP BY term out of range - should be between 1 and {len(bound_items)}",
+                raw_expr.position,
+                (),
+            )
+        target = bound_items[ordinal - 1]
+        if _contains_aggregate(target.expr):
+            raise BindError(
+                "aggregate functions are not allowed in the GROUP BY clause",
+                raw_expr.position,
+                (),
+            )
+        return target.expr
+
+    group_ctx = dataclasses.replace(
+        ctx,
+        select_items=bound_items,
+        alias_fallback=True,
+        alias_first=False,
+        reject_aggregates=False,
+    )
+    bound_expr = _bind_expr(raw_expr, group_ctx)
+    if _contains_aggregate(bound_expr):
+        raise BindError(
+            "aggregate functions are not allowed in the GROUP BY clause",
+            raw_expr.position,
+            (),
+        )
+    return bound_expr
+
+
+def _bind_group_by(
+    group_by: tuple[Expr, ...], ctx: _Context, bound_items: tuple[BoundSelectItem, ...]
+) -> tuple[Expr, ...]:
+    return tuple(_bind_group_by_item(item, ctx, bound_items) for item in group_by)
+
+
+# --- The grouped narrowing (issue #60, extended by #69) ---------------------
+#
+# #60's own rule ("a bare column mixed with an aggregate, no GROUP BY,
+# is a BindError") extends here to grouped queries: a select-list
+# expression must be an aggregate call, a GROUP BY key (exactly, or
+# built purely from GROUP BY keys - `_docs/decisions.md`'s follow-on
+# note), or a BindError. `_split_for_grouped_check` is
+# `_split_for_aggregate_check`'s own walk with one addition: at every
+# node, first check whether the whole subtree matches a GROUP BY key
+# by shape (`_expr_shape_equal`) - if so, that subtree is covered and
+# is never walked into for a bad bare column, whatever it contains.
+
+
+def _split_for_grouped_check(
+    expr: Expr, group_keys: tuple[Expr, ...]
+) -> tuple[bool, BoundColumnRef | None]:
+    """`(does expr contain an aggregate call anywhere outside a
+    covered GROUP BY key, the first bare BoundColumnRef found outside
+    both every aggregate call's own arguments and every covered
+    GROUP BY key - or None)`."""
+    for key in group_keys:
+        if _expr_shape_equal(expr, key):
+            return False, None
     if isinstance(expr, FunctionCall):
         return True, None
     if isinstance(expr, BoundColumnRef):
@@ -658,65 +832,68 @@ def _split_for_aggregate_check(expr: Expr) -> tuple[bool, BoundColumnRef | None]
     if isinstance(expr, Literal):
         return False, None
     if isinstance(expr, Star):
-        # Unreachable in practice: the only Star that survives binding
-        # is count(*)'s own sole argument, already consumed by the
-        # FunctionCall branch above before this function ever sees it.
-        # Kept for the same defensive reason evaluate() keeps its own
-        # Star guard.
         return False, None
     if isinstance(expr, UnaryOp):
-        return _split_for_aggregate_check(expr.operand)
+        return _split_for_grouped_check(expr.operand, group_keys)
     if isinstance(expr, Not):
-        return _split_for_aggregate_check(expr.operand)
+        return _split_for_grouped_check(expr.operand, group_keys)
     if isinstance(expr, BinaryOp):
-        left_has, left_bad = _split_for_aggregate_check(expr.left)
-        right_has, right_bad = _split_for_aggregate_check(expr.right)
+        left_has, left_bad = _split_for_grouped_check(expr.left, group_keys)
+        right_has, right_bad = _split_for_grouped_check(expr.right, group_keys)
         return left_has or right_has, left_bad or right_bad
     if isinstance(expr, And):
-        left_has, left_bad = _split_for_aggregate_check(expr.left)
-        right_has, right_bad = _split_for_aggregate_check(expr.right)
+        left_has, left_bad = _split_for_grouped_check(expr.left, group_keys)
+        right_has, right_bad = _split_for_grouped_check(expr.right, group_keys)
         return left_has or right_has, left_bad or right_bad
     if isinstance(expr, Or):
-        left_has, left_bad = _split_for_aggregate_check(expr.left)
-        right_has, right_bad = _split_for_aggregate_check(expr.right)
+        left_has, left_bad = _split_for_grouped_check(expr.left, group_keys)
+        right_has, right_bad = _split_for_grouped_check(expr.right, group_keys)
         return left_has or right_has, left_bad or right_bad
     if isinstance(expr, Is):
-        left_has, left_bad = _split_for_aggregate_check(expr.left)
-        right_has, right_bad = _split_for_aggregate_check(expr.right)
+        left_has, left_bad = _split_for_grouped_check(expr.left, group_keys)
+        right_has, right_bad = _split_for_grouped_check(expr.right, group_keys)
         return left_has or right_has, left_bad or right_bad
     if isinstance(expr, Like):
-        left_has, left_bad = _split_for_aggregate_check(expr.left)
-        pattern_has, pattern_bad = _split_for_aggregate_check(expr.pattern)
+        left_has, left_bad = _split_for_grouped_check(expr.left, group_keys)
+        pattern_has, pattern_bad = _split_for_grouped_check(expr.pattern, group_keys)
         return left_has or pattern_has, left_bad or pattern_bad
     if isinstance(expr, In):
-        has, bad = _split_for_aggregate_check(expr.left)
+        has, bad = _split_for_grouped_check(expr.left, group_keys)
         for value in expr.values:
-            value_has, value_bad = _split_for_aggregate_check(value)
+            value_has, value_bad = _split_for_grouped_check(value, group_keys)
             has = has or value_has
             bad = bad or value_bad
         return has, bad
     if isinstance(expr, Between):
-        op_has, op_bad = _split_for_aggregate_check(expr.operand)
-        low_has, low_bad = _split_for_aggregate_check(expr.low)
-        high_has, high_bad = _split_for_aggregate_check(expr.high)
+        op_has, op_bad = _split_for_grouped_check(expr.operand, group_keys)
+        low_has, low_bad = _split_for_grouped_check(expr.low, group_keys)
+        high_has, high_bad = _split_for_grouped_check(expr.high, group_keys)
         return op_has or low_has or high_has, op_bad or low_bad or high_bad
     raise AssertionError(f"sql/binder.py: unhandled expression node type {type(expr).__name__}")
 
 
-def _check_bare_columns_against_aggregates(bound_items: list[BoundSelectItem]) -> None:
-    """Raise `BindError` for the first bare, non-aggregated column
-    found in any select-list item, but only when the select list has
-    an aggregate call *somewhere* - an aggregate-free query is not
-    this rule's business at all, per the module docstring's "Aggregate
-    calls" section."""
-    splits = [(item, *_split_for_aggregate_check(item.expr)) for item in bound_items]
-    if not any(has_aggregate for _item, has_aggregate, _bad in splits):
+def _check_grouped_select_list(
+    bound_items: list[BoundSelectItem], group_by: tuple[Expr, ...]
+) -> None:
+    """Raise `BindError` for the first select-list item that is
+    neither an aggregate call, a `GROUP BY` key, nor built purely from
+    `GROUP BY` keys - but only when the query is grouped at all
+    (`group_by` is non-empty) or some select-list item already has an
+    aggregate call somewhere (#60's original trigger, unchanged for a
+    plain aggregate-free, GROUP BY-free query)."""
+    splits = [(item, *_split_for_grouped_check(item.expr, group_by)) for item in bound_items]
+    triggered = bool(group_by) or any(has_aggregate for _item, has_aggregate, _bad in splits)
+    if not triggered:
         return
     for _item, _has_aggregate, bad_column in splits:
         if bad_column is not None:
+            reason = (
+                "must appear in the GROUP BY clause or be used in an aggregate function"
+                if group_by
+                else "must appear in an aggregate function since this query has no GROUP BY"
+            )
             raise BindError(
-                f"column {bad_column.name} must appear in an aggregate function since "
-                "this query has no GROUP BY",
+                f"column {bad_column.name} {reason}",
                 bad_column.position,
                 (),
             )
@@ -778,11 +955,16 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema] = TABLES) -> BoundSel
     bound_items: list[BoundSelectItem] = []
     for item in stmt.select_list:
         bound_items.extend(_bind_select_item(item, ctx))
-    # Issue #60: the bare-column-mixed-with-aggregate narrowing, after
-    # the whole select list is bound and before WHERE - the select list
-    # resolves before WHERE per the module docstring's resolution-order
+    # Issue #69: GROUP BY resolves next - ordinal or named, alias
+    # fallback on, column-first - before the grouped narrowing check
+    # below, which needs the resolved keys to know what is covered.
+    bound_group_by = _bind_group_by(stmt.group_by, ctx, tuple(bound_items))
+    # Issue #60's bare-column-mixed-with-aggregate narrowing, extended
+    # by #69 to cover GROUP BY keys - after the whole select list and
+    # GROUP BY are bound and before WHERE - the select list resolves
+    # before WHERE per the module docstring's resolution-order
     # section, and this check is squarely part of resolving it.
-    _check_bare_columns_against_aggregates(bound_items)
+    _check_grouped_select_list(bound_items, bound_group_by)
     # WHERE binds with the select-list alias fallback on (issue #32),
     # column-first (`alias_first=False`), and aggregate calls rejected
     # outright (issue #60) - a fresh `_Context` rather than mutating
@@ -797,9 +979,27 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema] = TABLES) -> BoundSel
         reject_aggregates=True,
     )
     bound_where = _bind_expr(stmt.where, where_ctx) if stmt.where is not None else None
+    # HAVING (issue #69): the one clause where an aggregate call *is*
+    # legal, referenced directly or by select-list alias - the exact
+    # opposite of GROUP BY and WHERE. Binds like WHERE otherwise
+    # (alias fallback on, column-first), just with
+    # `reject_aggregates=False` so a real, correctly-arity aggregate
+    # call binds normally; splitting it out into an `Aggregate` slot
+    # is `plan/planner.py`'s job, reusing the same split it already
+    # applies to `select_list` (spec §3's "Expression evaluation").
+    having_ctx = dataclasses.replace(
+        ctx,
+        select_items=tuple(bound_items),
+        alias_fallback=True,
+        alias_first=False,
+        reject_aggregates=False,
+    )
+    bound_having = _bind_expr(stmt.having, having_ctx) if stmt.having is not None else None
     return BoundSelectStatement(
         select_list=tuple(bound_items),
         from_table=ctx.table_name,
         where=bound_where,
+        group_by=bound_group_by,
+        having=bound_having,
         position=stmt.position,
     )

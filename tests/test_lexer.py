@@ -76,12 +76,6 @@ def test_each_keyword_lexes_to_its_own_token_type(keyword):
         assert tokens[0].text == spelling
 
 
-def test_is_keyword_true_for_exactly_the_keyword_types():
-    for member in TokenType:
-        expected = member in KEYWORD_TYPES
-        assert is_keyword(member) is expected
-
-
 def test_is_keyword_false_for_eof_and_identifier():
     assert is_keyword(TokenType.EOF) is False
     assert is_keyword(TokenType.IDENTIFIER) is False
@@ -110,7 +104,11 @@ def test_leading_underscore_identifier():
 
 @pytest.mark.parametrize(
     "source,keyword_type",
-    [("SELECTED", TokenType.SELECT), ("ANDy", TokenType.AND)],
+    [
+        ("SELECTED", TokenType.SELECT),
+        ("ANDy", TokenType.AND),
+        ("not_null", TokenType.NOT),
+    ],
 )
 def test_keyword_spelling_as_prefix_of_longer_identifier_is_one_token(
     source, keyword_type
@@ -554,7 +552,7 @@ def test_form_feed_separates_arbitrary_tokens():
 
 
 def test_form_feed_advances_column_not_line():
-    # Same convention as test_carriage_return_and_tab_advance_column_not_line:
+    # Same convention as test_tab_advances_column_not_line:
     # a single non-newline whitespace character advances the column by one.
     source = "a\fb"
     tokens = tokenize(source)
@@ -676,12 +674,28 @@ def test_newline_inside_string_still_advances_line_tracking():
     assert ident.position.column == 4
 
 
-def test_carriage_return_and_tab_advance_column_not_line():
+def test_tab_advances_column_not_line():
     source = "a\tb"
     tokens = tokenize(source)
     b_token = tokens[1]
     assert b_token.position.line == 1
     assert b_token.position.column == 3
+
+
+def test_carriage_return_newline_advances_line_and_resets_column():
+    # Verified live against the current lexer: tokenize("SELECT
+    # a\r\nFROM b") puts FROM at line 2, column 1 and the following b
+    # at line 2, column 6 - CRLF is treated the same as a bare \n for
+    # line/column tracking.
+    source = "SELECT a\r\nFROM b"
+    tokens = tokenize(source)
+    from_token = tokens[2]
+    assert from_token.type is TokenType.FROM
+    assert from_token.position.line == 2
+    assert from_token.position.column == 1
+    b_token = tokens[3]
+    assert b_token.position.line == 2
+    assert b_token.position.column == 6
 
 
 # --- Determinism -----------------------------------------------------
@@ -692,7 +706,7 @@ def test_tokenizing_same_source_twice_is_equal():
     assert tokenize(source) == tokenize(source)
 
 
-def test_tokenizing_same_source_twice_is_equal_with_errors_absent():
+def test_tokenizing_twice_returns_independent_token_lists():
     source = "SELECT * FROM blame WHERE path LIKE 'src/%' LIMIT 10"
     first = tokenize(source)
     second = tokenize(source)

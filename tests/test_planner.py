@@ -23,8 +23,9 @@ from historian.exec.operators import Aggregate, Filter, Project, Scan, Sort
 from historian.plan.planner import TABLES, plan
 from historian.schema import Column, ColumnType, Row, Schema
 from historian.sql.ast import BinaryOp, FunctionCall, Literal, OrderDirection, Operator as Op, Star
-from historian.sql.binder import BoundColumnRef, BoundOrderByItem, BoundSelectItem, BoundSelectStatement
-from historian.sql.lexer import Position
+from historian.sql.binder import BoundColumnRef, BoundOrderByItem, BoundSelectItem, BoundSelectStatement, bind
+from historian.sql.lexer import Position, tokenize
+from historian.sql.parser import parse
 from historian.tables.blame import BlameScan
 
 _POS = Position(line=1, column=1, offset=0)
@@ -703,6 +704,43 @@ def test_plan_order_by_multi_key_end_to_end():
     )
 
     tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert list(tree.rows()) == [
+        (None, 2),
+        (None, 1),
+        ("x", 1),
+        ("x", None),
+        ("y", 1),
+        ("y", None),
+    ]
+
+
+def test_order_by_multi_key_end_to_end_through_the_real_parser_and_binder():
+    """`values.py`'s own multi-key worked example (`a ASC, b DESC`
+    over `('x',NULL),('x',1),(NULL,1),(NULL,2),('y',NULL),('y',1)` ->
+    `NULL|2, NULL|1, x|1, x|NULL, y|1, y|NULL`), run through the
+    *real* `tokenize -> parse -> bind -> plan -> tree.rows()`
+    pipeline - not a hand-built `BoundSelectStatement` bypassing the
+    binder, per this issue's own acceptance criterion. A real `blame`
+    column can never be NULL (`tables/blame.py` asserts this before a
+    row is emitted), so this uses a synthetic single-table catalog
+    instead - the same reason `tests/test_operators.py`'s `Aggregate`
+    section does."""
+    schema = Schema(columns=(Column("a", ColumnType.TEXT), Column("b", ColumnType.INTEGER)))
+    rows: list[Row] = [
+        ("x", None),
+        ("x", 1),
+        (None, 1),
+        (None, 2),
+        ("y", None),
+        ("y", 1),
+    ]
+    source = _FakeSource(rows)
+    source.schema = schema  # override _FakeSource's own default _SCHEMA
+
+    stmt = parse(tokenize("SELECT a, b FROM t ORDER BY a ASC, b DESC"))
+    bound = bind(stmt, catalog={"t": schema})
+    tree = plan(bound, Path("/nonexistent"), tables={"t": lambda repo: source})
 
     assert list(tree.rows()) == [
         (None, 2),

@@ -176,11 +176,14 @@ from historian.sql.ast import (
     Like,
     Literal,
     Not,
+    OrderByItem,
+    OrderDirection,
     Or,
     SelectItem,
     SelectStatement,
     Star,
     UnaryOp,
+    UnaryOperator,
 )
 from historian.sql.lexer import Position
 from historian.tables.blame import BLAME_SCHEMA
@@ -188,6 +191,7 @@ from historian.tables.blame import BLAME_SCHEMA
 __all__ = [
     "BindError",
     "BoundColumnRef",
+    "BoundOrderByItem",
     "BoundSelectItem",
     "BoundSelectStatement",
     "TABLES",
@@ -290,6 +294,23 @@ class BoundSelectItem:
 
 
 @dataclass(frozen=True)
+class BoundOrderByItem:
+    """One resolved entry in an `ORDER BY` list (issue #61): a bound
+    key expression and its direction - an ordinal is already resolved
+    to the referenced select-list item's own bound expression, not
+    carried as a `Literal` any more, exactly like `group_by`'s own
+    ordinal handling. Still may contain a real `FunctionCall` aggregate
+    node - splitting it out into an `Aggregate` slot is `plan/
+    planner.py`'s job, the same split already applied to `select_list`
+    and `having`.
+    """
+
+    expr: Expr
+    direction: OrderDirection
+    position: Position
+
+
+@dataclass(frozen=True)
 class BoundSelectStatement:
     """A `SelectStatement` with every table and column reference
     resolved. `from_table` is the catalog's own key for the FROM
@@ -304,7 +325,12 @@ class BoundSelectStatement:
     real `FunctionCall` aggregate nodes, since splitting those out
     into `Aggregate` slots is `plan/planner.py`'s job (the same split
     it already applies to `select_list`, per `_docs/spec.md` §3's
-    "Expression evaluation").
+    "Expression evaluation"). `order_by` (issue #61) is `()` when the
+    query has no `ORDER BY`, else the resolved `BoundOrderByItem`s in
+    clause order - see that class's own docstring, and the module
+    docstring's "`WHERE` resolving a select-list alias" section for
+    why `ORDER BY`'s own resolution is alias-first, the reverse of
+    every other clause here.
     """
 
     select_list: tuple[BoundSelectItem, ...]
@@ -312,6 +338,7 @@ class BoundSelectStatement:
     where: Expr | None
     group_by: tuple[Expr, ...]
     having: Expr | None
+    order_by: tuple[BoundOrderByItem, ...]
     position: Position
 
 
@@ -802,6 +829,83 @@ def _bind_group_by(
     return tuple(_bind_group_by_item(item, ctx, bound_items) for item in group_by)
 
 
+# --- ORDER BY (issue #61) ----------------------------------------------------
+#
+# The one clause that reverses two rules every other clause here holds:
+# the select-list alias wins over a same-named real column
+# (`_resolve_name`'s `alias_first=True` - #32's own reserved-but-unused
+# direction, confirmed against sqlite3 during this issue's grooming:
+# `select a as real_a, b as a from t order by a` sorts by the alias
+# `b`, not the real column `a`), and an aggregate call is legal even
+# when it resolves through an ordinal - `GROUP BY`'s ordinal rejects
+# one outright, `ORDER BY`'s does not (confirmed: `select k, count(*)
+# from g group by k order by 2 desc` succeeds in sqlite3, while the
+# identically-shaped `GROUP BY 2` pointing at an aggregate is rejected).
+#
+# A bare aggregate call is legal in `ORDER BY` only once the query is
+# already aggregating (`GROUP BY` present, or an aggregate call in the
+# select list) - confirmed live against sqlite3: `select p from u
+# order by count(*)` (no GROUP BY, no select-list aggregate) is
+# "misuse of aggregate: count()", the same rejection WHERE gets, while
+# `select count(*) from u order by count(*)` (select list already
+# aggregates) succeeds. `reject_aggregates` below is exactly this
+# question, inverted - the existing WHERE-rejection mechanism (#60),
+# reused rather than reimplemented.
+
+
+def _ordinal_value(expr: Expr) -> int | None:
+    """The integer value of *expr* if it is an `ORDER BY` ordinal -
+    `None` for anything else. A bare `INTEGER` `Literal` (`ORDER BY 2`)
+    is one; so is a single leading unary `+`/`-` wrapping one (`ORDER
+    BY -1`) - the lexer never emits a signed `INTEGER` token (see `sql/
+    parser.py`'s own docstring), so a negative ordinal is `UnaryOp(NEG,
+    Literal(1, ...))` here, not a negative `Literal`, and confirmed
+    against sqlite3 as still an ordinal, not a computed expression:
+    `select k from g order by -1` is "1st ORDER BY term out of range",
+    the identical shape `0` gets, not a value-based sort. `GROUP BY`'s
+    own ordinal handling (`_bind_group_by_item`) does not do this
+    unwrapping - out of this issue's file list to revisit - so this is
+    `ORDER BY`'s own helper, not a shared one."""
+    if isinstance(expr, Literal) and isinstance(expr.value, int) and not isinstance(expr.value, bool):
+        return expr.value
+    if (
+        isinstance(expr, UnaryOp)
+        and isinstance(expr.operand, Literal)
+        and isinstance(expr.operand.value, int)
+        and not isinstance(expr.operand.value, bool)
+    ):
+        magnitude = expr.operand.value
+        return magnitude if expr.op is UnaryOperator.POS else -magnitude
+    return None
+
+
+def _bind_order_by_item(
+    item: OrderByItem, ctx: _Context, bound_items: tuple[BoundSelectItem, ...]
+) -> BoundOrderByItem:
+    """Resolve one `ORDER BY` entry. An ordinal (`_ordinal_value`) is a
+    positional reference into `bound_items`, 1-based, out-of-range
+    (0, negative, or past the end) raising the same "1st ORDER BY term
+    out of range" shape `_bind_group_by_item` uses for `GROUP BY` -
+    unlike that method, an ordinal resolving to an aggregate call is
+    never rejected (see the section comment above). Anything else
+    binds as an ordinary expression through `ctx` - the caller supplies
+    `alias_first=True` and whichever `reject_aggregates` the query's
+    aggregate status calls for; this function does not decide either.
+    """
+    ordinal = _ordinal_value(item.expr)
+    if ordinal is not None:
+        if ordinal < 1 or ordinal > len(bound_items):
+            raise BindError(
+                f"1st ORDER BY term out of range - should be between 1 and {len(bound_items)}",
+                item.expr.position,
+                (),
+            )
+        bound_expr = bound_items[ordinal - 1].expr
+    else:
+        bound_expr = _bind_expr(item.expr, ctx)
+    return BoundOrderByItem(expr=bound_expr, direction=item.direction, position=item.position)
+
+
 # --- The grouped narrowing (issue #60, extended by #69) ---------------------
 #
 # #60's own rule ("a bare column mixed with an aggregate, no GROUP BY,
@@ -1044,11 +1148,53 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema] = TABLES) -> BoundSel
                 bad_column.position,
                 (),
             )
+    # ORDER BY (issue #61): whether the query aggregates at all - GROUP
+    # BY present, or an aggregate call anywhere in the select list -
+    # decides both whether a bare aggregate call in ORDER BY is legal
+    # (reject_aggregates, mirroring WHERE's outright rejection when
+    # `False`) and whether the grouped narrowing below applies. See the
+    # "ORDER BY" section comment above `_bind_order_by_item` for the
+    # sqlite3 evidence.
+    is_aggregate_query = bool(bound_group_by) or any(
+        _contains_aggregate(item.expr) for item in bound_items
+    )
+    order_ctx = dataclasses.replace(
+        ctx,
+        select_items=tuple(bound_items),
+        alias_fallback=True,
+        alias_first=True,
+        reject_aggregates=not is_aggregate_query,
+    )
+    bound_order_by = tuple(
+        _bind_order_by_item(item, order_ctx, tuple(bound_items)) for item in stmt.order_by
+    )
+    if is_aggregate_query:
+        # The same "grouped but not a key" narrowing HAVING already
+        # gets (2026-09-24's decisions.md entry), extended here: once
+        # the query aggregates, every ORDER BY expression must be an
+        # aggregate call, a GROUP BY key (matched by shape), or built
+        # purely from GROUP BY keys - reusing `_split_for_grouped_check`
+        # rather than a fresh walk. This deliberately diverges from
+        # sqlite3, which accepts a bare non-key, non-aggregate ORDER BY
+        # column and sorts by an arbitrary row's value per group
+        # (confirmed live: `select k, count(*) from g group by k order
+        # by v` succeeds in sqlite3) - see `_docs/decisions.md` for the
+        # dated follow-on note recording this.
+        for order_item in bound_order_by:
+            _has_aggregate, bad_column = _split_for_grouped_check(order_item.expr, bound_group_by)
+            if bad_column is not None:
+                raise BindError(
+                    f"column {bad_column.name} must appear in the GROUP BY "
+                    "clause or be used in an aggregate function",
+                    bad_column.position,
+                    (),
+                )
     return BoundSelectStatement(
         select_list=tuple(bound_items),
         from_table=ctx.table_name,
         where=bound_where,
         group_by=bound_group_by,
         having=bound_having,
+        order_by=bound_order_by,
         position=stmt.position,
     )

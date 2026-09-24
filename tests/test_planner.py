@@ -19,11 +19,11 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
-from historian.exec.operators import Aggregate, Filter, Project, Scan
+from historian.exec.operators import Aggregate, Filter, Project, Scan, Sort
 from historian.plan.planner import TABLES, plan
 from historian.schema import Column, ColumnType, Row, Schema
-from historian.sql.ast import BinaryOp, FunctionCall, Literal, Operator as Op, Star
-from historian.sql.binder import BoundColumnRef, BoundSelectItem, BoundSelectStatement
+from historian.sql.ast import BinaryOp, FunctionCall, Literal, OrderDirection, Operator as Op, Star
+from historian.sql.binder import BoundColumnRef, BoundOrderByItem, BoundSelectItem, BoundSelectStatement
 from historian.sql.lexer import Position
 from historian.tables.blame import BlameScan
 
@@ -60,7 +60,7 @@ def _select_item(expr) -> BoundSelectItem:
 
 
 def _stmt(
-    select_list, where=None, from_table="widgets", group_by=(), having=None
+    select_list, where=None, from_table="widgets", group_by=(), having=None, order_by=()
 ) -> BoundSelectStatement:
     return BoundSelectStatement(
         select_list=tuple(select_list),
@@ -68,6 +68,7 @@ def _stmt(
         where=where,
         group_by=tuple(group_by),
         having=having,
+        order_by=tuple(order_by),
         position=_POS,
     )
 
@@ -538,3 +539,176 @@ def test_plan_select_item_matching_group_key_reads_from_aggregate_output():
     rewritten = tree._select_list[0].expr
     assert isinstance(rewritten, BoundColumnRef)
     assert rewritten.offset == 0
+
+
+# --- ORDER BY / Sort (issue #61) --------------------------------------------
+
+
+def _order_item(expr, descending: bool = False) -> BoundOrderByItem:
+    direction = OrderDirection.DESC if descending else OrderDirection.ASC
+    return BoundOrderByItem(expr=expr, direction=direction, position=_POS)
+
+
+def test_plan_with_order_by_inserts_sort_below_project():
+    """`SELECT path FROM widgets ORDER BY path`: `Project(Sort(Scan(
+    ...), keys), select_list)` - `Sort` sits directly below `Project`,
+    per this issue's own tree-placement criterion."""
+    source = _FakeSource([("b.py", 1, "ana@x.com"), ("a.py", 2, "bo@x.com")])
+    stmt = _stmt([_select_item(_col("path"))], order_by=[_order_item(_col("path"))])
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Project)
+    assert isinstance(tree._child, Sort)
+    assert isinstance(tree._child._child, Scan)
+
+
+def test_plan_without_order_by_never_builds_sort():
+    source = _FakeSource([("a.py", 1, "ana@x.com")])
+    stmt = _stmt([_select_item(_col("path"))], order_by=())
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Project)
+    assert not isinstance(tree._child, Sort)
+
+
+def test_plan_order_by_produces_correctly_sorted_rows_end_to_end():
+    rows = [("b.py", 1, "e"), ("a.py", 2, "e"), ("c.py", 3, "e")]
+    source = _FakeSource(rows)
+    stmt = _stmt([_select_item(_col("path"))], order_by=[_order_item(_col("path"))])
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert list(tree.rows()) == [("a.py",), ("b.py",), ("c.py",)]
+
+
+def test_plan_order_by_sits_between_where_filter_and_project_with_no_aggregate():
+    """`Scan -> Filter (WHERE) -> Sort -> Project`, the non-aggregate
+    tree shape."""
+    source = _FakeSource([("a.py", 1, "ana@x.com"), ("b.py", 2, "bo@x.com")])
+    predicate = _bin(Op.GT, _col("line_no"), _lit(0))
+    stmt = _stmt(
+        [_select_item(_col("path"))], where=predicate, order_by=[_order_item(_col("path"))]
+    )
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Project)
+    assert isinstance(tree._child, Sort)
+    assert isinstance(tree._child._child, Filter)
+    assert isinstance(tree._child._child._child, Scan)
+
+
+def test_plan_order_by_with_aggregate_sits_above_having_filter_below_project():
+    """`Scan -> Aggregate -> Filter (HAVING) -> Sort -> Project` - the
+    full aggregating tree shape, `Sort` directly below `Project` and
+    directly above `HAVING`'s own `Filter`."""
+    source = _FakeSource([("a.py", 1, "ana@x.com")])
+    having = _bin(Op.GT, _count_star(), _lit(1))
+    stmt = _stmt(
+        [_select_item(_col("path")), _select_item(_count_star())],
+        where=None,
+        group_by=[_col("path")],
+        having=having,
+        order_by=[_order_item(_col("path"))],
+    )
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Project)
+    assert isinstance(tree._child, Sort)
+    assert isinstance(tree._child._child, Filter)  # HAVING
+    assert isinstance(tree._child._child._child, Aggregate)
+
+
+def test_plan_order_by_may_reference_a_column_absent_from_the_select_list():
+    """`SELECT path FROM widgets ORDER BY line_no`: `Sort`'s key
+    references the *pre-Project* row, so it can sort by a column the
+    final select list never projects - `select p from u order by n`,
+    confirmed legal against sqlite3 during this issue's grooming."""
+    rows = [("a.py", 3, "e"), ("b.py", 1, "e"), ("c.py", 2, "e")]
+    source = _FakeSource(rows)
+    stmt = _stmt([_select_item(_col("path"))], order_by=[_order_item(_col("line_no"))])
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert list(tree.rows()) == [("b.py",), ("c.py",), ("a.py",)]
+
+
+def test_plan_order_by_aggregate_call_not_in_select_list_gets_its_own_slot():
+    """`SELECT path FROM widgets GROUP BY path ORDER BY count(*) DESC`:
+    the aggregate is split out via the same shared `calls` list the
+    select list uses, even though `count(*)` never appears in the
+    select list itself - proving the offset-sharing, not merely that
+    the tree runs."""
+    rows = [
+        ("a.py", 1, "e"),
+        ("a.py", 2, "e"),
+        ("b.py", 3, "e"),
+    ]
+    source = _FakeSource(rows)
+    stmt = _stmt(
+        [_select_item(_col("path"))],
+        group_by=[_col("path")],
+        order_by=[_order_item(_count_star(), descending=True)],
+    )
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert list(tree.rows()) == [("a.py",), ("b.py",)]
+
+
+def test_plan_order_by_and_select_list_aggregate_calls_get_independent_slots():
+    """`SELECT path, count(*) FROM widgets GROUP BY path ORDER BY
+    count(*) DESC`: the select list's own `count(*)` and ORDER BY's own
+    `count(*)` are two separate occurrences and get two separate
+    `Aggregate` slots (this codebase's existing "no identity/equality
+    dedup" rule for `calls`, extended to ORDER BY) - proven by reading
+    `Aggregate`'s own call count, not merely by the rows coming out
+    right."""
+    rows = [("a.py", 1, "e"), ("a.py", 2, "e"), ("b.py", 3, "e")]
+    source = _FakeSource(rows)
+    stmt = _stmt(
+        [_select_item(_col("path")), _select_item(_count_star())],
+        group_by=[_col("path")],
+        order_by=[_order_item(_count_star(), descending=True)],
+    )
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Project)
+    aggregate = tree._child._child  # Sort -> Aggregate (no HAVING here)
+    assert isinstance(aggregate, Aggregate)
+    assert len(aggregate._calls) == 2
+    assert list(tree.rows()) == [("a.py", 2), ("b.py", 1)]
+
+
+def test_plan_order_by_multi_key_end_to_end():
+    """`ORDER BY path ASC, line_no DESC` through the real planner,
+    not just the bare `Sort` unit level - the `values.py` worked
+    example, end to end."""
+    rows = [
+        ("x", None, "e"),
+        ("x", 1, "e"),
+        (None, 1, "e"),
+        (None, 2, "e"),
+        ("y", None, "e"),
+        ("y", 1, "e"),
+    ]
+    source = _FakeSource(rows)
+    stmt = _stmt(
+        [_select_item(_col("path")), _select_item(_col("line_no"))],
+        order_by=[_order_item(_col("path")), _order_item(_col("line_no"), descending=True)],
+    )
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert list(tree.rows()) == [
+        (None, 2),
+        (None, 1),
+        ("x", 1),
+        ("x", None),
+        ("y", 1),
+        ("y", None),
+    ]

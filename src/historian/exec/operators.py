@@ -1,8 +1,8 @@
-"""The operator layer: `Scan`, `Filter`, `Project`.
+"""The operator layer: `Scan`, `Filter`, `Project`, `Aggregate`, `Sort`.
 
-Issue #34 (spec §6 M2 item 8b). Implements `_docs/spec.md` §3's
-"Operators" section for the first three of phase 1's seven operators
-(`Aggregate`, `Sort`, `Limit`, `Distinct` are §6 M3, not this issue) -
+Issue #34 (spec §6 M2 item 8b) built `Scan`/`Filter`/`Project`. `Sort`
+(issue #61) is the fifth of phase 1's seven operators (`Limit`,
+`Distinct` remain out of scope, filed as their own follow-on issues) -
 plus, at this layer, two rules §3 states elsewhere and this is where
 they are actually enforced: "Expression evaluation" (every predicate
 and select-list expression goes through `exec/expression.py`'s
@@ -40,7 +40,12 @@ reorder, deduplicate, or otherwise introduce non-deterministic
 iteration. Both are implemented as a single pass over `child.rows()`
 in order, with no `set`, no `dict`-keyed grouping, and no sort of any
 kind - row order in is row order out, restricted (`Filter`) or
-transformed per-row (`Project`), never rearranged.
+transformed per-row (`Project`), never rearranged. `Sort` (issue #61)
+is the one operator in this module that *is* allowed to reorder rows -
+that is its entire job - but the reordering itself must still be
+deterministic: see `Sort`'s own docstring for how it gets that from
+`values.py`'s stable, per-key, last-to-first contract rather than from
+anything ad hoc.
 
 The `Value`/`Bool3` coercion boundary (#38)
 --------------------------------------------
@@ -87,7 +92,17 @@ from historian.sql.ast import Expr
 from historian.sql.binder import BoundColumnRef, BoundSelectItem
 from historian.sql.lexer import Position
 
-__all__ = ["Aggregate", "AggregateCall", "Filter", "Operator", "Project", "Scan", "ScanSource"]
+__all__ = [
+    "Aggregate",
+    "AggregateCall",
+    "Filter",
+    "Operator",
+    "Project",
+    "Scan",
+    "ScanSource",
+    "Sort",
+    "SortKey",
+]
 
 
 class Operator(Protocol):
@@ -537,3 +552,75 @@ class Project:
             yield tuple(
                 coerce_to_value(evaluate(item.expr, row, child_schema)) for item in select_list
             )
+
+
+# --- Sort (issue #61) --------------------------------------------------------
+#
+# `_docs/spec.md` §3's `Sort` operator: `ORDER BY`. Sits below `Project`
+# (`plan/planner.py`'s job to place it there) because an `ORDER BY` key
+# may reference a column or aggregate slot absent from the final select
+# list - `Sort` needs the wider pre-`Project` row, never the narrower
+# projected one. Each key's own expression is already split by the
+# planner (`_split_expr`, the same machinery `HAVING`/`select_list` use)
+# so it never contains a raw aggregate `FunctionCall` by the time it
+# reaches here - only `BoundColumnRef`s and ordinary scalar expressions,
+# evaluated against `child`'s own schema exactly like every other
+# operator's expressions.
+
+
+@dataclass(frozen=True)
+class SortKey:
+    """One `ORDER BY` key `plan/planner.py` builds: the (already
+    aggregate-split) expression to sort by, and whether this key is
+    `DESC` (`ASC` when `False`)."""
+
+    expr: Expr
+    descending: bool
+
+
+class Sort:
+    """`ORDER BY` (spec §3): yields every row of `child`, reordered by
+    `keys`.
+
+    Applies `values.py`'s own multi-key `Sort` contract verbatim rather
+    than re-deriving it: a **stable** sort once per key, processing
+    keys from the **last** to the **first**, each pass using
+    `values.order_key` on that key's evaluated value with
+    `reverse=True` iff that key is `DESC`. Python's `list.sort` is
+    stable, so an earlier pass (a later key) never disturbs the
+    relative order two rows already have from a later pass (an earlier
+    key) among rows that tie on it - which is also what gives
+    historian's own determinism guarantee (`AGENTS.md`, spec §3's
+    "Determinism and row order") for rows that tie on every key: the
+    row order reaching `Sort` is already fixed (`Scan`/`Filter`/
+    `Aggregate` never reorder), and a stable sort preserves that
+    original relative order among ties rather than scrambling it.
+
+    Every key's expression is evaluated against `child`'s own schema
+    with `exec/expression.py`'s `evaluate()`, `coerce_to_value`d first
+    exactly as `Project` does - an `ORDER BY` key may be a bare
+    predicate shape (`ORDER BY x = 1`) as legally as a value shape.
+
+    Unlike every other operator in this module, `Sort` cannot stream:
+    a sort needs every row before it can produce the first one. It
+    materializes `child.rows()` exactly once, up front; the schema is
+    otherwise exactly `child`'s own - `ORDER BY` can only reorder rows,
+    never add, remove, or rename a column.
+    """
+
+    def __init__(self, child: Operator, keys: Sequence[SortKey]) -> None:
+        self._child = child
+        self._keys = tuple(keys)
+        self.schema = child.schema
+
+    def rows(self) -> Iterator[Row]:
+        child_schema = self._child.schema
+        rows = list(self._child.rows())
+        for key in reversed(self._keys):
+            rows.sort(
+                key=lambda row, expr=key.expr: values.order_key(
+                    coerce_to_value(evaluate(expr, row, child_schema))
+                ),
+                reverse=key.descending,
+            )
+        yield from rows

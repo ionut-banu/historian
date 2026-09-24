@@ -36,7 +36,7 @@ from collections.abc import Iterator, Sequence
 import pytest
 
 from historian.exec.expression import EvalError
-from historian.exec.operators import Aggregate, AggregateCall, Filter, Project, Scan
+from historian.exec.operators import Aggregate, AggregateCall, Filter, Project, Scan, Sort, SortKey
 from historian.schema import Column, ColumnType, Row, Schema
 from historian.sql.ast import And, BinaryOp, Literal, Not, Operator as Op
 from historian.sql.binder import BoundColumnRef, BoundSelectItem
@@ -936,3 +936,136 @@ def test_grouped_aggregate_consumes_each_child_row_exactly_once():
 
     assert set(tuple(row) for row in result.rows()) == {("a.py", 2), ("b.py", 1)}
     assert source.pulled == 3
+
+
+# --- Sort (issue #61) --------------------------------------------------------
+#
+# Unit-style against synthetic rows, mirroring the `Aggregate` section's
+# own fixtures (`_agg_child`, `_SCHEMA`) - `Sort` never touches git, and
+# the multi-key/NULL cases below are the exact worked example from
+# `values.py`'s own module docstring, exercised here end to end through
+# the real operator rather than at the bare `order_key` unit level.
+
+
+def _key(expr, descending: bool = False) -> SortKey:
+    return SortKey(expr=expr, descending=descending)
+
+
+def test_sort_ascending_single_key_is_the_default():
+    rows = [("c.py", 1, "e"), ("a.py", 1, "e"), ("b.py", 1, "e")]
+    result = Sort(_agg_child(rows), [_key(_col("path"))])
+
+    assert list(result.rows()) == [("a.py", 1, "e"), ("b.py", 1, "e"), ("c.py", 1, "e")]
+
+
+def test_sort_descending_single_key():
+    rows = [("a.py", 1, "e"), ("c.py", 1, "e"), ("b.py", 1, "e")]
+    result = Sort(_agg_child(rows), [_key(_col("path"), descending=True)])
+
+    assert list(result.rows()) == [("c.py", 1, "e"), ("b.py", 1, "e"), ("a.py", 1, "e")]
+
+
+def test_sort_nulls_first_ascending():
+    rows = [("a.py", 1, "e"), (None, 1, "e"), ("b.py", 1, "e")]
+    result = Sort(_agg_child(rows), [_key(_col("path"))])
+
+    assert [row[0] for row in result.rows()] == [None, "a.py", "b.py"]
+
+
+def test_sort_nulls_last_descending():
+    """DESC is the ascending order reversed for a single key
+    (`values.py`'s own contract), so NULLs land last, not first."""
+    rows = [("a.py", 1, "e"), (None, 1, "e"), ("b.py", 1, "e")]
+    result = Sort(_agg_child(rows), [_key(_col("path"), descending=True)])
+
+    assert [row[0] for row in result.rows()] == ["b.py", "a.py", None]
+
+
+def test_sort_mixed_storage_class_numeric_then_text():
+    """NULL < numeric < TEXT, matching `values.order_key`'s own
+    storage-class rank - reusing `author_email` (TEXT-declared but
+    unenforced at the row level, per this file's own convention) to
+    hold a genuine mix."""
+    rows = [("p", 1, "abc"), ("p", 1, 5), ("p", 1, None), ("p", 1, -3), ("p", 1, "a"), ("p", 1, 1.5)]
+    result = Sort(_agg_child(rows), [_key(_col("author_email"))])
+
+    assert [row[2] for row in result.rows()] == [None, -3, 1.5, 5, "a", "abc"]
+
+
+def test_sort_multi_key_matches_values_py_worked_example_end_to_end():
+    """`ORDER BY path ASC, line_no DESC` over `values.py`'s own
+    module-docstring example (`a`/`b` renamed to `path`/`line_no`):
+    `('x',NULL),('x',1),(NULL,1),(NULL,2),('y',NULL),('y',1)` ->
+    `NULL|2, NULL|1, x|1, x|NULL, y|1, y|NULL` - confirmed against
+    `sqlite3` there, exercised here through the real `Sort` operator
+    rather than at the bare `order_key` level."""
+    rows = [
+        ("x", None, "e"),
+        ("x", 1, "e"),
+        (None, 1, "e"),
+        (None, 2, "e"),
+        ("y", None, "e"),
+        ("y", 1, "e"),
+    ]
+    result = Sort(
+        _agg_child(rows),
+        [_key(_col("path")), _key(_col("line_no"), descending=True)],
+    )
+
+    assert [(row[0], row[1]) for row in result.rows()] == [
+        (None, 2),
+        (None, 1),
+        ("x", 1),
+        ("x", None),
+        ("y", 1),
+        ("y", None),
+    ]
+
+
+def test_sort_is_stable_among_rows_tied_on_every_key():
+    """Rows that tie on the sort key keep their original relative
+    order - the concrete determinism guarantee `AGENTS.md` names,
+    which falls out of a stable sort applied to already-deterministic
+    input rather than needing its own bookkeeping."""
+    rows = [("a.py", 3, "e"), ("a.py", 1, "e"), ("a.py", 2, "e")]
+    result = Sort(_agg_child(rows), [_key(_col("path"))])
+
+    assert list(result.rows()) == rows
+
+
+def test_sort_repeated_runs_give_identical_order():
+    """The same rows, sorted twice via two fresh `Sort` instances over
+    two fresh children, produce byte-identical order both times - the
+    direct (non-oracle) determinism test this issue's own grooming
+    asks for, with a genuinely non-unique key."""
+    rows = [("a.py", 2, "e"), ("b.py", 1, "e"), ("a.py", 1, "e"), ("b.py", 2, "e")]
+    keys = [_key(_col("path"))]
+
+    first = list(Sort(_agg_child(rows), keys).rows())
+    second = list(Sort(_agg_child(rows), keys).rows())
+
+    assert first == second
+
+
+def test_sort_schema_is_exactly_the_child_schema():
+    result = Sort(_agg_child([]), [_key(_col("path"))])
+    assert result.schema is _SCHEMA
+
+
+def test_sort_reads_child_rows_exactly_once():
+    source = _CountingSource([("b.py", 1, "e"), ("a.py", 2, "e")])
+    result = Sort(Scan(source), [_key(_col("path"))])
+
+    list(result.rows())
+
+    assert source.pulled == 2
+
+
+def test_sort_key_expression_may_be_a_computed_value_not_a_bare_column():
+    """A sort key need not be a bare column - `line_no + 1`, evaluated
+    per row exactly like any other value-shaped expression."""
+    rows = [("a.py", 3, "e"), ("a.py", 1, "e"), ("a.py", 2, "e")]
+    key_expr = _bin(Op.ADD, _col("line_no"), _lit(1))
+    result = Sort(_agg_child(rows), [_key(key_expr)])
+
+    assert [row[1] for row in result.rows()] == [1, 2, 3]

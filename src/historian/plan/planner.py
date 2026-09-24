@@ -69,7 +69,17 @@ from pathlib import Path
 
 from collections.abc import Sequence
 
-from historian.exec.operators import Aggregate, AggregateCall, Filter, Operator, Project, Scan, ScanSource
+from historian.exec.operators import (
+    Aggregate,
+    AggregateCall,
+    Filter,
+    Operator,
+    Project,
+    Scan,
+    ScanSource,
+    Sort,
+    SortKey,
+)
 from historian.sql.ast import (
     And,
     Between,
@@ -81,11 +91,12 @@ from historian.sql.ast import (
     Like,
     Literal,
     Not,
+    OrderDirection,
     Or,
     Star,
     UnaryOp,
 )
-from historian.sql.binder import BoundColumnRef, BoundSelectItem, BoundSelectStatement
+from historian.sql.binder import BoundColumnRef, BoundOrderByItem, BoundSelectItem, BoundSelectStatement
 from historian.tables.blame import BlameScan
 
 __all__ = ["ScanFactory", "TABLES", "plan"]
@@ -319,6 +330,30 @@ def _split_select_list(
     )
 
 
+def _split_order_by(
+    order_by: tuple[BoundOrderByItem, ...], calls: list[AggregateCall], group_by: Sequence[Expr]
+) -> tuple[SortKey, ...]:
+    """Split every `ORDER BY` key's expression through `_split_expr`,
+    exactly like `_split_select_list`/`HAVING`'s own call, appending to
+    the same shared *calls* list - issue #61's own acceptance
+    criterion: an `ORDER BY` expression containing an aggregate call
+    (legal even when that call is absent from the select list, per
+    `sql/binder.py`'s own aggregate-legality rule) must not collide
+    with a select-list or `HAVING` aggregate's own slot. Must run
+    *before* `Aggregate` is constructed in `plan()` - exactly like the
+    select-list and `HAVING` splits already do - since `Aggregate`
+    snapshots *calls* at construction time; splitting `ORDER BY` any
+    later would hand `Sort` a `BoundColumnRef` offset `Aggregate`
+    never built a column for."""
+    return tuple(
+        SortKey(
+            expr=_split_expr(item.expr, calls, group_by),
+            descending=item.direction is OrderDirection.DESC,
+        )
+        for item in order_by
+    )
+
+
 def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory] = TABLES) -> Operator:
     """Build the operator tree for *stmt*, a repository at *repo*.
 
@@ -330,17 +365,30 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory] 
     swapped for a fake in tests with no repository and no git
     subprocess, per this module's own docstring.
 
-    Tree shape, per `_docs/spec.md` §3 and issue #69's own acceptance
-    criteria: `Scan -> Filter (WHERE) -> Aggregate (grouped or
-    whole-table) -> Filter (HAVING) -> Project`. `Aggregate` (and,
-    above it, `HAVING`'s `Filter`) is inserted only when the query
-    needs it - `stmt.group_by` is non-empty, or the aggregate/scalar
-    split (`_split_select_list`/`_split_expr`, run over the select
-    list and then `HAVING`, sharing one flat `calls` list so their
-    offsets never collide) found at least one aggregate call anywhere
-    in either. A `GROUP BY`-free, aggregate-free query keeps issue
-    #13's original two shapes exactly - neither `Aggregate` nor
-    `HAVING`'s `Filter` ever appears for it.
+    Tree shape, per `_docs/spec.md` §3 and issue #61's own acceptance
+    criteria (extending #69's): `Scan -> Filter (WHERE) -> Aggregate
+    (grouped or whole-table) -> Filter (HAVING) -> Sort -> Project`.
+    `Aggregate` (and, above it, `HAVING`'s `Filter`) is inserted only
+    when the query needs it - `stmt.group_by` is non-empty, or the
+    aggregate/scalar split (`_split_select_list`/`_split_expr`, run
+    over the select list, then `HAVING`, then `ORDER BY`, sharing one
+    flat `calls` list so their offsets never collide) found at least
+    one aggregate call anywhere in any of the three. A `GROUP BY`-free,
+    aggregate-free query keeps issue #13's original two shapes exactly
+    - neither `Aggregate` nor `HAVING`'s `Filter` ever appears for it.
+    `Sort` is inserted only when `stmt.order_by` is non-empty, and
+    always directly below `Project` - `ORDER BY` may legally reference
+    a column or aggregate absent from the final select list (`select k
+    from g group by k order by count(*) desc` - confirmed against
+    sqlite3 during this issue's grooming), so `Sort` needs the wider
+    pre-`Project` row, never the narrower projected one, regardless of
+    whether the query aggregates.
+
+    All three splits - select list, `HAVING`, `ORDER BY` - must run
+    *before* `Aggregate` is constructed: `Aggregate.__init__` snapshots
+    `calls` (and builds its own output schema from that snapshot)
+    immediately, so any split run afterwards would silently hand a
+    downstream operator an offset `Aggregate` never built a column for.
 
     `sql/binder.py` (issue #69) refuses to bind a `HAVING` clause on a
     non-aggregate query at all - `HAVING` with no `GROUP BY` and no
@@ -354,7 +402,10 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory] 
     ordinary predicate over the `Scan`/`Filter(WHERE)` row rather than
     routing it through `Aggregate`, since there is nothing to compute
     or group - never reached for any statement `bind()` actually
-    produced.
+    produced. `sql/binder.py` (issue #61) similarly refuses to bind an
+    `ORDER BY` expression with a bare aggregate call unless the query
+    already aggregates, so `plan()` never legitimately sees `calls`
+    grow past what `stmt.group_by`/the select list already required.
     """
     source = tables[stmt.from_table](repo)
     tree: Operator = Scan(source)
@@ -364,6 +415,7 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory] 
     calls: list[AggregateCall] = []
     select_list = _split_select_list(stmt.select_list, calls, stmt.group_by)
     having = _split_expr(stmt.having, calls, stmt.group_by) if stmt.having is not None else None
+    order_keys = _split_order_by(stmt.order_by, calls, stmt.group_by)
 
     if calls or stmt.group_by:
         tree = Aggregate(tree, calls, group_by=stmt.group_by)
@@ -374,5 +426,8 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory] 
         # so a hand-built BoundSelectStatement still gets a sane tree
         # rather than plan() crashing on it.
         tree = Filter(tree, having)
+
+    if order_keys:
+        tree = Sort(tree, order_keys)
 
     return Project(tree, select_list)

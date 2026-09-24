@@ -1463,6 +1463,267 @@ def test_group_by_constant_expression_still_raises_bind_error(tiny_repo):
         run_historian("SELECT path, count(*) FROM blame GROUP BY 1+0", tiny_repo)
 
 
+# --- LIMIT / OFFSET (issue #77) -------------------------------------------
+#
+# The oracle problem (issue #77's own design, see its own grooming
+# comment and `_docs/decisions.md`): without `ORDER BY`, "the first n
+# rows" is engine-defined on both sides - SQLite promises no row order
+# at all, and historian's own order for a `LIMIT`-free query is merely
+# deterministic, not the same sequence SQLite happens to produce. Row
+# **count** is still comparable (`_assert_row_count_only`, below); row
+# **content** is checked the non-oracle way instead - a Python slice
+# of historian's own unlimited result for the same query
+# (`test_limit_offset_self_consistency_*`, later in this section).
+#
+# With `ORDER BY`, `assert_rows_match(ordered=True, key_positions=...)`
+# is reused exactly as #61 left it, but only once the cut is proven
+# boundary-tie-free: the row immediately before the cut and the row
+# immediately after it must not share an `ORDER BY` key tuple, checked
+# here against the unfiltered SQLite side, from a query - never
+# hard-coded - so a fixture change that later introduces a tie fails
+# loudly as a broken proof rather than as a false historian bug
+# (`_order_with_limit`, below).
+
+
+def _assert_row_count_only(repo, query: str) -> None:
+    """Row-count-only comparison (issue #77's own design) for a
+    `LIMIT`/`OFFSET` query with no `ORDER BY`: SQLite and historian
+    must return the same *number* of rows, even though which rows
+    those are is engine-defined on both sides - see this section's own
+    comment."""
+    conn = load_unfiltered(BlameScan, repo, BLAME_SCHEMA, "blame")
+    try:
+        sqlite_rows = conn.execute(query).fetchall()
+    finally:
+        conn.close()
+    _, historian_rows = run_historian(query, repo)
+    assert len(sqlite_rows) == len(historian_rows), (
+        f"row count mismatch for {query!r}: "
+        f"sqlite produced {len(sqlite_rows)}, historian produced {len(historian_rows)}\n"
+        f"sqlite:    {sqlite_rows!r}\n"
+        f"historian: {historian_rows!r}"
+    )
+
+
+def _order_with_limit(
+    repo,
+    base_query: str,
+    key_positions,
+    limit: int,
+    offset: int = 0,
+    limit_sql: str | None = None,
+) -> None:
+    """`LIMIT`/`OFFSET` combined with `ORDER BY`: reuses
+    `assert_rows_match(ordered=True, key_positions=...)` exactly as
+    #61 left it, provided the cut is boundary-tie-free - proved here
+    against the unfiltered SQLite side, from *base_query* (the same
+    `ORDER BY`, no `LIMIT`), never hard-coded. `limit`/`offset` are the
+    plain integers the boundary proof is computed against; `limit_sql`
+    lets the rendered query spell the same value a different way
+    (`-(-2)`, say) without changing what the proof checks."""
+    conn = load_unfiltered(BlameScan, repo, BLAME_SCHEMA, "blame")
+    try:
+        all_rows = conn.execute(base_query).fetchall()
+        for cut in (offset, offset + limit):
+            if 0 < cut < len(all_rows):
+                before = tuple(all_rows[cut - 1][pos] for pos in key_positions)
+                after = tuple(all_rows[cut][pos] for pos in key_positions)
+                assert before != after, (
+                    f"fixture is no longer boundary-tie-free at cut {cut} for "
+                    f"{base_query!r} - this differential case needs new data "
+                    f"or different key_positions: {before!r} == {after!r}"
+                )
+        limit_clause = limit_sql if limit_sql is not None else str(limit)
+        query = f"{base_query} LIMIT {limit_clause}"
+        if offset:
+            query += f" OFFSET {offset}"
+        sqlite_rows = conn.execute(query).fetchall()
+    finally:
+        conn.close()
+    _, historian_rows = run_historian(query, repo)
+    assert_rows_match(sqlite_rows, historian_rows, ordered=True, key_positions=key_positions)
+
+
+def test_limit_alone_no_order_by_row_count_only(tiny_repo):
+    _assert_row_count_only(tiny_repo, "SELECT path FROM blame LIMIT 2")
+
+
+def test_limit_offset_alone_no_order_by_row_count_only(tiny_repo):
+    _assert_row_count_only(tiny_repo, "SELECT path FROM blame LIMIT 1 OFFSET 1")
+
+
+def test_limit_zero_row_count_only(tiny_repo):
+    _assert_row_count_only(tiny_repo, "SELECT path FROM blame LIMIT 0")
+
+
+def test_negative_limit_gives_no_truncation_row_count_only(tiny_repo):
+    """Confirmed against sqlite3: a negative `LIMIT` means "no limit" -
+    every row, not zero."""
+    _assert_row_count_only(tiny_repo, "SELECT path FROM blame LIMIT -1")
+
+
+def test_negative_offset_clamped_to_zero_row_count_only(tiny_repo):
+    """Confirmed against sqlite3: `LIMIT 2 OFFSET -1` behaves exactly
+    like `LIMIT 2 OFFSET 0`."""
+    _assert_row_count_only(tiny_repo, "SELECT path FROM blame LIMIT 2 OFFSET -1")
+
+
+def test_offset_past_the_end_row_count_only(tiny_repo):
+    _assert_row_count_only(tiny_repo, "SELECT path FROM blame LIMIT 5 OFFSET 100")
+
+
+def test_limit_with_order_by_unique_composite_key(awkward_repo):
+    """`(path, line_no)` uniquely identifies every blame row (no two
+    rows share both), so `ORDER BY path, line_no` is tie-free at every
+    possible cut by construction - the "single key, unique" conformance
+    case, run against `awkward_repo` where `path` alone genuinely ties
+    (`café.py`, six ways)."""
+    _order_with_limit(
+        awkward_repo,
+        "SELECT path, line_no FROM blame ORDER BY path, line_no",
+        key_positions=(0, 1),
+        limit=3,
+    )
+
+
+def test_limit_offset_with_order_by_boundary_tie_free(awkward_repo):
+    """The `LIMIT`+`OFFSET`+`ORDER BY` conformance case: boundary-tie-
+    free at both the front cut (`OFFSET`) and the back cut
+    (`OFFSET + LIMIT`), proved by `_order_with_limit` against the same
+    unique composite key."""
+    _order_with_limit(
+        awkward_repo,
+        "SELECT path, line_no FROM blame ORDER BY path, line_no",
+        key_positions=(0, 1),
+        limit=4,
+        offset=3,
+    )
+
+
+def test_limit_with_group_by_having_order_by_end_to_end(awkward_repo):
+    """`LIMIT` combined with `GROUP BY` + `HAVING` + `ORDER BY`
+    together, through the full tree (`Scan -> Aggregate -> Filter
+    (HAVING) -> Sort -> Project -> Limit`). `awkward_repo` has exactly
+    two authors, so `author_name` is itself a tie-free key across the
+    whole (unlimited) grouped result - checked by `_order_with_limit`,
+    not assumed."""
+    _order_with_limit(
+        awkward_repo,
+        "SELECT author_name, count(*) FROM blame GROUP BY author_name "
+        "HAVING count(*) > 0 ORDER BY author_name",
+        key_positions=(0,),
+        limit=1,
+    )
+
+
+def test_limit_unary_paren_nested_literal_with_order_by(tiny_repo):
+    """`LIMIT -(-2)` - the same arbitrary unary/paren nesting
+    `_ordinal_value` already handles for `GROUP BY`/`ORDER BY`,
+    reused unchanged for `LIMIT`/`OFFSET` (issue #77's own design).
+    sqlite3 accepts `-(-2)` too (plain arithmetic, confirmed during
+    this issue's grooming), so this remains a genuine differential
+    case, not a historian-only shape."""
+    _order_with_limit(
+        tiny_repo,
+        "SELECT path, line_no FROM blame ORDER BY path, line_no",
+        key_positions=(0, 1),
+        limit=2,
+        limit_sql="-(-2)",
+    )
+
+
+# --- LIMIT / OFFSET (issue #77): BindError cases, asserted directly ------
+#
+# `<n>` narrows to a literal integer (arbitrarily unary/paren-wrapped),
+# reusing `_ordinal_value` - a deliberate syntactic narrowing of what
+# sqlite3 itself accepts here (see `_docs/decisions.md`). Each rejected
+# shape below is legal SQL in sqlite3 (confirmed during this issue's
+# grooming) but a `BindError` in historian.
+
+
+def test_limit_rejects_arithmetic_expression_bind_error(tiny_repo):
+    """`LIMIT 1+1` - legal in sqlite3 (2 rows), a `BindError` here."""
+    with pytest.raises(BindError):
+        run_historian("SELECT path FROM blame LIMIT 1+1", tiny_repo)
+
+
+def test_limit_rejects_column_reference_bind_error(tiny_repo):
+    """`LIMIT line_no` - "no such column" in sqlite3 too, for a
+    different reason (LIMIT has zero visible columns there); historian
+    rejects every non-ordinal shape uniformly instead."""
+    with pytest.raises(BindError):
+        run_historian("SELECT path FROM blame LIMIT line_no", tiny_repo)
+
+
+def test_limit_rejects_text_literal_bind_error(tiny_repo):
+    """`LIMIT '2'` - legal in sqlite3 (numeric-affinity TEXT coercion,
+    2 rows), deliberately not adopted here - see `_docs/decisions.md`.
+    A genuine, intentional divergence from sqlite3, not a bug."""
+    with pytest.raises(BindError):
+        run_historian("SELECT path FROM blame LIMIT '2'", tiny_repo)
+
+
+# --- LIMIT / OFFSET (issue #77): the comma form is out of scope ----------
+
+
+def test_limit_comma_form_is_rejected_not_silently_reordered(tiny_repo):
+    """`LIMIT m, n` is a v2 non-goal (issue #77's own grooming) -
+    confirmed against sqlite3 that it means `LIMIT n OFFSET m`, the
+    *reverse* argument order from the `OFFSET` spelling, which is
+    exactly the footgun this issue declines to build. historian raises
+    `ParseError`, naming the comma form, rather than silently accepting
+    it with either argument order."""
+    with pytest.raises(ParseError) as exc_info:
+        run_historian("SELECT path FROM blame LIMIT 3, 2", tiny_repo)
+    message = str(exc_info.value)
+    assert "LIMIT" in message
+    assert "OFFSET" in message
+
+
+# --- LIMIT / OFFSET (issue #77): non-oracle self-consistency and ---------
+# determinism checks
+#
+# No cross-engine oracle is needed for either: historian's own row
+# order is already deterministic (`Scan`/`Filter`/`Aggregate`/`Sort`
+# never reorder except `Sort`'s own deliberate reordering), so
+# `LIMIT n [OFFSET m]`'s result must equal a plain Python slice of the
+# same query's unlimited result, and running the same query twice must
+# give identical rows.
+
+
+def test_limit_offset_self_consistency_no_order_by(tiny_repo):
+    """No `ORDER BY`: `LIMIT n OFFSET m`'s result equals `[m:m+n]` of
+    the same, unlimited query's own result - `tiny_repo` has 3 rows, so
+    `LIMIT 2 OFFSET 1` reaches into the tail without running past it."""
+    _, unlimited = run_historian("SELECT path, line_no FROM blame", tiny_repo)
+    _, limited = run_historian("SELECT path, line_no FROM blame LIMIT 2 OFFSET 1", tiny_repo)
+    assert limited == unlimited[1:3]
+
+
+def test_limit_offset_self_consistency_with_order_by(awkward_repo):
+    """`ORDER BY` present: the same slice property holds over the
+    already-sorted result - `Limit` sits above `Sort`/`Project` and
+    must not disturb the order `Sort` already fixed."""
+    _, unlimited = run_historian(
+        "SELECT path, line_no FROM blame ORDER BY path, line_no", awkward_repo
+    )
+    _, limited = run_historian(
+        "SELECT path, line_no FROM blame ORDER BY path, line_no LIMIT 3 OFFSET 2", awkward_repo
+    )
+    assert limited == unlimited[2:5]
+
+
+def test_limit_offset_same_query_twice_gives_identical_rows(tiny_repo):
+    """The historian-side determinism criterion (`AGENTS.md`, spec
+    §3's "Determinism and row order"), mirroring #61's own
+    `test_order_by_same_query_twice_gives_identical_order` for this
+    clause: the same repository and query produce the same rows, in
+    the same order, every time."""
+    _, first = run_historian("SELECT path, line_no FROM blame LIMIT 2 OFFSET 1", tiny_repo)
+    _, second = run_historian("SELECT path, line_no FROM blame LIMIT 2 OFFSET 1", tiny_repo)
+    assert first == second
+
+
 # --- Known disagreements that raise before producing rows --------------
 #
 # #25, #32 and #51 are open design questions ("whether it should stay

@@ -1121,6 +1121,64 @@ def test_having_bare_column_matching_a_group_key(tiny_repo):
     )
 
 
+# --- GROUP BY / HAVING alias-vs-real-column resolution (issue #69 round 2) -
+#
+# QA's round-1 FAIL: the issue's own body commits twice to a
+# discriminating alias-vs-column test for GROUP BY/HAVING resolution,
+# mirroring #32's `test_where_real_column_wins_over_alias_of_a_different_
+# column`, and none existed. Both call sites bind with
+# `alias_first=False` (column-first) today, matching `sqlite3`'s own
+# `GROUP BY`/`HAVING` resolution rule. Flipping either call site to
+# `alias_first=True` makes the query below succeed silently instead of
+# raising - that is exactly what makes these tests discriminating: a
+# query that is *illegal* under the correct (column-first) reading and
+# *legal but silently wrong* under the buggy (alias-first) one.
+
+
+def test_group_by_real_column_wins_over_alias_of_a_different_column(tiny_repo):
+    """`author_name AS path` aliases a *different* column to `path`'s
+    own name. Column-first (correct): `GROUP BY path` resolves to the
+    real `path` column, so the select list's `author_name` is neither
+    the group key nor an aggregate - `BindError`, the same shape as
+    #32's `WHERE` finding. Alias-first (the bug QA found uncaught):
+    `GROUP BY path` would instead resolve through the select-list
+    alias to `author_name`, which then trivially matches its own
+    select-list item, and the query would succeed silently, grouping
+    by `author_name` while claiming to group by `path`. Confirmed live
+    against the real code before this test was written: the unmutated
+    branch raises `BindError`, and flipping
+    `_bind_group_by_item`'s `alias_first` to `True` makes it return
+    rows instead - the discriminating direction this test pins."""
+    with pytest.raises(BindError):
+        run_historian(
+            "SELECT author_name AS path, count(*) FROM blame GROUP BY path", tiny_repo
+        )
+
+
+def test_having_real_column_wins_over_alias_of_a_different_column(tiny_repo):
+    """`line_no AS path` aliases the integer `line_no` column to
+    `path`'s own name, with `GROUP BY line_no` (the real column,
+    unaliased) as the sole key. Column-first (correct): `HAVING path`
+    resolves to the real, TEXT `path` column, which is neither the
+    group key (`line_no`) nor inside an aggregate call - `BindError`
+    via the same "bare column not a group key" narrowing pinned
+    elsewhere in this file, just now reached through a name that is
+    *also* a select-list alias, which #32's alias fallback could pull
+    the wrong way. Alias-first (the bug QA found uncaught): `HAVING
+    path` would instead resolve through the select-list alias to
+    `line_no`, which matches the group key by shape and binds legally
+    - a real behavior difference, not just an error-message
+    difference. Confirmed live against the real code: the unmutated
+    branch raises `BindError`, and flipping the HAVING call site's
+    `alias_first` to `True` makes it bind instead."""
+    with pytest.raises(BindError):
+        run_historian(
+            "SELECT line_no AS path, count(*) FROM blame GROUP BY line_no "
+            "HAVING path = 'src/utils.py'",
+            tiny_repo,
+        )
+
+
 # --- Known disagreements that raise before producing rows --------------
 #
 # #25, #32 and #51 are open design questions ("whether it should stay

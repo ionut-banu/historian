@@ -947,3 +947,59 @@ def test_having_references_a_select_list_alias_of_a_group_key_is_legal():
         "SELECT author_name AS a, count(*) FROM blame GROUP BY author_name HAVING a = 'Ana Petrova'"
     )
     assert stmt.having is not None
+
+
+# --- GROUP BY / HAVING alias-vs-real-column resolution (issue #69 round 2) -
+#
+# QA's round-1 FAIL: no test anywhere pinned that GROUP BY/HAVING
+# resolve column-first (`alias_first=False`), even though the issue's
+# own body commits twice to exactly this test, mirroring #32's
+# `test_where_real_column_wins_over_alias_of_a_different_column`.
+# Mutation-tested against the real file: flipping either call site's
+# `alias_first` to `True` makes the corresponding test below stop
+# raising.
+
+
+def test_group_by_real_column_wins_over_alias_of_a_different_column():
+    """`author_name AS path` aliases a *different* column to `path`'s
+    name. Column-first (correct): `GROUP BY path` binds to the real
+    `path` column, so `author_name` in the select list is neither the
+    group key nor an aggregate - `BindError`. Alias-first (the round-1
+    gap): `GROUP BY path` would instead resolve through the alias to
+    `author_name`, which then trivially matches itself and the query
+    would bind without error - a silent, wrong-direction resolution
+    this test is built to catch."""
+    with pytest.raises(BindError):
+        _bind("SELECT author_name AS path, count(*) FROM blame GROUP BY path")
+
+
+def test_having_real_column_wins_over_alias_of_a_different_column():
+    """`line_no AS path` aliases `line_no` to `path`'s name, with the
+    real, unaliased `line_no` as the sole GROUP BY key. Column-first
+    (correct): `HAVING path` binds to the real, non-key `path` column
+    - `BindError`. Alias-first (the round-1 gap): `HAVING path` would
+    instead resolve through the alias to `line_no`, which matches the
+    group key by shape and binds legally - a real difference in what
+    binds, not just in the error text."""
+    with pytest.raises(BindError):
+        _bind(
+            "SELECT line_no AS path, count(*) FROM blame GROUP BY line_no "
+            "HAVING path = 'src/utils.py'"
+        )
+
+
+# --- Ordinal-to-aggregate BindError, pinned on its own -----------------
+#
+# QA's secondary note: with the ordinal-to-aggregate check disabled, a
+# query with no other reachable check (no non-key/non-aggregate column
+# in the select list to trip the grouped narrowing instead) surfaced an
+# `EvalError` rather than `BindError`. This query has no select-list
+# item that could be caught by any other check - both items are
+# themselves aggregate calls - so it exercises the ordinal-to-aggregate
+# rejection in `_bind_group_by_item` on its own, with nothing else able
+# to raise first.
+
+
+def test_group_by_ordinal_to_aggregate_is_a_bind_error_with_no_other_check_reachable():
+    with pytest.raises(BindError):
+        _bind("SELECT count(*), sum(line_no) FROM blame GROUP BY 1")

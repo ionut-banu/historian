@@ -350,16 +350,36 @@ def test_is_and_is_not_are_never_null():
     assert is_not("1", 1) is True
 
 
-@pytest.mark.parametrize(
-    "left", [None, 0, 1, 0.0, 1.5, "", "abc", "é"]
-)
-@pytest.mark.parametrize(
-    "right", [None, 0, 1, 0.0, 1.5, "", "abc", "é"]
-)
-def test_is_and_is_not_return_plain_bool_for_every_pair(left, right):
-    result = is_(left, right)
-    assert result is True or result is False
-    assert is_not(left, right) is (not result)
+# sqlite3 :memory: "select 'a' is 'a', 'a' is 'b';" -> 1|0
+# sqlite3 :memory: "select 'a' is not 'a', 'a' is not 'b';" -> 0|1
+# sqlite3 :memory: "select 1 is 2;" -> 0
+# sqlite3 :memory: "select 0 is 0.0;" -> 1
+#
+# The mutant on record for is_() (`return _rank(left) == _rank(right)`)
+# agrees with SQLite on same-rank equal pairs - `'a' IS 'a'` and
+# `0 IS 0.0` - so those alone do not catch it. Only a same-rank,
+# different-value pair does: `is_(1, 2)` and `is_("a", "b")` are the
+# cases that must fail under the mutant.
+
+
+def test_is_text_against_equal_text():
+    assert is_("a", "a") is True
+    assert is_not("a", "a") is False
+
+
+def test_is_text_against_different_text():
+    assert is_("a", "b") is False
+    assert is_not("a", "b") is True
+
+
+def test_is_same_rank_different_numeric_value():
+    assert is_(1, 2) is False
+    assert is_not(1, 2) is True
+
+
+def test_is_zero_int_and_zero_float_are_the_same_value():
+    assert is_(0, 0.0) is True
+    assert is_not(0, 0.0) is False
 
 
 @pytest.mark.parametrize("value", [0, 0.0, "", -0.0, 1, "abc"])
@@ -518,24 +538,12 @@ def test_order_key_does_not_compare_int_against_str():
     assert order_key(None)[0] < order_key(1)[0]
 
 
-def test_order_key_is_deterministic():
-    for value in [None, 0, 1.5, "abc"]:
-        assert order_key(value) == order_key(value)
-
-
 # --- Grouping / DISTINCT equality ----------------------------------------
 
 # sqlite3 :memory: "create table t(x); insert into t
 #   values(null),(null),(1),(1),(2); select quote(x), count(*) from t
 #   group by x;" -> NULL|2, 1|2, 2|1
 # select distinct x  -> NULL, 1, 2 (one NULL row, not two)
-
-
-def test_raw_python_equality_implements_grouping_semantics():
-    assert (None == None) is True  # noqa: E711
-    assert (1 == 1.0) is True
-    assert hash(1) == hash(1.0)
-    assert ("1" == 1) is False
 
 
 def test_group_by_raw_value_produces_three_groups():

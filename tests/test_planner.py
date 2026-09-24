@@ -454,22 +454,28 @@ def test_plan_group_by_without_having_omits_having_filter_node():
     assert isinstance(tree._child, Aggregate)
 
 
-def test_plan_having_without_group_by_or_aggregate_behaves_like_an_ordinary_filter():
-    """`HAVING` with no aggregate call and no `GROUP BY` at all is not
-    routed through `Aggregate` - it is an ordinary `Filter` over the
-    `Scan`/`Filter(WHERE)` row shape, since there is nothing to group
-    or compute."""
+def test_plan_having_with_only_a_select_list_aggregate_and_no_group_by():
+    """`SELECT count(*) FROM widgets HAVING 1` - confirmed against
+    `sqlite3 3.51.0` (issue #69's HAVING-on-a-non-aggregate-query
+    fix): an aggregate call in the select list alone is enough to
+    make this an aggregate query, even though `HAVING`'s own
+    predicate (`1`) has no aggregate call in it at all. `sql/
+    binder.py` is what rejects the case with no aggregate anywhere at
+    all (`no such reachable shape at the planner level once bind()
+    guarantees it - see tests/test_binder.py and tests/differential/
+    test_blame.py's own HAVING-on-a-non-aggregate-query cases`); this
+    planner test only pins that the legal shape still builds
+    `Aggregate` + `HAVING`'s `Filter` correctly."""
     source = _FakeSource([("a.py", 1, "ana@x.com"), ("b.py", 2, "bo@x.com")])
-    having = _bin(Op.GT, _col("line_no"), _lit(1))
-    stmt = _stmt([_select_item(_col("path"))], where=None, having=having)
+    having = _lit(1)
+    stmt = _stmt([_select_item(_count_star())], where=None, having=having)
 
     tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
 
     assert isinstance(tree, Project)
     assert isinstance(tree._child, Filter)
-    assert not isinstance(tree._child, Aggregate)
-    assert isinstance(tree._child._child, Scan)
-    assert list(tree.rows()) == [("b.py",)]
+    assert isinstance(tree._child._child, Aggregate)
+    assert list(tree.rows()) == [(2,)]
 
 
 def test_plan_group_by_query_produces_correct_grouped_rows_end_to_end():

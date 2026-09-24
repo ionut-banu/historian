@@ -340,11 +340,21 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory] 
     offsets never collide) found at least one aggregate call anywhere
     in either. A `GROUP BY`-free, aggregate-free query keeps issue
     #13's original two shapes exactly - neither `Aggregate` nor
-    `HAVING`'s `Filter` ever appears for it. A `HAVING` with no
-    aggregate call and no `GROUP BY` is *not* routed through
-    `Aggregate` at all - it behaves like an ordinary predicate over
-    the `Scan`/`Filter(WHERE)` row shape instead, since there is
-    nothing for `Aggregate` to compute or group in that case.
+    `HAVING`'s `Filter` ever appears for it.
+
+    `sql/binder.py` (issue #69) refuses to bind a `HAVING` clause on a
+    non-aggregate query at all - `HAVING` with no `GROUP BY` and no
+    aggregate call anywhere in the select list or `HAVING` itself is a
+    `BindError` there, matching `sqlite3`'s own "HAVING clause on a
+    non-aggregate query" rejection - so `plan()` never legitimately
+    sees a bound `having` with `calls` empty and `stmt.group_by`
+    empty. The `elif having is not None` branch below only exists
+    for a `BoundSelectStatement` built by hand (as some planner unit
+    tests do, bypassing `bind()`); it treats that shape as an
+    ordinary predicate over the `Scan`/`Filter(WHERE)` row rather than
+    routing it through `Aggregate`, since there is nothing to compute
+    or group - never reached for any statement `bind()` actually
+    produced.
     """
     source = tables[stmt.from_table](repo)
     tree: Operator = Scan(source)
@@ -360,6 +370,9 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory] 
         if having is not None:
             tree = Filter(tree, having)
     elif having is not None:
+        # See the docstring above: unreachable via bind(), kept only
+        # so a hand-built BoundSelectStatement still gets a sane tree
+        # rather than plan() crashing on it.
         tree = Filter(tree, having)
 
     return Project(tree, select_list)

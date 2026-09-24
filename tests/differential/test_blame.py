@@ -952,8 +952,8 @@ def test_group_by_two_columns_together(tiny_repo):
 
 
 def test_group_by_an_expression_not_a_bare_column(tiny_repo):
-    """historian has no `%` operator yet (not built by any prior
-    issue, and out of this issue's own file list) - `line_no + 1`
+    """historian has no `%` operator yet (issue #75 - not built by any
+    prior issue, and out of this issue's own file list) - `line_no + 1`
     stands in for the same "GROUP BY on an expression" shape the
     issue's own grooming used `line_no % 2` for."""
     _assert_differential(
@@ -1055,6 +1055,31 @@ def test_grouped_select_item_not_a_key_or_aggregate_raises_bind_error(tiny_repo)
         run_historian(
             "SELECT path, author_name, count(*) FROM blame GROUP BY author_name", tiny_repo
         )
+
+
+def test_having_with_no_group_by_and_no_aggregate_anywhere_raises_bind_error(tiny_repo):
+    """Confirmed against `sqlite3 3.51.0`: `select path from t having
+    path = 'x'` -> "HAVING clause on a non-aggregate query". Neither
+    `GROUP BY` nor an aggregate call anywhere (select list or HAVING
+    itself) is present here."""
+    with pytest.raises(BindError):
+        run_historian("SELECT path FROM blame HAVING path = 'src/utils.py'", tiny_repo)
+
+
+def test_having_aggregate_only_in_having_itself_still_raises_bind_error(tiny_repo):
+    """Confirmed against `sqlite3`: an aggregate call written in
+    HAVING itself does not by itself make the query aggregate -
+    `select path from t having count(*) > 1` still raises "HAVING
+    clause on a non-aggregate query"."""
+    with pytest.raises(BindError):
+        run_historian("SELECT path FROM blame HAVING count(*) > 1", tiny_repo)
+
+
+def test_having_legal_with_aggregate_only_in_the_select_list(tiny_repo):
+    """Confirmed against `sqlite3`: `select count(*) from t having 1`
+    succeeds - the select list's own aggregate is enough, even though
+    HAVING's own predicate has no aggregate call in it at all."""
+    _assert_differential(tiny_repo, "SELECT count(*) FROM blame HAVING 1")
 
 
 # --- Known disagreements that raise before producing rows --------------

@@ -995,6 +995,29 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema] = TABLES) -> BoundSel
         reject_aggregates=False,
     )
     bound_having = _bind_expr(stmt.having, having_ctx) if stmt.having is not None else None
+    if bound_having is not None and not bound_group_by:
+        # A `HAVING` clause only makes sense against an aggregate
+        # query - confirmed live against `sqlite3 3.51.0`:
+        # `select path from t having path = 'x'` (no GROUP BY, no
+        # aggregate anywhere) -> "HAVING clause on a non-aggregate
+        # query". Whether the query *is* an aggregate query is decided
+        # by `GROUP BY`'s presence or an aggregate call in the select
+        # list alone - `select count(*) from t having 1` succeeds
+        # (the select list's own `count(*)` is enough, even though
+        # HAVING's own predicate has no aggregate call in it at all).
+        # An aggregate call written in HAVING itself does *not* by
+        # itself make the query aggregate, also confirmed live:
+        # `select path from t having count(*) > 1` still raises the
+        # identical "HAVING clause on a non-aggregate query" error -
+        # only the select list (or GROUP BY) decides that question.
+        select_has_aggregate = any(_contains_aggregate(item.expr) for item in bound_items)
+        if not select_has_aggregate:
+            raise BindError(
+                "HAVING requires an aggregate query - add GROUP BY or an "
+                "aggregate function to the select list",
+                stmt.having.position,
+                (),
+            )
     return BoundSelectStatement(
         select_list=tuple(bound_items),
         from_table=ctx.table_name,

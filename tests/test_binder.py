@@ -718,3 +718,140 @@ def test_binder_module_does_not_import_subprocess_directly():
     import historian.sql.binder as binder_module
 
     assert "subprocess" not in vars(binder_module)
+
+
+# --- GROUP BY / HAVING (issue #69) ----------------------------------------
+
+
+def test_group_by_bare_column_resolves_and_is_legal():
+    stmt = _bind("SELECT author_name, count(*) FROM blame GROUP BY author_name")
+    assert len(stmt.group_by) == 1
+    assert isinstance(stmt.group_by[0], BoundColumnRef)
+    assert stmt.group_by[0].name == "author_name"
+
+
+def test_group_by_ordinal_resolves_to_select_list_position():
+    """`GROUP BY 1` groups by the *value* of the first select-list
+    item - resolved purely positionally, matching the ordinal's own
+    select-list item's already-bound expression."""
+    stmt = _bind("SELECT author_name, count(*) FROM blame GROUP BY 1")
+    assert stmt.group_by[0] == stmt.select_list[0].expr
+
+
+def test_group_by_ordinal_not_resolved_through_alias():
+    """An ordinal is positional, never name-based - `GROUP BY 1` with
+    `path AS x` groups by select-list position 1's value (`path`),
+    with no alias lookup involved at all."""
+    stmt = _bind("SELECT path AS x, count(*) FROM blame GROUP BY 1")
+    assert stmt.group_by[0] == stmt.select_list[0].expr
+    assert isinstance(stmt.group_by[0], BoundColumnRef)
+    assert stmt.group_by[0].name == "path"
+
+
+def test_group_by_ordinal_pointing_at_an_aggregate_is_a_bind_error():
+    """Orchestrator's correction: an ordinal that resolves to an
+    aggregate call is rejected exactly like a direct or aliased one -
+    `sqlite3` gives the identical "aggregate functions are not
+    allowed in the GROUP BY clause" for all three."""
+    with pytest.raises(BindError):
+        _bind("SELECT path, count(*) FROM blame GROUP BY 2")
+
+
+def test_group_by_direct_aggregate_call_is_a_bind_error():
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame GROUP BY count(*)")
+
+
+def test_group_by_aggregate_via_alias_is_a_bind_error():
+    with pytest.raises(BindError):
+        _bind("SELECT count(*) AS c FROM blame GROUP BY c")
+
+
+def test_group_by_ordinal_zero_is_out_of_range():
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame GROUP BY 0")
+
+
+def test_group_by_ordinal_past_the_end_is_out_of_range():
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame GROUP BY 2")
+
+
+def test_group_by_on_an_expression():
+    """`GROUP BY` on an expression, selecting that same expression
+    back (legal - it matches the group key by shape) alongside an
+    aggregate."""
+    stmt = _bind("SELECT line_no + 1, count(*) FROM blame GROUP BY line_no + 1")
+    assert len(stmt.group_by) == 1
+    assert len(stmt.select_list) == 2
+
+
+def test_group_by_unknown_column_raises_no_such_column():
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame GROUP BY ghost_column")
+
+
+# --- The grouped narrowing (issue #60, extended by #69) ---------------------
+
+
+def test_grouped_select_item_matching_the_group_key_is_legal():
+    stmt = _bind("SELECT author_name, count(*) FROM blame GROUP BY author_name")
+    assert len(stmt.select_list) == 2
+
+
+def test_grouped_select_item_not_a_key_and_not_an_aggregate_is_a_bind_error():
+    """`SELECT path, author_name, count(*) ... GROUP BY author_name` -
+    `path` is neither a group key nor an aggregate, extending #60's
+    narrowing to the grouped case."""
+    with pytest.raises(BindError):
+        _bind("SELECT path, author_name, count(*) FROM blame GROUP BY author_name")
+
+
+def test_group_by_with_no_aggregate_in_select_list_still_narrows():
+    """`GROUP BY` alone - no aggregate anywhere - still triggers the
+    narrowing: a select-list column that is not the group key is a
+    BindError, the grouped analogue of #60's aggregate-only trigger."""
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame GROUP BY author_name")
+
+
+def test_group_by_multiple_columns_both_legal_as_select_items():
+    stmt = _bind(
+        "SELECT author_name, path, count(*) FROM blame GROUP BY author_name, path"
+    )
+    assert len(stmt.select_list) == 3
+
+
+# --- HAVING (issue #69) ------------------------------------------------------
+
+
+def test_having_references_a_bare_aggregate_call():
+    stmt = _bind(
+        "SELECT author_name, count(*) FROM blame GROUP BY author_name HAVING count(*) > 1"
+    )
+    assert stmt.having is not None
+
+
+def test_having_references_a_select_list_alias():
+    stmt = _bind(
+        "SELECT author_name, count(*) AS c FROM blame GROUP BY author_name HAVING c > 1"
+    )
+    assert stmt.having is not None
+
+
+def test_having_references_an_aggregate_not_in_the_select_list():
+    stmt = _bind(
+        "SELECT author_name FROM blame GROUP BY author_name HAVING sum(line_no) > 0"
+    )
+    assert stmt.having is not None
+
+
+def test_having_without_group_by_binds():
+    stmt = _bind("SELECT count(*) FROM blame HAVING count(*) > 1")
+    assert stmt.group_by == ()
+    assert stmt.having is not None
+
+
+def test_having_unknown_column_raises_no_such_column():
+    with pytest.raises(BindError):
+        _bind("SELECT count(*) FROM blame HAVING ghost_column > 1")

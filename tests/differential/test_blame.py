@@ -1367,12 +1367,28 @@ def test_order_by_bare_positive_ordinal_matches_named_column(awkward_repo):
 
 def test_order_by_double_negative_ordinal_matches_named_column(awkward_repo):
     """`ORDER BY -(-1)` - confirmed against sqlite3: ordinal 1, sorts
-    by `path` exactly as `ORDER BY path`/`ORDER BY 1` would."""
-    _order(awkward_repo, "SELECT path FROM blame ORDER BY -(-1)", key_positions=(0,))
+    by `author_name` exactly as `ORDER BY author_name`/`ORDER BY 1`
+    would. Retargeted from `path` (issue #80): `awkward_repo`'s scan
+    order is already alphabetical by `path`, so an `ORDER BY path`
+    case can't tell a genuine sort from an unsorted scan-order pass-
+    through and catches nothing if the double-unary ordinal parsing
+    regresses. `author_name` is discriminating instead - its scan
+    order and its sorted order actually differ, per
+    `test_order_by_constant_expression_leaves_rows_in_scan_order`'s
+    own `constant_ordered != actually_sorted` proof against this same
+    fixture and column."""
+    _order(awkward_repo, "SELECT author_name FROM blame ORDER BY -(-1)", key_positions=(0,))
 
 
 def test_order_by_double_positive_ordinal_matches_named_column(awkward_repo):
-    _order(awkward_repo, "SELECT path FROM blame ORDER BY +(+1)", key_positions=(0,))
+    """`ORDER BY +(+1)`. Retargeted from `path` for the same reason as
+    `test_order_by_double_negative_ordinal_matches_named_column`
+    above: `awkward_repo`'s scan order is already alphabetical by
+    `path`, so that case can't catch a regression in double-unary
+    ordinal parsing. `author_name`'s scan order and sorted order
+    differ, per `test_order_by_constant_expression_leaves_rows_in_scan_order`'s
+    own `constant_ordered != actually_sorted` proof."""
+    _order(awkward_repo, "SELECT author_name FROM blame ORDER BY +(+1)", key_positions=(0,))
 
 
 def test_group_by_bare_positive_ordinal_matches_named_column(awkward_repo):

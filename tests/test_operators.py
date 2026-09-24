@@ -793,3 +793,146 @@ def test_aggregate_consumes_child_rows_exactly_once():
 
     assert tuple(result.rows()) == ((3, 6, 3),)
     assert source.pulled == 3
+
+
+# --- Aggregate (issue #69): the grouped path --------------------------------
+#
+# Unit tests against synthetic rows, same rationale as the whole-table
+# section above: `NULL`-valued and mixed-storage-class grouping keys
+# cannot be produced from real `blame` data (every column is
+# non-`NULL`, and `CASE` does not exist), so those cases live only
+# here - see `tests/differential/test_blame.py`'s own "Aggregate
+# (issue #69)" section for what real `blame` data does cover.
+
+
+def test_grouped_aggregate_over_zero_rows_yields_zero_rows():
+    """The one place the grouped and whole-table paths diverge on
+    purpose (spec §3): a `GROUP BY` over zero input rows has no groups
+    at all, unlike the whole-table case's one implicit row."""
+    result = Aggregate(_agg_child([]), [_call("count")], group_by=[_col("path")])
+
+    assert tuple(result.rows()) == ()
+
+
+def test_grouped_aggregate_one_row_per_distinct_key():
+    rows = [
+        ("a.py", 1, "x"),
+        ("a.py", 2, "x"),
+        ("b.py", 3, "x"),
+    ]
+    result = Aggregate(_agg_child(rows), [_call("count")], group_by=[_col("path")])
+
+    assert set(tuple(row) for row in result.rows()) == {("a.py", 2), ("b.py", 1)}
+
+
+def test_grouped_aggregate_emits_groups_in_first_row_encountered_order():
+    """Determinism (`AGENTS.md`, spec §3): groups are emitted in the
+    order their first row was seen in the child's own row order, not
+    sorted or otherwise rearranged - pinned exactly rather than merely
+    "some deterministic order", so a change that reorders groups fails
+    this test directly."""
+    rows = [
+        ("b.py", 1, "x"),
+        ("a.py", 2, "x"),
+        ("b.py", 3, "x"),
+        ("c.py", 4, "x"),
+        ("a.py", 5, "x"),
+    ]
+    result = Aggregate(_agg_child(rows), [_call("count")], group_by=[_col("path")])
+
+    assert [row[0] for row in result.rows()] == ["b.py", "a.py", "c.py"]
+
+
+def test_grouped_aggregate_is_stable_across_repeated_runs():
+    """The same operator, iterated twice, must produce the same order
+    both times - `rows()` is a generator method, not a cached list, so
+    this also proves a second call re-derives the same order rather
+    than depending on leftover state from the first."""
+    rows = [("b.py", 1, "x"), ("a.py", 2, "x"), ("b.py", 3, "x")]
+    result = Aggregate(_agg_child(rows), [_call("count")], group_by=[_col("path")])
+
+    first = [row[0] for row in result.rows()]
+    second = [row[0] for row in result.rows()]
+    assert first == second == ["b.py", "a.py"]
+
+
+def test_grouped_aggregate_two_columns_groups_on_the_combination():
+    rows = [
+        ("a.py", 1, "x"),
+        ("a.py", 1, "x"),
+        ("a.py", 2, "x"),
+        ("b.py", 1, "x"),
+    ]
+    result = Aggregate(
+        _agg_child(rows), [_call("count")], group_by=[_col("path"), _col("line_no")]
+    )
+
+    assert set(tuple(row) for row in result.rows()) == {
+        ("a.py", 1, 2),
+        ("a.py", 2, 1),
+        ("b.py", 1, 1),
+    }
+
+
+def test_grouped_aggregate_null_valued_key_forms_one_group():
+    """`_docs/spec.md`'s aggregate edge-case table: `GROUP BY` a
+    column containing `NULL`s -> all `NULL`s form one group. Real
+    `blame` data can never produce this (every column is non-`NULL`),
+    so this is unit-only."""
+    rows = [
+        ("a.py", 1, None),
+        ("a.py", 2, None),
+        ("a.py", 3, "x@example.com"),
+    ]
+    result = Aggregate(_agg_child(rows), [_call("count")], group_by=[_col("author_email")])
+
+    assert set(tuple(row) for row in result.rows()) == {(None, 2), ("x@example.com", 1)}
+
+
+def test_grouped_aggregate_key_group_by_expression_not_bare_column():
+    """`GROUP BY` on an expression, not a bare column - groups by the
+    *value* of `line_no + 1`, matching `_docs/spec.md`'s "an arbitrary
+    expression is a legal grouping key" note."""
+    rows = [("a.py", 1, "x"), ("a.py", 2, "x"), ("a.py", 4, "x")]
+    key_expr = _bin(Op.ADD, _col("line_no"), _lit(1))
+    result = Aggregate(_agg_child(rows), [_call("count")], group_by=[key_expr])
+
+    assert set(tuple(row) for row in result.rows()) == {(2, 1), (3, 1), (5, 1)}
+
+
+def test_grouped_aggregate_mixed_storage_class_numeric_keys_merge():
+    """A key of `1` and `1.0` group together (storage-class-
+    insensitive numeric equality, confirmed against `sqlite3` during
+    this issue's grooming); a same-valued text key `'1'` stays
+    separate - not yet a code-level test before this issue."""
+    # Three rows, three distinct Python-typed key values sharing one
+    # column (author_email is TEXT-declared but nothing here enforces
+    # that at the row level - the accumulator only sees raw Values).
+    rows_with_keys: list[Row] = [
+        ("a.py", 1, 1),
+        ("a.py", 1, 1.0),
+        ("a.py", 1, "1"),
+    ]
+    result = Aggregate(
+        _agg_child(rows_with_keys), [_call("count")], group_by=[_col("author_email")]
+    )
+
+    assert set(tuple(row) for row in result.rows()) == {(1, 2), ("1", 1)}
+
+
+def test_grouped_aggregate_schema_has_group_columns_before_aggregate_columns():
+    result = Aggregate(_agg_child([]), [_call("count")], group_by=[_col("path"), _col("line_no")])
+
+    assert [c.name for c in result.schema.columns] == ["path", "line_no", "count_1"]
+    assert result.schema.columns[0].type is ColumnType.TEXT
+    assert result.schema.columns[1].type is ColumnType.INTEGER
+    assert result.schema.columns[2].type is ColumnType.INTEGER
+
+
+def test_grouped_aggregate_consumes_each_child_row_exactly_once():
+    source = _CountingSource([("a.py", 1, "x"), ("b.py", 2, "x"), ("a.py", 3, "x")])
+    scan = Scan(source)
+    result = Aggregate(scan, [_call("count")], group_by=[_col("path")])
+
+    assert set(tuple(row) for row in result.rows()) == {("a.py", 2), ("b.py", 1)}
+    assert source.pulled == 3

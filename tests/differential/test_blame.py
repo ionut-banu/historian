@@ -1179,6 +1179,198 @@ def test_having_real_column_wins_over_alias_of_a_different_column(tiny_repo):
         )
 
 
+# --- ORDER BY (issue #61) ------------------------------------------------
+#
+# `assert_rows_match`'s `ordered=True` mode (`tests/differential/
+# conftest.py`) needs the ORDER BY key's output position(s) whenever the
+# key is selected, or `None` plus a tie-free-by-construction proof when
+# it is not - see that function's own docstring for the design. `_order`
+# below is this file's equivalent of `_assert_differential`, scoped to
+# `ordered=True` queries.
+#
+# `awkward_repo` is the fixture of choice here, not `tiny_repo`: it has
+# two authors and a path (`café.py`) blamed across six lines, so
+# `ORDER BY path` has a genuine, multi-row tie to exercise the
+# tie-tolerant comparison - `tiny_repo`'s three rows share no repeated
+# value on any real column. NULL ordering and mixed-storage-class
+# ordering (also named in this issue's conformance list) are *not*
+# reachable here: `tables/blame.py` asserts every blame column is
+# non-NULL before a row is ever emitted (same constraint `test_operators.
+# py`'s own `Aggregate` section documents), so no real `blame` column can
+# ever be NULL for some rows and a real value for others, or mix
+# storage classes within one column - `line_no` is always INTEGER,
+# every text column always TEXT. Those two shapes are covered at the
+# unit level instead: `tests/test_operators.py`'s `Sort` section
+# (`test_sort_nulls_first_ascending`, `test_sort_nulls_last_descending`,
+# `test_sort_mixed_storage_class_numeric_then_text`) and `tests/
+# test_planner.py`'s `test_plan_order_by_multi_key_end_to_end`, which
+# runs `values.py`'s own multi-key NULL example through the real
+# parser/binder/planner/`Sort`, exactly as that module's docstring
+# describes doing.
+
+
+def _order(repo, query: str, key_positions) -> None:
+    """Steps 1-5 for one `ORDER BY` query, `ordered=True`. Mirrors
+    `_assert_differential` above; separate rather than adding an
+    `ordered=`/`key_positions=` parameter to it, since every one of
+    that function's existing callers is unordered and would otherwise
+    carry two always-default arguments for no benefit."""
+    conn = load_unfiltered(BlameScan, repo, BLAME_SCHEMA, "blame")
+    try:
+        sqlite_rows = conn.execute(query).fetchall()
+    finally:
+        conn.close()
+    _, historian_rows = run_historian(query, repo)
+    assert_rows_match(sqlite_rows, historian_rows, ordered=True, key_positions=key_positions)
+
+
+def test_order_by_ascending_single_key_with_genuine_ties(awkward_repo):
+    """`café.py` is blamed across six lines, so `path` ties six ways -
+    the tie-tolerant comparison's central case."""
+    _order(awkward_repo, "SELECT path FROM blame ORDER BY path", key_positions=(0,))
+
+
+def test_order_by_descending_single_key_with_genuine_ties(awkward_repo):
+    _order(awkward_repo, "SELECT path FROM blame ORDER BY path DESC", key_positions=(0,))
+
+
+def test_order_by_multiple_keys_independent_directions(awkward_repo):
+    """`ORDER BY path ASC, line_no DESC` - the `values.py` worked
+    example's shape, run against real data end to end rather than
+    fabricated rows."""
+    _order(
+        awkward_repo,
+        "SELECT path, line_no FROM blame ORDER BY path ASC, line_no DESC",
+        key_positions=(0, 1),
+    )
+
+
+def test_order_by_alias_wins_over_real_column_of_the_same_name(awkward_repo):
+    """The central risk this issue names, run differentially rather
+    than only structurally: `line_no AS path` aliases the INTEGER
+    `line_no` column to `path`'s own name. Alias-first (correct):
+    `ORDER BY path` sorts by `line_no`'s numeric order. Column-first
+    (the bug): it would sort by the real, TEXT `path` column's
+    alphabetical order instead - a genuinely different row sequence
+    over `awkward_repo`'s data, which is what makes this differential
+    case discriminating rather than coincidental (`tests/test_binder.
+    py`'s structural version of this same test pins the same risk at
+    the binder level alone)."""
+    _order(
+        awkward_repo,
+        "SELECT line_no AS path, path AS real_path FROM blame ORDER BY path",
+        key_positions=(0,),
+    )
+
+
+def test_order_by_ordinal_matches_a_plain_column(awkward_repo):
+    _order(awkward_repo, "SELECT path, line_no FROM blame ORDER BY 2", key_positions=(1,))
+
+
+def test_order_by_ordinal_pointing_at_an_aggregate(awkward_repo):
+    """Legal in `ORDER BY`, unlike `GROUP BY`'s own ordinal - confirmed
+    against sqlite3 during this issue's grooming."""
+    _order(
+        awkward_repo,
+        "SELECT author_name, count(*) FROM blame GROUP BY author_name ORDER BY 2 DESC",
+        key_positions=(1,),
+    )
+
+
+def test_order_by_a_group_by_key(awkward_repo):
+    _order(
+        awkward_repo,
+        "SELECT author_name, count(*) FROM blame GROUP BY author_name ORDER BY author_name DESC",
+        key_positions=(0,),
+    )
+
+
+def test_order_by_aggregate_not_in_the_select_list(awkward_repo):
+    """`select k from g group by k order by count(*) desc` - the
+    aggregate is the sort key but is never selected, so the harness
+    cannot see ties on it (`assert_rows_match`'s `key_positions=None`
+    mode). The case must be tie-free by construction, proven here on
+    the SQLite side: `author_name`'s two groups must have distinct
+    `count(*)` values, checked directly rather than assumed, so a
+    fixture change that later gives two authors an equal line count
+    fails this assertion loudly instead of producing a silent flake in
+    `_order` below."""
+    conn = load_unfiltered(BlameScan, awkward_repo, BLAME_SCHEMA, "blame")
+    try:
+        counts = [
+            row[0]
+            for row in conn.execute(
+                "SELECT count(*) FROM blame GROUP BY author_name"
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+    assert len(counts) == len(set(counts)), (
+        f"fixture is no longer tie-free on count(*) per author: {counts!r} - "
+        "this differential case needs new data or key_positions instead of None"
+    )
+    _order(
+        awkward_repo,
+        "SELECT author_name FROM blame GROUP BY author_name ORDER BY count(*) DESC",
+        key_positions=None,
+    )
+
+
+def test_order_by_same_query_twice_gives_identical_order(awkward_repo):
+    """The historian-side determinism criterion (`AGENTS.md`, spec
+    §3's "Determinism and row order"): the same repository and query
+    produce the same row order every time, including the relative
+    order among rows that tie on every key - a direct (non-oracle)
+    check, run against `path`, the same genuinely non-unique key
+    `test_order_by_ascending_single_key_with_genuine_ties` uses."""
+    _, first = run_historian("SELECT path, line_no FROM blame ORDER BY path", awkward_repo)
+    _, second = run_historian("SELECT path, line_no FROM blame ORDER BY path", awkward_repo)
+    assert first == second
+
+
+# --- ORDER BY (issue #61): BindError cases, asserted directly ----------
+#
+# sqlite3 accepts every shape below - see this issue's own grooming for
+# the confirmed sqlite3 output. historian rejects them: out-of-range
+# ordinals are errors in both engines, but the aggregate-query narrowing
+# is a deliberate historian-only divergence, matching #69's own
+# GROUP BY/HAVING narrowing precedent - see `_docs/decisions.md`.
+
+
+def test_order_by_ordinal_zero_raises_bind_error(tiny_repo):
+    with pytest.raises(BindError):
+        run_historian("SELECT path FROM blame ORDER BY 0", tiny_repo)
+
+
+def test_order_by_negative_ordinal_raises_bind_error(tiny_repo):
+    with pytest.raises(BindError):
+        run_historian("SELECT path FROM blame ORDER BY -1", tiny_repo)
+
+
+def test_order_by_ordinal_past_the_end_raises_bind_error(tiny_repo):
+    with pytest.raises(BindError):
+        run_historian("SELECT path, line_no FROM blame ORDER BY 3", tiny_repo)
+
+
+def test_order_by_bare_ungrouped_column_in_an_aggregate_query_raises_bind_error(tiny_repo):
+    """Legal in sqlite3 (sorts by an arbitrary row's value per group) -
+    historian's own narrowing, extending #69's GROUP BY/HAVING
+    precedent to ORDER BY."""
+    with pytest.raises(BindError):
+        run_historian(
+            "SELECT author_name, count(*) FROM blame GROUP BY author_name ORDER BY line_no",
+            tiny_repo,
+        )
+
+
+def test_order_by_aggregate_call_illegal_without_group_by_or_select_aggregate(tiny_repo):
+    """Legal in `HAVING`, illegal in `ORDER BY` unless the query
+    already aggregates - confirmed against sqlite3: "misuse of
+    aggregate: count()"."""
+    with pytest.raises(BindError):
+        run_historian("SELECT path FROM blame ORDER BY count(*)", tiny_repo)
+
+
 # --- Known disagreements that raise before producing rows --------------
 #
 # #25, #32 and #51 are open design questions ("whether it should stay

@@ -1409,6 +1409,140 @@ def test_digit_group_separator_glue_still_hits_the_bare_alias_parse_error(tiny_r
         run_historian("SELECT 3_1 FROM blame", tiny_repo)
 
 
+# --- Issue #63: Bool3 -> Value reverse coercion at a nested operand site -
+#
+# #38 fixed the two root boundaries (a select-list root, a WHERE/HAVING
+# predicate root). This is one recursion level deeper: a predicate-shaped
+# result (a comparison, IS, LIKE, IN, BETWEEN) reaching a *nested* Value-
+# requiring operand - a comparison operand, ||'s two sides, LIKE's two
+# sides, IN's left operand and each list element, BETWEEN's operand/low/
+# high, and arithmetic/unary-minus's operand. Every shape below used to
+# raise a bare TypeError; each is now confirmed to match sqlite3 exactly,
+# per this issue's own grooming audit and its sqlite3 3.51.0 transcript.
+
+
+def test_comparison_nested_predicate_operand_eq(tiny_repo):
+    """sqlite3: `select (1=1) = 1;` -> 1."""
+    _assert_differential(tiny_repo, "SELECT (1=1) = 1 FROM blame")
+
+
+def test_comparison_nested_predicate_operand_ne(tiny_repo):
+    """sqlite3: `select (1=1) <> 1;` -> 0."""
+    _assert_differential(tiny_repo, "SELECT (1=1) <> 1 FROM blame")
+
+
+def test_is_nested_predicate_operand_left_side(tiny_repo):
+    """sqlite3: `select (1=1) is 1;` -> 1."""
+    _assert_differential(tiny_repo, "SELECT (1=1) IS 1 FROM blame")
+
+
+def test_is_nested_predicate_operand_right_side(tiny_repo):
+    """sqlite3: `select 1 is (1=1);` -> 1."""
+    _assert_differential(tiny_repo, "SELECT 1 IS (1=1) FROM blame")
+
+
+def test_concat_nested_predicate_operand(tiny_repo):
+    """sqlite3: `select (1=1) || 'x';` -> '1x'."""
+    _assert_differential(tiny_repo, "SELECT (1=1) || 'x' FROM blame")
+
+
+def test_like_nested_predicate_operand_pattern_side_discriminating(tiny_repo):
+    """sqlite3 (`t(n,p)` with `p='1'`): `select p from t where p like
+    (1=1);` matches only the row whose TEXT is exactly `'1'` - proving
+    the coercion produces SQLite's own `'1'` text spelling of TRUE, not
+    a `str(bool)` bug (`str(True)` = `'True'`, which would match
+    nothing here and hide the bug). Literal-only, so it does not depend
+    on `tiny`'s own `path` values - it runs once per `blame` row and
+    every row must agree independently."""
+    _assert_differential(tiny_repo, "SELECT '1' LIKE (1=1) FROM blame")
+
+
+def test_like_nested_predicate_operand_pattern_side_discriminating_false_branch(tiny_repo):
+    """sqlite3: `select '0' like (1=2);` -> 1 - the `(1=2)` sibling of
+    the discriminating case above."""
+    _assert_differential(tiny_repo, "SELECT '0' LIKE (1=2) FROM blame")
+
+
+def test_like_nested_predicate_operand_discriminates_against_str_bool(tiny_repo):
+    """sqlite3: `select 'True' like (1=1);` -> 0 - a `str(bool)` bug
+    (`str(True)` = `'True'`) would make this `1`; SQLite's own `'1'`
+    text spelling of TRUE does not match the text `'True'`."""
+    _assert_differential(tiny_repo, "SELECT 'True' LIKE (1=1) FROM blame")
+
+
+def test_like_nested_predicate_operand_left_side(tiny_repo):
+    """sqlite3: `select (1=1) like '1';` -> 1 - the left side of LIKE,
+    not just the pattern side."""
+    _assert_differential(tiny_repo, "SELECT (1=1) LIKE '1' FROM blame")
+
+
+def test_in_nested_predicate_operand_left_side(tiny_repo):
+    """sqlite3: `select (1=1) in (1,2);` -> 1."""
+    _assert_differential(tiny_repo, "SELECT (1=1) IN (1, 2) FROM blame")
+
+
+def test_in_nested_predicate_operand_list_element(tiny_repo):
+    """sqlite3 (`n` INTEGER, `n=1`): `select n in (1=1, 2);` -> 1."""
+    _assert_differential(tiny_repo, "SELECT line_no IN (1=1, 2) FROM blame")
+
+
+def test_between_nested_predicate_operand_itself(tiny_repo):
+    """sqlite3: `select (1=1) between 0 and 2;` -> 1."""
+    _assert_differential(tiny_repo, "SELECT (1=1) BETWEEN 0 AND 2 FROM blame")
+
+
+def test_between_nested_predicate_low_bound(tiny_repo):
+    """sqlite3 (`n` INTEGER): `select n between (1=1) and 5;` matches
+    the low bound coerced to 1."""
+    _assert_differential(tiny_repo, "SELECT line_no BETWEEN (1=1) AND 5 FROM blame")
+
+
+def test_between_nested_predicate_high_bound(tiny_repo):
+    """sqlite3 (`n` INTEGER): `select n between 1 and (1=1);` matches
+    the high bound coerced to 1."""
+    _assert_differential(tiny_repo, "SELECT line_no BETWEEN 1 AND (1=1) FROM blame")
+
+
+def test_where_position_nested_predicate_operand(tiny_repo):
+    """The same reverse-coercion shape proven from a `WHERE` position,
+    not only the select list."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE (line_no = 1) = 1")
+
+
+def test_having_position_nested_predicate_operand(tiny_repo):
+    """`HAVING` is planned as a `Filter`, same as `WHERE` - shares the
+    identical `evaluate()` path and the identical gap, per this issue's
+    own audit. `line_no` is both the `GROUP BY` key and the operand of
+    the nested comparison, so the query binds cleanly."""
+    _assert_differential(
+        tiny_repo,
+        "SELECT line_no, count(*) FROM blame GROUP BY line_no HAVING (line_no = 1) = 1",
+    )
+
+
+def test_comparison_of_a_null_predicate_result_stays_null(tiny_repo):
+    """sqlite3: `select (1=NULL) = 1;` -> NULL. Not a defect - `Bool3`
+    `NULL` and `Value` `NULL` are already the identical Python `None`
+    on both sides of this boundary - but pinned here explicitly as a
+    regression guard rather than left to accident, per this issue's own
+    acceptance criteria."""
+    _assert_differential(tiny_repo, "SELECT (1=NULL) = 1 FROM blame")
+
+
+def test_arithmetic_on_a_nested_predicate_operand(tiny_repo):
+    """sqlite3: `select (1=1)+10, typeof((1=1)+10);` -> 11|integer.
+    Correct by explicit `coerce_to_value()` at the arithmetic call site
+    now, not merely by Python's `bool` subclassing `int` - see
+    `tests/test_expression.py` for the unit-level mutation check that
+    actually discriminates the two implementations."""
+    _assert_differential(tiny_repo, "SELECT (1=1)+10 FROM blame")
+
+
+def test_unary_minus_on_a_nested_predicate_operand(tiny_repo):
+    """sqlite3: `select -(1=1);` -> -1."""
+    _assert_differential(tiny_repo, "SELECT -(1=1) FROM blame")
+
+
 # --- Known disagreements deliberately not included here ----------------
 #
 # #24 (rejecting §1's non-goals by name - CTEs, window functions, and

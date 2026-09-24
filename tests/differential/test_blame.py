@@ -175,6 +175,61 @@ def test_null_containing_rows_sort_and_compare_without_raising():
     assert_rows_match([(None, 1), (1, None)], [(1, None), (None, 1)])
 
 
+def test_ordered_with_no_key_positions_and_no_tie_free_proof_raises():
+    """Issue #80: the call QA got through on #61 -
+    `assert_rows_match(ordered=True)` with neither `key_positions` nor
+    `tie_free_proof` - must be impossible to write without hitting an
+    error. No fixture is needed: this is a property of the harness
+    itself, checked with fabricated rows whose length already agrees,
+    so nothing but the missing-proof dispatch can be what raises."""
+    with pytest.raises(ValueError):
+        assert_rows_match([("a",)], [("a",)], ordered=True)
+
+
+def test_tie_free_proof_with_unequal_totals_raises_before_comparing_rows():
+    """`tie_free_proof=(3, 2)` claims 3 rows collapse into only 2
+    distinct key tuples - i.e. a tie - so the harness must refuse to
+    trust positional order at all, before ever comparing a single row,
+    and its message must name both numbers so a failure is
+    diagnosable without re-deriving them."""
+    with pytest.raises(AssertionError) as excinfo:
+        assert_rows_match(
+            [("a",), ("b",), ("c",)],
+            [("a",), ("b",), ("c",)],
+            ordered=True,
+            tie_free_proof=(3, 2),
+        )
+    message = str(excinfo.value)
+    assert "3" in message
+    assert "2" in message
+
+
+def test_tie_free_proof_with_equal_totals_and_matching_order_passes():
+    """A valid, tie-free proof (`total == distinct`) licenses the
+    positional fallback comparison, which passes when the two engines'
+    rows genuinely agree in order."""
+    assert_rows_match(
+        [("a",), ("b",), ("c",)],
+        [("a",), ("b",), ("c",)],
+        ordered=True,
+        tie_free_proof=(3, 3),
+    )
+
+
+def test_tie_free_proof_with_equal_totals_but_reordered_rows_still_fails():
+    """A tie-free proof only licenses a positional comparison - it
+    does not relax it. Two row sequences that differ only in order
+    must still fail, proving the fallback is still exact, not merely
+    a length check in disguise."""
+    with pytest.raises(AssertionError):
+        assert_rows_match(
+            [("a",), ("b",), ("c",)],
+            [("c",), ("b",), ("a",)],
+            ordered=True,
+            tie_free_proof=(3, 3),
+        )
+
+
 # --- tiny_repo: WHERE, expressions, and the #47 affinity asymmetry ----
 
 

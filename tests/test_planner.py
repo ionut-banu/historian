@@ -365,3 +365,170 @@ def test_plan_aggregate_query_produces_correct_row_end_to_end():
     tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
 
     assert list(tree.rows()) == [(2,)]
+
+
+# --- GROUP BY / HAVING (issue #69) ------------------------------------------
+
+
+def test_plan_group_by_inserts_aggregate_with_group_by_set():
+    """`SELECT path, count(*) FROM widgets GROUP BY path`: `Project(
+    Aggregate(Scan(...), calls, group_by=(path,)), select_list)` -
+    `Aggregate` gets a non-empty `group_by`, matching the issue's own
+    tree-shape criterion."""
+    source = _FakeSource([("a.py", 1, "ana@x.com")])
+    stmt = _stmt(
+        [_select_item(_col("path")), _select_item(_count_star())],
+        where=None,
+        group_by=[_col("path")],
+    )
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Project)
+    assert isinstance(tree._child, Aggregate)
+    assert isinstance(tree._child._child, Scan)
+    assert tree._child._group_by == (_col("path"),)
+
+
+def test_plan_group_by_and_having_inserts_filter_between_aggregate_and_project():
+    """`SELECT path, count(*) FROM widgets GROUP BY path HAVING
+    count(*) > 1`: the full `Scan -> Aggregate -> Filter (HAVING) ->
+    Project` shape - `Filter` sits directly above `Aggregate` and
+    directly below `Project`."""
+    source = _FakeSource([("a.py", 1, "ana@x.com")])
+    having = _bin(Op.GT, _count_star(), _lit(1))
+    stmt = _stmt(
+        [_select_item(_col("path")), _select_item(_count_star())],
+        where=None,
+        group_by=[_col("path")],
+        having=having,
+    )
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Project)
+    assert isinstance(tree._child, Filter)
+    assert isinstance(tree._child._child, Aggregate)
+    assert isinstance(tree._child._child._child, Scan)
+
+
+def test_plan_group_by_with_where_full_tree_shape():
+    """`Scan -> Filter (WHERE) -> Aggregate -> Filter (HAVING) ->
+    Project`, every stage present, pinning the issue's own full tree
+    shape exactly."""
+    source = _FakeSource([("a.py", 1, "ana@x.com")])
+    predicate = _bin(Op.GT, _col("line_no"), _lit(0))
+    having = _bin(Op.GT, _count_star(), _lit(1))
+    stmt = _stmt(
+        [_select_item(_col("path")), _select_item(_count_star())],
+        where=predicate,
+        group_by=[_col("path")],
+        having=having,
+    )
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Project)
+    assert isinstance(tree._child, Filter)  # HAVING
+    assert tree._child._predicate is not predicate
+    assert isinstance(tree._child._child, Aggregate)
+    assert isinstance(tree._child._child._child, Filter)  # WHERE
+    assert tree._child._child._child._predicate is predicate
+    assert isinstance(tree._child._child._child._child, Scan)
+
+
+def test_plan_group_by_without_having_omits_having_filter_node():
+    """A `GROUP BY` query with no `HAVING` at all must not grow an
+    always-present no-op `Filter` above `Aggregate` - `Project`'s
+    child is `Aggregate` directly."""
+    source = _FakeSource([("a.py", 1, "ana@x.com")])
+    stmt = _stmt(
+        [_select_item(_col("path")), _select_item(_count_star())],
+        where=None,
+        group_by=[_col("path")],
+    )
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Project)
+    assert isinstance(tree._child, Aggregate)
+
+
+def test_plan_having_without_group_by_or_aggregate_behaves_like_an_ordinary_filter():
+    """`HAVING` with no aggregate call and no `GROUP BY` at all is not
+    routed through `Aggregate` - it is an ordinary `Filter` over the
+    `Scan`/`Filter(WHERE)` row shape, since there is nothing to group
+    or compute."""
+    source = _FakeSource([("a.py", 1, "ana@x.com"), ("b.py", 2, "bo@x.com")])
+    having = _bin(Op.GT, _col("line_no"), _lit(1))
+    stmt = _stmt([_select_item(_col("path"))], where=None, having=having)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Project)
+    assert isinstance(tree._child, Filter)
+    assert not isinstance(tree._child, Aggregate)
+    assert isinstance(tree._child._child, Scan)
+    assert list(tree.rows()) == [("b.py",)]
+
+
+def test_plan_group_by_query_produces_correct_grouped_rows_end_to_end():
+    """`SELECT path, count(*) FROM widgets GROUP BY path` against
+    three fake rows, two sharing a path: the whole tree, assembled
+    purely by `plan()`, must actually produce the grouped rows when
+    pulled."""
+    rows = [
+        ("a.py", 1, "ana@x.com"),
+        ("a.py", 2, "ana@x.com"),
+        ("b.py", 3, "bo@x.com"),
+    ]
+    source = _FakeSource(rows)
+    stmt = _stmt(
+        [_select_item(_col("path")), _select_item(_count_star())],
+        where=None,
+        group_by=[_col("path")],
+    )
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert set(tree.rows()) == {("a.py", 2), ("b.py", 1)}
+
+
+def test_plan_having_query_produces_correctly_filtered_rows_end_to_end():
+    rows = [
+        ("a.py", 1, "ana@x.com"),
+        ("a.py", 2, "ana@x.com"),
+        ("b.py", 3, "bo@x.com"),
+    ]
+    source = _FakeSource(rows)
+    having = _bin(Op.GT, _count_star(), _lit(1))
+    stmt = _stmt(
+        [_select_item(_col("path")), _select_item(_count_star())],
+        where=None,
+        group_by=[_col("path")],
+        having=having,
+    )
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert list(tree.rows()) == [("a.py", 2)]
+
+
+def test_plan_select_item_matching_group_key_reads_from_aggregate_output():
+    """`SELECT path, count(*) FROM widgets GROUP BY path`: the
+    `path`-select item is rewritten to reference `Aggregate`'s own
+    output row (the group-key column, offset 0), not the original
+    `Scan`-schema offset - proving the group-key rewrite, not merely
+    the tree shape."""
+    source = _FakeSource([("a.py", 1, "ana@x.com")])
+    stmt = _stmt(
+        [_select_item(_col("path")), _select_item(_count_star())],
+        where=None,
+        group_by=[_col("path")],
+    )
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    rewritten = tree._select_list[0].expr
+    assert isinstance(rewritten, BoundColumnRef)
+    assert rewritten.offset == 0

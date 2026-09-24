@@ -948,3 +948,78 @@ def test_unresolved_column_ref_and_from_table():
         name="nonexistent_column",
         position=stmt.select_list[0].expr.position,
     )
+
+
+# --- GROUP BY / HAVING (issue #69) ----------------------------------------
+
+
+def test_no_group_by_or_having_defaults_to_empty_and_none():
+    stmt = _parse("SELECT path FROM blame")
+    assert stmt.group_by == ()
+    assert stmt.having is None
+
+
+def test_group_by_single_column():
+    stmt = _parse("SELECT author_name, count(*) FROM blame GROUP BY author_name")
+    assert len(stmt.group_by) == 1
+    assert stmt.group_by[0] == ColumnRef(
+        table=None, name="author_name", position=stmt.group_by[0].position
+    )
+    assert stmt.having is None
+
+
+def test_group_by_multiple_expressions():
+    """`GROUP BY` is a plain comma-separated expression list, not just
+    bare columns - an expression (`line_no % 2`) is as legal as a
+    column reference."""
+    stmt = _parse(
+        "SELECT author_name, path, count(*) FROM blame "
+        "GROUP BY author_name, path"
+    )
+    assert len(stmt.group_by) == 2
+
+
+def test_group_by_ordinal_is_a_plain_integer_literal():
+    """`GROUP BY 2` parses the ordinal as an ordinary `INTEGER`
+    `Literal` - resolving it to a select-list position is the
+    binder's job, not the parser's (see `sql/ast.py`'s docstring)."""
+    stmt = _parse("SELECT author_name, count(*) FROM blame GROUP BY 1")
+    assert stmt.group_by == (Literal(value=1, position=stmt.group_by[0].position),)
+
+
+def test_group_by_expression():
+    """`GROUP BY` on an expression, not just a bare column - historian
+    has no `%` operator (no prior issue lexes or parses it, and this
+    issue's own file list does not touch `lexer.py`), so `line_no + 1`
+    stands in for the same "not a bare column" shape."""
+    stmt = _parse("SELECT line_no FROM blame GROUP BY line_no + 1")
+    assert isinstance(stmt.group_by[0], BinaryOp)
+    assert stmt.group_by[0].op is Operator.ADD
+
+
+def test_having_parses_as_a_predicate():
+    stmt = _parse(
+        "SELECT author_name, count(*) FROM blame "
+        "GROUP BY author_name HAVING count(*) > 1"
+    )
+    assert isinstance(stmt.having, BinaryOp)
+    assert stmt.having.op is Operator.GT
+
+
+def test_having_without_group_by_parses():
+    """`HAVING` with no `GROUP BY` at all is legal grammar - the
+    binder (not this module) is what decides whether the query means
+    anything, per issue #69."""
+    stmt = _parse("SELECT count(*) FROM blame HAVING count(*) > 1")
+    assert stmt.group_by == ()
+    assert isinstance(stmt.having, BinaryOp)
+
+
+def test_where_group_by_having_all_together():
+    stmt = _parse(
+        "SELECT author_name, count(*) FROM blame WHERE line_no > 0 "
+        "GROUP BY author_name HAVING count(*) > 1"
+    )
+    assert stmt.where is not None
+    assert len(stmt.group_by) == 1
+    assert stmt.having is not None

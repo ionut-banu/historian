@@ -73,6 +73,7 @@ from historian.exec.operators import (
     Aggregate,
     AggregateCall,
     Filter,
+    Limit,
     Operator,
     Project,
     Scan,
@@ -365,9 +366,17 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory] 
     swapped for a fake in tests with no repository and no git
     subprocess, per this module's own docstring.
 
-    Tree shape, per `_docs/spec.md` §3 and issue #61's own acceptance
-    criteria (extending #69's): `Scan -> Filter (WHERE) -> Aggregate
-    (grouped or whole-table) -> Filter (HAVING) -> Sort -> Project`.
+    Tree shape, per `_docs/spec.md` §3 and issue #77's own acceptance
+    criteria (extending #61's/#69's): `Scan -> Filter (WHERE) ->
+    Aggregate (grouped or whole-table) -> Filter (HAVING) -> Sort ->
+    Project -> Limit`. `Limit` is the new outermost operator, inserted
+    only when `stmt.limit is not None` - `stmt.offset` defaults to 0
+    when absent (`OFFSET` cannot appear without `LIMIT` per §1's
+    grammar, so there is no case of `Limit` present for `OFFSET`
+    alone). It wraps `Project` unconditionally rather than being
+    inserted anywhere below it - issue #77's own tree-placement
+    decision, which leaves `DISTINCT`'s future slot ("12c") between
+    `Project` and `Limit` for whenever that operator is built.
     `Aggregate` (and, above it, `HAVING`'s `Filter`) is inserted only
     when the query needs it - `stmt.group_by` is non-empty, or the
     aggregate/scalar split (`_split_select_list`/`_split_expr`, run
@@ -430,4 +439,10 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory] 
     if order_keys:
         tree = Sort(tree, order_keys)
 
-    return Project(tree, select_list)
+    tree = Project(tree, select_list)
+
+    if stmt.limit is not None:
+        offset = stmt.offset if stmt.offset is not None else 0
+        tree = Limit(tree, limit=stmt.limit, offset=offset)
+
+    return tree

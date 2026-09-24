@@ -1,14 +1,15 @@
-"""The operator layer: `Scan`, `Filter`, `Project`, `Aggregate`, `Sort`.
+"""The operator layer: `Scan`, `Filter`, `Project`, `Aggregate`,
+`Sort`, `Limit`.
 
 Issue #34 (spec §6 M2 item 8b) built `Scan`/`Filter`/`Project`. `Sort`
-(issue #61) is the fifth of phase 1's seven operators (`Limit`,
-`Distinct` remain out of scope, filed as their own follow-on issues) -
-plus, at this layer, two rules §3 states elsewhere and this is where
-they are actually enforced: "Expression evaluation" (every predicate
-and select-list expression goes through `exec/expression.py`'s
-`evaluate(expr, row, schema)`, #12, merged) and "Determinism and row
-order" ("the same repository and the same query always produce the
-same rows in the same order").
+(issue #61) and `Limit` (issue #77) are the fifth and sixth of phase
+1's seven operators (`Distinct` remains out of scope, filed as its own
+follow-on issue, "12c") - plus, at this layer, two rules §3 states
+elsewhere and this is where they are actually enforced: "Expression
+evaluation" (every predicate and select-list expression goes through
+`exec/expression.py`'s `evaluate(expr, row, schema)`, #12, merged) and
+"Determinism and row order" ("the same repository and the same query
+always produce the same rows in the same order").
 
 Volcano-style iteration, per §3 verbatim: *"Each operator pulls rows
 from its children... A `Row` is a tuple of values. The schema lives on
@@ -96,6 +97,7 @@ __all__ = [
     "Aggregate",
     "AggregateCall",
     "Filter",
+    "Limit",
     "Operator",
     "Project",
     "Scan",
@@ -624,3 +626,82 @@ class Sort:
                 reverse=key.descending,
             )
         yield from rows
+
+
+# --- Limit (issue #77) --------------------------------------------------------
+#
+# `_docs/spec.md` §3's `Limit` operator: `LIMIT`/`OFFSET`. Outermost in
+# the tree (`plan/planner.py` places it above `Project`) - see issue
+# #77's own design, which leaves `DISTINCT`'s future slot ("12c")
+# between `Project` and `Limit`. Semantics verified against sqlite3
+# 3.51.0 during this issue's own grooming (`_docs/decisions.md`):
+# `LIMIT 0` is zero rows; a negative `LIMIT` means "no limit" and
+# `OFFSET` still applies; a negative `OFFSET` is clamped to 0; an
+# `OFFSET` at or past the end of `child`'s rows is zero rows, not an
+# error.
+
+
+class Limit:
+    """`LIMIT`/`OFFSET` (spec §3): yields up to `limit` rows of `child`,
+    after skipping the first `offset` (clamped to 0 if negative).
+
+    Unlike `Sort`/`Aggregate`, `Limit` is a plain Volcano generator: it
+    never materializes `child.rows()`. It pulls at most `offset +
+    limit` rows from `child` before it stops asking for more - fewer,
+    if `child` itself runs out first - so a query like `SELECT path
+    FROM blame LIMIT 3` can stop the underlying scan's work (`git
+    blame`, for `blame`) once three rows exist, rather than computing
+    every row and discarding the rest. This is the one narrow slice of
+    laziness this issue's own scope covers - not `LIMIT` pushdown into
+    a scan (spec §3/§6, M4), which is a planner/scan negotiation this
+    operator knows nothing about. See `tests/test_operators.py`'s own
+    spy-`ScanSource` tests for the pull-count proof.
+
+    A negative `limit` is the one case where `Limit` is *not* bounded
+    by `offset + limit` - "no limit" means every remaining row of
+    `child` is yielded, so the whole child is necessarily pulled
+    (still without ever calling `list(...)` on it up front).
+    """
+
+    def __init__(self, child: Operator, limit: int, offset: int = 0) -> None:
+        self._child = child
+        self._limit = limit
+        # A negative OFFSET behaves exactly like OFFSET 0 - confirmed
+        # against sqlite3 - clamped once here rather than at every call
+        # site that reads `self._offset`.
+        self._offset = max(0, offset)
+        # LIMIT/OFFSET only ever remove rows from the end or the start
+        # of the sequence - never add, rename, or retype a column.
+        self.schema = child.schema
+
+    def rows(self) -> Iterator[Row]:
+        child_iter = iter(self._child.rows())
+        for _ in range(self._offset):
+            try:
+                next(child_iter)
+            except StopIteration:
+                # OFFSET at or past the end of child's rows: zero rows,
+                # not an error - confirmed against sqlite3. Nothing left
+                # to skip or yield.
+                return
+        if self._limit < 0:
+            # Negative LIMIT: "no limit" - every row after OFFSET,
+            # unbounded. The one case this operator pulls all of
+            # `child`, necessarily, since every remaining row must be
+            # yielded.
+            yield from child_iter
+            return
+        remaining = self._limit
+        if remaining == 0:
+            # LIMIT 0: zero rows, and - per the laziness contract - not
+            # even one row pulled from `child` to discover that.
+            return
+        for row in child_iter:
+            yield row
+            remaining -= 1
+            if remaining == 0:
+                # Stop the instant the limit is satisfied, before ever
+                # asking `child_iter` for another row - this is what
+                # keeps the total pull count at exactly `offset +
+                # limit`, never `offset + limit + 1`.
+                return

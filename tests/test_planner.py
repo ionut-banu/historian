@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
-from historian.exec.operators import Aggregate, Filter, Project, Scan, Sort
+from historian.exec.operators import Aggregate, Filter, Limit, Project, Scan, Sort
 from historian.plan.planner import TABLES, plan
 from historian.schema import Column, ColumnType, Row, Schema
 from historian.sql.ast import BinaryOp, FunctionCall, Literal, OrderDirection, Operator as Op, Star
@@ -759,3 +759,121 @@ def test_order_by_multi_key_end_to_end_through_the_real_parser_and_binder():
         ("y", 1),
         ("y", None),
     ]
+
+
+# --- LIMIT / OFFSET (issue #77) -------------------------------------------
+#
+# `Limit` is the new tree root - above `Project` - inserted only when
+# `stmt.limit is not None`, per this issue's own tree-placement
+# decision (leaving `DISTINCT`'s future slot, "12c", between `Project`
+# and `Limit`).
+
+
+def test_plan_with_limit_wraps_project_as_the_new_root():
+    """`SELECT path FROM widgets LIMIT 2`: `Limit(Project(Scan(...),
+    select_list), limit=2)` - `Limit` is the new outermost operator."""
+    source = _FakeSource([("a.py", 1, "ana@x.com"), ("b.py", 2, "bo@x.com")])
+    stmt = _stmt([_select_item(_col("path"))], limit=2)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Limit)
+    assert isinstance(tree._child, Project)
+    assert isinstance(tree._child._child, Scan)
+
+
+def test_plan_without_limit_never_builds_limit():
+    source = _FakeSource([("a.py", 1, "ana@x.com")])
+    stmt = _stmt([_select_item(_col("path"))])
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Project)
+    assert not isinstance(tree, Limit)
+
+
+def test_plan_limit_carries_the_bound_limit_value():
+    source = _FakeSource([("a.py", 1, "ana@x.com"), ("b.py", 2, "bo@x.com")])
+    stmt = _stmt([_select_item(_col("path"))], limit=1)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Limit)
+    assert tree._limit == 1
+    assert tree._offset == 0
+
+
+def test_plan_offset_defaults_to_zero_when_absent():
+    source = _FakeSource([("a.py", 1, "ana@x.com")])
+    stmt = _stmt([_select_item(_col("path"))], limit=5, offset=None)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Limit)
+    assert tree._offset == 0
+
+
+def test_plan_limit_carries_the_bound_offset_value():
+    source = _FakeSource([("a.py", 1, "ana@x.com")])
+    stmt = _stmt([_select_item(_col("path"))], limit=5, offset=2)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Limit)
+    assert tree._offset == 2
+
+
+def test_plan_limit_sits_above_sort_and_project_when_order_by_present():
+    """`SELECT path FROM widgets ORDER BY path LIMIT 1`: `Limit(
+    Project(Sort(Scan(...), keys), select_list), limit=1)` - `Sort`
+    still sits directly below `Project` (issue #61's own placement,
+    unaffected by this issue), with `Limit` wrapping the whole thing."""
+    source = _FakeSource([("b.py", 1, "ana@x.com"), ("a.py", 2, "bo@x.com")])
+    stmt = _stmt(
+        [_select_item(_col("path"))], order_by=[_order_item(_col("path"))], limit=1
+    )
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Limit)
+    assert isinstance(tree._child, Project)
+    assert isinstance(tree._child._child, Sort)
+    assert isinstance(tree._child._child._child, Scan)
+
+
+def test_plan_limit_produces_correctly_truncated_rows_end_to_end():
+    rows = [("a.py", 1, "e"), ("b.py", 2, "e"), ("c.py", 3, "e")]
+    source = _FakeSource(rows)
+    stmt = _stmt([_select_item(_col("path"))], limit=2)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert list(tree.rows()) == [("a.py",), ("b.py",)]
+
+
+def test_plan_limit_offset_produces_correctly_sliced_rows_end_to_end():
+    rows = [("a.py", 1, "e"), ("b.py", 2, "e"), ("c.py", 3, "e")]
+    source = _FakeSource(rows)
+    stmt = _stmt([_select_item(_col("path"))], limit=1, offset=1)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert list(tree.rows()) == [("b.py",)]
+
+
+def test_limit_offset_through_the_real_parser_and_binder_and_planner():
+    """The full, real pipeline - `tokenize -> parse -> bind -> plan ->
+    tree.rows()` - rather than a hand-built `BoundSelectStatement`,
+    matching `test_order_by_multi_key_end_to_end_through_the_real_
+    parser_and_binder`'s own convention for issue #61."""
+    schema = Schema(columns=(Column("a", ColumnType.TEXT),))
+    rows: list[Row] = [("x",), ("y",), ("z",)]
+    source = _FakeSource(rows)
+    source.schema = schema
+
+    stmt = parse(tokenize("SELECT a FROM t ORDER BY a LIMIT 2 OFFSET 1"))
+    bound = bind(stmt, catalog={"t": schema})
+    tree = plan(bound, Path("/nonexistent"), tables={"t": lambda repo: source})
+
+    assert isinstance(tree, Limit)
+    assert list(tree.rows()) == [("y",), ("z",)]

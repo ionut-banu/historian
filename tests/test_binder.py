@@ -25,9 +25,12 @@ import pytest
 
 from historian.schema import Column, ColumnType, Schema
 from historian.sql.ast import (
+    BinaryOp,
     ColumnRef,
     FunctionCall,
     Literal,
+    Operator,
+    OrderDirection,
     SelectItem,
     SelectStatement,
     Star,
@@ -1007,3 +1010,229 @@ def test_having_real_column_wins_over_alias_of_a_different_column():
 def test_group_by_ordinal_to_aggregate_is_a_bind_error_with_no_other_check_reachable():
     with pytest.raises(BindError):
         _bind("SELECT count(*), sum(line_no) FROM blame GROUP BY 1")
+
+
+# --- ORDER BY (issue #61) -----------------------------------------------
+#
+# The central risk named in this issue's grooming: `_resolve_name`'s
+# `alias_first` flag (#32) has a caller here that no other clause
+# supplies - `ORDER BY` is the one clause where the alias wins over a
+# same-named real column, the reverse of WHERE/GROUP BY/HAVING. Written
+# and watched fail before `bind()` grew ORDER BY support at all.
+
+
+def test_order_by_alias_wins_over_real_column_of_the_same_name():
+    """`author_name AS path` aliases a *different* column to `path`'s
+    own name. Alias-first (correct - the one direction unique to
+    `ORDER BY`, confirmed against sqlite3 during this issue's grooming:
+    `select a as real_a, b as a from t order by a` sorts by the alias
+    `b`, not the real column `a`): `ORDER BY path` resolves through the
+    select-list alias to `author_name`'s own bound expression, not the
+    real `path` column. Column-first (the bug this test is built to
+    catch, and the direction every other clause uses): `ORDER BY path`
+    would instead resolve to the real `path` column - a silent,
+    wrong-direction resolution. Confirmed live against the real code:
+    flipping `bind()`'s ORDER BY call site's `alias_first` to `False`
+    makes the offset asserted below stop matching."""
+    bound = _bind("SELECT author_name AS path FROM blame ORDER BY path")
+    order_expr = bound.order_by[0].expr
+    assert isinstance(order_expr, BoundColumnRef)
+    assert order_expr.offset == BLAME_SCHEMA.index_of("author_name")
+    assert order_expr.offset != BLAME_SCHEMA.index_of("path")
+
+
+def test_no_order_by_defaults_to_empty_tuple():
+    assert _bind("SELECT path FROM blame").order_by == ()
+
+
+def test_order_by_bare_column_resolves_and_defaults_ascending():
+    bound = _bind("SELECT path FROM blame ORDER BY path")
+    assert len(bound.order_by) == 1
+    item = bound.order_by[0]
+    assert isinstance(item.expr, BoundColumnRef)
+    assert item.expr.offset == BLAME_SCHEMA.index_of("path")
+    assert item.direction is OrderDirection.ASC
+
+
+def test_order_by_desc_direction_carried_through():
+    bound = _bind("SELECT path FROM blame ORDER BY path DESC")
+    assert bound.order_by[0].direction is OrderDirection.DESC
+
+
+def test_order_by_multiple_keys_each_with_own_direction():
+    bound = _bind("SELECT path, line_no FROM blame ORDER BY path ASC, line_no DESC")
+    assert len(bound.order_by) == 2
+    assert bound.order_by[0].direction is OrderDirection.ASC
+    assert bound.order_by[1].direction is OrderDirection.DESC
+
+
+def test_order_by_qualified_reference_never_falls_back_to_alias():
+    """`blame.path` is table-qualified - never a candidate for the
+    alias fallback, mirroring `_resolve_name`'s existing rule for
+    `WHERE`/`GROUP BY`/`HAVING` (confirmed against sqlite3 for `WHERE`
+    by #32: `select b as x from t where t.x = 10` still raises "no
+    such column: t.x"). `line_no AS path` would otherwise make
+    `ORDER BY path` ambiguous with the alias; `ORDER BY blame.path`
+    must still resolve to the real column."""
+    bound = _bind("SELECT line_no AS path FROM blame ORDER BY blame.path")
+    item = bound.order_by[0]
+    assert isinstance(item.expr, BoundColumnRef)
+    assert item.expr.offset == BLAME_SCHEMA.index_of("path")
+
+
+def test_order_by_unknown_column_raises_no_such_column():
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame ORDER BY ghost_column")
+
+
+# --- ORDER BY ordinal (issue #61) ---------------------------------------
+
+
+def test_order_by_ordinal_resolves_to_select_list_position():
+    bound = _bind("SELECT author_name, line_no FROM blame ORDER BY 2")
+    item = bound.order_by[0]
+    assert isinstance(item.expr, BoundColumnRef)
+    assert item.expr.offset == BLAME_SCHEMA.index_of("line_no")
+
+
+def test_order_by_ordinal_not_resolved_through_alias():
+    """An ordinal is a positional reference, never a name - it does
+    not go through `_resolve_name`'s alias-vs-column logic at all, so
+    `alias_first` cannot affect it either way. `ORDER BY 1` must always
+    mean the first select-list item regardless of what it is named."""
+    bound = _bind("SELECT author_name AS x FROM blame ORDER BY 1")
+    item = bound.order_by[0]
+    assert isinstance(item.expr, BoundColumnRef)
+    assert item.expr.offset == BLAME_SCHEMA.index_of("author_name")
+
+
+def test_order_by_ordinal_pointing_at_an_aggregate_is_legal():
+    """Unlike `GROUP BY`'s own ordinal (which rejects this shape
+    outright), `ORDER BY`'s ordinal may legally point at an aggregate
+    call - confirmed against sqlite3: `select k, count(*) from g group
+    by k order by 2 desc` succeeds."""
+    bound = _bind("SELECT author_name, count(*) FROM blame GROUP BY author_name ORDER BY 2 DESC")
+    item = bound.order_by[0]
+    assert isinstance(item.expr, FunctionCall)
+    assert item.expr.name == "count"
+
+
+def test_order_by_ordinal_zero_is_out_of_range():
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame ORDER BY 0")
+
+
+def test_order_by_negative_ordinal_is_out_of_range():
+    """`ORDER BY -1` - parsed as `UnaryOp(NEG, Literal(1))`, per `sql/
+    parser.py`'s own docstring - is still recognised as an ordinal and
+    rejected as out of range, confirmed against sqlite3: "1st ORDER BY
+    term out of range - should be between 1 and 1" for a single-column
+    select list."""
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame ORDER BY -1")
+
+
+def test_order_by_ordinal_past_the_end_is_out_of_range():
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame ORDER BY 2")
+
+
+def test_order_by_explicit_positive_ordinal_still_resolves():
+    """`ORDER BY +1` - `UnaryOp(POS, Literal(1))` - is still an
+    ordinal, confirmed against sqlite3 (`select k from g order by +1`
+    succeeds, same as a bare `1`)."""
+    bound = _bind("SELECT path FROM blame ORDER BY +1")
+    item = bound.order_by[0]
+    assert isinstance(item.expr, BoundColumnRef)
+    assert item.expr.offset == BLAME_SCHEMA.index_of("path")
+
+
+# --- ORDER BY and aggregate legality (issue #61) -------------------------
+
+
+def test_order_by_aggregate_call_with_no_group_by_and_no_select_aggregate_is_a_bind_error():
+    """Confirmed against sqlite3: `select p from u order by count(*)`
+    (no GROUP BY, no aggregate in the select list) is "misuse of
+    aggregate: count()" - the same rejection WHERE gets, not the
+    HAVING-style allowance."""
+    with pytest.raises(BindError):
+        _bind("SELECT path FROM blame ORDER BY count(*)")
+
+
+def test_order_by_aggregate_call_legal_once_select_list_already_aggregates():
+    """Confirmed against sqlite3: `select count(*) from u order by
+    count(*)` succeeds - the select list's own aggregate is enough to
+    make ORDER BY's aggregate call legal, with no GROUP BY at all."""
+    bound = _bind("SELECT count(*) FROM blame ORDER BY count(*)")
+    assert isinstance(bound.order_by[0].expr, FunctionCall)
+
+
+def test_order_by_aggregate_not_in_select_list_is_legal_when_grouped():
+    """Confirmed against sqlite3: `select k from g group by k order by
+    count(*) desc` succeeds - the aggregate need not appear in the
+    select list at all once GROUP BY makes the query aggregate."""
+    bound = _bind("SELECT author_name FROM blame GROUP BY author_name ORDER BY count(*) DESC")
+    assert isinstance(bound.order_by[0].expr, FunctionCall)
+
+
+def test_order_by_references_a_group_by_key_is_legal():
+    bound = _bind(
+        "SELECT author_name, count(*) FROM blame GROUP BY author_name ORDER BY author_name DESC"
+    )
+    item = bound.order_by[0]
+    assert isinstance(item.expr, BoundColumnRef)
+
+
+def test_order_by_bare_column_not_a_group_key_is_a_bind_error():
+    """Confirmed against sqlite3 as *legal* there (`select k, count(*)
+    from g group by k order by v` sorts by an arbitrary row's `v` per
+    group) - historian deliberately narrows this the same way it
+    narrows HAVING (`_docs/decisions.md`, 2026-09-19/2026-09-24 and
+    this issue's own follow-on): a bare, non-key, non-aggregate column
+    in an aggregating query's ORDER BY is a BindError."""
+    with pytest.raises(BindError):
+        _bind("SELECT author_name, count(*) FROM blame GROUP BY author_name ORDER BY line_no")
+
+
+def test_order_by_bare_column_not_a_group_key_is_a_bind_error_whole_table_aggregate():
+    """The same narrowing applies to a whole-table aggregate query (no
+    GROUP BY at all, so there are zero keys) - every bare column in
+    ORDER BY is then a BindError, the same "no keys means every bare
+    column is rejected" reasoning HAVING already uses with no GROUP
+    BY."""
+    with pytest.raises(BindError):
+        _bind("SELECT count(*) FROM blame ORDER BY path")
+
+
+def test_order_by_expression_built_purely_from_group_keys_is_legal():
+    bound = _bind(
+        "SELECT line_no, count(*) FROM blame GROUP BY line_no ORDER BY line_no + 1"
+    )
+    item = bound.order_by[0]
+    assert isinstance(item.expr, BinaryOp)
+    assert item.expr.op is Operator.ADD
+    assert isinstance(item.expr.left, BoundColumnRef)
+    assert item.expr.left.offset == BLAME_SCHEMA.index_of("line_no")
+
+
+def test_order_by_narrowing_does_not_apply_to_a_non_aggregate_query():
+    """No GROUP BY, no aggregate anywhere - `is_aggregate_query` is
+    `False`, so the narrowing never triggers and an ordinary bare
+    column binds exactly as it would in any other non-aggregate
+    query."""
+    bound = _bind("SELECT path FROM blame ORDER BY line_no")
+    assert isinstance(bound.order_by[0].expr, BoundColumnRef)
+
+
+def test_order_by_real_column_wins_over_alias_of_a_different_column_when_grouped():
+    """Sanity check that the grouped narrowing runs against the
+    *alias-resolved* expression, not the written name: `line_no AS
+    path` with `GROUP BY line_no` as the sole key - `ORDER BY path`
+    resolves (alias-first) to `line_no`, which *is* the group key, so
+    this must bind, not raise."""
+    bound = _bind(
+        "SELECT line_no AS path, count(*) FROM blame GROUP BY line_no ORDER BY path"
+    )
+    item = bound.order_by[0]
+    assert isinstance(item.expr, BoundColumnRef)
+    assert item.expr.offset == BLAME_SCHEMA.index_of("line_no")

@@ -59,9 +59,16 @@ def _select_item(expr) -> BoundSelectItem:
     return BoundSelectItem(expr=expr, alias=None, output_name=output_name, position=_POS)
 
 
-def _stmt(select_list, where=None, from_table="widgets") -> BoundSelectStatement:
+def _stmt(
+    select_list, where=None, from_table="widgets", group_by=(), having=None
+) -> BoundSelectStatement:
     return BoundSelectStatement(
-        select_list=tuple(select_list), from_table=from_table, where=where, position=_POS
+        select_list=tuple(select_list),
+        from_table=from_table,
+        where=where,
+        group_by=tuple(group_by),
+        having=having,
+        position=_POS,
     )
 
 

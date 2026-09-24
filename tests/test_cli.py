@@ -220,9 +220,10 @@ def test_unknown_column_exits_1(tiny_repo, capsys):
 
 
 def test_unimplemented_grammar_exits_1(tiny_repo, capsys):
-    """Grammar the parser already rejects outright (`GROUP BY` is not
-    yet implemented) is a `ParseError`, not a traceback."""
-    ret = cli.main(["-C", str(tiny_repo), "SELECT path FROM blame GROUP BY path"])
+    """Grammar the parser already rejects outright (`ORDER BY` is not
+    yet implemented - `GROUP BY`/`HAVING` were this test's own example
+    until issue #69 built them) is a `ParseError`, not a traceback."""
+    ret = cli.main(["-C", str(tiny_repo), "SELECT path FROM blame ORDER BY path"])
 
     assert ret == 1
     captured = capsys.readouterr()

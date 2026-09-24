@@ -1462,3 +1462,182 @@ def test_no_stray_float_calls_outside_the_named_exceptions():
 
     _FloatCallVisitor().visit(tree)
     assert violations == []
+
+
+# --- Issue #63: Bool3 -> Value reverse coercion at a nested operand site -
+#
+# #38 fixed the two root boundaries (a select-list root, a WHERE/HAVING
+# predicate root). This is one recursion level deeper: a predicate-shaped
+# result (a comparison, IS, LIKE, IN, BETWEEN) reaching a *nested*
+# Value-requiring operand of another node - one unit case per row of this
+# issue's own audit table, each confirmed against sqlite3 3.51.0 in the
+# issue body. `_TRUE`/`_FALSE`/`_NULL` (defined above, near the AND/OR/NOT
+# section) are reused throughout: each is a real comparison `BinaryOp`
+# node, not a hand-fed Python bool, so `evaluate()` genuinely dispatches
+# through the comparison branch and produces a real `bool` the way a
+# predicate-shaped subexpression actually would.
+
+
+def test_arithmetic_operand_raises_on_a_raw_bool_true():
+    """Defensive guard, mirroring the exact pattern `values.py`'s own
+    `_rank` and this module's own `_coerce_to_text` already use: a raw
+    Python `bool` must never reach arithmetic. Not reachable through
+    `evaluate()` itself once the call-site coercion below is in place -
+    this pins the guard directly, at the unit most likely to catch a
+    future regression that removes the call-site coercion without also
+    removing this defensive check."""
+    from historian.exec.expression import _arithmetic_operand
+
+    with pytest.raises(TypeError):
+        _arithmetic_operand(True)
+
+
+def test_arithmetic_operand_raises_on_a_raw_bool_false():
+    from historian.exec.expression import _arithmetic_operand
+
+    with pytest.raises(TypeError):
+        _arithmetic_operand(False)
+
+
+def test_comparison_nested_predicate_operand_left_side_converts_to_sqlite_int():
+    """sqlite3: `select (1=1) = 1;` -> 1. `(1=1)` is itself a
+    comparison `BinaryOp` nested as the left operand of another
+    comparison - before this issue's fix, `_evaluate_affinity_pair`
+    handed `values.eq` a raw Python `True`, which raised."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.EQ, _TRUE, _lit(1)), _ROW, _SCHEMA)
+    assert result is True
+
+
+def test_comparison_nested_predicate_operand_ne():
+    """sqlite3: `select (1=1) <> 1;` -> 0."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.NE, _TRUE, _lit(1)), _ROW, _SCHEMA)
+    assert result is False
+
+
+def test_is_nested_predicate_operand_left_side():
+    """sqlite3: `select (1=1) is 1;` -> 1."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_is(_TRUE, _lit(1)), _ROW, _SCHEMA) is True
+
+
+def test_is_nested_predicate_operand_right_side():
+    """sqlite3: `select 1 is (1=1);` -> 1."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_is(_lit(1), _TRUE), _ROW, _SCHEMA) is True
+
+
+def test_concat_nested_predicate_operand():
+    """sqlite3: `select (1=1) || 'x';` -> '1x'."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.CONCAT, _TRUE, _lit("x")), _ROW, _SCHEMA)
+    assert result == "1x"
+
+
+def test_like_nested_predicate_operand_left_side():
+    """sqlite3: `select (1=1) like '1';` -> 1 - the left side of LIKE."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_like(_TRUE, _lit("1")), _ROW, _SCHEMA) is True
+
+
+def test_like_nested_predicate_operand_pattern_side():
+    """sqlite3: `select '1' like (1=1);` -> 1 - the pattern side of
+    LIKE."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_like(_lit("1"), _TRUE), _ROW, _SCHEMA) is True
+
+
+def test_like_nested_predicate_operand_discriminates_against_str_bool():
+    """sqlite3: `select 'True' like (1=1);` -> 0. A conversion that
+    went through `str(bool)` (`str(True)` = `'True'`) would wrongly
+    match here - SQLite's own `'1'` text spelling of TRUE does not."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_like(_lit("True"), _TRUE), _ROW, _SCHEMA) is False
+
+
+def test_in_nested_predicate_operand_left_side():
+    """sqlite3: `select (1=1) in (1,2);` -> 1."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_in(_TRUE, [_lit(1), _lit(2)]), _ROW, _SCHEMA) is True
+
+
+def test_in_nested_predicate_operand_list_element():
+    """sqlite3: `select 1 in (1=1, 2);` -> 1 - the list element, not
+    the left operand."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_in(_lit(1), [_TRUE, _lit(2)]), _ROW, _SCHEMA) is True
+
+
+def test_between_nested_predicate_operand_itself():
+    """sqlite3: `select (1=1) between 0 and 2;` -> 1."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_between(_TRUE, _lit(0), _lit(2)), _ROW, _SCHEMA) is True
+
+
+def test_between_nested_predicate_low_bound():
+    """sqlite3: `select 1 between (1=1) and 5;` -> 1 - the low bound,
+    coerced to 1."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_between(_lit(1), _TRUE, _lit(5)), _ROW, _SCHEMA) is True
+
+
+def test_between_nested_predicate_high_bound():
+    """sqlite3: `select 1 between 0 and (1=1);` -> 1 - the high bound,
+    coerced to 1."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_between(_lit(1), _lit(0), _TRUE), _ROW, _SCHEMA) is True
+
+
+def test_arithmetic_on_a_nested_predicate_operand_still_returns_eleven():
+    """sqlite3: `select (1=1)+10, typeof((1=1)+10);` -> 11|integer.
+    `(1=1)+10` computed via an explicit `Bool3 -> Value` conversion
+    first and computed by handing Python's raw `True` straight to `+`
+    produce the identical object - `11`, an `int` - so this assertion
+    alone cannot discriminate the deliberate fix from the accident
+    (see this issue's own "Arithmetic" section). It only discriminates
+    in combination with `test_arithmetic_operand_raises_on_a_raw_bool_true`
+    above: with the defensive guard in `_arithmetic_operand` in place,
+    deleting the explicit `coerce_to_value()` call at this call site
+    turns *this* test red (`TypeError` instead of `11`) while leaving
+    the guard test alone unaffected - verified by hand as part of this
+    issue's own verification, not merely asserted here."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.ADD, _TRUE, _lit(10)), _ROW, _SCHEMA)
+    assert result == 11
+    assert type(result) is int
+
+
+def test_unary_minus_on_a_nested_predicate_operand():
+    """sqlite3: `select -(1=1);` -> -1. Same discriminating relationship
+    with the `_arithmetic_operand` guard as the arithmetic test above,
+    for `_eval_unary`'s own call site."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_unary(UnaryOperator.NEG, _TRUE), _ROW, _SCHEMA)
+    assert result == -1
+    assert type(result) is int
+
+
+def test_comparison_of_a_null_predicate_result_stays_null():
+    """sqlite3: `select (1=NULL) = 1;` -> NULL. Not a defect - `Bool3`
+    `NULL` and `Value` `NULL` are already the identical Python `None`
+    on both sides of this boundary - pinned explicitly as a regression
+    guard rather than left to accident."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_bin(Operator.EQ, _NULL, _lit(1)), _ROW, _SCHEMA) is None

@@ -50,13 +50,10 @@ construction of two independent code paths*, not by coincidence of
 one shared call.
 
 Comparison follows §3: sorted multisets unless the query has an
-`ORDER BY`, exact order when it does. No query can carry an `ORDER BY`
-today - `sql/ast.py`'s `SelectStatement` has no field for it, and
-`historian "SELECT path FROM blame ORDER BY path"` is a `ParseError` -
-so `assert_rows_match` below only ever implements the sorted-multiset
-half. #61 adds `ORDER BY` and, with it, the exact-order branch; the
-seam is `assert_rows_match` itself, which should grow an `ordered:
-bool` parameter then rather than being rebuilt.
+`ORDER BY`, exact order when it does. `assert_rows_match` grows two
+keyword-only parameters for the `ORDER BY` case (issue #61):
+`ordered` and `key_positions` - see its own docstring for the tie-
+tolerant design and why it exists.
 
 This layer tests the SQL engine, not the extraction (spec §4): both
 sides read rows from the same `BlameScan`, so a wrong `authored_at`
@@ -66,6 +63,7 @@ would be wrong on both sides and invisible here. That is what
 
 from __future__ import annotations
 
+import itertools
 import sqlite3
 from collections.abc import Sequence
 from pathlib import Path
@@ -227,23 +225,120 @@ def _row_sort_key(row: Row) -> tuple:
     return tuple(_cell_sort_key(value) for value in row)
 
 
-def assert_rows_match(sqlite_rows: Sequence[Row], historian_rows: Sequence[Row]) -> None:
-    """Step 5, "Comparison follows §3": sorted multisets, since no
-    query reachable today carries an `ORDER BY` (see the module
-    docstring's seam note for #61).
-
-    Requires equal row counts, sorts both lists with `_row_sort_key`
-    (never Python's bare `sorted()`, which raises `TypeError`
-    comparing `None` to anything or comparing across storage classes -
-    `values.order_key` already implements SQLite's total order and
-    handles both), then compares corresponding rows cell-by-cell
-    requiring **both** the same Python type and the same value.
+def _assert_row_sequences_match(
+    sqlite_rows: Sequence[Row], historian_rows: Sequence[Row], *, context: str = ""
+) -> None:
+    """Cell-by-cell comparison of two same-length row sequences, in
+    the order given - the shared innermost check both comparison modes
+    below build on. `context` is prepended to every failure message
+    (e.g. `"tied group (('x',),): "`) so a mismatch inside one tied
+    group of an `ordered=True` comparison is still easy to place.
 
     Never bare `==`: `True == 1` in Python, so a comparator using it
     would report `[(True,)]` (historian's actual output for `SELECT
     1 = 1 FROM blame`) as matching `[(1,)]` (SQLite's actual answer)
     and be structurally blind to #48 - see `_docs/decisions.md` for
-    why this is a decision, not an implementation detail.
+    why this is a decision, not an implementation detail. Requires
+    both the same Python type and the same value, for exactly that
+    reason.
+    """
+    assert len(sqlite_rows) == len(historian_rows), (
+        f"{context}row count mismatch: sqlite produced {len(sqlite_rows)}, "
+        f"historian produced {len(historian_rows)}\n"
+        f"sqlite:    {sqlite_rows!r}\n"
+        f"historian: {historian_rows!r}"
+    )
+    for index, (sqlite_row, historian_row) in enumerate(zip(sqlite_rows, historian_rows)):
+        assert len(sqlite_row) == len(historian_row), (
+            f"{context}row {index} has a different number of columns: "
+            f"sqlite={sqlite_row!r} historian={historian_row!r}"
+        )
+        for col, (sqlite_cell, historian_cell) in enumerate(zip(sqlite_row, historian_row)):
+            matches = type(sqlite_cell) is type(historian_cell) and sqlite_cell == historian_cell
+            assert matches, (
+                f"{context}row {index} column {col} disagrees: "
+                f"sqlite={sqlite_cell!r} ({type(sqlite_cell).__name__}) "
+                f"historian={historian_cell!r} ({type(historian_cell).__name__})"
+            )
+
+
+def _assert_multiset_match(
+    sqlite_rows: Sequence[Row], historian_rows: Sequence[Row], *, context: str = ""
+) -> None:
+    """Sorts both lists with `_row_sort_key` (never Python's bare
+    `sorted()`, which raises `TypeError` comparing `None` to anything
+    or comparing across storage classes - `values.order_key` already
+    implements SQLite's total order and handles both), then compares
+    corresponding rows via `_assert_row_sequences_match`."""
+    sorted_sqlite = sorted(sqlite_rows, key=_row_sort_key)
+    sorted_historian = sorted(historian_rows, key=_row_sort_key)
+    _assert_row_sequences_match(sorted_sqlite, sorted_historian, context=context)
+
+
+def _grouped_by_consecutive_key(rows: Sequence[Row], keys: list[tuple]) -> list[tuple[tuple, list[Row]]]:
+    """*rows* split into consecutive runs of equal *keys* entries, as
+    `(key, rows_in_that_run)` pairs, in first-appearance order - a
+    correctly `ORDER BY`-sorted result always has every row sharing a
+    key adjacent to each other, so a run-based grouping (rather than a
+    dict keyed by value) is also what makes a genuine tie-breaking bug
+    visible: if `Sort` ever split one key's rows into two non-adjacent
+    runs, this produces *two* groups for that key instead of one, and
+    the distinct-key-sequence comparison below then legitimately
+    disagrees with the other engine's single run."""
+    return [
+        (key, [row for _key, row in group])
+        for key, group in itertools.groupby(zip(keys, rows), key=lambda pair: pair[0])
+    ]
+
+
+def assert_rows_match(
+    sqlite_rows: Sequence[Row],
+    historian_rows: Sequence[Row],
+    *,
+    ordered: bool = False,
+    key_positions: Sequence[int] | None = None,
+) -> None:
+    """Step 5, "Comparison follows §3": sorted multisets by default,
+    or - when the query has an `ORDER BY` (`ordered=True`) - a
+    tie-tolerant exact-order comparison (issue #61).
+
+    `AGENTS.md` guarantees historian's own row order is deterministic,
+    but SQLite makes no such promise for rows that tie on every
+    `ORDER BY` key - a naive positional comparison would then report a
+    false mismatch whenever the two engines break the same tie
+    differently, which neither engine's own contract calls a bug. The
+    orchestrator's own correction to this issue's grooming further
+    named the shape a positional-*or*-grouped comparison alone cannot
+    handle: an `ORDER BY` key that is not itself selected (`SELECT p
+    FROM u ORDER BY n`) has no column in the output rows to group by
+    at all. So this function takes two independent, keyword-only
+    parameters rather than inferring either from the rows themselves -
+    it never parses or rewrites the query to recover a hidden key,
+    which would put a second SQL front end in the oracle:
+
+    - `ordered=False` (the default): sorted-multiset comparison, via
+      `_assert_multiset_match` - unaffected by `key_positions`.
+    - `ordered=True, key_positions=(<0-based output column index>, ...)`:
+      every `ORDER BY` key is selected. Rows are grouped into
+      consecutive runs by their values at `key_positions`
+      (`_grouped_by_consecutive_key`); the *sequence of distinct key
+      tuples* must match exactly, in position, between the two
+      engines, and the rows *within* each corresponding tied group are
+      compared as a multiset (`_assert_multiset_match` again, scoped
+      to that group) rather than requiring one specific sub-order -
+      stricter than a plain multiset comparison (it still catches a
+      key-ordering bug) and no stricter than what either engine
+      actually promises (it never fails over a tie).
+    - `ordered=True, key_positions=None`: at least one `ORDER BY` key
+      is not selected, so the harness cannot see ties at all. The
+      calling test must make the case tie-free *by construction* and
+      prove it on the SQLite side (see `tests/differential/
+      test_blame.py`'s own "ORDER BY" section for the pattern: compare
+      `count(*)` against `count(DISTINCT <key>)` over the same FROM/
+      WHERE), so a fixture change that later introduces a tie fails
+      loudly as a broken test rather than as a false historian bug.
+      Comparison is then a plain positional `_assert_row_sequences_match`,
+      no grouping possible or needed.
     """
     assert len(sqlite_rows) == len(historian_rows), (
         f"row count mismatch: sqlite produced {len(sqlite_rows)}, "
@@ -252,18 +347,29 @@ def assert_rows_match(sqlite_rows: Sequence[Row], historian_rows: Sequence[Row])
         f"historian: {historian_rows!r}"
     )
 
-    sorted_sqlite = sorted(sqlite_rows, key=_row_sort_key)
-    sorted_historian = sorted(historian_rows, key=_row_sort_key)
+    if not ordered:
+        _assert_multiset_match(sqlite_rows, historian_rows)
+        return
 
-    for index, (sqlite_row, historian_row) in enumerate(zip(sorted_sqlite, sorted_historian)):
-        assert len(sqlite_row) == len(historian_row), (
-            f"row {index} has a different number of columns: "
-            f"sqlite={sqlite_row!r} historian={historian_row!r}"
-        )
-        for col, (sqlite_cell, historian_cell) in enumerate(zip(sqlite_row, historian_row)):
-            matches = type(sqlite_cell) is type(historian_cell) and sqlite_cell == historian_cell
-            assert matches, (
-                f"row {index} column {col} disagrees: "
-                f"sqlite={sqlite_cell!r} ({type(sqlite_cell).__name__}) "
-                f"historian={historian_cell!r} ({type(historian_cell).__name__})"
-            )
+    if key_positions is None:
+        _assert_row_sequences_match(sqlite_rows, historian_rows)
+        return
+
+    sqlite_keys = [tuple(_cell_sort_key(row[pos]) for pos in key_positions) for row in sqlite_rows]
+    historian_keys = [
+        tuple(_cell_sort_key(row[pos]) for pos in key_positions) for row in historian_rows
+    ]
+    sqlite_groups = _grouped_by_consecutive_key(sqlite_rows, sqlite_keys)
+    historian_groups = _grouped_by_consecutive_key(historian_rows, historian_keys)
+
+    sqlite_key_sequence = [key for key, _rows in sqlite_groups]
+    historian_key_sequence = [key for key, _rows in historian_groups]
+    assert sqlite_key_sequence == historian_key_sequence, (
+        "ORDER BY key sequence disagrees (ties aside, the two engines "
+        "must visit the same distinct key values in the same order):\n"
+        f"sqlite:    {sqlite_key_sequence!r}\n"
+        f"historian: {historian_key_sequence!r}"
+    )
+
+    for (key, sqlite_group_rows), (_key, historian_group_rows) in zip(sqlite_groups, historian_groups):
+        _assert_multiset_match(sqlite_group_rows, historian_group_rows, context=f"tied group {key!r}: ")

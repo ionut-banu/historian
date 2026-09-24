@@ -1264,19 +1264,30 @@ def test_having_real_column_wins_over_alias_of_a_different_column(tiny_repo):
 # describes doing.
 
 
-def _order(repo, query: str, key_positions) -> None:
+def _order(repo, query: str, key_positions, *, tie_free_proof: tuple[int, int] | None = None) -> None:
     """Steps 1-5 for one `ORDER BY` query, `ordered=True`. Mirrors
     `_assert_differential` above; separate rather than adding an
     `ordered=`/`key_positions=` parameter to it, since every one of
     that function's existing callers is unordered and would otherwise
-    carry two always-default arguments for no benefit."""
+    carry two always-default arguments for no benefit.
+
+    `tie_free_proof` (issue #80) passes straight through to
+    `assert_rows_match` - only the `key_positions=None` callers need
+    it, and it defaults to `None` like `assert_rows_match`'s own
+    parameter does."""
     conn = load_unfiltered(BlameScan, repo, BLAME_SCHEMA, "blame")
     try:
         sqlite_rows = conn.execute(query).fetchall()
     finally:
         conn.close()
     _, historian_rows = run_historian(query, repo)
-    assert_rows_match(sqlite_rows, historian_rows, ordered=True, key_positions=key_positions)
+    assert_rows_match(
+        sqlite_rows,
+        historian_rows,
+        ordered=True,
+        key_positions=key_positions,
+        tie_free_proof=tie_free_proof,
+    )
 
 
 def test_order_by_ascending_single_key_with_genuine_ties(awkward_repo):
@@ -1426,11 +1437,14 @@ def test_order_by_aggregate_not_in_the_select_list(awkward_repo):
     aggregate is the sort key but is never selected, so the harness
     cannot see ties on it (`assert_rows_match`'s `key_positions=None`
     mode). The case must be tie-free by construction, proven here on
-    the SQLite side: `author_name`'s two groups must have distinct
-    `count(*)` values, checked directly rather than assumed, so a
-    fixture change that later gives two authors an equal line count
-    fails this assertion loudly instead of producing a silent flake in
-    `_order` below."""
+    the SQLite side over the same FROM/GROUP BY as the query under
+    test: `author_name`'s groups must have distinct `count(*)` values,
+    checked by computing `(total_rows, distinct_key_tuples)` from that
+    real query and handing it to `assert_rows_match` as
+    `tie_free_proof` (issue #80) - the harness itself now asserts they
+    match, loudly, before trusting a positional comparison, rather
+    than this test asserting it separately and then discarding the
+    result."""
     conn = load_unfiltered(BlameScan, awkward_repo, BLAME_SCHEMA, "blame")
     try:
         counts = [
@@ -1441,14 +1455,11 @@ def test_order_by_aggregate_not_in_the_select_list(awkward_repo):
         ]
     finally:
         conn.close()
-    assert len(counts) == len(set(counts)), (
-        f"fixture is no longer tie-free on count(*) per author: {counts!r} - "
-        "this differential case needs new data or key_positions instead of None"
-    )
     _order(
         awkward_repo,
         "SELECT author_name FROM blame GROUP BY author_name ORDER BY count(*) DESC",
         key_positions=None,
+        tie_free_proof=(len(counts), len(set(counts))),
     )
 
 

@@ -1267,12 +1267,22 @@ def test_order_by_ordinal_matches_a_plain_column(awkward_repo):
     _order(awkward_repo, "SELECT path, line_no FROM blame ORDER BY 2", key_positions=(1,))
 
 
-def test_order_by_ordinal_pointing_at_an_aggregate(awkward_repo):
+def test_order_by_ordinal_pointing_at_a_count_star_aggregate(awkward_repo):
     """Legal in `ORDER BY`, unlike `GROUP BY`'s own ordinal - confirmed
     against sqlite3 during this issue's grooming."""
     _order(
         awkward_repo,
         "SELECT author_name, count(*) FROM blame GROUP BY author_name ORDER BY 2 DESC",
+        key_positions=(1,),
+    )
+
+
+def test_order_by_ordinal_pointing_at_a_sum_aggregate(awkward_repo):
+    """The second shape this issue's grooming verified against
+    sqlite3 alongside `count(*)`: an ordinal pointing at `sum(...)`."""
+    _order(
+        awkward_repo,
+        "SELECT author_name, sum(line_no) FROM blame GROUP BY author_name ORDER BY 2 DESC",
         key_positions=(1,),
     )
 

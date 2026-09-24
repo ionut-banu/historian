@@ -932,9 +932,10 @@ will extend this rule rather than replace it: a bare column that
 exists, but that is out of this decision's scope.
 
 2026-09-24 - follow-on to 2026-09-19: the grouped-but-not-a-key
-narrowing, and an aggregate can never be a GROUP BY key
+narrowing, an aggregate can never be a GROUP BY key, and HAVING
+gets the same narrowing as the select list
 
-Issue #69. Two additions to the 2026-09-19 entry above, not a
+Issue #69. Three additions to the 2026-09-19 entry above, not a
 new decision from scratch - the same reasoning transfers rather
 than being re-derived.
 
@@ -979,6 +980,29 @@ regardless of how the aggregate call is reached. An ordinal
 resolving to a non-aggregate expression remains legal, and an
 out-of-range ordinal (`select b from t group by 3` -> "1st GROUP
 BY term out of range") is its own, separate BindError.
+
+Third, orchestrator review of the first pass caught that this
+narrowing had not been extended to HAVING, and that the gap is a
+silent wrong answer, not merely an omission: `select count(*)
+from t having path = 'x'` returns `3` in sqlite3 (evaluating the
+bare `path` against an arbitrary row of the query's one implicit
+group), and `select a, count(*) from t group by a having
+path = 'z'` returns `2|1` the same way. Before this fix historian
+ran both to completion and returned 0 rows - not an error, not
+sqlite3's answer, just wrong, because `HAVING`'s own `Filter`
+evaluated `path` against `Aggregate`'s output row, which has no
+such column. The fix applies exactly the reasoning above to
+HAVING: a bare column reference in HAVING must be a GROUP BY key
+(matched by shape) or sit inside an aggregate call's own
+arguments, whether or not GROUP BY is present - with no GROUP BY
+there are no keys, so every bare column outside an aggregate is
+rejected. `HAVING count(*) > 1` and `HAVING sum(x) > 3` (column
+inside an aggregate's arguments) stay legal, as does referencing
+a select-list alias of a key or an aggregate (resolved through
+the same `#32` alias-fallback function, `alias_first=False`, that
+GROUP BY already uses) and an expression key matched by shape
+(`GROUP BY a + 1 HAVING a + 1 > 2`, confirmed legal against
+sqlite3 before implementing).
 
 2026-09-24 - HAVING on a non-aggregate query is a BindError
 

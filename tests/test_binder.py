@@ -883,3 +883,67 @@ def test_having_with_aggregate_only_in_having_itself_is_still_a_bind_error():
     aggregate call in the select list decides that."""
     with pytest.raises(BindError):
         _bind("SELECT path FROM blame HAVING count(*) > 1")
+
+
+# --- HAVING's own grouped narrowing (orchestrator correction) --------------
+#
+# A bare column reference in HAVING must be a GROUP BY key (matched by
+# shape) or sit inside an aggregate call's arguments - the same
+# "grouped but not a key" reasoning `_docs/decisions.md`'s 2026-09-24
+# follow-on note already gives for the select list, extended to
+# HAVING. sqlite3 instead evaluates the bare column against an
+# arbitrary row of the group, confirmed live:
+# `select count(*) from t having path = 'x'` -> `3`;
+# `select a, count(*) from t group by a having path = 'z'` -> `2|1`.
+
+
+def test_having_bare_column_with_no_group_by_is_a_bind_error():
+    """No `GROUP BY` means no keys at all - every bare column outside
+    an aggregate is rejected."""
+    with pytest.raises(BindError):
+        _bind("SELECT count(*) FROM blame HAVING path = 'src/utils.py'")
+
+
+def test_having_bare_column_not_a_group_key_is_a_bind_error():
+    with pytest.raises(BindError):
+        _bind("SELECT line_no, count(*) FROM blame GROUP BY line_no HAVING path = 'src/utils.py'")
+
+
+def test_having_bare_aggregate_call_is_legal():
+    stmt = _bind("SELECT count(*) FROM blame HAVING count(*) > 1")
+    assert stmt.having is not None
+
+
+def test_having_column_inside_an_aggregate_argument_is_legal():
+    stmt = _bind("SELECT count(*) FROM blame HAVING sum(line_no) > 3")
+    assert stmt.having is not None
+
+
+def test_having_bare_column_matching_a_group_key_is_legal():
+    stmt = _bind("SELECT path, count(*) FROM blame GROUP BY path HAVING path = 'src/utils.py'")
+    assert stmt.having is not None
+
+
+def test_having_expression_matching_an_expression_group_key_is_legal():
+    """`GROUP BY line_no + 1 HAVING line_no + 1 > 2` - an expression
+    key matched by shape, not just a bare column - confirmed legal
+    against `sqlite3` before implementing (`select a+1, count(*) from
+    t group by a+1 having a+1 > 2` -> a row)."""
+    stmt = _bind(
+        "SELECT line_no + 1, count(*) FROM blame GROUP BY line_no + 1 HAVING line_no + 1 > 2"
+    )
+    assert stmt.having is not None
+
+
+def test_having_references_a_select_list_alias_of_an_aggregate_is_legal():
+    stmt = _bind(
+        "SELECT author_name, count(*) AS c FROM blame GROUP BY author_name HAVING c > 1"
+    )
+    assert stmt.having is not None
+
+
+def test_having_references_a_select_list_alias_of_a_group_key_is_legal():
+    stmt = _bind(
+        "SELECT author_name AS a, count(*) FROM blame GROUP BY author_name HAVING a = 'Ana Petrova'"
+    )
+    assert stmt.having is not None

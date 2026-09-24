@@ -1018,6 +1018,32 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema] = TABLES) -> BoundSel
                 stmt.having.position,
                 (),
             )
+    if bound_having is not None:
+        # Orchestrator correction: a bare column reference in HAVING
+        # that is neither a GROUP BY key (matched by shape, exactly
+        # `_check_grouped_select_list`'s own rule for the select list)
+        # nor inside an aggregate call's own arguments is a BindError,
+        # whether or not GROUP BY is present - with no GROUP BY there
+        # are no keys, so every bare column outside an aggregate is
+        # rejected. sqlite3 instead evaluates it against an arbitrary
+        # row of the (possibly single, implicit) group - confirmed
+        # live: `select count(*) from t having path = 'x'` -> `3`;
+        # `select a, count(*) from t group by a having path = 'z'` ->
+        # `2|1`. Reusing `_split_for_grouped_check`'s own walk is the
+        # same "grouped but not a key" reasoning `_docs/decisions.md`'s
+        # follow-on note already gives for the select list - a
+        # non-key, non-aggregate column's value is still whichever row
+        # sqlite3 happened to visit last, which breaks AGENTS.md's
+        # determinism rule and would feed the oracle unfixable false
+        # mismatches, exactly as it would in the select list.
+        _has_aggregate, bad_column = _split_for_grouped_check(bound_having, bound_group_by)
+        if bad_column is not None:
+            raise BindError(
+                f"column {bad_column.name} must appear in the GROUP BY "
+                "clause or be used in an aggregate function",
+                bad_column.position,
+                (),
+            )
     return BoundSelectStatement(
         select_list=tuple(bound_items),
         from_table=ctx.table_name,

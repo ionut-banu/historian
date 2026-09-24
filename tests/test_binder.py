@@ -489,6 +489,8 @@ def test_star_with_alias_raises_defensive_error():
         select_list=(SelectItem(expr=Star(table=None, position=_POS), alias="x", position=_POS),),
         from_table="blame",
         where=None,
+        group_by=(),
+        having=None,
         position=_POS,
     )
     with pytest.raises(BindError):
@@ -505,6 +507,8 @@ def test_star_in_general_expression_position_raises_defensive_error():
         select_list=(SelectItem(expr=Literal(1, _POS), alias=None, position=_POS),),
         from_table="blame",
         where=where,
+        group_by=(),
+        having=None,
         position=_POS,
     )
     with pytest.raises(BindError):
@@ -522,6 +526,8 @@ def test_qualified_star_as_function_argument_raises_defensive_error():
         select_list=(SelectItem(expr=call, alias=None, position=_POS),),
         from_table="blame",
         where=None,
+        group_by=(),
+        having=None,
         position=_POS,
     )
     with pytest.raises(BindError):
@@ -543,6 +549,8 @@ def test_star_as_non_sole_function_argument_raises_defensive_error():
         select_list=(SelectItem(expr=call, alias=None, position=_POS),),
         from_table="blame",
         where=None,
+        group_by=(),
+        having=None,
         position=_POS,
     )
     with pytest.raises(BindError):

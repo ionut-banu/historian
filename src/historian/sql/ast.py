@@ -26,13 +26,17 @@ deliberately never imports.
 What v1's grammar does not need yet
 ------------------------------------
 
-`DISTINCT`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET` and any
-`JOIN` have no node here - see issue #8's grooming. Adding a field to a
-frozen dataclass later is additive, not a rewrite, so there is nothing
-to pre-declare. `CASE` is deferred the same way, for a different
-reason: it is an independent keyword-delimited primary expression form
-that does not interact with precedence, so building it earlier than it
-is needed would buy nothing.
+`DISTINCT`, `ORDER BY`, `LIMIT`, `OFFSET` and any `JOIN` have no node
+here - see issue #8's grooming. Adding a field to a frozen dataclass
+later is additive, not a rewrite, so there is nothing to pre-declare.
+`CASE` is deferred the same way, for a different reason: it is an
+independent keyword-delimited primary expression form that does not
+interact with precedence, so building it earlier than it is needed
+would buy nothing. `GROUP BY` and `HAVING` (issue #69) add
+`SelectStatement.group_by` (a possibly-empty `tuple[Expr, ...]`) and
+`SelectStatement.having` (`Expr | None`) - no new node types, since
+both clauses are plain expression lists/an expression against the
+grammar this module already has.
 
 `IS NULL` / `IS NOT NULL` are not their own node types
 --------------------------------------------------------
@@ -330,15 +334,25 @@ class SelectItem:
 
 @dataclass(frozen=True)
 class SelectStatement(Stmt):
-    """`SELECT <select_list> FROM <from_table> [WHERE <where>]`.
+    """`SELECT <select_list> FROM <from_table> [WHERE <where>]
+    [GROUP BY <group_by>] [HAVING <having>]`.
 
     `from_table` is a bare, unresolved table name - not a node of its
-    own - and `where` is `None` when the clause is absent. Neither
-    `from_table` nor any `ColumnRef` inside this tree is checked
-    against a catalog; see the module docstring.
+    own - and `where`/`having` are `None` when their clause is absent.
+    `group_by` is `()` when the clause is absent, else the
+    comma-separated expression list `GROUP BY` names verbatim - an
+    ordinal (`GROUP BY 2`) parses as an ordinary integer `Literal`
+    here, indistinguishable at this stage from a literal written in
+    any other clause; resolving an ordinal to a select-list position
+    is `sql/binder.py`'s job (issue #69), not this module's, per the
+    module docstring's schema-blind design. Neither `from_table` nor
+    any `ColumnRef` inside this tree is checked against a catalog; see
+    the module docstring.
     """
 
     select_list: tuple[SelectItem, ...]
     from_table: str
     where: Expr | None
+    group_by: tuple[Expr, ...]
+    having: Expr | None
     position: Position

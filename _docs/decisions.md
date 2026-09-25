@@ -1961,3 +1961,61 @@ correctly rounded `float()`, while SQLite on this platform does
 not always - so historian and the oracle can disagree on a
 literal's own value before any arithmetic runs, for this same
 17-digit/large-exponent shape. Filed on #6, not fixed here.
+2026-09-25 - §1's six reachable non-goals are rejected by name
+(`UnsupportedGrammarError`, an `isinstance` of `ParseError`), not
+folded into the generic `ParseError` every other unbuilt construct
+raises
+
+Issue #24. `sqlite3` itself runs several of these constructs -
+subqueries, CTEs, window functions, and `UNION`/`INTERSECT`/`EXCEPT`
+all execute under real `sqlite3` - so historian's rejection of them is
+a deliberate §1 narrowing, not a mismatch for the differential oracle
+to catch; no new differential cases were added for this issue, and
+none should be. `_docs/spec.md` §3's "Unsupported grammar" rule and
+§5's own literal example (`error: window functions are not
+supported ...`) already said the shape; this issue is what makes six
+of §1's non-goals actually take it, in place of the "expected end of
+query, found ..." (or similarly generic) message the parser raised
+for all of them before.
+
+Detection is by token *text* at a specific grammar position, never by
+token type: none of `WITH`, `UNION`, `INTERSECT`, `EXCEPT`, `OVER`,
+`LEFT`, `RIGHT`, `FULL`, `OUTER`, `CROSS`, or `NATURAL` are lexer
+keywords (confirmed by reading `KEYWORD_TYPES` in `sql/lexer.py`
+directly) - they all lex as plain `IDENTIFIER`, so promoting any of
+them to a keyword to detect them would make each illegal as an
+ordinary identifier everywhere in the grammar (`SELECT over FROM
+blame`, `SELECT path AS union FROM blame`, and the rest), which is
+precisely the regression this issue exists to avoid. `sql/lexer.py`
+is untouched.
+
+The trap this issue exists to avoid making twice: `INNER JOIN` (and
+plain `JOIN`) is v1 grammar phase 3 (§6) simply hasn't built yet, not
+a §1 non-goal - §1 says "outer and cross joins," not joins in
+general - so it keeps the ordinary generic `ParseError` unchanged,
+and `tests/test_cli.py::test_unimplemented_grammar_exits_1` (a plain
+`JOIN`) passes unmodified. `NATURAL JOIN` is excluded for the same
+literal-wording reason and is regression-tested explicitly, so a
+later "completion" of join detection does not silently sweep it in.
+
+`UnsupportedGrammarError` subclasses `ParseError` rather than being a
+new sibling exception (correcting issue #8's original grooming
+proposal, `UnsupportedError`): `cli.py`'s `except (LexError,
+ParseError, BindError, EvalError)` clause, a closed set fixed by
+issue #49, catches it via `isinstance` with zero changes to `cli.py` -
+exit code `1`, the same as any other bad query, not exit `4`'s "a bug
+in historian" backstop, which a new top-level exception would have
+fallen into.
+
+Outer/cross-join detection is keyed on the *token sequence*
+(`LEFT`/`RIGHT`/`FULL` followed by `JOIN` or by `OUTER JOIN`, `CROSS`
+followed by `JOIN`), not the bare word immediately after `FROM
+<table>` - an orchestrator amendment ahead of dispatch. historian has
+no table-alias grammar yet, so any identifier in that position is
+already an error today, and keying on the bare word alone would have
+worked for now; but once table aliases exist, `FROM blame left` (an
+alias named `left`) would silently become a false "outer and cross
+joins are not supported" error, with nothing to signal that it had
+regressed. `tests/test_parser.py::test_bare_left_without_join_keeps_
+ordinary_parse_error` pins the distinction now, before aliases exist,
+specifically so that a future alias implementation trips it.

@@ -82,6 +82,7 @@ itself: the coercion helpers live next to `evaluate()` in
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Protocol
@@ -267,32 +268,162 @@ _SUM_INT64_MAX = 9223372036854775807
 
 
 def _sum_add(total: int, value: int) -> tuple[int, bool]:
-    """One running-total step for `sum`'s *exact* integer accumulator
-    only (never `avg`, which accumulates independently as a float and
-    never raises - see `_Accumulator.step`'s own `avg` branch).
+    """One running-total step for the *exact* integer accumulator
+    (`iSum`, SQLite's `SumCtx.iSum`) shared by both `sum`'s and `avg`'s
+    own `_Accumulator` instances (issue #91: `avg` reuses `sum`'s
+    accumulator, per SQLite's `sumStep` being both aggregates' shared
+    `xStep` - see the module-level KBN helpers below and `_Accumulator`
+    itself).
 
-    Corrected per issue #88, which fixes a bug #60 shipped: this no
-    longer raises. It returns the new exact total - Python's `int` is
-    unbounded, so nothing here ever actually overflows - and whether
-    *this step's* total left SQLite's int64 range. It does not matter
-    whether a later step's total comes back into range; overflow is
-    recorded by the caller (`_Accumulator._sum_overflowed`, latched
-    permanently once set) and only ever turned into an `EvalError` at
-    `finish()` time, and only if no non-integer-classified value (a
-    REAL, or TEXT that is not a clean whole-string integer) was seen
-    anywhere in the aggregate's input - confirmed against `sqlite3`
-    3.51.0 directly (issue #88's own grooming, correcting #60's
-    "order-dependent asymmetry" description): a value that permanently
-    switches the running total to float suppresses the overflow check
-    for the rest of the aggregate regardless of whether it arrives
-    before or after the overflowing addition, and an overflow that
-    happens while every value is still integer-classified stays an
-    error even if a later addition would bring the exact total back
-    within int64 range.
+    Its role changed with issue #91: on `main` before this issue, the
+    caller committed this function's `new_total` to `self._sum_int`
+    unconditionally, *and* kept an unconditional parallel naive float
+    accumulator (`self._sum_float += float(value)`) on every step -
+    the bug this issue fixes (a parallel naive float total is not what
+    `sqlite3` computes; see the module's own KBN helpers). Now, this
+    function is consulted only while the caller is still on the exact
+    path (`not self._sum_approx`), and the caller commits `new_total`
+    to `self._sum_int` only when this step did *not* overflow; on
+    overflow, `self._sum_int` is left exactly as it was (the pre-
+    overflow exact total) so the caller can fold that value into the
+    KBN accumulator via `_kbn_init` before adding the overflowing
+    addend itself via `_kbn_step_int64` - the same "fold, then add
+    the addend" split SQLite's own `sumStep` performs in its
+    `sqlite3AddInt64` failure branch.
+
+    It returns the new exact total - Python's `int` is unbounded, so
+    nothing here ever actually overflows - and whether *this step's*
+    total left SQLite's int64 range. It does not matter whether a
+    later step's total comes back into range; overflow is recorded by
+    the caller (`_Accumulator._sum_overflowed`, latched permanently
+    once set) and only ever turned into an `EvalError` at `finish()`
+    time, and only if no non-integer-classified value (a REAL, or TEXT
+    that is not a clean whole-string integer) was seen anywhere in the
+    aggregate's input - confirmed against `sqlite3` 3.51.0 directly
+    (issue #88's own grooming, correcting #60's "order-dependent
+    asymmetry" description, and reconfirmed equivalent to SQLite's own
+    live-clearing `ovrfl` state machine by issue #91's grooming - see
+    `_Accumulator`'s own docstring): a value that permanently switches
+    the running total to float suppresses the overflow check for the
+    rest of the aggregate regardless of whether it arrives before or
+    after the overflowing addition, and an overflow that happens while
+    every value is still integer-classified stays an error even if a
+    later addition would bring the exact total back within int64
+    range.
     """
     new_total = total + value
     overflowed = not (_SUM_INT64_MIN <= new_total <= _SUM_INT64_MAX)
     return new_total, overflowed
+
+
+#: The fold/split threshold both `kahanBabuskaNeumaierStepInt64` and
+#: `kahanBabuskaNeumaierInit` use in SQLite's `src/func.c`: 2**52. An
+#: integer at or past this magnitude is split into a multiple of 16384
+#: plus a signed remainder (`_kbn_split_int64`) before either half is
+#: converted to `float`, because a plain `int -> float` cast loses
+#: precision past 2**53 - splitting off a multiple of 2**14 first
+#: leaves at most 63 - 14 = 49 significant bits in the "big" half,
+#: which fits a double's 53-bit mantissa exactly regardless of the
+#: original magnitude.
+_KBN_INT64_FOLD_THRESHOLD = 4503599627370496
+
+
+def _kbn_step(r_sum: float, r_err: float, addend: float) -> tuple[float, float]:
+    """One Kahan-Babuska-Neumaier compensated-summation step, ported
+    from SQLite's `kahanBabuskaNeumaierStep` (`src/func.c`) verbatim,
+    including its exact floating-point operation grouping:
+
+    ```c
+    static void kahanBabuskaNeumaierStep(volatile SumCtx *pSum, volatile double r){
+      volatile double s = pSum->rSum;
+      volatile double t = s + r;
+      if( fabs(s) > fabs(r) ){
+        pSum->rErr += (s - t) + r;
+      }else{
+        pSum->rErr += (r - t) + s;
+      }
+      pSum->rSum = t;
+    }
+    ```
+
+    The grouping matters and is easy to get wrong in translation: C's
+    `pSum->rErr += (s - t) + r` computes `(s - t) + r` as one unit
+    *first*, then adds the old `rErr` to that unit last - not
+    `(rErr + (s - t)) + r`, which a left-to-right `a + b + c`
+    transliteration would silently produce and which rounds
+    differently once `rErr` and `s`/`r` are at very different
+    magnitudes (confirmed while porting this: the naive left-to-right
+    grouping fails case B of issue #91's own verification table).
+    Pure - never raises, never touches `_Accumulator` state directly.
+    """
+    total = r_sum + addend
+    if abs(r_sum) > abs(addend):
+        delta = (r_sum - total) + addend
+    else:
+        delta = (addend - total) + r_sum
+    return total, r_err + delta
+
+
+def _kbn_split_int64(value: int) -> tuple[float, float]:
+    """Splits *value* into a multiple of 16384 (`big`) and a signed
+    remainder (`small`, `-16383..16383`) the way SQLite's
+    `kahanBabuskaNeumaierStepInt64`/`Init` do for `|value| >= 2**52` -
+    see `_KBN_INT64_FOLD_THRESHOLD`'s own docstring for why both
+    halves then convert to `float` exactly.
+
+    C's `%` truncates toward zero; Python's `%` floors - the two
+    disagree on the remainder's *sign* (never its magnitude, since
+    16384 is a power of two) whenever *value* is negative and not an
+    exact multiple of 16384. Computed here with exact Python `int`
+    arithmetic (never `math.fmod`, which would first convert *value*
+    to `float` - already lossy for an `int` this large, defeating the
+    entire point of the split) and an explicit sign fixup: Python's
+    `value % 16384` is always in `[0, 16383]`; C's truncating result
+    for a negative *value* with a nonzero remainder is that same
+    magnitude, negated.
+    """
+    remainder = value % 16384
+    if remainder != 0 and value < 0:
+        remainder -= 16384
+    big = value - remainder
+    return float(big), float(remainder)
+
+
+def _kbn_step_int64(r_sum: float, r_err: float, value: int) -> tuple[float, float]:
+    """Port of SQLite's `kahanBabuskaNeumaierStepInt64`: adds the
+    exact integer *value* to the running `(r_sum, r_err)` pair,
+    splitting first via `_kbn_split_int64` when `|value| >= 2**52` so
+    neither half loses precision in the `int -> float` conversion,
+    then performing two ordinary `_kbn_step` calls; below the
+    threshold, converts directly (still exact - every `int` below
+    2**52 fits a double's mantissa) and takes one step."""
+    if value <= -_KBN_INT64_FOLD_THRESHOLD or value >= _KBN_INT64_FOLD_THRESHOLD:
+        big, small = _kbn_split_int64(value)
+        r_sum, r_err = _kbn_step(r_sum, r_err, big)
+        return _kbn_step(r_sum, r_err, small)
+    return _kbn_step(r_sum, r_err, float(value))
+
+
+def _kbn_init(value: int) -> tuple[float, float]:
+    """Port of SQLite's `kahanBabuskaNeumaierInit`: folds the exact
+    integer accumulator *value* into a fresh `(r_sum, r_err)` pair by
+    direct assignment - not a step - the first time the exact `iSum`
+    path is abandoned (`_Accumulator.step`'s transition into
+    `self._sum_approx`). Same `_KBN_INT64_FOLD_THRESHOLD` split as
+    `_kbn_step_int64`, for the same exactness reason."""
+    if value <= -_KBN_INT64_FOLD_THRESHOLD or value >= _KBN_INT64_FOLD_THRESHOLD:
+        return _kbn_split_int64(value)
+    return float(value), 0.0
+
+
+def _kbn_is_overflow(x: float) -> bool:
+    """Port of SQLite's `sqlite3IsOverflow` (`src/util.c`): true iff
+    *x* is NaN or +/-Inf. `sumFinalize`/`avgFinalize` both guard the
+    `rSum + rErr` step with this - in practice `rErr` only reaches it
+    if an intermediate KBN step itself produced infinity (summing
+    values near `DBL_MAX`); no test in this issue's scope needs it,
+    but it is ported for fidelity rather than assumed unreachable."""
+    return math.isnan(x) or math.isinf(x)
 
 
 class _Accumulator:
@@ -332,19 +463,62 @@ class _Accumulator:
     `sum`/`avg` over TEXT (issue #88): both reuse `exec/expression.py`'s
     `try_numeric_affinity` (whole-string numeric-affinity
     classification) and `arithmetic_operand` (leading-prefix coercion)
-    rather than duplicating either parser (#53). `sum` classifies each
+    rather than duplicating either parser (#53). Both classify each
     value with `try_numeric_affinity` first: a plain `INTEGER`, or TEXT
     whose entire trimmed string is integer-shaped, stays on the exact
     `self._sum_int` int64 path (`self._sum_overflowed` latches if a
     step's exact total leaves int64 range); anything else - a `REAL`,
-    or TEXT that is not a clean whole-string integer - is added to
-    `self._sum_float` via `arithmetic_operand`'s leading-prefix
-    coercion and latches `self._sum_saw_non_integer`. `finish()` raises
-    only at the very end, and only if `self._sum_overflowed` and not
-    `self._sum_saw_non_integer` - never mid-accumulation, and never
-    un-latched by a later value bringing the total back in range. `avg`
-    needs none of `sum`'s classification: every value goes through
-    `arithmetic_operand` and accumulates as a float unconditionally.
+    or TEXT that is not a clean whole-string integer - is folded into
+    the KBN accumulator via `arithmetic_operand`'s leading-prefix
+    coercion and latches `self._sum_saw_non_integer`. `sum.finish()`
+    raises only at the very end, and only if `self._sum_overflowed` and
+    not `self._sum_saw_non_integer` - never mid-accumulation, and never
+    un-latched by a later value bringing the total back in range.
+
+    `sum`/`avg`'s shared KBN accumulator (issue #91): SQLite's own
+    `avg` is not a separately-implemented "cast everything to float and
+    sum" aggregate - it shares `sum`'s `xStep` (`sumStep`, `src/func.c`)
+    outright, differing only in `xFinal`. So `_Accumulator.step`'s
+    `sum`/`avg` branches below are one code path, not two: both kinds
+    build the exact same `(self._sum_int, self._sum_approx,
+    self._sum_r_sum, self._sum_r_err)` state (each call still gets its
+    *own* `_Accumulator` instance - a query with both `sum(x)` and
+    `avg(x)` steps two independent accumulators over the same rows, per
+    `Aggregate.rows()` - only the *algorithm* is shared, not the
+    state). While every value seen so far is integer-classified and the
+    exact `self._sum_int` addition never leaves int64 range, nothing
+    about `self._sum_r_sum`/`self._sum_r_err` is touched at all - not
+    even a parallel naive float accumulation, which is exactly the bug
+    this issue fixes (`main` kept `self._sum_float`/`self._avg_total`
+    running unconditionally, in parallel, every step - not what
+    `sqlite3` computes, and observably wrong for `avg` past 2**53,
+    since `float` is not distributive over integer addition). The
+    first row that is either non-integer-classified, or an integer
+    whose exact addition overflows int64, triggers a one-time
+    transition: `_kbn_init` folds the *current* `self._sum_int` (the
+    pre-overflow total, for the overflow case - the overflowing row
+    itself is added afterward via `_kbn_step_int64`, not folded into
+    the init) into `(self._sum_r_sum, self._sum_r_err)`, and
+    `self._sum_approx` latches `True` permanently; `self._sum_int` is
+    never read or written again after that. `sum.finish()` never
+    raises on `avg`'s own accumulator, and vice versa - each kind's
+    `finish()` only ever reads its own instance's state.
+
+    `sum`'s live-clearing `ovrfl` vs. #88's permanent latch: SQLite's
+    own `sumStep` clears `p->ovrfl = 0` on every non-integer value
+    stepped while `p->approx` is already set, so a prior overflow can
+    be silently un-flagged - but issue #91's own grooming proved this
+    is exactly equivalent, for every possible input sequence, to #88's
+    simpler design here (`self._sum_overflowed` and
+    `self._sum_saw_non_integer`, both latched, neither ever un-latched,
+    gated together only once at `finish()` time): an overflow can only
+    occur while `self._sum_approx` is still `False`, which is only
+    true before the first non-integer value in the whole input, so
+    whenever any non-integer value appears anywhere, any overflow must
+    have happened strictly before it and is therefore always
+    unconditionally suppressed - matching `not self._sum_saw_non_
+    integer` exactly. No live clearing is implemented here; `_sum_add`
+    and this class's own docstring below carry the citation.
     """
 
     def __init__(self, call: AggregateCall) -> None:
@@ -352,11 +526,12 @@ class _Accumulator:
         self._count = 0  # count(*)/count(): every row, NULL or not
         self._non_null_count = 0  # count(<expr>), and avg's denominator
         self._sum_seen = False  # sum: whether any non-NULL value has been accumulated yet
-        self._sum_int = 0  # sum's exact integer running total (issue #88)
-        self._sum_float = 0.0  # sum's running float total, kept in parallel with _sum_int
+        self._sum_int = 0  # exact integer running total (SumCtx.iSum) - sum and avg each own one
+        self._sum_r_sum = 0.0  # KBN running sum (SumCtx.rSum), meaningful once self._sum_approx
+        self._sum_r_err = 0.0  # KBN compensation term (SumCtx.rErr)
+        self._sum_approx = False  # SumCtx.approx: latched True once the exact iSum path is abandoned
         self._sum_overflowed = False  # issue #88: latched once a step's exact total leaves int64 range
         self._sum_saw_non_integer = False  # issue #88: latched by any REAL, or TEXT that isn't a clean whole-string integer
-        self._avg_total = 0.0  # avg's own running total - always float, never raises
         self._extreme: values.Value = None  # min/max's running extreme; None until the first non-NULL value
         self._distinct_seen: set | None = set() if call.distinct else None
 
@@ -400,29 +575,54 @@ class _Accumulator:
         if call.distinct and call.kind in ("sum", "avg") and self._distinct_duplicate(value):
             return
         self._non_null_count += 1
-        if call.kind == "sum":
-            # issue #88: classify by whole-string numeric affinity
-            # first. A plain int, or TEXT whose entire trimmed string
-            # is integer-shaped, stays on the exact int64 path; a
+        if call.kind == "sum" or call.kind == "avg":
+            # Shared step algorithm (issue #91): `avg` reuses `sum`'s
+            # own exact-iSum/KBN accumulator, per SQLite's own
+            # `sumStep` being both aggregates' shared `xStep` - see
+            # this class's docstring. issue #88: classify by
+            # whole-string numeric affinity first. A plain int, or
+            # TEXT whose entire trimmed string is integer-shaped,
+            # stays on the exact int64 path for as long as possible; a
             # float classification (an ordinary REAL, or TEXT whose
             # whole string is a well-formed real, e.g. '3.0') and a
             # str classification (TEXT with no whole-string numeric
             # reading at all, e.g. '3abc'/'abc'/'') are both
-            # "non-integer" and contribute via the leading-prefix
-            # coercion instead - confirmed against sqlite3 (issue #88's
-            # own grooming).
-            self._sum_seen = True
+            # "non-integer" and are folded into the KBN accumulator via
+            # the leading-prefix coercion instead - confirmed against
+            # sqlite3 (issue #88's own grooming).
+            if call.kind == "sum":
+                self._sum_seen = True
             classified = try_numeric_affinity(value)
             if isinstance(classified, int):
-                self._sum_int, overflowed = _sum_add(self._sum_int, classified)
-                if overflowed:
-                    self._sum_overflowed = True
-                self._sum_float += float(classified)
+                if not self._sum_approx:
+                    new_total, overflowed = _sum_add(self._sum_int, classified)
+                    if overflowed:
+                        # The exact iSum path is abandoned here: fold
+                        # the pre-overflow total (self._sum_int, not
+                        # yet reassigned) into the KBN accumulator,
+                        # then add this overflowing addend via the
+                        # int64-aware step - the same split SQLite's
+                        # own sumStep performs.
+                        self._sum_overflowed = True
+                        self._sum_r_sum, self._sum_r_err = _kbn_init(self._sum_int)
+                        self._sum_approx = True
+                        self._sum_r_sum, self._sum_r_err = _kbn_step_int64(
+                            self._sum_r_sum, self._sum_r_err, classified
+                        )
+                    else:
+                        self._sum_int = new_total
+                else:
+                    self._sum_r_sum, self._sum_r_err = _kbn_step_int64(
+                        self._sum_r_sum, self._sum_r_err, classified
+                    )
             else:
                 self._sum_saw_non_integer = True
-                self._sum_float += float(arithmetic_operand(value))
-        elif call.kind == "avg":
-            self._avg_total += float(arithmetic_operand(value))
+                if not self._sum_approx:
+                    self._sum_r_sum, self._sum_r_err = _kbn_init(self._sum_int)
+                    self._sum_approx = True
+                self._sum_r_sum, self._sum_r_err = _kbn_step(
+                    self._sum_r_sum, self._sum_r_err, float(arithmetic_operand(value))
+                )
         elif call.kind == "min":
             if self._extreme is None or values.order_key(value) < values.order_key(self._extreme):
                 self._extreme = value
@@ -445,22 +645,37 @@ class _Accumulator:
             # integer-classified. A non-integer value anywhere (before
             # or after the overflowing addition) permanently suppresses
             # this check; the flag is never un-latched by a later value
-            # bringing the exact total back into range.
+            # bringing the exact total back into range. Proven
+            # equivalent to SQLite's own live-clearing `ovrfl` by issue
+            # #91's grooming - see this class's own docstring.
             if self._sum_overflowed and not self._sum_saw_non_integer:
                 raise EvalError(
                     "integer overflow computing sum(...) - sqlite3 raises here too, "
                     "rather than wrapping or promoting to REAL",
                     call.position,
                 )
-            return self._sum_float if self._sum_saw_non_integer else self._sum_int
+            if self._sum_approx:
+                # sumFinalize: rSum + rErr, unless rErr itself is NaN
+                # or Inf (_kbn_is_overflow - SQLite's sqlite3IsOverflow),
+                # in which case fall back to rSum alone.
+                if _kbn_is_overflow(self._sum_r_err):
+                    return self._sum_r_sum
+                return self._sum_r_sum + self._sum_r_err
+            return self._sum_int
         if call.kind == "avg":
-            # Real-typed unconditionally, even when the division is
-            # exact (confirmed against sqlite3: avg(2,4,6) is 4.0, not
-            # 4) - Python's `/` already returns a float here since
-            # self._avg_total starts at 0.0, so no explicit cast is
-            # needed for that; the NULL-over-zero-rows case still needs
-            # its own check, since 0/0 would otherwise raise.
-            return None if self._non_null_count == 0 else self._avg_total / self._non_null_count
+            # avgFinalize: same approx/iSum read as sum, no ovrfl check
+            # at all (avg never raises), always divides as float. The
+            # NULL-over-zero-rows case still needs its own check, since
+            # 0/0 would otherwise raise.
+            if self._non_null_count == 0:
+                return None
+            if self._sum_approx:
+                total = self._sum_r_sum
+                if not _kbn_is_overflow(self._sum_r_err):
+                    total += self._sum_r_err
+            else:
+                total = float(self._sum_int)
+            return total / self._non_null_count
         if call.kind in ("min", "max"):
             return self._extreme  # None (NULL) if no non-NULL value was ever seen
         raise AssertionError(f"exec/operators.py: unhandled aggregate kind {call.kind!r}")

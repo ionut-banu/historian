@@ -301,6 +301,23 @@ class _Accumulator:
     same style `exec/expression.py`'s own `evaluate()` already uses for
     its node-type dispatch. This is meant to port to Rust later, where
     an enum match is the direct idiom for exactly this shape.
+
+    `self._distinct_seen` (issue #84) is a `set` of `values.order_key`
+    results, `None` when `call.distinct` is `False` - mirroring
+    `self._extreme`/`self._sum`'s own "`None` until seen" style, except
+    this one stays `None` for the whole call's life rather than being
+    populated lazily. Consulted only in the `count(<expr>)`, `sum`, and
+    `avg` branches of `step()` below: before counting/summing/
+    accumulating a non-NULL value, its `order_key` is checked against
+    the set; already present means the value's SQL-equal group has
+    already contributed and the whole step is skipped (no count, no
+    sum, no running total change), otherwise the key is recorded and
+    the step proceeds exactly as it would without `DISTINCT`. NULLs
+    are excluded (the existing `is None` checks below) before this
+    gate is ever reached, so a `NULL` argument value never touches the
+    dedup set. `min`/`max` never consult it - removing a duplicate can
+    never change which value is most extreme, so those two branches
+    are byte-for-byte what they were before this issue.
     """
 
     def __init__(self, call: AggregateCall) -> None:
@@ -310,6 +327,20 @@ class _Accumulator:
         self._sum: values.Value = None  # sum's running total; None until the first non-NULL value
         self._avg_total = 0.0  # avg's own running total - always float, never raises
         self._extreme: values.Value = None  # min/max's running extreme; None until the first non-NULL value
+        self._distinct_seen: set | None = set() if call.distinct else None
+
+    def _distinct_duplicate(self, value: values.Value) -> bool:
+        """`True` when *value*'s `order_key` has already been recorded
+        for this call - and records it when it has not. Only ever
+        called from the `count(<expr>)`, `sum`, and `avg` branches of
+        `step()`, and only when `self._call.distinct` (`self.
+        _distinct_seen` is `None` otherwise, so this is never reached
+        for a non-DISTINCT call - see the class docstring)."""
+        key = values.order_key(value)
+        if key in self._distinct_seen:
+            return True
+        self._distinct_seen.add(key)
+        return False
 
     def step(self, row: Row, schema: Schema) -> None:
         call = self._call
@@ -321,8 +352,12 @@ class _Accumulator:
             self._count += 1
             if call.arg is None:
                 return
-            if coerce_to_value(evaluate(call.arg, row, schema)) is not None:
-                self._non_null_count += 1
+            value = coerce_to_value(evaluate(call.arg, row, schema))
+            if value is None:
+                return
+            if call.distinct and self._distinct_duplicate(value):
+                return
+            self._non_null_count += 1
             return
 
         # sum/avg/min/max all ignore a NULL argument value entirely -
@@ -330,6 +365,8 @@ class _Accumulator:
         # table: "sum/avg/min/max with some NULLs: NULLs ignored").
         value = coerce_to_value(evaluate(call.arg, row, schema))
         if value is None:
+            return
+        if call.distinct and call.kind in ("sum", "avg") and self._distinct_duplicate(value):
             return
         self._non_null_count += 1
         if call.kind == "sum":

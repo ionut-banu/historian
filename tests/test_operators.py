@@ -589,8 +589,8 @@ def _agg_child(rows: Sequence[Row]) -> Scan:
     return Scan(_FakeSource(rows))
 
 
-def _call(kind: str, arg=None) -> AggregateCall:
-    return AggregateCall(kind=kind, arg=arg, position=_POS)
+def _call(kind: str, arg=None, distinct: bool = False) -> AggregateCall:
+    return AggregateCall(kind=kind, arg=arg, position=_POS, distinct=distinct)
 
 
 def test_aggregate_over_zero_rows_still_yields_exactly_one_row():
@@ -803,6 +803,192 @@ def test_aggregate_consumes_child_rows_exactly_once():
 
     assert tuple(result.rows()) == ((3, 6, 3),)
     assert source.pulled == 3
+
+
+# --- Aggregate DISTINCT (issue #84): unit-only cases -------------------
+#
+# NULL exclusion, mixed storage classes, order-dependent representative
+# typing, and the int64-overflow interaction are all unreachable through
+# real `blame` data - see `tests/differential/test_blame.py`'s own
+# "Aggregate DISTINCT (issue #84)" section for what real `blame` data
+# does cover (whole-table DISTINCT, computed-expression DISTINCT,
+# grouped DISTINCT with HAVING, both DISTINCT mechanisms together).
+# Every expected value below was checked against `sqlite3` 3.51.0
+# directly - see issue #84's own grooming.
+
+
+def test_distinct_null_exclusion_happens_before_the_dedup_set_is_consulted():
+    """A NULL argument value is discarded by the pre-existing `if value
+    is None: return` before the new dedup set is ever consulted -
+    confirmed against `sqlite3` over an all-NULL column: `count(DISTINCT
+    x)` is `0`, `sum`/`avg`/`min`/`max(DISTINCT x)` are all `NULL` -
+    the ordinary zero-non-NULL-values rule, unaffected by DISTINCT."""
+    rows: list[Row] = [("a.py", None, "e"), ("a.py", None, "e"), ("a.py", None, "e")]
+    calls = [
+        _call("count", _col("line_no"), distinct=True),
+        _call("sum", _col("line_no"), distinct=True),
+        _call("avg", _col("line_no"), distinct=True),
+        _call("min", _col("line_no"), distinct=True),
+        _call("max", _col("line_no"), distinct=True),
+    ]
+    result = Aggregate(_agg_child(rows), calls)
+
+    assert tuple(result.rows()) == ((0, None, None, None, None),)
+
+
+def test_distinct_empty_input_matches_the_all_null_case():
+    """Zero rows at all - `count(*)`'s own "classic mistake" case
+    still applies: one output row, `count(DISTINCT x)=0`, the rest
+    `NULL`."""
+    calls = [
+        _call("count", _col("line_no"), distinct=True),
+        _call("sum", _col("line_no"), distinct=True),
+        _call("avg", _col("line_no"), distinct=True),
+        _call("min", _col("line_no"), distinct=True),
+        _call("max", _col("line_no"), distinct=True),
+    ]
+    result = Aggregate(_agg_child([]), calls)
+
+    assert tuple(result.rows()) == ((0, None, None, None, None),)
+
+
+def test_distinct_dedups_by_order_key_across_mixed_storage_classes():
+    """Confirmed live over one column holding `1, 1.0, '1', NULL,
+    NULL, 1`: `count(DISTINCT x)=2`, `sum(DISTINCT x)=2`,
+    `min(DISTINCT x)=1` (typeof integer), `max(DISTINCT x)='1'`
+    (typeof text) - the two numeric storage classes merge into one
+    distinct value, the TEXT `'1'` stays a separate one, and NULLs are
+    excluded before dedup even runs.
+
+    `avg` is left out here (`sqlite3` itself gives `avg(DISTINCT
+    x)=1.0` for the same input): `sqlite3`'s `avg`/`sum` convert a
+    numeric-looking TEXT value to a number before adding it in,
+    accepting `'1'` the same as `1`. `_Accumulator`'s own `avg` branch
+    (`self._avg_total += value`) has never done that conversion, with
+    or without `DISTINCT` - it is a pre-existing gap in plain `avg`
+    over a TEXT argument, not something this issue's dedup-set change
+    introduces or is scoped to fix, and it is not reachable through
+    real `blame` data (no `blame` column ever mixes TEXT with
+    numeric)."""
+    rows: list[Row] = [
+        ("a.py", 1, "e"),
+        ("a.py", 1.0, "e"),
+        ("a.py", "1", "e"),
+        ("a.py", None, "e"),
+        ("a.py", None, "e"),
+        ("a.py", 1, "e"),
+    ]
+    calls = [
+        _call("count", _col("line_no"), distinct=True),
+        _call("sum", _col("line_no"), distinct=True),
+        _call("min", _col("line_no"), distinct=True),
+        _call("max", _col("line_no"), distinct=True),
+    ]
+    (row,) = tuple(Aggregate(_agg_child(rows), calls).rows())
+
+    assert row == (2, 2, 1, "1")
+    assert type(row[2]) is int
+    assert type(row[3]) is str
+
+
+def test_distinct_sum_keeps_the_first_encountered_representative_int_then_float():
+    """`values(1),(1.0)` -> `sum(DISTINCT x) = 1`, `typeof` integer -
+    confirmed live. The dedup gate never runs `_sum_add` a second time
+    for the same key, so the survivor is whichever raw value first
+    flipped the key from unseen to seen."""
+    rows: list[Row] = [("a.py", 1, "e"), ("a.py", 1.0, "e")]
+    (row,) = tuple(
+        Aggregate(_agg_child(rows), [_call("sum", _col("line_no"), distinct=True)]).rows()
+    )
+
+    assert row == (1,)
+    assert type(row[0]) is int
+
+
+def test_distinct_sum_keeps_the_first_encountered_representative_float_then_int():
+    """The reverse order of the case above: `values(1.0),(1)` ->
+    `sum(DISTINCT x) = 1.0`, `typeof` real - confirmed live. Pins that
+    the representative genuinely depends on insertion order, not on
+    some canonical "prefer int" or "prefer float" rule."""
+    rows: list[Row] = [("a.py", 1.0, "e"), ("a.py", 1, "e")]
+    (row,) = tuple(
+        Aggregate(_agg_child(rows), [_call("sum", _col("line_no"), distinct=True)]).rows()
+    )
+
+    assert row == (1.0,)
+    assert type(row[0]) is float
+
+
+def test_distinct_count_and_avg_are_unaffected_by_which_representative_survives():
+    """Same two orderings as the pair above: `count(DISTINCT x)` is
+    `1` and `avg(DISTINCT x)` is `1.0` regardless of order - a single
+    merged group's count and average do not depend on which raw value
+    was kept."""
+    calls = [_call("count", _col("line_no"), distinct=True), _call("avg", _col("line_no"), distinct=True)]
+
+    int_then_float: list[Row] = [("a.py", 1, "e"), ("a.py", 1.0, "e")]
+    (row_a,) = tuple(Aggregate(_agg_child(int_then_float), calls).rows())
+    assert row_a == (1, 1.0)
+
+    float_then_int: list[Row] = [("a.py", 1.0, "e"), ("a.py", 1, "e")]
+    (row_b,) = tuple(Aggregate(_agg_child(float_then_int), calls).rows())
+    assert row_b == (1, 1.0)
+
+
+def test_distinct_sum_integer_overflow_does_not_raise_once_the_duplicate_is_removed():
+    """`sum(x)` over two copies of int64-max raises `EvalError`
+    (`test_sum_integer_overflow_raises_eval_error_not_wrap_or_promote`
+    above) - `sum(DISTINCT x)` over the exact same two rows does not,
+    because the duplicate is removed by the dedup gate before
+    `_sum_add` is ever called a second time, so the running total
+    never exceeds int64-max. Confirmed live."""
+    rows: list[Row] = [("a.py", 9223372036854775807, "e"), ("a.py", 9223372036854775807, "e")]
+
+    plain_result = Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))])
+    with pytest.raises(EvalError):
+        list(plain_result.rows())
+
+    (row,) = tuple(
+        Aggregate(_agg_child(rows), [_call("sum", _col("line_no"), distinct=True)]).rows()
+    )
+    assert row == (9223372036854775807,)
+
+
+def test_distinct_min_max_never_change_under_deduplication():
+    """`min`/`max(DISTINCT x)` always equal their plain forms - removing
+    a duplicate can never change which value is most extreme. Over
+    `5,3,3,9,9,1`: confirmed live, `min(x)=min(DISTINCT x)=1`,
+    `max(x)=max(DISTINCT x)=9`. This is the accumulator-level pin that
+    `_Accumulator`'s min/max branches are untouched by this issue."""
+    rows: list[Row] = [
+        ("a.py", 5, "e"),
+        ("a.py", 3, "e"),
+        ("a.py", 3, "e"),
+        ("a.py", 9, "e"),
+        ("a.py", 9, "e"),
+        ("a.py", 1, "e"),
+    ]
+    plain = [_call("min", _col("line_no")), _call("max", _col("line_no"))]
+    distinct = [_call("min", _col("line_no"), distinct=True), _call("max", _col("line_no"), distinct=True)]
+
+    (plain_row,) = tuple(Aggregate(_agg_child(rows), plain).rows())
+    (distinct_row,) = tuple(Aggregate(_agg_child(rows), distinct).rows())
+
+    assert plain_row == (1, 9)
+    assert distinct_row == (1, 9)
+
+
+def test_distinct_count_star_is_unaffected_by_distinct_flag():
+    """`count(*)`/`count()` (`call.arg is None`) can never carry
+    `distinct=True` by construction (the parser never reads `DISTINCT`
+    on those shapes) - but even if an `AggregateCall` were built with
+    `arg=None, distinct=True` directly, `step`'s existing `call.arg is
+    None` early return means the flag has no way to be consulted,
+    since `count(*)` counts every row regardless of value."""
+    rows: list[Row] = [("a.py", 1, "e"), ("a.py", 1, "e"), ("a.py", 2, "e")]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("count", arg=None, distinct=True)]).rows())
+
+    assert row == (3,)
 
 
 # --- Aggregate (issue #69): the grouped path --------------------------------

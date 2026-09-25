@@ -1350,9 +1350,13 @@ def test_kbn_case_d_integers_then_reals():
     values = [1, 2, 3, 4, 5, 0.1, 0.1, 0.1]
     naive = _naive_float_sum(values)
     assert naive.hex() == "0x1.e999999999999p+3"
-    assert naive == sum(float(v) for v in values), (
-        "built-in sum() should coincide with the hand-rolled naive loop here, "
-        "confirming naive itself (not builtin sum) is what's being compared"
+    assert naive == sum(values), (
+        "built-in sum() over this mixed int/float sequence should coincide with "
+        "the hand-rolled naive loop here, confirming naive itself (not builtin "
+        "sum) is what's being compared - sum(float(v) for v in values), an all-"
+        "float generator, takes a different internal fast path and happens to "
+        "match sqlite3 instead, which is exactly why this test drives historian "
+        "through Aggregate/_Accumulator rather than trusting either shortcut"
     )
 
     row = _sum_rows(values)
@@ -1470,6 +1474,43 @@ def test_kbn_structural_f3_negative_boundary_catches_truncating_remainder_bug():
     catches that mistake."""
     row = _sum_rows([-9223372036854775808, 0.5, 1])
     assert row[0].hex() == "-0x1.0000000000000p+63"
+
+
+def test_kbn_structural_f4_midrange_large_integer_split_changes_the_rounded_bit():
+    """`0.5, 2603998922240651546, 585036` -> `2.6039989222412365e+18`
+    (`0x1.211a19c91d82fp+61`), confirmed against `sqlite3` (bundled
+    module). Engineered by search (not hand-picked, unlike F1-F3):
+    `int64max`/`int64min` at the exact int64 boundary happen to
+    round-trip through a direct `float(value)` cast identically to a
+    properly split-then-compensated one for every subsequent addend
+    this issue's own F1-F3/G rows use, which is why those rows alone
+    cannot tell `kahanBabuskaNeumaierStepInt64`'s split apart from a
+    naive direct cast - both land on the same final double there. This
+    pair does not: a direct `float(2603998922240651546)` cast rounds
+    to a different double than splitting it into a multiple of 16384
+    plus a remainder and compensating each half separately, and that
+    one-ULP difference survives to the final result once `585036` is
+    added - `0x1.211a19c91d830p+61` under a direct cast versus
+    `0x1.211a19c91d82fp+61` under the correct split, confirmed both
+    ways live against this file's own `_kbn_step_int64`."""
+    row = _sum_rows([0.5, 2603998922240651546, 585036])
+    assert row[0].hex() == "0x1.211a19c91d82fp+61"
+
+
+def test_kbn_structural_f5_midrange_large_integer_init_split_changes_the_rounded_bit():
+    """`-52717978204320948, -0.5` -> `-5.271797820432095e+16`
+    (`-0x1.769571984a697p+55`), confirmed against `sqlite3` (bundled
+    module). The `kahanBabuskaNeumaierInit` counterpart to F4:
+    `int64max`/`int64min` at the exact int64 boundary (F2, F3) happen
+    to round-trip through a direct `float(value)` cast identically to
+    a properly split-then-folded one, which is why those two rows
+    alone cannot tell `kahanBabuskaNeumaierInit`'s split apart from a
+    naive direct cast. This pair does: a direct `float(-52717978204320948)`
+    cast, folded and then stepped with `-0.5`, rounds to a different
+    double than splitting the integer into a multiple of 16384 plus a
+    remainder and folding each half separately."""
+    row = _sum_rows([-52717978204320948, -0.5])
+    assert row[0].hex() == "-0x1.769571984a697p+55"
 
 
 def test_kbn_structural_g_overflow_then_real_does_not_raise():

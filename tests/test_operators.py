@@ -36,7 +36,17 @@ from collections.abc import Iterator, Sequence
 import pytest
 
 from historian.exec.expression import EvalError
-from historian.exec.operators import Aggregate, AggregateCall, Filter, Limit, Project, Scan, Sort, SortKey
+from historian.exec.operators import (
+    Aggregate,
+    AggregateCall,
+    Distinct,
+    Filter,
+    Limit,
+    Project,
+    Scan,
+    Sort,
+    SortKey,
+)
 from historian.schema import Column, ColumnType, Row, Schema
 from historian.sql.ast import And, BinaryOp, Literal, Not, Operator as Op
 from historian.sql.binder import BoundColumnRef, BoundSelectItem
@@ -1232,3 +1242,145 @@ def test_negative_limit_over_a_spy_source_still_pulls_every_row_eventually():
 
     assert tuple(result.rows()) == rows
     assert source.pulled == 5
+
+
+# --- Distinct (issue #78) --------------------------------------------------
+#
+# `_docs/spec.md` §3's `Distinct` operator: `SELECT DISTINCT`. Sits
+# directly above `Project` (`plan/planner.py`'s job to place it there),
+# in the slot #77's own design reserved between `Project` and `Limit`.
+
+
+def test_distinct_removes_exact_duplicate_rows():
+    rows = (("a.py", 1, "e"), ("a.py", 1, "e"), ("b.py", 2, "e"))
+    result = Distinct(_child(rows))
+
+    assert tuple(result.rows()) == (("a.py", 1, "e"), ("b.py", 2, "e"))
+
+
+def test_distinct_keeps_first_occurrence_order():
+    """First-seen order, not sorted - the concrete determinism
+    guarantee this operator commits to (spec §3's "Determinism and row
+    order", `AGENTS.md`)."""
+    rows = (("c.py", 1, "e"), ("a.py", 1, "e"), ("c.py", 1, "e"), ("b.py", 1, "e"))
+    result = Distinct(_child(rows))
+
+    assert tuple(result.rows()) == (("c.py", 1, "e"), ("a.py", 1, "e"), ("b.py", 1, "e"))
+
+
+def test_distinct_with_no_duplicates_returns_every_row_unchanged():
+    result = Distinct(_child(_ROWS))
+    assert tuple(result.rows()) == _ROWS
+
+
+def test_distinct_over_empty_child_yields_no_rows():
+    result = Distinct(_child(()))
+    assert tuple(result.rows()) == ()
+
+
+def test_distinct_schema_is_exactly_the_child_schema():
+    result = Distinct(_child(()))
+    assert result.schema is _SCHEMA
+
+
+def test_distinct_dedups_numeric_storage_classes_via_order_key():
+    """`1` and `1.0` merge into one dedup group - the same
+    storage-class-insensitive numeric equality `values.order_key`
+    already gives `Aggregate`'s own grouped path, reused here."""
+    rows = (("a.py", 1, "e"), ("a.py", 1.0, "e"), ("a.py", 2, "e"))
+    result = Distinct(_child(rows))
+
+    assert tuple(result.rows()) == (("a.py", 1, "e"), ("a.py", 2, "e"))
+
+
+def test_distinct_nulls_are_equal_to_each_other():
+    """Two `NULL`s in the same column position form one dedup group -
+    spec §3's aggregate edge-case table ("DISTINCT over NULLs: NULLs
+    are equal to each other"), which this issue is what makes
+    reachable."""
+    rows = (("a.py", 1, None), ("a.py", 1, None), ("a.py", 1, "e"))
+    result = Distinct(_child(rows))
+
+    assert tuple(result.rows()) == (("a.py", 1, None), ("a.py", 1, "e"))
+
+
+def test_distinct_text_and_numeric_do_not_merge():
+    """`'1'` (TEXT) and `1` (INTEGER) stay separate dedup groups -
+    `author_email` is declared TEXT but unenforced at the row level
+    (this file's own convention, see `test_sort_mixed_storage_class_
+    numeric_then_text`), so it can carry a genuine mix here too."""
+    rows = (("a.py", 1, "1"), ("a.py", 1, 1))
+    result = Distinct(_child(rows))
+
+    assert tuple(result.rows()) == (("a.py", 1, "1"), ("a.py", 1, 1))
+
+
+def test_distinct_full_mixed_storage_class_and_null_dedup_end_to_end():
+    """The exact worked example from this issue's own grooming,
+    confirmed live against sqlite3: over `1, 1.0, '1', NULL, NULL, 1`
+    in one column, `SELECT DISTINCT x` keeps exactly three rows - the
+    first-seen integer `1` (absorbing the later `1.0` and the final
+    repeated `1`), the text `'1'`, and one `NULL` (absorbing the
+    second `NULL`) - in that first-seen order. NULL and mixed-storage-
+    class dedup cannot be reached through `blame` (every blame column
+    is non-NULL with one fixed storage class), so this case is
+    unit-only, per this issue's own scope note."""
+    rows = (
+        ("a.py", 1, 1),
+        ("a.py", 1, 1.0),
+        ("a.py", 1, "1"),
+        ("a.py", 1, None),
+        ("a.py", 1, None),
+        ("a.py", 1, 1),
+    )
+    result = Distinct(_child(rows))
+
+    values_seen = [row[2] for row in result.rows()]
+
+    assert values_seen == [1, "1", None]
+    assert type(values_seen[0]) is int  # the first-seen representative, not the later 1.0
+
+
+def test_distinct_which_duplicate_is_kept_is_unobservable():
+    """Design note mirrored from the operator's own docstring: two rows
+    sharing a dedup key are identical in every column by definition -
+    `Distinct` groups by the whole row, so there is nothing else to
+    assert here beyond "exactly one survives, with every column
+    intact"."""
+    rows = (("a.py", 1, "e"), ("a.py", 1, "e"), ("a.py", 1, "e"))
+    result = Distinct(_child(rows))
+
+    assert tuple(result.rows()) == (("a.py", 1, "e"),)
+
+
+def test_distinct_repeated_runs_give_identical_order():
+    """The same rows, deduplicated twice via two fresh `Distinct`
+    instances over two fresh children, produce byte-identical order
+    both times - mirroring `test_sort_repeated_runs_give_identical_
+    order`'s own direct (non-oracle) determinism check."""
+    rows = (("b.py", 1, "e"), ("a.py", 1, "e"), ("b.py", 1, "e"))
+
+    first = list(Distinct(_child(rows)).rows())
+    second = list(Distinct(_child(rows)).rows())
+
+    assert first == second
+
+
+def test_distinct_streams_rather_than_materializing_the_child():
+    """The laziness criterion (this issue's own acceptance criteria):
+    `Distinct` pulls one row at a time and yields a row the first
+    time its key is new, without ever materializing `child.rows()` up
+    front - mirroring `test_limit_streams_rather_than_pulling_more_
+    than_offset_plus_limit_rows`'s own pattern, one operator over.
+    Built directly on `Scan` over a `_CountingSource` so nothing
+    between `Scan` and `Distinct` consumes the child eagerly; pulling
+    only the first three distinct rows out of twenty available proves
+    `Distinct` never pulled the rest."""
+    rows = tuple(("a.py", n, None) for n in range(20))
+    source = _CountingSource(rows)
+    result = Distinct(Scan(source))
+
+    first_three = list(itertools.islice(result.rows(), 3))
+
+    assert first_three == list(rows[:3])
+    assert source.pulled == 3

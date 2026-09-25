@@ -482,11 +482,11 @@ def test_modulo_comparison_result_as_operand():
 def test_modulo_operand_raw_bool_raises_via_arithmetic_operand_guard():
     """Same defensive guard as the other arithmetic operators
     (`test_arithmetic_operand_raises_on_a_raw_bool_true`) - a raw
-    Python `bool` must never reach `_arithmetic_operand`."""
-    from historian.exec.expression import _arithmetic_operand
+    Python `bool` must never reach `arithmetic_operand`."""
+    from historian.exec.expression import arithmetic_operand
 
     with pytest.raises(TypeError):
-        _arithmetic_operand(True)
+        arithmetic_operand(True)
 
 
 # --- Concatenation (||) --------------------------------------------------
@@ -1868,7 +1868,7 @@ def test_coerce_to_value_applied_to_a_real_comparison_evaluate_result():
 
 # --- coerce_to_bool3: Value -> Bool3, Filter's own coercion (#38) --------
 #
-# Leading-prefix numeric coercion (the same rule `_arithmetic_operand`
+# Leading-prefix numeric coercion (the same rule `arithmetic_operand`
 # already implements for arithmetic), then `!= 0` - confirmed case by
 # case against `sqlite3` in issue #38's own body, not "nonempty string
 # is truthy".
@@ -2080,17 +2080,17 @@ def test_arithmetic_operand_raises_on_a_raw_bool_true():
     this pins the guard directly, at the unit most likely to catch a
     future regression that removes the call-site coercion without also
     removing this defensive check."""
-    from historian.exec.expression import _arithmetic_operand
+    from historian.exec.expression import arithmetic_operand
 
     with pytest.raises(TypeError):
-        _arithmetic_operand(True)
+        arithmetic_operand(True)
 
 
 def test_arithmetic_operand_raises_on_a_raw_bool_false():
-    from historian.exec.expression import _arithmetic_operand
+    from historian.exec.expression import arithmetic_operand
 
     with pytest.raises(TypeError):
-        _arithmetic_operand(False)
+        arithmetic_operand(False)
 
 
 def test_comparison_nested_predicate_operand_left_side_converts_to_sqlite_int():
@@ -2204,7 +2204,7 @@ def test_arithmetic_on_a_nested_predicate_operand_still_returns_eleven():
     alone cannot discriminate the deliberate fix from the accident
     (see this issue's own "Arithmetic" section). It only discriminates
     in combination with `test_arithmetic_operand_raises_on_a_raw_bool_true`
-    above: with the defensive guard in `_arithmetic_operand` in place,
+    above: with the defensive guard in `arithmetic_operand` in place,
     deleting the explicit `coerce_to_value()` call at this call site
     turns *this* test red (`TypeError` instead of `11`) while leaving
     the guard test alone unaffected - verified by hand as part of this
@@ -2218,7 +2218,7 @@ def test_arithmetic_on_a_nested_predicate_operand_still_returns_eleven():
 
 def test_unary_minus_on_a_nested_predicate_operand():
     """sqlite3: `select -(1=1);` -> -1. Same discriminating relationship
-    with the `_arithmetic_operand` guard as the arithmetic test above,
+    with the `arithmetic_operand` guard as the arithmetic test above,
     for `_eval_unary`'s own call site."""
     from historian.exec.expression import evaluate
 

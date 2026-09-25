@@ -78,7 +78,7 @@ since all four route their operands through it), and `_eval_binary`'s
 `||`/arithmetic branches, `_eval_like`, and `_eval_unary`'s `-` branch
 each do the same at their own call site. Still no `position` parameter:
 each of these already knows, structurally, that the operand it is about
-to hand to `values.eq`/`_coerce_to_text`/`_arithmetic_operand` must be a
+to hand to `values.eq`/`_coerce_to_text`/`arithmetic_operand` must be a
 `Value`, from its own node shape alone.
 
 Column affinity
@@ -166,7 +166,14 @@ from historian.values import Bool3, Value
 # behaviour, even though the import graph is not literally free of the
 # word `subprocess`.
 
-__all__ = ["EvalError", "coerce_to_bool3", "coerce_to_value", "evaluate"]
+__all__ = [
+    "EvalError",
+    "arithmetic_operand",
+    "coerce_to_bool3",
+    "coerce_to_value",
+    "evaluate",
+    "try_numeric_affinity",
+]
 
 #: SQLite's `int64` bounds. This module's own constants - not imported
 #: from `sql/parser.py`'s private `_INT64_MAX`, which is off-limits for
@@ -371,7 +378,7 @@ def coerce_to_bool3(result: Value | Bool3) -> Bool3:
     predicate (`WHERE line_no`, `WHERE path`), confirmed case by case
     against `sqlite3` in issue #38's own body - not "nonempty string is
     truthy", but the exact leading-prefix numeric coercion
-    `_arithmetic_operand` already implements for arithmetic (`'0abc'`
+    `arithmetic_operand` already implements for arithmetic (`'0abc'`
     -> `0`, falsy; `'1abc'` -> `1`, truthy; `'  1  '` -> `1`, truthy;
     `''`/`'abc'`, no digit anywhere, -> `0`, falsy), followed by
     `!= 0`.
@@ -397,7 +404,7 @@ def coerce_to_bool3(result: Value | Bool3) -> Bool3:
     """
     if isinstance(result, bool) or result is None:
         return result
-    return _arithmetic_operand(result) != 0
+    return arithmetic_operand(result) != 0
 
 
 def _eval_between(expr: Between, row: Row, schema: Schema) -> Bool3:
@@ -654,7 +661,7 @@ def _apply_affinity(
     affinity at all - two literals compare with no coercion, matching
     `values.py`'s own class-rank comparison."""
     if left_affinity in _NUMERIC_AFFINITIES or right_affinity in _NUMERIC_AFFINITIES:
-        return _try_numeric_affinity(left), _try_numeric_affinity(right)
+        return try_numeric_affinity(left), try_numeric_affinity(right)
     if left_affinity is ColumnType.TEXT or right_affinity is ColumnType.TEXT:
         return _coerce_to_text(left), _coerce_to_text(right)
     return left, right
@@ -669,7 +676,7 @@ def _strip_numeric_whitespace(text: str) -> str:
     return text.strip(_NUMERIC_WHITESPACE)
 
 
-def _try_numeric_affinity(value: Value) -> Value:
+def try_numeric_affinity(value: Value) -> Value:
     """Column affinity's text-to-number conversion: the *entire*
     (whitespace-trimmed) string must be a well-formed number, or the
     value is left as text, unconverted - a stricter rule than
@@ -744,7 +751,7 @@ def _eval_unary(expr: UnaryOp, row: Row, schema: Schema) -> Value:
     operand = coerce_to_value(evaluate(expr.operand, row, schema))
     if operand is None:
         return None
-    numeric = _arithmetic_operand(operand)
+    numeric = arithmetic_operand(operand)
     if isinstance(numeric, int):
         return _int64_bounded(-numeric)
     return _squash_nan(-numeric)
@@ -974,7 +981,7 @@ def _coerce_arithmetic_text(text: str) -> int | float:
     return scanned[0] if scanned is not None else 0
 
 
-def _arithmetic_operand(value: Value) -> int | float:
+def arithmetic_operand(value: Value) -> int | float:
     """A `Value` as an arithmetic operand: a number passes through
     unchanged, text goes through the leading-prefix coercion above.
     Never called with `None` - the caller checks for NULL first, since
@@ -1123,8 +1130,8 @@ def _arithmetic(op: Operator, left: Value, right: Value) -> Value:
     """
     if left is None or right is None:
         return None
-    left_num = _arithmetic_operand(left)
-    right_num = _arithmetic_operand(right)
+    left_num = arithmetic_operand(left)
+    right_num = arithmetic_operand(right)
     if op is Operator.DIV:
         if right_num == 0:
             return None

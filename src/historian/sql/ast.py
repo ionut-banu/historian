@@ -221,11 +221,21 @@ class FunctionCall(Expr):
     concern once a registry of built-ins exists (`_docs/spec.md` §3),
     not a parser one - `foo(x)` is syntactically identical whether
     `foo` is `count` or an invented name.
+
+    `distinct` (issue #84) is `True` when an optional `DISTINCT` token
+    was read immediately after `(`, on the ordinary comma-separated
+    expression-list call shape only - never on `name()` or `name(*)`,
+    both checked first in `sql/parser.py`'s `_parse_function_call`.
+    Like `name` itself, nothing here knows whether `distinct` means
+    anything for this particular call: `foo(DISTINCT x)` parses the
+    same whether `foo` is a real aggregate or not, the same "arity and
+    name validation happen later" rule `*` already follows.
     """
 
     name: str
     args: tuple[Expr, ...]
     position: Position
+    distinct: bool = False
 
 
 @dataclass(frozen=True)

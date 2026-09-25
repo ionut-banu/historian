@@ -171,6 +171,106 @@ def test_function_call_with_expression_arg():
     assert isinstance(expr.args[0], BinaryOp)
 
 
+# --- FunctionCall DISTINCT (issue #84) --------------------------------------
+#
+# `DISTINCT` is read immediately after `(`, but only on the ordinary
+# comma-separated expression-list branch of `_parse_function_call` - the
+# no-argument `name()` shape and the bare-`*` `name(*)` shape are both
+# checked first and return before `DISTINCT` is ever consulted. Confirmed
+# live against `sqlite3` 3.51.0 (issue #84's grooming): `count(distinct *)`
+# and `abs(distinct *)` are both "near \"*\": syntax error" for any
+# function name, and `count(distinct)` alone is a `sqlite3` prepare-time
+# error too - here it falls out of `_parse_expr()` failing on the `)`
+# straight after `DISTINCT` is consumed.
+
+
+def test_function_call_without_distinct_defaults_to_false():
+    expr = _select_expr("SELECT sum(line_no) FROM blame")
+    assert isinstance(expr, FunctionCall)
+    assert expr.distinct is False
+
+
+def test_function_call_with_distinct_sets_the_flag():
+    expr = _select_expr("SELECT count(DISTINCT line_no) FROM blame")
+    assert isinstance(expr, FunctionCall)
+    assert expr.name == "count"
+    assert expr.distinct is True
+    assert expr.args == (ColumnRef(table=None, name="line_no", position=expr.args[0].position),)
+
+
+def test_function_call_distinct_is_accepted_for_any_function_name():
+    """The parser has never known which names are real functions - the
+    same reason it already accepts a bare `*` for any name. Whether
+    `foo` is a real aggregate is a binder concern (`no such function`),
+    not a parser one."""
+    expr = _select_expr("SELECT foo(DISTINCT a) FROM blame")
+    assert isinstance(expr, FunctionCall)
+    assert expr.name == "foo"
+    assert expr.distinct is True
+
+
+def test_function_call_distinct_with_expression_argument():
+    expr = _select_expr("SELECT count(DISTINCT line_no % 3) FROM blame")
+    assert isinstance(expr, FunctionCall)
+    assert expr.distinct is True
+    assert isinstance(expr.args[0], BinaryOp)
+
+
+def test_function_call_distinct_with_multiple_arguments_still_parses():
+    """Arity is a binder concern (#84's own grooming): `count(DISTINCT
+    a, b)` parses fine here and is rejected later by the pre-existing
+    arity check in `sql/binder.py`."""
+    expr = _select_expr("SELECT count(DISTINCT a, b) FROM blame")
+    assert isinstance(expr, FunctionCall)
+    assert expr.distinct is True
+    assert len(expr.args) == 2
+
+
+def test_function_call_distinct_star_is_a_parse_error():
+    with pytest.raises(ParseError):
+        _parse("SELECT count(DISTINCT *) FROM blame")
+
+
+def test_function_call_distinct_star_is_a_parse_error_for_a_non_aggregate_name():
+    """Not `count`-specific - the grammar change applies to any
+    function name, matching how bare `*` already does."""
+    with pytest.raises(ParseError):
+        _parse("SELECT abs(DISTINCT *) FROM blame")
+
+
+def test_function_call_distinct_with_nothing_after_is_a_parse_error():
+    with pytest.raises(ParseError):
+        _parse("SELECT count(DISTINCT) FROM blame")
+
+
+def test_function_call_no_args_shape_never_reads_distinct():
+    """`name()` is a different shape, unrelated to `DISTINCT` - a stray
+    `DISTINCT` before the closing paren of the zero-argument form is
+    not the grammar this issue adds, and must still fail."""
+    with pytest.raises(ParseError):
+        _parse("SELECT count(DISTINCT) FROM blame")
+
+
+def test_function_call_star_shape_never_reads_distinct_after_the_star():
+    """`count(* DISTINCT)` is nonsense in either order - confirming the
+    star branch still expects `)` immediately after `*`, unaffected by
+    the new `DISTINCT` handling in the general branch."""
+    with pytest.raises(ParseError):
+        _parse("SELECT count(* DISTINCT) FROM blame")
+
+
+def test_count_star_and_no_args_forms_are_unaffected_by_distinct_support():
+    """Re-pinning existing shapes so the `_parse_function_call` change
+    cannot silently break them."""
+    star_expr = _select_expr("SELECT count(*) FROM blame")
+    assert isinstance(star_expr, FunctionCall)
+    assert star_expr.distinct is False
+
+    noargs_expr = _select_expr("SELECT count() FROM blame")
+    assert isinstance(noargs_expr, FunctionCall)
+    assert noargs_expr.distinct is False
+
+
 # --- Star positions (issue #31) --------------------------------------------
 #
 # `*`/`table.*` is legal in exactly two grammar positions: a whole,

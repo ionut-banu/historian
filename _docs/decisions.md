@@ -1364,3 +1364,124 @@ change that later introduces a boundary tie fails the proof
 loudly, as a broken test, rather than silently passing on a false
 historian bug. No new parameter on `assert_rows_match` and no
 change to `conftest.py` was needed for this either.
+
+2026-09-25 - SELECT DISTINCT's ORDER BY narrows to keys built from
+the select list; Sort's placement does not move; the justification
+is oracle reliability, not historian's own determinism
+
+Issue #78. `Distinct` is the seventh and last of phase 1's operators,
+inserted directly above `Project` whenever `SELECT DISTINCT` is
+present - exactly the slot #77's own design reserved
+(`Scan -> Filter(WHERE) -> Aggregate -> Filter(HAVING) -> Sort ->
+Project -> Distinct -> Limit`). Two things needed deciding, both
+re-verified live against sqlite3 3.51.0 rather than carried over from
+#61's own grooming (per this project's three-strikes history of
+grooming passes that trusted unverified sqlite3 recollections).
+
+First: `Sort`'s own placement does not move, despite #61's grooming
+having speculated it might need to. `Sort` still sorts the wide,
+pre-`Project` row set, exactly where #61/#77 already put it; `Distinct`
+simply appends after `Project`, the same way `Limit` already does.
+Confirmed live this holds even for a non-contiguous case:
+
+    sqlite> create table t3(p,m); insert into t3 values
+       ...> ('b',2),('b',2),('a',1),('a',1),('a',3);
+    sqlite> select distinct p, m from t3 order by m;
+    a|1
+    b|2
+    a|3
+
+The two `a` rows are not adjacent in the insert order and `p`'s own
+groups are not contiguous, yet `m`-order interleaving comes out
+correct. The reasoning: whenever every bare column an `ORDER BY` key
+touches is itself a selected column (or built purely from selected
+columns - the narrowing below is what guarantees this), two pre-
+`Distinct` rows headed for the same output row necessarily carry the
+same `ORDER BY` key value, so sorting the wide row set and only then
+projecting and deduplicating in a streaming, order-preserving pass
+gives the identical answer to sorting the narrow, deduplicated set
+directly. `tests/test_planner.py`'s
+`test_distinct_with_order_by_and_limit_through_the_real_pipeline_end_to_end`
+runs this exact case through the real pipeline.
+
+Second, and the reason the first part is safe to rely on: a new
+binder narrowing, symmetric to the GROUP BY/HAVING one (2026-09-19/
+2026-09-24 entries above) but matched against the *select list*
+instead of `GROUP BY`'s keys. Once `SELECT DISTINCT` is present,
+every bare column an `ORDER BY` key touches must match a select-list
+item by shape (exactly, or be built purely from select-list items),
+or it is a `BindError`. Implemented in `sql/binder.py`'s `bind()`,
+reusing `_split_for_grouped_check` and `_expr_shape_equal` unchanged
+- the identical walk the GROUP BY narrowing already uses, called with
+the bound select-list expressions in place of `group_by`'s keys. An
+ordinal `ORDER BY` key needs no extra check (it already resolves to
+the referenced select-list item's own bound expression, which
+trivially shape-matches itself), and neither does a select-list alias
+reference (`_resolve_name`'s `alias_first=True` for `ORDER BY`
+already splices in that item's own bound expression).
+
+Unlike the 2026-09-19 GROUP BY entry's own justification ("SQLite's
+own choice is an unspecified internal choice, so there is no rule to
+copy"), this narrowing is **not** framed that way, on the orchestrator's
+own correction during this issue's grooming: it is the oracle, not
+historian's own determinism, that makes the excluded shape unsafe.
+historian's own pipeline - a stable `Sort`, then a streaming
+first-seen `Distinct` - is already fully deterministic for the
+excluded shape too, with no narrowing at all: the same repository and
+query always produce the same rows in the same order, exactly
+`AGENTS.md`'s guarantee, whether or not the `ORDER BY` key is built
+from selected columns. The problem is on the other side of the
+comparison: sqlite3's own answer for this shape is not reproducible
+from any documented or stable rule, so matching it would mean
+reverse-engineering (and permanently pinning historian to) an
+undocumented, version-fragile SQLite internal, and getting that
+reverse-engineering wrong would be invisible until the oracle
+disagreed on some future query nobody thought to check.
+
+The discriminating evidence, confirmed live and worth recording in
+full rather than summarized, since it is what makes this a genuine
+narrowing decision and not a coincidence:
+
+    sqlite> create table u2(p,n); insert into u2 values
+       ...> ('x',2),('x',1),('y',1);
+    sqlite> select distinct p from u2 order by n;
+    y
+    x
+
+Two plausible deterministic rules both predict the *opposite* answer,
+`x` then `y`, which is what makes this discriminating rather than an
+arbitrary preference:
+
+1. "Sort the wide rows by `n` first, then dedup keeping the first
+   occurrence." Stable-sorting `('x',2),('x',1),('y',1)` by `n`
+   ascending gives `('x',1),('y',1),('x',2)` - the two `n=1` rows keep
+   their original relative order, `x` before `y`, and the `n=2` row
+   moves last. First-occurrence dedup by `p` over that gives `x` then
+   `y` - the wrong order.
+2. "Dedup first by `p`, keeping each group's first-encountered `n`,
+   then sort the representatives by `n`." `x`'s first-encountered row
+   has `n=2`, `y`'s has `n=1`; sorting those two representatives by
+   `n` gives `y` (`n=1`) then `x` (`n=2`) - which happens to match
+   sqlite3's actual output this time, but only by coincidence: swap
+   the insert order of `x`'s two rows and rule 2's answer changes,
+   while sqlite3's actual behaviour is driven by its own B-tree
+   internals, not by insertion order in any documented way.
+
+Since neither rule is reliably right and sqlite3 gives no documented
+contract for which one applies (or whether either applies at all once
+its query planner picks a different index or join order), there is no
+rule for historian to copy - which is precisely why this shape is
+narrowed away with a `BindError` instead of guessed at.
+`tests/test_binder.py`'s
+`test_distinct_order_by_a_column_not_in_the_select_list_is_a_bind_error`
+and `tests/differential/test_blame.py`'s
+`test_distinct_order_by_column_not_in_select_list_raises_bind_error`
+pin this.
+
+`count(DISTINCT x)` and the same form for `sum`/`avg`/`min`/`max` -
+confirmed live during this issue's own grooming that all five accept
+it - is a different mechanism entirely (deduplicating one aggregate's
+own input, inside `Aggregate`/`_Accumulator`, never touching
+`Project`/`Distinct`/the plan tree above `Aggregate`) and is
+deliberately out of this issue's scope, left for its own follow-up
+issue per the grooming note on #78.

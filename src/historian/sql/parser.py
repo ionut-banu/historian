@@ -791,7 +791,17 @@ class _Parser:
         appear anywhere else in it: `foo(1, *)` and `foo(*, 1)` both
         fail naturally - the first in `_parse_primary`, which has no
         `STAR` case, and the second when `,` is found where `)` was
-        expected."""
+        expected.
+
+        `DISTINCT` (issue #84) is read only on the third shape, right
+        after `(` and before the first argument - the no-argument and
+        bare-`*` shapes above are both checked first and return before
+        `DISTINCT` is ever consulted, so `count(DISTINCT *)` never
+        reaches this branch: `*` is not a legal token in
+        `_parse_expr()`, so it fails there the same way `foo(1, *)`
+        already does. Legal for any function name, matching how a bare
+        `*` already is - arity and name validation happen later, not
+        in the parser."""
         self._advance()  # LPAREN
         if self._check(TokenType.RPAREN):
             self._advance()
@@ -806,10 +816,14 @@ class _Parser:
                 args=(Star(table=None, position=star_token.position),),
                 position=name_token.position,
             )
+        distinct = self._match(TokenType.DISTINCT)
         args = [self._parse_expr()]
         while self._match(TokenType.COMMA):
             args.append(self._parse_expr())
         self._expect(TokenType.RPAREN, "')'")
         return FunctionCall(
-            name=name_token.text, args=tuple(args), position=name_token.position
+            name=name_token.text,
+            args=tuple(args),
+            position=name_token.position,
+            distinct=distinct,
         )

@@ -1147,6 +1147,23 @@ def test_like_wildcards_and_ascii_case_insensitivity(text, pattern, expected):
     assert evaluate(_like(_lit(text), _lit(pattern)), _ROW, _SCHEMA) is expected
 
 
+@pytest.mark.parametrize(
+    "pattern",
+    ["a_c", "a%c"],
+)
+def test_like_wildcards_match_a_newline(pattern):
+    """sqlite3: `select ('a' || char(10) || 'c') like 'a_c', ('a' ||
+    char(10) || 'c') like 'a%c';` -> `1|1`. `LIKE` has no notion of
+    "line", so both `_` (exactly one character) and `%` (any sequence)
+    must match a newline the same as any other character - pinned
+    through `evaluate()`, not against `_like_pattern_to_regex`'s
+    internals, so it survives #51's concurrent rewrite of that
+    function."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_like(_lit("a\nc"), _lit(pattern)), _ROW, _SCHEMA) is True
+
+
 def test_like_case_folding_is_ascii_only_not_unicode():
     """sqlite3: `select 'café' like 'CAFÉ';` -> 0 - the é/É pair is not
     ASCII and is not folded, reusing the same rule
@@ -1369,6 +1386,24 @@ def test_not_between_is_not3_of_the_unnegated_result():
 
     assert evaluate(_between(_lit(5), _lit(1), _lit(10), negated=True), _ROW, _SCHEMA) is False
     assert evaluate(_between(_lit(50), _lit(1), _lit(10), negated=True), _ROW, _SCHEMA) is True
+
+
+def test_not_between_with_satisfied_low_and_null_high_is_null():
+    """sqlite3: `select 5 not between 1 and NULL is null;` -> `1`.
+
+    The one shape that tells real `and3(...)`-then-`not3` apart from a
+    `bool(a and b)`-then-`not3` mutant: the low bound (`5 >= 1`) is
+    `TRUE`, so Python's `and` does not short-circuit on the left the
+    way it does in `test_between_null_propagation_matches_and3_short_circuit`
+    above, and instead evaluates the high bound (`5 <= NULL`), which is
+    `None`. The real `and3(True, None)` is `None`, and
+    `not3(None)` is `None`. The mutant instead collapses to
+    `bool(True and None)` = `bool(None)` = `False`, and `not3(False)`
+    is `True` - wrongly keeping the row instead of dropping it."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_between(_lit(5), _lit(1), _lit(None), negated=True), _ROW, _SCHEMA)
+    assert result is None
 
 
 # --- coerce_to_value: Bool3 -> Value, Project's own coercion (#38) -------

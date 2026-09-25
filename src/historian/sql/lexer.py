@@ -92,7 +92,7 @@ class TokenType(Enum):
     has to special-case running off the end.
     """
 
-    # Keywords - the v1 grammar's closed 30-keyword set (_docs/spec.md §1).
+    # Keywords - the v1 grammar's closed 31-keyword set (_docs/spec.md §1).
     SELECT = auto()
     DISTINCT = auto()
     AS = auto()
@@ -123,6 +123,7 @@ class TokenType(Enum):
     THEN = auto()
     ELSE = auto()
     END = auto()
+    ESCAPE = auto()
 
     # Literals and names.
     IDENTIFIER = auto()
@@ -153,7 +154,7 @@ class TokenType(Enum):
 
 
 #: The keyword `TokenType` members, exactly - a test in `tests/
-#: test_lexer.py` asserts this set equals the v1 grammar's 30-keyword
+#: test_lexer.py` asserts this set equals the v1 grammar's 31-keyword
 #: list, so a keyword added to the grammar later that the lexer forgets
 #: to wire up fails a test here rather than surfacing as a silent parse
 #: gap.
@@ -189,6 +190,7 @@ KEYWORD_TYPES: frozenset[TokenType] = frozenset(
         TokenType.THEN,
         TokenType.ELSE,
         TokenType.END,
+        TokenType.ESCAPE,
     }
 )
 
@@ -200,12 +202,12 @@ _KEYWORDS_BY_TEXT: dict[str, TokenType] = {
 
 
 def is_keyword(token_type: TokenType) -> bool:
-    """Is *token_type* one of the 30 v1 keywords?
+    """Is *token_type* one of the 31 v1 keywords?
 
     The escape hatch for call sites that need "any keyword," not one in
     particular - an error message, or a check for whether a token can
-    start a clause - so they don't have to enumerate all thirty members
-    or fall back to string comparison against `token.text`.
+    start a clause - so they don't have to enumerate all thirty-one
+    members or fall back to string comparison against `token.text`.
     """
     return token_type in KEYWORD_TYPES
 

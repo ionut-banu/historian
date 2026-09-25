@@ -681,6 +681,56 @@ def test_not_like():
     assert expr.negated is True
 
 
+# --- LIKE ... ESCAPE (issue #51) ----------------------------------------
+#
+# sqlite3 3.51.0: `select '100%' like '100|%' escape '|';` -> 1. The
+# escape operand is an arbitrary expression at tier 1 (`_parse_relational`),
+# the same as `pattern` - confirmed: `select '10%' like '10' || '!%'
+# escape ('!');` -> 1 and `select '10%' like '10!%' escape
+# substr('!x',1,1);` -> 1, both run without error in sqlite3.
+
+
+def test_like_without_escape_has_none_escape_field():
+    expr = _select_expr("SELECT a LIKE 'x%' FROM blame")
+    assert isinstance(expr, Like)
+    assert expr.escape is None
+
+
+def test_like_escape_parses_a_string_literal():
+    expr = _select_expr("SELECT a LIKE '100|%' ESCAPE '|' FROM blame")
+    assert isinstance(expr, Like)
+    assert expr.negated is False
+    assert expr.escape == Literal(value="|", position=expr.escape.position)
+
+
+def test_not_like_escape_parses_a_string_literal():
+    expr = _select_expr("SELECT a NOT LIKE '100|%' ESCAPE '|' FROM blame")
+    assert isinstance(expr, Like)
+    assert expr.negated is True
+    assert expr.escape == Literal(value="|", position=expr.escape.position)
+
+
+def test_like_escape_accepts_an_arbitrary_expression_not_just_a_literal():
+    """`ESCAPE (1=1)` - confirmed against sqlite3: `select '10%' like
+    '10!%' escape (1=1);` -> 0 (runs without a parse error; #63's
+    coercion is what turns the comparison result into text at eval
+    time, not this parser rule)."""
+    expr = _select_expr("SELECT a LIKE 'x%' ESCAPE (1=1) FROM blame")
+    assert isinstance(expr, Like)
+    assert isinstance(expr.escape, BinaryOp)
+    assert expr.escape.op is Operator.EQ
+
+
+def test_like_escape_operand_parses_at_tier_one_includes_concat():
+    """`ESCAPE '1' || '0'` must parse as one `||` expression, not stop
+    at the first operand - `_parse_relational` (tier 1) includes
+    concatenation, same as `pattern`."""
+    expr = _select_expr("SELECT a LIKE 'x%' ESCAPE '1' || '0' FROM blame")
+    assert isinstance(expr, Like)
+    assert isinstance(expr.escape, BinaryOp)
+    assert expr.escape.op is Operator.CONCAT
+
+
 def test_not_in():
     expr = _select_expr("SELECT a NOT IN (1, 2) FROM blame")
     assert isinstance(expr, In)

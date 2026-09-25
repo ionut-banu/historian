@@ -308,12 +308,22 @@ class Is(Expr):
 
 @dataclass(frozen=True)
 class Like(Expr):
-    """`left LIKE pattern` / `left NOT LIKE pattern`."""
+    """`left LIKE pattern [ESCAPE escape]` / `left NOT LIKE pattern
+    [ESCAPE escape]` (issue #51).
+
+    `escape` is `None` when the clause is absent - not a second node
+    type, since `ESCAPE` has no meaning without a `LIKE`/`NOT LIKE` it
+    modifies, the same reasoning #78 used for `DISTINCT` on
+    `SelectStatement`. When present it is an arbitrary expression, not
+    restricted to a `STRING` literal - confirmed against `sqlite3`
+    3.51.0, e.g. `select '10%' like '10' || '!%' escape ('!');` -> `1`.
+    """
 
     left: Expr
     pattern: Expr
     negated: bool
     position: Position
+    escape: Expr | None = None
 
 
 @dataclass(frozen=True)

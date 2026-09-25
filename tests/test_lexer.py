@@ -28,7 +28,7 @@ V1_KEYWORDS = {
     "SELECT", "DISTINCT", "AS", "FROM", "INNER", "JOIN", "ON", "USING",
     "WHERE", "GROUP", "BY", "HAVING", "ORDER", "ASC", "DESC", "LIMIT",
     "OFFSET", "AND", "OR", "NOT", "LIKE", "IN", "BETWEEN", "IS", "NULL",
-    "CASE", "WHEN", "THEN", "ELSE", "END",
+    "CASE", "WHEN", "THEN", "ELSE", "END", "ESCAPE",
 }
 
 

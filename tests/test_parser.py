@@ -1602,21 +1602,39 @@ def test_window_function_buried_in_larger_expression_is_unsupported_grammar():
 
 
 def test_union_is_unsupported_grammar_and_names_union():
+    """`UNION` is a singular keyword, not a plural feature name, so the
+    shared "{feature} are not supported" template wraps it as
+    "compound queries (UNION)" rather than passing it bare - a bare
+    "UNION are not supported" reads wrong. Asserted by the full, exact
+    message text, not just a substring, so a regression back to the
+    bare-keyword phrasing is actually caught."""
     with pytest.raises(UnsupportedGrammarError) as exc_info:
         _parse("SELECT * FROM blame UNION SELECT * FROM blame")
-    assert "UNION" in str(exc_info.value)
+    assert str(exc_info.value) == (
+        "compound queries (UNION) are not supported\n"
+        "  historian implements a subset of SQL. See the non-goals in\n"
+        "  _docs/spec.md §1."
+    )
 
 
 def test_intersect_is_unsupported_grammar_and_names_intersect():
     with pytest.raises(UnsupportedGrammarError) as exc_info:
         _parse("SELECT * FROM blame INTERSECT SELECT * FROM blame")
-    assert "INTERSECT" in str(exc_info.value)
+    assert str(exc_info.value) == (
+        "compound queries (INTERSECT) are not supported\n"
+        "  historian implements a subset of SQL. See the non-goals in\n"
+        "  _docs/spec.md §1."
+    )
 
 
 def test_except_is_unsupported_grammar_and_names_except():
     with pytest.raises(UnsupportedGrammarError) as exc_info:
         _parse("SELECT * FROM blame EXCEPT SELECT * FROM blame")
-    assert "EXCEPT" in str(exc_info.value)
+    assert str(exc_info.value) == (
+        "compound queries (EXCEPT) are not supported\n"
+        "  historian implements a subset of SQL. See the non-goals in\n"
+        "  _docs/spec.md §1."
+    )
 
 
 # Outer and cross joins ------------------------------------------------

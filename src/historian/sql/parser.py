@@ -238,9 +238,16 @@ def _unsupported_grammar_message(feature: str) -> str:
           _docs/spec.md §1.
 
     *feature* is a short phrase - "CTEs", "subqueries", "window
-    functions", one of "UNION"/"INTERSECT"/"EXCEPT", or "outer and
-    cross joins" - matching §1's own wording where §1 names the
-    construct directly (`_docs/spec.md` §1)."""
+    functions", "compound queries (UNION)"/"compound queries
+    (INTERSECT)"/"compound queries (EXCEPT)", or "outer and cross
+    joins" - matching §1's own wording where §1 names the construct
+    directly (`_docs/spec.md` §1). Always grammatically plural, so the
+    fixed "{feature} are not supported" template agrees for every
+    caller: a bare "UNION are not supported" reads wrong, since UNION
+    is a singular keyword, not a plural feature name - wrapped in
+    "compound queries (...)" instead of passed bare, matching SQLite's
+    own term for `UNION`/`INTERSECT`/`EXCEPT` ("compound select
+    statement") while still naming the specific keyword seen."""
     return (
         f"{feature} are not supported\n"
         "  historian implements a subset of SQL. See the non-goals in\n"
@@ -383,11 +390,15 @@ class _Parser:
         by token text since none of the three are lexer keywords: the
         query is otherwise complete, so this is the only place they
         can be recognised specifically rather than falling into the
-        generic "expected end of query" message below."""
+        generic "expected end of query" message below. Named as
+        "compound queries (<KEYWORD>)", not the bare keyword - `UNION`
+        etc. are singular, and the shared message template
+        ("{feature} are not supported") needs a grammatically plural
+        subject; a bare "UNION are not supported" reads wrong."""
         if self._check(TokenType.IDENTIFIER):
             word = self._peek().text.upper()
             if word in ("UNION", "INTERSECT", "EXCEPT"):
-                raise self._unsupported(word)
+                raise self._unsupported(f"compound queries ({word})")
         self._match(TokenType.SEMICOLON)
         if not self._check(TokenType.EOF):
             raise self._error(

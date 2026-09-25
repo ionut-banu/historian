@@ -2019,3 +2019,25 @@ joins are not supported" error, with nothing to signal that it had
 regressed. `tests/test_parser.py::test_bare_left_without_join_keeps_
 ordinary_parse_error` pins the distinction now, before aliases exist,
 specifically so that a future alias implementation trips it.
+
+Follow-up, same day: the shared message template
+(`"{feature} are not supported"`) assumes a grammatically plural
+*feature* - true of "CTEs", "subqueries", "window functions", and
+"outer and cross joins", but not of a bare `UNION`/`INTERSECT`/
+`EXCEPT`, which produced "error: UNION are not supported" - a
+singular keyword with a plural verb. Found by the orchestrator running
+real CLI queries after the initial implementation, not by any test,
+since every test up to that point only checked for the keyword's
+presence as a substring rather than the message's exact text. Fixed by
+wrapping the three set-operator keywords as "compound queries
+(UNION)"/"compound queries (INTERSECT)"/"compound queries (EXCEPT)" at
+the one call site in `expect_end()`, rather than threading a verb
+parameter through `_unsupported_grammar_message` and every one of the
+six call sites: "compound queries" is SQLite's own term for a
+`UNION`/`INTERSECT`/`EXCEPT` statement, reads correctly with "are",
+and still names the specific keyword seen, so the fixed template needs
+no change and the other five call sites are untouched. The three
+`test_..._is_unsupported_grammar_and_names_...` tests in `tests/
+test_parser.py` were widened from a substring check to the full exact
+message text, so a regression back to the bare-keyword phrasing is
+actually caught rather than merely still containing the keyword.

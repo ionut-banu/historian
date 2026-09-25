@@ -1806,6 +1806,122 @@ def test_limit_offset_same_query_twice_gives_identical_rows(tiny_repo):
     assert first == second
 
 
+# --- DISTINCT (issue #78) --------------------------------------------------
+#
+# `SELECT DISTINCT` (spec §3's `Distinct` operator, sitting directly
+# above `Project`, per #77's own reserved slot). Every case below runs
+# against real `blame` data - `awkward_repo`'s known row counts (see
+# its own docstring/`tests/fixtures/build.py`) are what make several
+# of these shapes reachable with real data at all, rather than needing
+# a synthetic catalog.
+
+
+def test_distinct_single_column_no_order_by(tiny_repo):
+    """`tiny`'s blame table has 3 rows but only 2 distinct `path`
+    values (`src/utils.py` appears twice, for its two lines) - the
+    sorted-multiset comparison `_assert_differential` already uses
+    catches a `Distinct` that fails to remove the real duplicate, with
+    no harness change needed for this shape."""
+    _assert_differential(tiny_repo, "SELECT DISTINCT path FROM blame")
+
+
+def test_distinct_two_columns_order_by_first_with_genuine_ties(awkward_repo):
+    """`(path, line_no)` already uniquely identifies every blame row
+    (no two rows share both), so `DISTINCT` removes nothing here - but
+    it still exercises the real `Distinct` operator, and `café.py`'s
+    six lines (`tests/fixtures/build.py`) give a genuine tie on `path`
+    (the sole `ORDER BY` key) once `line_no` differs between them,
+    exactly the tie-tolerant exact-order comparison shape."""
+    query = "SELECT DISTINCT path, line_no FROM blame ORDER BY path"
+    conn = load_unfiltered(BlameScan, awkward_repo, BLAME_SCHEMA, "blame")
+    try:
+        sqlite_rows = conn.execute(query).fetchall()
+    finally:
+        conn.close()
+    _, historian_rows = run_historian(query, awkward_repo)
+    assert_rows_match(sqlite_rows, historian_rows, ordered=True, key_positions=(0,))
+
+
+def test_distinct_order_by_limit(awkward_repo):
+    """`DISTINCT` applies before `LIMIT`/`OFFSET` (tree placement,
+    `plan/planner.py`) - `awkward_repo` has exactly 5 distinct `path`
+    values, each appearing exactly once once deduplicated, so the
+    result is tie-free *by construction* once `DISTINCT` has run and
+    needs none of `LIMIT`/`OFFSET`'s own boundary-tie proof (#77's own
+    conformance case) to use the exact-order comparison safely."""
+    query = "SELECT DISTINCT path FROM blame ORDER BY path LIMIT 2"
+    conn = load_unfiltered(BlameScan, awkward_repo, BLAME_SCHEMA, "blame")
+    try:
+        sqlite_rows = conn.execute(query).fetchall()
+    finally:
+        conn.close()
+    _, historian_rows = run_historian(query, awkward_repo)
+    assert_rows_match(sqlite_rows, historian_rows, ordered=True, key_positions=(0,))
+
+
+def test_distinct_star_with_path_prefix_predicate(awkward_repo):
+    """`SELECT DISTINCT *` needs no special-casing beyond `Project`'s
+    existing `Star` expansion, which already runs before `Distinct`
+    ever sees a row - `WHERE path LIKE 'c%'` matches only `café.py`'s
+    six already-distinct rows here, so this also proves `DISTINCT`
+    combines correctly with a pushdown-shaped `WHERE` predicate."""
+    _assert_differential(awkward_repo, "SELECT DISTINCT * FROM blame WHERE path LIKE 'c%'")
+
+
+def test_distinct_zero_matching_rows(tiny_repo):
+    """A predicate matching zero rows is not an error: `SELECT
+    DISTINCT` returns zero rows, exactly like plain `SELECT`."""
+    _assert_differential(tiny_repo, "SELECT DISTINCT path FROM blame WHERE 1 = 2")
+
+
+def test_distinct_collapses_group_by_aggregate_collisions(awkward_repo):
+    """`GROUP BY path` on `awkward_repo` gives five groups with counts
+    1, 1, 6, 3, 1 (`a "quoted" name.txt`, `binary.bin`, `café.py`,
+    `no_newline.txt`, `phoenix.txt` - `tests/fixtures/build.py`'s own
+    known row counts) - three of those five groups share the count
+    `1`, so `SELECT DISTINCT count(*) ... GROUP BY path` genuinely
+    collapses five rows to three distinct values (`1`, `3`, `6`) -
+    reachable with real data, no synthetic catalog needed for this
+    issue's own "GROUP BY collision" acceptance criterion."""
+    _assert_differential(awkward_repo, "SELECT DISTINCT count(*) FROM blame GROUP BY path")
+
+
+# --- DISTINCT (issue #78): BindError cases, asserted directly ------------
+#
+# `sql/binder.py`'s own DISTINCT/ORDER BY narrowing (`_docs/
+# decisions.md`): once `SELECT DISTINCT` is present, every bare column
+# an `ORDER BY` key touches must match a select-list item by shape, or
+# it is a `BindError` - justified by oracle reliability (sqlite3's own
+# answer for the excluded case has no documented, reproducible rule),
+# not historian's own determinism.
+
+
+def test_distinct_order_by_column_not_in_select_list_raises_bind_error(tiny_repo):
+    """`line_no` is never selected - legal, engine-defined-but-real SQL
+    in sqlite3, a deliberate `BindError` here."""
+    with pytest.raises(BindError):
+        run_historian("SELECT DISTINCT path FROM blame ORDER BY line_no", tiny_repo)
+
+
+def test_distinct_order_by_ordinal_is_legal(tiny_repo):
+    """An ordinal already points at a select-list item verbatim, by
+    construction - no `BindError`, unlike the bare-column case above."""
+    _, rows = run_historian(
+        "SELECT DISTINCT path, line_no FROM blame ORDER BY 2", tiny_repo
+    )
+    assert rows
+
+
+def test_distinct_order_by_expression_built_from_selected_column_is_legal(tiny_repo):
+    """`line_no + 1` is built purely from the selected `line_no` column
+    - legal, the same "built purely from" allowance the GROUP BY
+    narrowing already gives its own keys."""
+    _, rows = run_historian(
+        "SELECT DISTINCT line_no FROM blame ORDER BY line_no + 1", tiny_repo
+    )
+    assert rows
+
+
 # --- Known disagreements that raise before producing rows --------------
 #
 # #25, #32 and #51 are open design questions ("whether it should stay

@@ -141,6 +141,7 @@ class TokenType(Enum):
     MINUS = auto()  # -
     STAR = auto()  # *
     SLASH = auto()  # /
+    PERCENT = auto()  # %
     CONCAT = auto()  # ||
     LPAREN = auto()  # (
     RPAREN = auto()  # )
@@ -511,6 +512,7 @@ class _Lexer:
         "-": TokenType.MINUS,
         "*": TokenType.STAR,
         "/": TokenType.SLASH,
+        "%": TokenType.PERCENT,
         "(": TokenType.LPAREN,
         ")": TokenType.RPAREN,
         ",": TokenType.COMMA,

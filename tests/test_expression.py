@@ -157,9 +157,12 @@ def test_ordinary_arithmetic_on_two_integers():
     assert evaluate(_bin(Operator.DIV, _lit(5), _lit(3)), _ROW, _SCHEMA) == 1
 
 
-@pytest.mark.parametrize("op", [Operator.ADD, Operator.SUB, Operator.MUL, Operator.DIV])
+@pytest.mark.parametrize(
+    "op", [Operator.ADD, Operator.SUB, Operator.MUL, Operator.DIV, Operator.MOD]
+)
 def test_null_propagates_through_every_arithmetic_operator(op):
-    """sqlite3: `select NULL+1, NULL-1, NULL*1, NULL/1;` -> all NULL."""
+    """sqlite3: `select NULL+1, NULL-1, NULL*1, NULL/1, NULL%1;` -> all
+    NULL."""
     from historian.exec.expression import evaluate
 
     assert evaluate(_bin(op, _lit(None), _lit(1)), _ROW, _SCHEMA) is None
@@ -342,6 +345,148 @@ def test_add_within_int64_bounds_stays_int():
     result = evaluate(_bin(Operator.ADD, _lit(9223372036854775806), _lit(1)), _ROW, _SCHEMA)
     assert result == 9223372036854775807
     assert isinstance(result, int)
+
+
+# --- Arithmetic: % (issue #75), C-style truncating remainder ------------
+#
+# Mirrors the DIV tests above: `_truncating_int_div` is reused directly
+# (`remainder = left - _truncating_int_div(left, right) * right`), so
+# `%`'s sign rule is the DIV sign rule with the quotient discarded.
+#
+# sqlite3: `select 7%2, -7%2, 7%-2, -7%-2;` -> 1|-1|1|-1
+
+
+@pytest.mark.parametrize(
+    "left,right,expected",
+    [(7, 2, 1), (-7, 2, -1), (7, -2, 1), (-7, -2, -1)],
+)
+def test_modulo_sign_follows_the_dividend(left, right, expected):
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.MOD, _lit(left), _lit(right)), _ROW, _SCHEMA)
+    assert result == expected
+    assert isinstance(result, int)
+
+
+# sqlite3: `select 7%0, 7%0.0, 7.5%0;` -> NULL|NULL|NULL
+
+
+@pytest.mark.parametrize("left,right", [(7, 0), (7, 0.0), (7.5, 0)])
+def test_modulo_by_zero_is_null_not_an_exception(left, right):
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_bin(Operator.MOD, _lit(left), _lit(right)), _ROW, _SCHEMA) is None
+
+
+def test_modulo_zero_check_is_against_the_truncated_divisor():
+    """sqlite3: `select 7%0.5;` -> NULL. `0.5` truncates to integer `0`
+    before the zero check, so this is a zero-divisor case even though
+    the literal written is not zero - the truncation must happen
+    before the check, not after."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_bin(Operator.MOD, _lit(7), _lit(0.5)), _ROW, _SCHEMA) is None
+
+
+# sqlite3: `select 7.5%2, -7.5%2, 7%2.5, typeof(7.5%2);` -> 1.0|-1.0|1.0|real
+
+
+@pytest.mark.parametrize(
+    "left,right,expected",
+    [(7.5, 2, 1.0), (-7.5, 2, -1.0), (7, 2.5, 1.0)],
+)
+def test_modulo_real_operand_truncates_toward_zero_before_the_remainder(left, right, expected):
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.MOD, _lit(left), _lit(right)), _ROW, _SCHEMA)
+    assert result == expected
+    assert isinstance(result, float)
+
+
+def test_modulo_result_storage_class_is_real_even_for_an_integral_valued_real():
+    """sqlite3: `select 4.0%3, typeof(4.0%3);` -> 1.0|real - REAL-ness
+    is about storage class, not value: `4.0` is integral-valued but was
+    stored as REAL, so the result is REAL too."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.MOD, _lit(4.0), _lit(3)), _ROW, _SCHEMA)
+    assert result == 1.0
+    assert isinstance(result, float)
+
+
+# sqlite3: `select 1e19%7, -1e300%7;` -> 0.0|-1.0 - large-magnitude REAL
+# operands clamp to the int64 range the way `CAST(x AS INTEGER)` does,
+# rather than converting with Python's unbounded `int()`:
+# `CAST(1e19 AS INTEGER)` = 9223372036854775807 (int64 max, clamped),
+# and `9223372036854775807 % 7` = 0; `CAST(-1e300 AS INTEGER)` clamps to
+# int64 min, and `-9223372036854775808 % 7` = -1.
+
+
+@pytest.mark.parametrize("left,expected", [(1e19, 0.0), (-1e300, -1.0)])
+def test_modulo_large_magnitude_real_operand_clamps_to_int64_range(left, expected):
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.MOD, _lit(left), _lit(7)), _ROW, _SCHEMA)
+    assert result == expected
+    assert isinstance(result, float)
+
+
+def test_modulo_int64_min_by_negative_one_does_not_trap():
+    """sqlite3: `select -9223372036854775808%-1,
+    typeof(-9223372036854775808%-1);` -> 0|integer. Unlike `/`, `%`'s
+    result magnitude can never exceed `abs(right)`, so it can never
+    overflow int64 when both operands already fit int64 - no
+    `_int64_bounded` call is needed on the remainder itself."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(
+        _bin(Operator.MOD, _lit(-9223372036854775808), _lit(-1)), _ROW, _SCHEMA
+    )
+    assert result == 0
+    assert isinstance(result, int)
+
+
+# sqlite3: `select '7abc'%2, 'abc'%2, ' 7 '%2, '-7abc'%2, '7.5abc'%2,
+# typeof('7.5abc'%2);` -> 1|0|1|-1|1.0|real
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("7abc", 1),
+        ("abc", 0),
+        (" 7 ", 1),
+        ("-7abc", -1),
+        ("7.5abc", 1.0),
+    ],
+)
+def test_modulo_text_operand_goes_through_leading_prefix_coercion(text, expected):
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.MOD, _lit(text), _lit(2)), _ROW, _SCHEMA)
+    assert result == expected
+    assert type(result) is type(expected)
+
+
+def test_modulo_comparison_result_as_operand():
+    """sqlite3: `select (1=1)%2;` -> 1. The same `coerce_to_value` path
+    issue #63 added for the other arithmetic operators, routed through
+    `_eval_binary`'s `_ARITHMETIC_OPS` branch - not a new call site."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.MOD, _TRUE, _lit(2)), _ROW, _SCHEMA)
+    assert result == 1
+    assert isinstance(result, int)
+
+
+def test_modulo_operand_raw_bool_raises_via_arithmetic_operand_guard():
+    """Same defensive guard as the other arithmetic operators
+    (`test_arithmetic_operand_raises_on_a_raw_bool_true`) - a raw
+    Python `bool` must never reach `_arithmetic_operand`."""
+    from historian.exec.expression import _arithmetic_operand
+
+    with pytest.raises(TypeError):
+        _arithmetic_operand(True)
 
 
 # --- Concatenation (||) --------------------------------------------------
@@ -1429,6 +1574,13 @@ def test_no_stray_float_calls_outside_the_named_exceptions():
       own function, never called from `_apply_affinity`, `_eval_is`,
       `_eval_in`, `_eval_between`, or the comparison branch of
       `_eval_binary`.
+    - `_mod_result` - a fourth exception, the same "arithmetic result
+      production" shape as `_int64_bounded`, added for `%` (issue
+      #75): `%`'s remainder is always computed as an exact `int`, but
+      its storage class follows the *original* operands (REAL if
+      either was REAL) - reporting a REAL result needs converting that
+      exact `int` remainder to `float`, kept in its own function for
+      the same reason `_int64_bounded` is.
 
     Any `float(` call appearing anywhere else in this module - most
     plausibly, a future "normalize this before comparing" edit to the
@@ -1439,7 +1591,7 @@ def test_no_stray_float_calls_outside_the_named_exceptions():
 
     from historian.exec import expression
 
-    allowed_functions = {"_scan_number", "_format_float", "_int64_bounded"}
+    allowed_functions = {"_scan_number", "_format_float", "_int64_bounded", "_mod_result"}
     tree = ast.parse(inspect.getsource(expression))
 
     violations: list[tuple[str, int]] = []

@@ -106,5 +106,11 @@ right.
 When historian and SQLite disagree, SQLite is right. Do not reason
 about which answer seems more sensible. Report the disagreement.
 
+Any ad hoc re-derivation you do by hand - independent of the
+differential suite and fuzzer, which already go through Python's
+bundled `sqlite3` module via the harness - uses that same module or
+`tests/oracle.py`, never the system `sqlite3` CLI. See
+`_docs/process.md`, "The oracle".
+
 Ignore what the implementation says it does. Only the acceptance
 criteria, the oracle, and the running code count.

@@ -76,9 +76,11 @@ stops you from talking yourself into whatever the code happens to do.
 For each acceptance criterion:
 
 1. Work out the expected value. When it involves SQL semantics, do not
-   reason it out - ask. `sqlite3` in a terminal is authoritative, and
-   two minutes with it beats an afternoon of being confidently wrong
-   about `NULL`.
+   reason it out - ask. The oracle is Python's bundled `sqlite3`
+   module, not the system `sqlite3` CLI - use the one-liner or
+   `tests/oracle.py` (see `_docs/process.md`, "The oracle"), and two
+   minutes with it beats an afternoon of being confidently wrong about
+   `NULL`.
 2. Write the test with that value. Run it. Watch it fail.
 3. Make it pass.
 

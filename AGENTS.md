@@ -9,6 +9,9 @@ Commands
 - `uv run pytest tests/test_parser.py` - one test file
 - `uv run historian "SELECT ..."` - run a query against the repo you
   are standing in
+- `uv run python tests/oracle.py "<setup SQL>" "<query SQL>"` - ask
+  the oracle (Python's bundled `sqlite3` module) an ad hoc question;
+  setup is optional - see `_docs/process.md`, "The oracle"
 
 Layout
 

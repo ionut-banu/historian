@@ -598,6 +598,149 @@ def test_float_division_by_zero_is_null(tiny_repo):
     _assert_differential(tiny_repo, "SELECT 5.0 / 0 FROM blame")
 
 
+# --- Modulo (%): C-style truncating remainder (issue #75) --------------
+#
+# Literal-only, the same pattern the Division section above uses:
+# `blame.line_no` is always a small positive INTEGER, so it cannot by
+# itself exercise negative operands, REAL operands, or the int64-range
+# edge cases below - each case instead runs a fixed expression once per
+# `blame` row and every row must agree independently. The GROUP BY case
+# below, over the real `line_no` column, is the one exception - it is
+# the shape grooming originally asked for (see
+# `test_group_by_a_modulo_expression` above).
+
+
+def test_modulo_sign_both_positive(tiny_repo):
+    """`sqlite3: select 7 % 2;` -> 1."""
+    _assert_differential(tiny_repo, "SELECT 7 % 2 FROM blame")
+
+
+def test_modulo_sign_negative_dividend(tiny_repo):
+    """`sqlite3: select -7 % 2;` -> -1 - sign follows the dividend, not
+    Python's `%` (which would give `1`, the divisor's sign)."""
+    _assert_differential(tiny_repo, "SELECT -7 % 2 FROM blame")
+
+
+def test_modulo_sign_negative_divisor(tiny_repo):
+    """`sqlite3: select 7 % -2;` -> 1."""
+    _assert_differential(tiny_repo, "SELECT 7 % -2 FROM blame")
+
+
+def test_modulo_sign_both_negative(tiny_repo):
+    """`sqlite3: select -7 % -2;` -> -1."""
+    _assert_differential(tiny_repo, "SELECT -7 % -2 FROM blame")
+
+
+def test_modulo_real_operand_result_is_real(tiny_repo):
+    """`sqlite3: select 7.5 % 2, typeof(7.5 % 2);` -> 1.0|real. The
+    type-strict row comparison (`test_type_strict_comparison_catches_
+    bool_vs_int_mismatch` above) is what makes this differential case
+    also pin the storage class, not only the numeric value."""
+    _assert_differential(tiny_repo, "SELECT 7.5 % 2 FROM blame")
+
+
+def test_modulo_large_magnitude_real_operand_clamps_positive(tiny_repo):
+    """`sqlite3: select 1e19 % 7;` -> 0.0 - `1e19` clamps to int64 max
+    (`CAST(1e19 AS INTEGER)` = `9223372036854775807`) before the
+    remainder is computed, rather than converting exactly. Spelled as a
+    plain decimal (`10000000000000000000.0`), not `1e19` - scientific
+    notation does not lex yet (issue #6, out of scope here); both
+    spellings parse to the identical `float`, confirmed against
+    `sqlite3` directly."""
+    _assert_differential(tiny_repo, "SELECT 10000000000000000000.0 % 7 FROM blame")
+
+
+def test_modulo_large_magnitude_real_operand_clamps_negative(tiny_repo):
+    """`sqlite3: select -1e300 % 7;` -> -1.0 - clamps to int64 min.
+    Spelled as a plain 300-digit decimal for the same reason as the
+    positive case above - confirmed against `sqlite3` directly to
+    evaluate identically to `-1e300 % 7`."""
+    # "1" followed by 300 zeros, i.e. 1e300 spelled as a plain decimal
+    # (see the docstring above for why): built rather than hand-typed
+    # to keep the zero count visibly and provably exact.
+    _assert_differential(
+        tiny_repo, f"SELECT -1{'0' * 300}.0 % 7 FROM blame"
+    )
+
+
+def test_modulo_by_zero_is_null(tiny_repo):
+    """`sqlite3: select (7 % 0) is NULL;` -> 1 (TRUE)."""
+    _assert_differential(tiny_repo, "SELECT 7 % 0 FROM blame")
+
+
+def test_modulo_by_a_value_that_truncates_to_zero_is_null(tiny_repo):
+    """`sqlite3: select (7 % 0.5) is NULL;` -> 1 (TRUE): `0.5` truncates
+    to the integer `0` before the zero-divisor check runs, so this is a
+    zero-divisor case even though the literal written is not zero."""
+    _assert_differential(tiny_repo, "SELECT 7 % 0.5 FROM blame")
+
+
+def test_modulo_int64_min_by_negative_one_does_not_trap(tiny_repo):
+    """`sqlite3: select -9223372036854775808 % -1,
+    typeof(-9223372036854775808 % -1);` -> 0|integer - unlike `/`, this
+    does not overflow to REAL, since `%`'s result magnitude can never
+    exceed `abs(right)`."""
+    _assert_differential(tiny_repo, "SELECT -9223372036854775808 % -1 FROM blame")
+
+
+def test_modulo_text_operand_leading_prefix_coercion(tiny_repo):
+    """`sqlite3: select '7.5abc' % 2, typeof('7.5abc' % 2);` ->
+    1.0|real - the coerced prefix `7.5` has a decimal point, so the
+    result is REAL even though the operand's own storage class is
+    TEXT."""
+    _assert_differential(tiny_repo, "SELECT '7.5abc' % 2 FROM blame")
+
+
+def test_modulo_text_operand_sign_carries_through_coercion(tiny_repo):
+    """`sqlite3: select '-7abc' % 2;` -> -1 - the sign carries through
+    the leading-prefix coercion into the C-style remainder."""
+    _assert_differential(tiny_repo, "SELECT '-7abc' % 2 FROM blame")
+
+
+def test_modulo_null_left_operand(tiny_repo):
+    """`sqlite3: select NULL % 2;` -> NULL."""
+    _assert_differential(tiny_repo, "SELECT NULL % 2 FROM blame")
+
+
+def test_modulo_null_right_operand(tiny_repo):
+    """`sqlite3: select 2 % NULL;` -> NULL."""
+    _assert_differential(tiny_repo, "SELECT 2 % NULL FROM blame")
+
+
+def test_modulo_binds_tighter_than_addition(tiny_repo):
+    """`sqlite3: select 2 + 7 % 3;` -> 3, only possible as `2 + (7 %
+    3)`."""
+    _assert_differential(tiny_repo, "SELECT 2 + 7 % 3 FROM blame")
+
+
+def test_modulo_is_left_associative_with_multiplication(tiny_repo):
+    """`sqlite3: select 7 % 3 * 2;` -> 2, only possible as `(7 % 3) *
+    2`, left-associative within the shared multiplicative tier."""
+    _assert_differential(tiny_repo, "SELECT 7 % 3 * 2 FROM blame")
+
+
+def test_modulo_comparison_result_as_operand(tiny_repo):
+    """`sqlite3: select (1=1) % 2;` -> 1 - the same `coerce_to_value`
+    path issue #63 added for the other arithmetic operators."""
+    _assert_differential(tiny_repo, "SELECT (1=1) % 2 FROM blame")
+
+
+def test_modulo_in_where_position(tiny_repo):
+    """`%` filtering rows, not just computing a select-list value."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE line_no % 2 = 0")
+
+
+def test_modulo_in_order_by_position(tiny_repo):
+    """`%` as the `ORDER BY` sort key itself, selected at position 0 so
+    `assert_rows_match`'s tie-tolerant comparison has a concrete
+    position to check."""
+    _order(
+        tiny_repo,
+        "SELECT line_no % 3 FROM blame ORDER BY line_no % 3",
+        key_positions=(0,),
+    )
+
+
 # --- Float-to-text: precision and shape must survive a `%.15g` change --
 #
 # `blame` has no REAL column and the case set had no float literal
@@ -1007,12 +1150,22 @@ def test_group_by_two_columns_together(tiny_repo):
 
 
 def test_group_by_an_expression_not_a_bare_column(tiny_repo):
-    """historian has no `%` operator yet (issue #75 - not built by any
-    prior issue, and out of this issue's own file list) - `line_no + 1`
-    stands in for the same "GROUP BY on an expression" shape the
-    issue's own grooming used `line_no % 2` for."""
+    """`GROUP BY` on an expression, not just a bare column - `line_no +
+    1` covers the general "not a bare column" shape; the `%` operator
+    (issue #75) gets its own dedicated case immediately below, which is
+    the one grooming originally intended here."""
     _assert_differential(
         tiny_repo, "SELECT line_no + 1, count(*) FROM blame GROUP BY line_no + 1"
+    )
+
+
+def test_group_by_a_modulo_expression(tiny_repo):
+    """The `line_no % 2` case grooming originally intended for the test
+    above (issue #75), added alongside it rather than replacing it -
+    `%` needed the lexer/parser/evaluator work this issue does before
+    it could parse at all."""
+    _assert_differential(
+        tiny_repo, "SELECT line_no % 2, count(*) FROM blame GROUP BY line_no % 2"
     )
 
 

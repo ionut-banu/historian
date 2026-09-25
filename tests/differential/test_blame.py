@@ -1149,6 +1149,47 @@ def test_aggregate_avg_of_a_text_literal_leading_prefix(tiny_repo):
     _assert_differential(tiny_repo, "SELECT avg('3abc') FROM blame")
 
 
+# --- Aggregate sum/avg KBN compensated summation (issue #91) -----------
+#
+# `sum(0.1)`/`avg(0.1)` on `tiny_repo` do not reproduce the original bug
+# report (too few rows, or the wrong shape) - `awkward_repo` does,
+# confirmed live during grooming: its `blame` table's `line_no` column
+# is exactly `1,1,1,2,3,4,5,6,1,2,3,1` (12 rows), and `sum(0.1)` over 12
+# rows of the literal `0.1` lands on a bit pattern naive float
+# accumulation cannot reach. `sum(line_no * 0.1)` - the expression named
+# in the original bug report - is deliberately absent: checked live
+# during grooming, it does *not* diverge from naive on this fixture's
+# specific `line_no` values, so it would pass under the pre-#91 code
+# too and prove nothing.
+
+
+def test_aggregate_sum_of_a_repeated_real_literal_diverges_from_naive(awkward_repo):
+    """`sum(0.1)` over `awkward_repo`'s 12 rows reproduces the original
+    bug report exactly: confirmed live, `sqlite3` gives
+    `1.2000000000000002`, naive left-to-right float accumulation gives
+    `1.2` - a different bit pattern historian returned on `main` before
+    this issue."""
+    _assert_differential(awkward_repo, "SELECT sum(0.1) FROM blame")
+
+
+def test_aggregate_avg_of_a_repeated_real_literal_diverges_from_naive(awkward_repo):
+    """`avg(0.1)` over the same 12 rows: `sqlite3` gives
+    `0.10000000000000002`, naive gives `0.09999999999999999`."""
+    _assert_differential(awkward_repo, "SELECT avg(0.1) FROM blame")
+
+
+def test_aggregate_sum_of_line_no_plus_a_real_literal_diverges_from_naive(awkward_repo):
+    """`sum(line_no + 0.1)`: `sqlite3` gives `31.2`
+    (`0x1.f333333333333p+4`), naive gives `0x1.f333333333334p+4`."""
+    _assert_differential(awkward_repo, "SELECT sum(line_no + 0.1) FROM blame")
+
+
+def test_aggregate_sum_of_line_no_times_1_1_diverges_from_naive(awkward_repo):
+    """`sum(line_no * 1.1)`: `sqlite3` gives `33.0`
+    (`0x1.0800000000000p+5`), naive gives `0x1.0800000000001p+5`."""
+    _assert_differential(awkward_repo, "SELECT sum(line_no * 1.1) FROM blame")
+
+
 # --- Aggregate (issue #60): BindError cases, asserted directly ---------
 #
 # Unlike the section above, these never reach SQLite at all - historian

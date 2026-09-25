@@ -1257,6 +1257,254 @@ def test_sum_overflow_table_row_8_negative_overflow_with_a_real_suppresses_it():
     assert row[0] == float(_INT64_MIN) + -1.0 + 0.0
 
 
+# --- Aggregate sum/avg Kahan-Babuska-Neumaier compensated summation ----
+# (issue #91)
+#
+# `sum`/`avg` over REAL values (and over an integer running total that
+# has already left the exact `iSum` path) must match SQLite 3.51.0's
+# own KBN-compensated summation bit-for-bit - not `math.fsum`, not
+# Python's own compensated `sum()`, and not plain naive `float`
+# accumulation, all three of which the issue found disagreeing with
+# SQLite simultaneously on at least one row below (case I). Every
+# expected value is `sqlite3`'s own answer, obtained through Python's
+# bundled `sqlite3` module (3.50.4, matching `tests/differential/
+# conftest.py`'s oracle - never the system CLI, which is an Apple-
+# patched build that computes different bit patterns for exactly this
+# kind of adversarial float sum, per issue #93) and compared
+# bit-exact via `float.hex()`, never a tolerance-based `==` on the
+# printed decimal. Every "Required" row below also asserts that plain
+# left-to-right naive `float` accumulation (`total = 0.0; total +=
+# float(v)` per value, in row order) produces a *different* bit
+# pattern - proof the row actually exercises the fix rather than
+# passing by coincidence, per the issue's own verification table.
+
+
+def _naive_float_sum(values: Sequence) -> float:
+    """Plain left-to-right naive `float` accumulation, the specific
+    algorithm the issue's verification table diverges from - not
+    Python's own built-in `sum()`, which (3.12+) already runs a
+    compensated (Neumaier) summation internally and would coincide
+    with the fix on several rows below, silently proving nothing."""
+    total = 0.0
+    for v in values:
+        total += float(v)
+    return total
+
+
+def _sum_rows(values: Sequence) -> Row:
+    rows: list[Row] = [("a.py", v, "e") for v in values]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+    return row
+
+
+def _avg_rows(values: Sequence) -> Row:
+    rows: list[Row] = [("a.py", v, "e") for v in values]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("avg", _col("line_no"))]).rows())
+    return row
+
+
+def test_kbn_case_a_ten_copies_of_0_1_rounds_to_exactly_1():
+    """`0.1` x 10 -> `1.0` (`0x1.0000000000000p+0`) - the classic KBN
+    demo. Confirmed against `sqlite3` (bundled module)."""
+    values = [0.1] * 10
+    naive = _naive_float_sum(values)
+    assert naive.hex() == "0x1.fffffffffffffp-1"  # proves naive would fail here
+
+    row = _sum_rows(values)
+    assert type(row[0]) is float
+    assert row[0].hex() == "0x1.0000000000000p+0"
+    assert row[0] != naive
+
+
+def test_kbn_case_b_large_then_small_then_negated_large_cancels_exactly():
+    """`1e16, 1.0, -1e16` -> `1.0` - the case named in the original bug
+    report."""
+    values = [1e16, 1.0, -1e16]
+    naive = _naive_float_sum(values)
+    assert naive.hex() == "0x0.0p+0"
+
+    row = _sum_rows(values)
+    assert row[0].hex() == "0x1.0000000000000p+0"
+    assert row[0] != naive
+
+
+def test_kbn_case_c_real_integer_mix_large_then_small():
+    """`1e16, 3, 5, -1, -1, -1, -1e16` -> `5.0` - REAL/INTEGER mix,
+    large-then-small."""
+    values = [1e16, 3, 5, -1, -1, -1, -1e16]
+    naive = _naive_float_sum(values)
+    assert naive.hex() == "0x1.0000000000000p+3"
+
+    row = _sum_rows(values)
+    assert row[0].hex() == "0x1.4000000000000p+2"
+    assert row[0] != naive
+
+
+def test_kbn_case_d_integers_then_reals():
+    """`1, 2, 3, 4, 5, 0.1, 0.1, 0.1` -> `15.3`
+    (`0x1.e99999999999ap+3`) - integers then REALs. Python's built-in
+    `sum()` also gives the naive answer here (matches naive, not
+    sqlite3) - the exact trap the original bug report warned about,
+    which is why `_naive_float_sum` above is a hand-rolled loop and
+    not `sum(...)`."""
+    values = [1, 2, 3, 4, 5, 0.1, 0.1, 0.1]
+    naive = _naive_float_sum(values)
+    assert naive.hex() == "0x1.e999999999999p+3"
+    assert naive == sum(float(v) for v in values), (
+        "built-in sum() should coincide with the hand-rolled naive loop here, "
+        "confirming naive itself (not builtin sum) is what's being compared"
+    )
+
+    row = _sum_rows(values)
+    assert row[0].hex() == "0x1.e99999999999ap+3"
+    assert row[0] != naive
+
+
+def test_kbn_case_h_extreme_dynamic_range():
+    """`1e100, 1, 1, 1, 1, 1, -1e100` -> `5.0` - extreme dynamic
+    range."""
+    values = [1e100, 1, 1, 1, 1, 1, -1e100]
+    naive = _naive_float_sum(values)
+    assert naive.hex() == "0x0.0p+0"
+
+    row = _sum_rows(values)
+    assert row[0].hex() == "0x1.4000000000000p+2"
+    assert row[0] != naive
+
+
+def test_kbn_case_i_naive_kbn_and_fsum_are_three_distinct_bit_patterns():
+    """`1.2e6, -5.51e-6, 5.34e55, 4.22e21, -7.65e23, 8.9e57, -9.13e57,
+    5.55e0` -> `-1.7660000000000074e+56` (`-0x1.ccf28fdbfe1c2p+186`) -
+    naive, KBN, and `math.fsum` are three distinct bit patterns on this
+    one row (confirmed during grooming): `math.fsum` is the correctly-
+    rounded sum and is genuinely not what `sqlite3`'s `sum()` computes,
+    so it is not an acceptable substitute for the ported KBN steps even
+    though it is also compensated."""
+    import math
+
+    values = [1.2e6, -5.51e-6, 5.34e55, 4.22e21, -7.65e23, 8.9e57, -9.13e57, 5.55e0]
+    naive = _naive_float_sum(values)
+    fsum = math.fsum(values)
+    assert naive.hex() == "-0x1.ccf28fdbfe1c0p+186"
+    assert fsum.hex() == "-0x1.ccf28fdbfe1c3p+186"
+
+    row = _sum_rows(values)
+    assert row[0].hex() == "-0x1.ccf28fdbfe1c2p+186"
+    assert row[0] != naive
+    assert row[0] != fsum
+
+
+def test_kbn_avg_1_ten_copies_of_0_1():
+    """`avg(x)` over `0.1` x 10 -> `0.1` (`0x1.999999999999ap-4`)."""
+    values = [0.1] * 10
+    naive = _naive_float_sum(values) / len(values)
+    assert naive.hex() == "0x1.9999999999999p-4"
+
+    row = _avg_rows(values)
+    assert type(row[0]) is float
+    assert row[0].hex() == "0x1.999999999999ap-4"
+    assert row[0] != naive
+
+
+def test_kbn_avg_2_large_then_small_then_negated_large():
+    """`avg(x)` over `1e16, 1.0, -1e16` -> `0.3333333333333333`."""
+    values = [1e16, 1.0, -1e16]
+    naive = _naive_float_sum(values) / len(values)
+    assert naive.hex() == "0x0.0p+0"
+
+    row = _avg_rows(values)
+    assert row[0].hex() == "0x1.5555555555555p-2"
+    assert row[0] != naive
+
+
+def test_kbn_avg_3_near_2_53_avg_keeps_an_exact_integer_running_total():
+    """`avg(x)` over `9007199254740993, 1` (both plain integers, one
+    just past 2^53) -> `4503599627370497.0` (`0x1.0000000000001p+52`) -
+    the second bug this issue folds in: `avg` must keep an exact `iSum`
+    running total for as long as possible, the same way `sum` already
+    does, converting to `float` only once at `finish()` time (or at the
+    fold transition). The old bug cast every value to `float`
+    individually before accumulating (`self._avg_total +=
+    float(arithmetic_operand(value))`), which loses precision past
+    2^53 and gives `4503599627370496.0` instead - confirmed live
+    against `historian` on `main` (b59a7f2) before this issue."""
+    values = [9007199254740993, 1]
+    naive_cast_per_term = (float(values[0]) + float(values[1])) / len(values)
+    assert naive_cast_per_term == 4503599627370496.0
+
+    row = _avg_rows(values)
+    assert type(row[0]) is float
+    assert row[0] == 4503599627370497.0
+    assert row[0].hex() == "0x1.0000000000001p+52"
+    assert row[0] != naive_cast_per_term
+
+
+# --- Structural rows: state-machine fidelity, not required to diverge --
+# from naive (they don't) - included to prove the ported state machine
+# handles paths the precision rows above don't reach.
+
+
+def test_kbn_structural_f1_real_first_then_large_integer_exercises_stepint64_split():
+    """`0.1, 9223372036854775807` -> `9.223372036854776e+18` - REAL
+    first, then an integer >= 2^52 while `approx` is already set -
+    exercises `kahanBabuskaNeumaierStepInt64`'s split path."""
+    row = _sum_rows([0.1, 9223372036854775807])
+    assert row[0].hex() == "0x1.0000000000000p+63"
+
+
+def test_kbn_structural_f2_large_integer_first_then_real_exercises_init_split():
+    """`9223372036854775807, 0.1` -> `9.223372036854776e+18` - integer
+    >= 2^52 first (still on the exact path, no overflow - int64max
+    alone doesn't overflow int64), then REAL - exercises
+    `kahanBabuskaNeumaierInit`'s split path."""
+    row = _sum_rows([9223372036854775807, 0.1])
+    assert row[0].hex() == "0x1.0000000000000p+63"
+
+
+def test_kbn_structural_f3_negative_boundary_catches_truncating_remainder_bug():
+    """`-9223372036854775808, 0.5, 1` -> `-9.223372036854776e+18` - the
+    16384 remainder in `kahanBabuskaNeumaierStepInt64`/`Init` is C's
+    truncating `%`, which disagrees with Python's floored `%` for
+    negative operands; a naive Python port of `iVal % 16384` is wrong
+    for exactly this case and must be corrected. This is the row that
+    catches that mistake."""
+    row = _sum_rows([-9223372036854775808, 0.5, 1])
+    assert row[0].hex() == "-0x1.0000000000000p+63"
+
+
+def test_kbn_structural_g_overflow_then_real_does_not_raise():
+    """`9223372036854775807, 1, 1.5` -> `9.223372036854776e+18` -
+    overflow-then-REAL: confirms `ovrfl`'s equivalent (`_sum_overflowed
+    and not _sum_saw_non_integer`, issue #88's latch design, proven
+    equivalent to SQLite's live-clearing `ovrfl` mechanism by this
+    issue's own grooming) survives the KBN refactor - must not raise."""
+    row = _sum_rows([9223372036854775807, 1, 1.5])
+    assert row[0].hex() == "0x1.0000000000000p+63"
+
+
+# --- Regression: #88's overflow rule is unchanged by the KBN refactor --
+
+
+def test_kbn_refactor_preserves_88_overflow_rule_pure_integer_overflow_still_raises():
+    """Pure-integer overflow with no REAL ever seen still raises, after
+    the refactor that moved `sum`'s float path onto the KBN state
+    machine - the overflow gate itself (`_sum_overflowed and not
+    _sum_saw_non_integer`) is untouched by this issue."""
+    rows: list[Row] = [("a.py", _INT64_MAX, "e"), ("a.py", 1, "e")]
+    with pytest.raises(EvalError):
+        list(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+
+def test_kbn_refactor_preserves_88_overflow_rule_overflow_then_real_does_not_raise():
+    """Case G again, phrased as an explicit #88-rule regression rather
+    than a KBN-fidelity check: overflow followed by a REAL must not
+    raise."""
+    rows: list[Row] = [("a.py", _INT64_MAX, "e"), ("a.py", 1, "e"), ("a.py", 1.5, "e")]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+    assert type(row[0]) is float
+
+
 # --- Aggregate (issue #69): the grouped path --------------------------------
 #
 # Unit tests against synthetic rows, same rationale as the whole-table

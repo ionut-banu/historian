@@ -1217,3 +1217,69 @@ def test_limit_comma_form_error_position_is_the_comma():
         _parse(stmt_tokens_query)
     # The comma sits right after "LIMIT 3 " - column 33 (1-based).
     assert exc_info.value.position.column == stmt_tokens_query.index(",") + 1
+
+
+# --- DISTINCT (issue #78) --------------------------------------------------
+#
+# An optional `DISTINCT` keyword read immediately after `SELECT`,
+# before the select list - `SelectStatement.distinct`, a bare `bool`,
+# `False` when the keyword is absent. No new AST node: `DISTINCT` has
+# no operand of its own, it modifies the whole select list.
+
+
+def test_no_distinct_defaults_to_false():
+    stmt = _parse("SELECT path FROM blame")
+    assert stmt.distinct is False
+
+
+def test_distinct_keyword_sets_the_flag():
+    stmt = _parse("SELECT DISTINCT path FROM blame")
+    assert stmt.distinct is True
+
+
+def test_distinct_does_not_change_the_select_list_itself():
+    stmt = _parse("SELECT DISTINCT path, line_no FROM blame")
+    assert stmt.distinct is True
+    assert len(stmt.select_list) == 2
+
+
+def test_distinct_with_star():
+    stmt = _parse("SELECT DISTINCT * FROM blame")
+    assert stmt.distinct is True
+    assert isinstance(stmt.select_list[0].expr, Star)
+
+
+def test_distinct_combines_with_where_group_by_having_order_by_limit():
+    stmt = _parse(
+        "SELECT DISTINCT author_name FROM blame WHERE line_no > 0 "
+        "GROUP BY author_name HAVING count(*) > 1 ORDER BY author_name LIMIT 5"
+    )
+    assert stmt.distinct is True
+    assert stmt.where is not None
+    assert len(stmt.group_by) == 1
+    assert stmt.having is not None
+    assert len(stmt.order_by) == 1
+    assert stmt.limit is not None
+
+
+def test_distinct_position_is_still_the_select_keyword():
+    """`distinct` is a bare flag, not a node with its own position -
+    the statement's own `position` is unaffected, still the `SELECT`
+    keyword's, exactly like a `DISTINCT`-free query."""
+    with_distinct = _parse("SELECT DISTINCT path FROM blame")
+    without_distinct = _parse("SELECT path FROM blame")
+    assert with_distinct.position == without_distinct.position
+
+
+def test_distinct_missing_select_list_is_a_parse_error():
+    with pytest.raises(ParseError):
+        _parse("SELECT DISTINCT FROM blame")
+
+
+def test_distinct_written_twice_is_a_parse_error():
+    """`DISTINCT` is consumed at most once, immediately after
+    `SELECT` - a second `DISTINCT` is not a select-list expression, so
+    it falls through to `_parse_primary`'s generic "expected
+    expression" rejection."""
+    with pytest.raises(ParseError):
+        _parse("SELECT DISTINCT DISTINCT path FROM blame")

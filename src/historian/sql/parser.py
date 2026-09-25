@@ -9,17 +9,25 @@ dynamism applies just as much to the piece meant to translate to a
 Rust `match` later).
 
 Scope: issue #8, Part A; `GROUP BY`/`HAVING` added by #69;
-`ORDER BY` added by #61
+`ORDER BY` added by #61; `LIMIT`/`OFFSET` added by #77;
+`DISTINCT` added by #78
 -------------------------------------------------------------
 
-`DISTINCT`, `LIMIT`, `OFFSET`, any `JOIN`, and `CASE` are not
-implemented - see `sql/ast.py`'s module docstring. Ordinary SQL that
-uses them fails with a generic `ParseError` ("expected end of query"
-or similar), which is correct for now: naming the six §1 non-goals
-specifically (subqueries, CTEs, window functions,
-`UNION`/`INTERSECT`/`EXCEPT`, outer/cross joins, and would-be UDFs) by
-their own dedicated error is issue #24, not this module. This parser
-only ever raises `ParseError`.
+Any `JOIN` and `CASE` are not implemented - see `sql/ast.py`'s module
+docstring. Ordinary SQL that uses them fails with a generic
+`ParseError` ("expected end of query" or similar), which is correct
+for now: naming the six §1 non-goals specifically (subqueries, CTEs,
+window functions, `UNION`/`INTERSECT`/`EXCEPT`, outer/cross joins, and
+would-be UDFs) by their own dedicated error is issue #24, not this
+module. This parser only ever raises `ParseError`.
+
+`SELECT [DISTINCT] <select_list> ...` (issue #78): an optional
+`DISTINCT` keyword is read immediately after `SELECT`, before the
+select list - `parse_select_statement` just checks for the token with
+`self._match(TokenType.DISTINCT)` right after consuming `SELECT`
+itself, nowhere near the select list's own parsing or anything else
+in the grammar. `sql/ast.py`'s `SelectStatement.distinct` carries the
+result straight through, `False` when the keyword is absent.
 
 `GROUP BY <expr>, ...` and `HAVING <predicate>` (issue #69) parse
 after `WHERE` and before end-of-statement - `GROUP BY`'s list is
@@ -332,6 +340,7 @@ class _Parser:
 
     def parse_select_statement(self) -> SelectStatement:
         start = self._expect(TokenType.SELECT, "SELECT").position
+        distinct = self._match(TokenType.DISTINCT)
         select_list = self._parse_select_list()
         if self._check(TokenType.IDENTIFIER):
             # An identifier here, instead of `,` or `FROM`, is almost
@@ -383,6 +392,7 @@ class _Parser:
             limit=limit,
             offset=offset,
             position=start,
+            distinct=distinct,
         )
 
     def _parse_expr_list(self) -> tuple[Expr, ...]:

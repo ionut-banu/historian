@@ -1578,9 +1578,19 @@ def test_no_stray_float_calls_outside_the_named_exceptions():
     reverse the answer
     (`test_2_53_boundary_comparison_stays_exact_through_a_bound_column_ref`
     above is the *value* pin for this rule; this is the *code-level*
-    pin, so a future "tidy-up" cannot silently reintroduce a call the
-    value-level test happens not to exercise - matching how
-    `tests/test_values.py` pins the 2^53 case for `values.py`).
+    pin, matching how `tests/test_values.py` pins the 2^53 case for
+    `values.py`).
+
+    This code-level walk only catches an explicit `float(` call site
+    appearing somewhere it isn't allowed - it cannot see an *implicit*
+    float route, such as `math.trunc(left / right)`, which reaches the
+    same lossy division with no `float(` call anywhere in the source
+    for this walk to find. That route is instead caught by the
+    value-level `test_truncating_division_never_routes_through_float`,
+    which is the actual guard against it (re-verified live, issue
+    #50: replacing `_truncating_int_div`'s body with
+    `math.trunc(left / right)` passes this AST walk unchanged and is
+    only caught by that other test).
 
     Walks this module's own source with `ast`, and asserts every
     `float(` call site sits inside a function on an explicit allowlist

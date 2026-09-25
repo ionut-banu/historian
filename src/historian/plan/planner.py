@@ -72,6 +72,7 @@ from collections.abc import Sequence
 from historian.exec.operators import (
     Aggregate,
     AggregateCall,
+    Distinct,
     Filter,
     Limit,
     Operator,
@@ -366,17 +367,26 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory] 
     swapped for a fake in tests with no repository and no git
     subprocess, per this module's own docstring.
 
-    Tree shape, per `_docs/spec.md` §3 and issue #77's own acceptance
-    criteria (extending #61's/#69's): `Scan -> Filter (WHERE) ->
+    Tree shape, per `_docs/spec.md` §3 and issue #78's own acceptance
+    criteria (extending #61's/#69's/#77's): `Scan -> Filter (WHERE) ->
     Aggregate (grouped or whole-table) -> Filter (HAVING) -> Sort ->
-    Project -> Limit`. `Limit` is the new outermost operator, inserted
-    only when `stmt.limit is not None` - `stmt.offset` defaults to 0
-    when absent (`OFFSET` cannot appear without `LIMIT` per §1's
-    grammar, so there is no case of `Limit` present for `OFFSET`
-    alone). It wraps `Project` unconditionally rather than being
-    inserted anywhere below it - issue #77's own tree-placement
-    decision, which leaves `DISTINCT`'s future slot ("12c") between
-    `Project` and `Limit` for whenever that operator is built.
+    Project -> Distinct -> Limit`. `Limit` is the new outermost
+    operator, inserted only when `stmt.limit is not None` - `stmt.
+    offset` defaults to 0 when absent (`OFFSET` cannot appear without
+    `LIMIT` per §1's grammar, so there is no case of `Limit` present
+    for `OFFSET` alone). It wraps `Project` (and, when present,
+    `Distinct`) unconditionally rather than being inserted anywhere
+    below either - issue #77's own tree-placement decision, which left
+    exactly this slot ("12c") between `Project` and `Limit` for
+    `Distinct` to fill. `Distinct` (issue #78) is inserted directly
+    above `Project`, whenever `stmt.distinct` is `True` - `Sort`'s own
+    placement is unchanged by this (still directly below `Project`,
+    #61's own decision): `_docs/decisions.md` records why sorting the
+    wider, pre-`Project` row set and only then projecting and
+    deduplicating in a streaming, order-preserving pass gives the same
+    answer as sorting the narrower, deduplicated set, for every
+    `ORDER BY` shape `sql/binder.py`'s own DISTINCT narrowing still
+    allows to bind.
     `Aggregate` (and, above it, `HAVING`'s `Filter`) is inserted only
     when the query needs it - `stmt.group_by` is non-empty, or the
     aggregate/scalar split (`_split_select_list`/`_split_expr`, run
@@ -440,6 +450,9 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory] 
         tree = Sort(tree, order_keys)
 
     tree = Project(tree, select_list)
+
+    if stmt.distinct:
+        tree = Distinct(tree)
 
     if stmt.limit is not None:
         offset = stmt.offset if stmt.offset is not None else 0

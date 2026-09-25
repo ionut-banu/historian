@@ -1,10 +1,10 @@
 """The operator layer: `Scan`, `Filter`, `Project`, `Aggregate`,
-`Sort`, `Limit`.
+`Sort`, `Limit`, `Distinct`.
 
 Issue #34 (spec §6 M2 item 8b) built `Scan`/`Filter`/`Project`. `Sort`
-(issue #61) and `Limit` (issue #77) are the fifth and sixth of phase
-1's seven operators (`Distinct` remains out of scope, filed as its own
-follow-on issue, "12c") - plus, at this layer, two rules §3 states
+(issue #61), `Limit` (issue #77) and `Distinct` (issue #78) are the
+fifth, sixth and seventh - the last - of phase 1's seven operators -
+plus, at this layer, two rules §3 states
 elsewhere and this is where they are actually enforced: "Expression
 evaluation" (every predicate and select-list expression goes through
 `exec/expression.py`'s `evaluate(expr, row, schema)`, #12, merged) and
@@ -96,6 +96,7 @@ from historian.sql.lexer import Position
 __all__ = [
     "Aggregate",
     "AggregateCall",
+    "Distinct",
     "Filter",
     "Limit",
     "Operator",
@@ -705,3 +706,64 @@ class Limit:
                 # keeps the total pull count at exactly `offset +
                 # limit`, never `offset + limit + 1`.
                 return
+
+
+# --- Distinct (issue #78) ----------------------------------------------------
+#
+# `_docs/spec.md` §3's `Distinct` operator: `SELECT DISTINCT`. Sits
+# directly above `Project` (`plan/planner.py`'s job to place it there,
+# in the slot #77's own design reserved) - `Distinct` dedups
+# *projected* output rows, never the wider pre-`Project` row `Sort`
+# (below `Project`, unmoved by this issue - see `_docs/decisions.md`
+# for why that placement still gives the right answer once `sql/
+# binder.py`'s own DISTINCT/ORDER BY narrowing is in place) sorts by.
+
+
+class Distinct:
+    """`SELECT DISTINCT` (spec §3): yields every row of `child` the
+    first time its dedup key is seen, and never again.
+
+    Two key tuples are the same dedup group under SQL equality, not
+    Python `==` - `tuple(values.order_key(value) for value in row)` is
+    exactly the per-column key `Aggregate`'s own grouped path
+    (`exec/operators.py`'s `Aggregate.rows()`) already builds to group
+    by SQL equality rather than Python's: `NULL`s are equal to each
+    other and form one group, `1` and `1.0` merge into one group (the
+    first-encountered representative is what gets yielded), and `'1'`
+    (`TEXT`) stays its own group, never merging with numeric `1`
+    (`values.order_key`'s own storage-class ranking keeps them apart).
+
+    Streams: pulls one row at a time from `child` and yields it
+    immediately the first time its key is new, holding only the
+    growing set of already-seen keys in memory - unlike `Sort`, it
+    never materializes `child.rows()` up front. This also gives
+    determinism for free: first-seen order is exactly the order rows
+    arrive from `child`, which is already fixed by everything below it
+    (`Scan`/`Filter`/`Aggregate` never reorder; `Sort`, when present,
+    reorders deterministically via its own stable, per-key contract;
+    `Project` is a 1-in-1-out, order-preserving generator).
+
+    Which row a group of duplicates keeps is moot and needs no design
+    of its own, let alone a test that could observe it: `Distinct`
+    groups by the *entire* output row, so two rows sharing a dedup key
+    are, by construction, identical in every column - there is no
+    other row's value that could leak through regardless of which one
+    happens to be first.
+    """
+
+    def __init__(self, child: Operator) -> None:
+        self._child = child
+        # DISTINCT can only remove rows, never add, rename, or retype
+        # a column - the output schema is exactly the child's, the
+        # same reasoning `Filter`'s own schema assignment already
+        # uses.
+        self.schema = child.schema
+
+    def rows(self) -> Iterator[Row]:
+        seen: set[tuple[object, ...]] = set()
+        for row in self._child.rows():
+            key = tuple(values.order_key(value) for value in row)
+            if key in seen:
+                continue
+            seen.add(key)
+            yield row

@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
-from historian.exec.operators import Aggregate, Filter, Limit, Project, Scan, Sort
+from historian.exec.operators import Aggregate, Distinct, Filter, Limit, Project, Scan, Sort
 from historian.plan.planner import TABLES, plan
 from historian.schema import Column, ColumnType, Row, Schema
 from historian.sql.ast import BinaryOp, FunctionCall, Literal, OrderDirection, Operator as Op, Star
@@ -69,6 +69,7 @@ def _stmt(
     order_by=(),
     limit=None,
     offset=None,
+    distinct=False,
 ) -> BoundSelectStatement:
     return BoundSelectStatement(
         select_list=tuple(select_list),
@@ -80,6 +81,7 @@ def _stmt(
         limit=limit,
         offset=offset,
         position=_POS,
+        distinct=distinct,
     )
 
 
@@ -877,3 +879,142 @@ def test_limit_offset_through_the_real_parser_and_binder_and_planner():
 
     assert isinstance(tree, Limit)
     assert list(tree.rows()) == [("y",), ("z",)]
+
+
+# --- DISTINCT (issue #78) --------------------------------------------------
+#
+# `Distinct` is inserted directly above `Project` whenever `stmt.
+# distinct` is `True` - the slot #77's own design reserved, between
+# `Project` and `Limit`. `Sort`'s own placement is unaffected: still
+# directly below `Project`, unmoved by this issue.
+
+
+def test_plan_with_distinct_inserts_distinct_directly_above_project():
+    source = _FakeSource([("a.py", 1, "ana@x.com"), ("a.py", 1, "ana@x.com")])
+    stmt = _stmt([_select_item(_col("path"))], distinct=True)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Distinct)
+    assert isinstance(tree._child, Project)
+    assert isinstance(tree._child._child, Scan)
+
+
+def test_plan_without_distinct_never_builds_distinct():
+    source = _FakeSource([("a.py", 1, "ana@x.com")])
+    stmt = _stmt([_select_item(_col("path"))])
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Project)
+    assert not isinstance(tree, Distinct)
+
+
+def test_plan_distinct_sits_below_limit_and_above_project():
+    """`SELECT DISTINCT path FROM widgets LIMIT 1`: `Limit(Distinct(
+    Project(Scan(...), select_list)), limit=1)` - `Distinct` fills the
+    slot #77's own design reserved between `Project` and `Limit`."""
+    source = _FakeSource([("a.py", 1, "ana@x.com"), ("a.py", 1, "ana@x.com")])
+    stmt = _stmt([_select_item(_col("path"))], distinct=True, limit=1)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Limit)
+    assert isinstance(tree._child, Distinct)
+    assert isinstance(tree._child._child, Project)
+    assert isinstance(tree._child._child._child, Scan)
+
+
+def test_plan_distinct_sits_above_sort_and_project_when_order_by_present():
+    """`Sort`'s own placement is unchanged (still directly below
+    `Project`, #61's own decision) - `Distinct` sits above `Project`,
+    which sits above `Sort`."""
+    source = _FakeSource([("b.py", 1, "ana@x.com"), ("a.py", 2, "bo@x.com")])
+    stmt = _stmt(
+        [_select_item(_col("path"))],
+        distinct=True,
+        order_by=[_order_item(_col("path"))],
+    )
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Distinct)
+    assert isinstance(tree._child, Project)
+    assert isinstance(tree._child._child, Sort)
+    assert isinstance(tree._child._child._child, Scan)
+
+
+def test_plan_distinct_produces_deduplicated_rows_end_to_end():
+    rows = [("a.py", 1, "e"), ("a.py", 1, "e"), ("b.py", 2, "e")]
+    source = _FakeSource(rows)
+    stmt = _stmt([_select_item(_col("path"))], distinct=True)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert list(tree.rows()) == [("a.py",), ("b.py",)]
+
+
+def test_plan_distinct_with_limit_produces_correctly_truncated_deduplicated_rows():
+    """DISTINCT applies before LIMIT/OFFSET - three duplicate-collapsed
+    rows exist, but LIMIT 2 only keeps the first two of *those*."""
+    rows = [
+        ("a.py", 1, "e"),
+        ("a.py", 1, "e"),
+        ("b.py", 2, "e"),
+        ("c.py", 3, "e"),
+    ]
+    source = _FakeSource(rows)
+    stmt = _stmt([_select_item(_col("path"))], distinct=True, limit=2)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert list(tree.rows()) == [("a.py",), ("b.py",)]
+
+
+def test_plan_distinct_collapses_rows_that_only_became_equal_after_projection():
+    """`DISTINCT` dedups the *projected* row, not the wider pre-Project
+    row - two source rows differing only in a column absent from the
+    select list collapse into one output row."""
+    rows = [("a.py", 1, "ana@x.com"), ("a.py", 2, "bo@x.com")]
+    source = _FakeSource(rows)
+    stmt = _stmt([_select_item(_col("path"))], distinct=True)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert list(tree.rows()) == [("a.py",)]
+
+
+def test_distinct_through_the_real_parser_and_binder_and_planner():
+    """The full, real pipeline - `tokenize -> parse -> bind -> plan ->
+    tree.rows()` - rather than a hand-built `BoundSelectStatement`,
+    matching `test_limit_offset_through_the_real_parser_and_binder_
+    and_planner`'s own convention for issue #77."""
+    schema = Schema(columns=(Column("a", ColumnType.TEXT),))
+    rows: list[Row] = [("x",), ("x",), ("y",)]
+    source = _FakeSource(rows)
+    source.schema = schema
+
+    stmt = parse(tokenize("SELECT DISTINCT a FROM t"))
+    bound = bind(stmt, catalog={"t": schema})
+    tree = plan(bound, Path("/nonexistent"), tables={"t": lambda repo: source})
+
+    assert isinstance(tree, Distinct)
+    assert list(tree.rows()) == [("x",), ("y",)]
+
+
+def test_distinct_with_order_by_and_limit_through_the_real_pipeline_end_to_end():
+    """The interleaving case this issue's own grooming verified live
+    against sqlite3: `SELECT DISTINCT p, m FROM t3 ORDER BY m` over
+    `('b',2),('b',2),('a',1),('a',1),('a',3)` gives `a|1, b|2, a|3` -
+    correctly interleaved even though the two `a` rows are not
+    adjacent in the input and `p`'s own groups are not contiguous."""
+    schema = Schema(columns=(Column("p", ColumnType.TEXT), Column("m", ColumnType.INTEGER)))
+    rows: list[Row] = [("b", 2), ("b", 2), ("a", 1), ("a", 1), ("a", 3)]
+    source = _FakeSource(rows)
+    source.schema = schema
+
+    stmt = parse(tokenize("SELECT DISTINCT p, m FROM t3 ORDER BY m"))
+    bound = bind(stmt, catalog={"t3": schema})
+    tree = plan(bound, Path("/nonexistent"), tables={"t3": lambda repo: source})
+
+    assert list(tree.rows()) == [("a", 1), ("b", 2), ("a", 3)]

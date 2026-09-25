@@ -1123,6 +1123,25 @@ def test_avg_over_mixed_integer_and_text_uses_leading_prefix_coercion():
     assert type(row[0]) is float
 
 
+def test_avg_of_non_whole_string_text_uses_leading_prefix_not_whole_string_affinity():
+    """`avg('3abc')` over three rows is `3.0` - confirmed against
+    `sqlite3`. The distinguishing case for `avg`, mirroring `sum`'s own
+    `test_sum_of_non_whole_string_text_becomes_real_via_leading_prefix`
+    above: `'3abc'` fails `try_numeric_affinity`'s whole-string
+    classification, so a mutant that ran `avg` through that
+    classification instead of `arithmetic_operand`'s leading-prefix
+    coercion would treat it as wholly non-numeric and contribute `0`
+    per row (`avg` = `0.0`), not `3` per row (`avg` = `3.0`) - the two
+    schemes disagree here even though both treat clean whole-string
+    integers and fully non-numeric text (`'abc'`) identically, which is
+    why those cases alone (the tests above) cannot tell them apart."""
+    rows: list[Row] = [("a.py", "3abc", "e"), ("a.py", "3abc", "e"), ("a.py", "3abc", "e")]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("avg", _col("line_no"))]).rows())
+
+    assert row == (3.0,)
+    assert type(row[0]) is float
+
+
 def test_distinct_sum_coerces_only_after_the_dedup_check_not_before():
     """`sum(DISTINCT x)` over raw values `'3'`, `3` (one row each) is
     `6`, `type` `int`, and `count(DISTINCT x)` over the same is `2` -

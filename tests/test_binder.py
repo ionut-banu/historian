@@ -721,6 +721,63 @@ def test_two_aggregate_calls_in_one_query_bind_successfully():
     assert bound.select_list[0].expr is not None
 
 
+# --- Aggregate DISTINCT (issue #84) ------------------------------------
+#
+# The settled design needs no new binder logic at all: `_validate_
+# function_call`'s existing name/arity checks already cover every case
+# `DISTINCT` can interact with, and `call.distinct` passes through
+# `_bind_expr`'s existing `dataclasses.replace(expr, args=...)`
+# unchanged. These tests confirm that rather than add anything new.
+
+
+def test_distinct_aggregate_call_binds_successfully_and_keeps_the_flag():
+    """`SELECT count(DISTINCT line_no) FROM blame` binds like any other
+    aggregate call, and the bound `FunctionCall` still carries
+    `distinct=True` - `_bind_expr`'s `dataclasses.replace` only
+    touches `args`, so every other field, including `distinct`,
+    survives unchanged."""
+    bound = _bind("SELECT count(DISTINCT line_no) FROM blame")
+    call = bound.select_list[0].expr
+    assert isinstance(call, FunctionCall)
+    assert call.distinct is True
+
+
+def test_non_distinct_aggregate_call_keeps_the_flag_false():
+    bound = _bind("SELECT count(line_no) FROM blame")
+    call = bound.select_list[0].expr
+    assert isinstance(call, FunctionCall)
+    assert call.distinct is False
+
+
+def test_count_distinct_two_arguments_is_still_an_arity_error():
+    """`count(DISTINCT a, b)` fails via the pre-existing `>1 argument`
+    branch, unrelated to `DISTINCT` - confirmed live against `sqlite3`:
+    identical rejection (differently worded) to plain `count(a, b)`."""
+    with pytest.raises(BindError):
+        _bind("SELECT count(DISTINCT path, line_no) FROM blame")
+
+
+def test_unknown_function_name_with_distinct_is_still_a_bind_error():
+    """`nonexistent_fn(DISTINCT path)` - the existing unknown-name
+    check fires first, unaffected by whether `DISTINCT` was written,
+    exactly like a hypothetical future scalar function would need to
+    decide separately (out of this issue's scope, per its own
+    grooming)."""
+    with pytest.raises(BindError) as exc_info:
+        _bind("SELECT nonexistent_fn(DISTINCT path) FROM blame")
+    assert "nonexistent_fn" in str(exc_info.value)
+
+
+def test_min_max_distinct_bind_successfully_with_the_flag_set():
+    """`min`/`max(DISTINCT x)` are accepted syntactically at bind time
+    even though the accumulator never consults the flag for these two
+    - see `exec/operators.py`'s `_Accumulator`."""
+    bound = _bind("SELECT min(DISTINCT line_no), max(DISTINCT line_no) FROM blame")
+    min_call, max_call = (item.expr for item in bound.select_list)
+    assert isinstance(min_call, FunctionCall) and min_call.distinct is True
+    assert isinstance(max_call, FunctionCall) and max_call.distinct is True
+
+
 # --- No git, no subprocess needed to exercise this module --------------------
 
 

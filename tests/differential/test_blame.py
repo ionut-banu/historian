@@ -25,6 +25,7 @@ from collections.abc import Iterator, Sequence
 
 import pytest
 
+from historian.exec.expression import EvalError
 from historian.exec.operators import ScanSource
 from historian.plan.planner import ScanFactory
 from historian.schema import Row
@@ -2284,14 +2285,231 @@ def test_where_select_list_still_cannot_see_its_own_alias(tiny_repo):
         run_historian("SELECT path AS x, x FROM blame", tiny_repo)
 
 
-def test_like_escape_is_a_parse_error(tiny_repo):
-    """#51: SQLite supports `LIKE ... ESCAPE` - confirmed: `sqlite3
-    :memory: "select '100%' like '100|%' escape '|';"` -> `1`.
-    historian's lexer/parser has no `ESCAPE` clause at all and fails
-    with a `ParseError` ("expected FROM, found identifier 'ESCAPE'"),
-    not an "unsupported feature" error."""
-    with pytest.raises(ParseError):
-        run_historian("SELECT path FROM blame WHERE path LIKE '100|%' ESCAPE '|'", tiny_repo)
+# --- LIKE ... ESCAPE (issue #51) ----------------------------------------
+#
+# Replaces test_like_escape_is_a_parse_error above: ESCAPE is now
+# implemented, so there is no longer a single query to pin as a parse
+# error - see _docs/decisions.md, 2026-09-25, for the full grooming
+# and implementation record, and tests/test_expression.py's own
+# "LIKE ... ESCAPE" section for the sqlite3-verified value behind each
+# case below (every value here was independently re-confirmed against
+# sqlite3 3.51.0 during this issue's own work).
+
+
+def test_where_like_escape_matches_a_real_path_column(tiny_repo):
+    """A path-shaped case, not just a literal-vs-literal comparison -
+    `src/utils.py` is a real post-rename path in `tiny_repo` at HEAD.
+    The `ESCAPE` clause has nothing to escape here; this proves the
+    clause parses, binds (nothing to bind - see the decisions.md entry
+    on why `Like.escape` itself is never bound), and evaluates
+    end-to-end against a real column, not just against a bare string
+    literal select-list item."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE path LIKE 'src/utils.py' ESCAPE '!'")
+
+
+def test_where_not_like_escape_excludes_a_real_path_column(tiny_repo):
+    """The complement of the case above, `NOT LIKE ... ESCAPE` against
+    a real column."""
+    _assert_differential(
+        tiny_repo, "SELECT path FROM blame WHERE path NOT LIKE 'src/utils.py' ESCAPE '!'"
+    )
+
+
+def test_like_escape_basic_percent_escaping(tiny_repo):
+    """sqlite3: `select '10%' like '10!%' escape '!';` -> 1 (a literal
+    `%`, not a wildcard)."""
+    _assert_differential(tiny_repo, "SELECT '10%' LIKE '10!%' ESCAPE '!' FROM blame")
+
+
+def test_like_escape_basic_underscore_escaping(tiny_repo):
+    """sqlite3: `select 'a_b' like 'a!_b' escape '!';` -> 1 (a literal
+    `_`, not the single-character wildcard)."""
+    _assert_differential(tiny_repo, "SELECT 'a_b' LIKE 'a!_b' ESCAPE '!' FROM blame")
+
+
+def test_like_escape_escaping_the_escape_character_itself(tiny_repo):
+    """sqlite3: `select 'a!b' like 'a!!b' escape '!';` -> 1 - pattern
+    `a!!b` with escape `!` means literal `a`, literal `!`, literal
+    `b`."""
+    _assert_differential(tiny_repo, "SELECT 'a!b' LIKE 'a!!b' ESCAPE '!' FROM blame")
+
+
+def test_like_escape_at_end_of_pattern_is_unsatisfiable(tiny_repo):
+    """sqlite3: `select 'a!' like 'a!' escape '!';` -> 0, even though
+    the two strings are byte-identical - a trailing escape character
+    with nothing after it makes the pattern impossible to match, not a
+    literal `!` and not an error."""
+    _assert_differential(tiny_repo, "SELECT 'a!' LIKE 'a!' ESCAPE '!' FROM blame")
+
+
+def test_like_escape_before_an_ordinary_character_is_a_no_op(tiny_repo):
+    """sqlite3: `select 'ab' like 'a!b' escape '!';` -> 1 - escaping a
+    character that needed no escaping is a no-op, matching it
+    literally."""
+    _assert_differential(tiny_repo, "SELECT 'ab' LIKE 'a!b' ESCAPE '!' FROM blame")
+
+
+@pytest.mark.parametrize(
+    "text,pattern,escape",
+    [
+        # Escape-character recognition is case-sensitive / exact
+        # codepoint, independent of LIKE's own ASCII fold of the
+        # matched text - all four probes confirmed live against
+        # sqlite3: 0, 1, 0, 0 respectively.
+        ("a%b", "axb", "X"),  # lowercase x != uppercase escape X -> 0
+        ("aXb", "axb", "X"),  # pattern's x stays ordinary, ASCII-folds -> 1
+        ("a%b", "aXb", "x"),  # uppercase X != lowercase escape x -> 0
+        ("a%b", "ax%b", "X"),  # x not recognised as X; % stays a wildcard -> 0
+    ],
+)
+def test_like_escape_recognition_is_case_sensitive_not_ascii_folded(
+    tiny_repo, text, pattern, escape
+):
+    _assert_differential(
+        tiny_repo, f"SELECT '{text}' LIKE '{pattern}' ESCAPE '{escape}' FROM blame"
+    )
+
+
+def test_not_like_escape_composes_with_negation(tiny_repo):
+    """sqlite3: `select '10x' not like '10!%' escape '!';` -> 1."""
+    _assert_differential(tiny_repo, "SELECT '10x' NOT LIKE '10!%' ESCAPE '!' FROM blame")
+
+
+def test_like_escape_null_escape_operand_is_null(tiny_repo):
+    """sqlite3: `select typeof('10%' LIKE '10!%' ESCAPE NULL);` ->
+    `null`, no error - the NULL check on the escape operand comes
+    before the single-character length check."""
+    _assert_differential(tiny_repo, "SELECT '10%' LIKE '10!%' ESCAPE NULL FROM blame")
+
+
+def test_like_escape_operand_is_an_arbitrary_expression(tiny_repo):
+    """#63's coercion applies to the escape operand exactly as it
+    already does for left/pattern: `ESCAPE (1=1)` reads as the text
+    `'1'`. sqlite3: `select '10%' LIKE '10!%' ESCAPE (1=1);` -> 0 and
+    `select '10%' LIKE '101%' ESCAPE (1=1);` -> 0 - neither is a parse
+    error, both run to a real (FALSE) answer, confirming the escape
+    operand is not restricted to a `STRING` literal token."""
+    _assert_differential(tiny_repo, "SELECT '10%' LIKE '10!%' ESCAPE (1=1) FROM blame")
+    _assert_differential(tiny_repo, "SELECT '10%' LIKE '101%' ESCAPE (1=1) FROM blame")
+
+
+@pytest.mark.parametrize("bad_escape", ["", "!!"])
+def test_like_escape_invalid_length_raises_eval_error(tiny_repo, bad_escape):
+    """sqlite3's own wording, reused verbatim: `ESCAPE expression must
+    be a single character` - identical for both an empty and a 2+
+    character escape. The check is a runtime EvalError, only reachable
+    once the query is actually evaluated - it never raises during
+    tokenize/parse/bind, which `run_historian` exercises unconditionally
+    before the row generator (that this raises at all proves it is
+    reached at evaluation, not parse/bind, time)."""
+    with pytest.raises(EvalError) as excinfo:
+        run_historian(f"SELECT path FROM blame WHERE path LIKE 'a' ESCAPE '{bad_escape}'", tiny_repo)
+    assert "ESCAPE expression must be a single character" in str(excinfo.value)
+
+
+def test_like_escape_non_ascii_multibyte_single_codepoint_escape(tiny_repo):
+    """"Single character" is Unicode code points, not UTF-8 bytes -
+    sqlite3: `select length('😀');` -> 1 although `😀` is 4 bytes.
+    Confirmed both directions: `select '10😀%' LIKE '10😀é%' ESCAPE
+    '😀';` -> 0 and `select '10%' LIKE '10😀%' ESCAPE '😀';` -> 1."""
+    _assert_differential(tiny_repo, "SELECT '10😀%' LIKE '10😀é%' ESCAPE '😀' FROM blame")
+    _assert_differential(tiny_repo, "SELECT '10%' LIKE '10😀%' ESCAPE '😀' FROM blame")
+
+
+# --- LIKE ... ESCAPE and AND/OR short-circuit (issue #51, widened by --
+# --- the orchestrator's correction on this issue) -----------------------
+#
+# SQLite evaluates AND/OR left to right and stops early; ESCAPE is the
+# first expression that can raise at runtime, so this becomes visible
+# for the first time here. Confirmed live with the toy table the
+# orchestrator's own correction used; re-confirmed below with real
+# `blame` rows.
+#
+# One real-data subtlety, found and verified live while writing these
+# cases, that the toy-table example does not surface: the left and
+# right operand below must be **different columns**. SQLite has a
+# genuinely separate optimization - constant propagation - that
+# rewrites `col = 'const' AND col LIKE ...` (the *same* TEXT-affinity
+# column compared to a literal on both sides) by substituting the
+# constant into the LIKE before the AND's short-circuit even gets a
+# chance to apply, so it raises regardless of operand order once `col`
+# has a declared TEXT affinity (confirmed live: `create table t(p
+# text); insert into t values('a'),('b'),('c'); select p from t where p
+# = 'zzz' and p like 'a' escape 'ab';` raises, where the exact same
+# query against an *undeclared*-affinity `create table t(p)` does not -
+# affinity is what gates the optimization). `blame.path` is a real
+# TEXT column, so a same-column version of this case would be testing
+# SQLite's constant-propagation optimizer, not AND/OR short-circuit,
+# and would be a false negative for historian (which implements no such
+# optimizer and is not asked to). Using `author_name` on the left and
+# `path` on the right - two unrelated columns - sidesteps that
+# optimization entirely (confirmed live against a `blame`-shaped table)
+# and isolates the thing this issue actually changed: per-row
+# left-to-right AND/OR evaluation order, not query-plan rewriting. This
+# is exactly the same category of "known difference, not replicated" as
+# the constant-folding entry in `_docs/decisions.md`'s 2026-09-25 entry
+# - it is recorded there, not repeated per test.
+
+
+def test_and_short_circuits_real_columns_false_left_no_error(tiny_repo):
+    """`author_name = '<nonexistent>'` is FALSE for every row, so the
+    ESCAPE-poisoned right operand of AND (on the unrelated `path`
+    column) never runs for any row and the query returns 0 rows with
+    no error - matching sqlite3. Confirmed live against a
+    `blame`-shaped table with these two columns."""
+    _assert_differential(
+        tiny_repo,
+        "SELECT path FROM blame WHERE author_name = 'no-such-author' AND path LIKE 'a' ESCAPE 'ab'",
+    )
+
+
+def test_and_does_not_short_circuit_real_columns_true_left_raises(tiny_repo):
+    """`author_name = 'Ana Petrova'` is TRUE for at least one real row
+    in `tiny_repo` (a real author in this fixture), so AND does not
+    short-circuit for that row and the invalid-length ESCAPE on `path`
+    raises - matching sqlite3's own `where p = 'zzz' and p like 'a'
+    escape 'ab'` -> 0 rows vs `where p like 'a' escape 'ab' and p =
+    'zzz'` -> Error shape, but with a left operand genuinely TRUE for
+    some rows rather than always FALSE."""
+    with pytest.raises(EvalError):
+        run_historian(
+            "SELECT path FROM blame WHERE author_name = 'Ana Petrova' AND path LIKE 'a' ESCAPE 'ab'",
+            tiny_repo,
+        )
+
+
+def test_and_left_operand_being_the_poison_always_raises_regardless_of_data(tiny_repo):
+    """The ESCAPE-poisoned expression on the *left* of AND is evaluated
+    first, unconditionally, for every row - it always raises, whatever
+    the row's data happens to be."""
+    with pytest.raises(EvalError):
+        run_historian(
+            "SELECT path FROM blame WHERE path LIKE 'a' ESCAPE 'ab' AND author_name = 'Ana Petrova'",
+            tiny_repo,
+        )
+
+
+def test_or_short_circuits_real_columns_true_left_no_error(tiny_repo):
+    """`author_name = author_name` is TRUE for every row (a self-
+    comparison, not a constant - so SQLite's constant-propagation
+    optimizer above does not apply to it), so OR short-circuits for
+    every row and the ESCAPE-poisoned right operand (`path`) never
+    runs. Confirmed live against a `blame`-shaped table."""
+    _assert_differential(
+        tiny_repo,
+        "SELECT path FROM blame WHERE author_name = author_name OR path LIKE 'a' ESCAPE 'ab'",
+    )
+
+
+def test_or_does_not_short_circuit_real_columns_false_left_raises(tiny_repo):
+    """`author_name <> author_name` is FALSE for every row, so OR does
+    not short-circuit and the ESCAPE-poisoned `path` operand raises for
+    every row."""
+    with pytest.raises(EvalError):
+        run_historian(
+            "SELECT path FROM blame WHERE author_name <> author_name OR path LIKE 'a' ESCAPE 'ab'",
+            tiny_repo,
+        )
 
 
 # --- Fixed by this issue: a digit run glued to an identifier (#22) -----

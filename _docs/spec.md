@@ -72,8 +72,8 @@ LIMIT    <n> [OFFSET <n>]
 ```
 
 Expressions: column references, literals, `AND`/`OR`/`NOT`, comparison
-operators, `LIKE`, `IN`, `BETWEEN`, `IS NULL`/`IS NOT NULL`, arithmetic,
-string concatenation, `CASE`.
+operators, `LIKE [ESCAPE <expr>]`, `IN`, `BETWEEN`, `IS NULL`/`IS NOT
+NULL`, arithmetic, string concatenation, `CASE`.
 
 Aggregates: `count`, `sum`, `avg`, `min`, `max`.
 

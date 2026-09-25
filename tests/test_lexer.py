@@ -473,13 +473,14 @@ def test_double_equals_lexes_as_two_eq_tokens():
 
 
 def test_all_punctuation_tokens():
-    source = "+ - * / ( ) , . ;"
+    source = "+ - * / % ( ) , . ;"
     tokens = tokenize(source)
     assert _types(tokens) == [
         TokenType.PLUS,
         TokenType.MINUS,
         TokenType.STAR,
         TokenType.SLASH,
+        TokenType.PERCENT,
         TokenType.LPAREN,
         TokenType.RPAREN,
         TokenType.COMMA,
@@ -487,6 +488,36 @@ def test_all_punctuation_tokens():
         TokenType.SEMICOLON,
         TokenType.EOF,
     ]
+
+
+def test_percent_lexes_as_a_single_operator_token():
+    """`%` (issue #75): SQL's modulo operator, at the same one-character
+    tier as `*`/`/` in `_ONE_CHAR_OPERATORS` - not a two-character
+    munch, and not the `LIKE` pattern wildcard, which is just a plain
+    character inside a string literal (see the tests below)."""
+    tokens = tokenize("line_no % 2")
+    assert _types(tokens) == [
+        TokenType.IDENTIFIER,
+        TokenType.PERCENT,
+        TokenType.INTEGER,
+        TokenType.EOF,
+    ]
+
+
+def test_percent_inside_a_string_literal_is_not_lexed_as_an_operator():
+    """Pins the acceptance criterion that lexing `%` as an operator
+    cannot affect string literals: `_read_string` never calls
+    `_read_operator`, so `LIKE 'src/%'` still lexes its pattern as one
+    `STRING` token, not a `STRING` token followed by a stray
+    `PERCENT`."""
+    tokens = tokenize("path LIKE 'src/%'")
+    assert _types(tokens) == [
+        TokenType.IDENTIFIER,
+        TokenType.LIKE,
+        TokenType.STRING,
+        TokenType.EOF,
+    ]
+    assert tokens[2].text == "src/%"
 
 
 # --- Comments ----------------------------------------------------------

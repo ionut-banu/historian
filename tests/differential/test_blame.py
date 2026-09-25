@@ -2062,6 +2062,90 @@ def test_distinct_collapses_group_by_aggregate_collisions(awkward_repo):
     _assert_differential(awkward_repo, "SELECT DISTINCT count(*) FROM blame GROUP BY path")
 
 
+# --- Aggregate DISTINCT (issue #84) --------------------------------------
+#
+# `count`/`sum`/`avg`/`min`/`max(DISTINCT <expr>)`: dedup happens
+# entirely inside `Aggregate`'s own `_Accumulator`, by SQL equality via
+# `values.order_key` - see `tests/test_operators.py`'s own "Aggregate
+# DISTINCT" section for the unit-only cases (NULL exclusion, mixed
+# storage classes, order-dependent representative typing, int64
+# overflow) that real `blame` data cannot produce. Everything below
+# uses `awkward_repo`, whose known row shape (`tests/fixtures/
+# build.py`) gives genuine duplicates to dedup: two authors (`Sam Lee`,
+# `Zoë Müller`), and `line_no` restarts at 1 for every file, so it
+# repeats across paths - `min`/`max` are pinned identical to their
+# plain forms in the same query as `sum`/`avg`, since removing a
+# duplicate can never change which value is most extreme.
+
+
+def test_aggregate_distinct_count_over_a_text_column(awkward_repo):
+    """`count(DISTINCT author_name)`: `awkward_repo` has exactly two
+    author identities (confirmed live, `2`), against `count(author_
+    name)`'s own much larger row count - the whole-table, no-`GROUP
+    BY` case."""
+    _assert_differential(awkward_repo, "SELECT count(DISTINCT author_name) FROM blame")
+
+
+def test_aggregate_distinct_sum_avg_min_max_over_line_no(awkward_repo):
+    """`line_no` restarts at `1` for every file `awkward_repo` blames,
+    so it genuinely repeats across paths (confirmed live: plain
+    `sum(line_no)=30`, `avg=2.5`; `DISTINCT` collapses those repeats to
+    `sum=21`, `avg=3.5` - a real, measurable difference - while
+    `min`/`max` stay `1`/`6` either way, confirming no accumulator
+    change for those two even with real duplicate data)."""
+    _assert_differential(
+        awkward_repo,
+        "SELECT sum(DISTINCT line_no), avg(DISTINCT line_no), "
+        "min(DISTINCT line_no), max(DISTINCT line_no) FROM blame",
+    )
+
+
+def test_aggregate_distinct_min_max_equal_their_plain_forms(awkward_repo):
+    """The Conformance section's own explicit pin, independent of the
+    combined query above: `min`/`max(DISTINCT line_no)` equal plain
+    `min`/`max(line_no)` in the same select list, over real data with
+    genuine repeats."""
+    _assert_differential(
+        awkward_repo,
+        "SELECT min(line_no), max(line_no), min(DISTINCT line_no), max(DISTINCT line_no) FROM blame",
+    )
+
+
+def test_aggregate_distinct_over_a_computed_expression(awkward_repo):
+    """`DISTINCT` dedups the expression's own computed result, not a
+    bare column - confirmed live, `count(DISTINCT line_no % 3)` over
+    `awkward_repo` is `3` (residues `0`, `1`, `2` all occur)."""
+    _assert_differential(awkward_repo, "SELECT count(DISTINCT line_no % 3) FROM blame")
+
+
+def test_aggregate_distinct_grouped_with_having(awkward_repo):
+    """`count(DISTINCT line_no)` per author, filtered by `HAVING` on
+    that same `DISTINCT` aggregate: confirmed live, `Sam Lee` has `3`
+    distinct `line_no` values and `Zoë Müller` has `4` - `HAVING
+    count(DISTINCT line_no) > 3` genuinely excludes `Sam Lee`, keeping
+    only `Zoë Müller`."""
+    _assert_differential(
+        awkward_repo,
+        "SELECT author_name, count(DISTINCT line_no) FROM blame "
+        "GROUP BY author_name HAVING count(DISTINCT line_no) > 3",
+    )
+
+
+def test_aggregate_distinct_combined_with_select_distinct(awkward_repo):
+    """Both `DISTINCT` mechanisms in one query: `GROUP BY path` on
+    `awkward_repo` gives five groups whose own `count(DISTINCT
+    line_no)` is `1, 1, 6, 3, 1` (confirmed live - the three
+    single-line files share `1`), so the outer `SELECT DISTINCT`
+    genuinely collapses five rows to three distinct values (`1`, `3`,
+    `6`) - real fixture data produces a genuine collision for this
+    combination too, no synthetic catalog needed, mirroring
+    `test_distinct_collapses_group_by_aggregate_collisions` above but
+    with an inner `DISTINCT` aggregate instead of a plain `count(*)`."""
+    _assert_differential(
+        awkward_repo, "SELECT DISTINCT count(DISTINCT line_no) FROM blame GROUP BY path"
+    )
+
+
 # --- DISTINCT (issue #78): BindError cases, asserted directly ------------
 #
 # `sql/binder.py`'s own DISTINCT/ORDER BY narrowing (`_docs/

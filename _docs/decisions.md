@@ -1866,3 +1866,48 @@ particular follow-on addends) - found by a randomized search over
 large integers and confirmed against `sqlite3` directly, so the
 `StepInt64`/`Init` split's own correctness has a test that actually
 depends on it.
+
+2026-09-25 - The CLI-versus-module float disagreement reported
+during #91's and #93's grooming was a printf display artifact,
+not a computation difference
+
+Both #91's and #93's grooming reported that the system `sqlite3`
+CLI (3.51.0, an Apple-patched build) and Python's bundled `sqlite3`
+module (3.50.4) gave "a different bit pattern" for an adversarial
+float sum. #93's dispatch found this false: the two compute the
+same values. Checked with exact comparison rather than printed
+text - 300 random sums, mixed magnitudes up to 1e300, compared as
+`sum(x) = <module repr>` inside SQL - 0/300 mismatches.
+
+The earlier reports read printed text and were misled by the CLI's
+own `printf`. It stops producing real digits after about 16
+significant figures and pads the rest with zeros, and the CLI's
+default float display is only 15 digits wide - so a padded string
+can look like a different double from the one the module reports
+in full precision. Reproduced directly on the literal alone, no sum
+involved:
+
+    sqlite> select printf('%.20e', -1.8193757715275717e+299);
+    -1.81937577152757100000e+299
+
+The padded `...5710...` looks like a different double from the
+literal's own `...5717...`, but `printf('%!.20e', ...)` (the
+"unlimited precision" verb) on the same value shows real digits
+throughout and matches; the two engines were never disagreeing on
+the number, only on how the CLI chose to print it.
+
+Consequence: the module - `tests/differential/conftest.py`'s own
+oracle - was never the thing in doubt. What was wrong is treating
+either engine's *printed* float output as authoritative. A float
+must be compared exactly - `float.hex()`, or an equality test
+inside SQL - never by reading digits either tool prints, in either
+direction: the CLI's padding can manufacture a false disagreement,
+and its 15-digit default can just as easily hide a real one.
+`_docs/process.md`'s "The oracle" section and `tests/oracle.py`
+(#93) are written around this rule.
+
+This entry corrects the record left by #91's grooming and #93's own
+first grooming pass, both of which reported the CLI as computing a
+different value. It does not edit either - this file is
+append-only - and does not audit `_docs/decisions.md`'s other
+entries for the same mistake; none is known to rest on it.

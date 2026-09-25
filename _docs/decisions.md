@@ -1868,46 +1868,96 @@ large integers and confirmed against `sqlite3` directly, so the
 depends on it.
 
 2026-09-25 - The CLI-versus-module float disagreement reported
-during #91's and #93's grooming was a printf display artifact,
-not a computation difference
+during #91's and #93's grooming came from binding values versus
+writing them as SQL literals - a real difference, on this
+platform, not a printf display artifact
 
 Both #91's and #93's grooming reported that the system `sqlite3`
-CLI (3.51.0, an Apple-patched build) and Python's bundled `sqlite3`
-module (3.50.4) gave "a different bit pattern" for an adversarial
-float sum. #93's dispatch found this false: the two compute the
-same values. Checked with exact comparison rather than printed
-text - 300 random sums, mixed magnitudes up to 1e300, compared as
-`sum(x) = <module repr>` inside SQL - 0/300 mismatches.
+CLI (3.51.0, Apple-patched) and Python's bundled `sqlite3` module
+(3.50.4) computed a genuinely different double for an adversarial
+float sum. This entry's own first version, written earlier during
+#93, misdiagnosed the cause as `printf` zero-padding and claimed
+the two computed the same values - wrong, caught before the branch
+reached main, and rewritten here rather than left standing with a
+second entry stacked on top; `_docs/process.md`'s "if a decision
+contradicts the spec, the spec is edited in the same commit" is
+the closest precedent for correcting a decision found wrong before
+it lands, and this file's append-only rule protects entries once
+they are part of the shared record, not a mistake caught inside
+the same still-open branch that wrote it.
 
-The earlier reports read printed text and were misled by the CLI's
-own `printf`. It stops producing real digits after about 16
-significant figures and pads the rest with zeros, and the CLI's
-default float display is only 15 digits wide - so a padded string
-can look like a different double from the one the module reports
-in full precision. Reproduced directly on the literal alone, no sum
-involved:
+**Reproduced inside the module alone, no CLI involved** - so the
+Apple build is not the variable. Same three values throughout
+(`-6.6116480458179635e-18`, `-1.8193757715275717e+299`,
+`3729136089270252.0`): bound as Python floats via `execute('...
+VALUES (?)', (v,))`, they sum to `-0x1.16317cc804165p+994`; written
+as the identical text as SQL literals (`INSERT INTO t VALUES
+(-1.8193757715275717e+299)`, or via `executescript`), they sum to
+`-0x1.16317cc804164p+994` - one ULP lower. Reproducible with
+`tests/oracle.py` (#93):
 
-    sqlite> select printf('%.20e', -1.8193757715275717e+299);
-    -1.81937577152757100000e+299
+    uv run python tests/oracle.py "" "SELECT ? + ? + ?" -6.6116480458179635e-18 -1.8193757715275717e+299 3729136089270252.0
+    uv run python tests/oracle.py "" "SELECT -6.6116480458179635e-18 + -1.8193757715275717e+299 + 3729136089270252.0"
 
-The padded `...5710...` looks like a different double from the
-literal's own `...5717...`, but `printf('%!.20e', ...)` (the
-"unlimited precision" verb) on the same value shows real digits
-throughout and matches; the two engines were never disagreeing on
-the number, only on how the CLI chose to print it.
+**Cause: SQLite's own decimal-literal parser is not correctly
+rounded on this platform, for some values.** Measured directly,
+comparing `select <lit>` against Python's own `float(<lit>)` for
+the same literal text:
 
-Consequence: the module - `tests/differential/conftest.py`'s own
-oracle - was never the thing in doubt. What was wrong is treating
-either engine's *printed* float output as authoritative. A float
-must be compared exactly - `float.hex()`, or an equality test
-inside SQL - never by reading digits either tool prints, in either
-direction: the CLI's padding can manufacture a false disagreement,
-and its 15-digit default can just as easily hide a real one.
-`_docs/process.md`'s "The oracle" section and `tests/oracle.py`
-(#93) are written around this rule.
+    <=6 significant digits, exponent -10..10        0 / 10000 differ
+    <=15 significant digits, exponent -20..20        0 / 10000
+    17 significant digits, exponent -20..20          0 / 10000
+    17 significant digits, exponent 200..300      1622 / 10000  differ by 1 ULP
+    plain decimals (e.g. 3.14159)                     0 / 10000
 
-This entry corrects the record left by #91's grooming and #93's own
-first grooming pass, both of which reported the CLI as computing a
-different value. It does not edit either - this file is
-append-only - and does not audit `_docs/decisions.md`'s other
-entries for the same mistake; none is known to rest on it.
+Independently spot-checked at smaller scale during this rewrite
+(2000 trials per row, a fresh seed): 0/2000 for the first three
+rows, 299/2000 (about 15%) for the large-exponent 17-digit row -
+same shape, same order of magnitude, confirming the effect rather
+than merely repeating the earlier number. Only 17-significant-digit
+literals at large exponents are affected, and at that shape the
+mismatch rate is in the tens of percent, not rare. Likely
+mechanism: SQLite's text-to-double conversion goes through `long
+double`, and on arm64 macOS `long double` is the same width as
+`double`, so the extra rounding headroom other platforms get for
+free is unavailable here - making this platform-dependent SQLite
+behaviour, not something specific to Apple's CLI patch. The CLI and
+the module parse literals the same way; #91's and #93's grooming
+disagreed only because their two checks fed the value down
+different paths - the CLI checks wrote it as a literal, the module
+checks bound it.
+
+**The earlier "300 trials, 0 mismatches" exact-comparison check
+(this entry's own first pass) was invalid, not merely
+insufficient.** It compared `sum(x) = <module repr>` entirely
+inside SQL, so the module's `repr()` text was itself re-parsed by
+SQLite as a literal on the right-hand side of `=` - both sides of
+every comparison went through SQLite's own literal parser, so a
+parsing error present on both sides canceled itself out and was
+invisible to that check by construction.
+
+`printf`'s zero-padding past about 16 significant digits is real
+and still worth knowing - `select printf('%.20e',
+-1.8193757715275717e+299)` still prints
+`-1.81937577152757100000e+299` - but it is a separate display
+hazard, not the cause of the reported disagreement: even
+`printf('%!.20e', ...)`, which does show real digits throughout,
+still disagrees between the literal-parsed value and the bound
+value, because they are genuinely different doubles.
+
+**The rule going forward:** be deliberate about how a value reaches
+SQLite. A value written as a SQL literal goes through SQLite's own
+parser; a value bound as a parameter is Python's exact double,
+untouched. A comparison against the oracle must feed both sides the
+same way. The differential harness (`tests/differential/
+conftest.py`) loads blame rows by binding, so it is unaffected.
+`tests/oracle.py` (#93) now accepts bind arguments after its setup
+and query strings for exactly this reason - see its own docstring.
+`_docs/process.md`'s "The oracle" section states the rule.
+
+Also noted for #6 (scientific notation in historian's own lexer,
+not yet built): historian will parse `REAL` literals with Python's
+correctly rounded `float()`, while SQLite on this platform does
+not always - so historian and the oracle can disagree on a
+literal's own value before any arithmetic runs, for this same
+17-digit/large-exponent shape. Filed on #6, not fixed here.

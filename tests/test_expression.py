@@ -1116,8 +1116,10 @@ def test_and_still_raises_on_a_genuinely_invalid_bool3_from_values_py():
 # --- LIKE: unconditional text coercion, no affinity, ASCII-only fold ----
 
 
-def _like(left, pattern, negated=False) -> Like:
-    return Like(left=left, pattern=pattern, negated=negated, position=_POS)
+def _like(left, pattern, negated=False, escape=None) -> Like:
+    return Like(
+        left=left, pattern=pattern, negated=negated, position=_POS, escape=escape
+    )
 
 
 def test_like_does_not_use_affinity_casts_both_sides_to_text_unconditionally():
@@ -1191,6 +1193,340 @@ def test_not_like_is_not3_of_the_unnegated_result():
     assert evaluate(_like(_lit("abc"), _lit("abc"), negated=True), _ROW, _SCHEMA) is False
     assert evaluate(_like(_lit("abc"), _lit("xyz"), negated=True), _ROW, _SCHEMA) is True
     assert evaluate(_like(_lit(None), _lit("x"), negated=True), _ROW, _SCHEMA) is None
+
+
+# --- LIKE ... ESCAPE (issue #51) -----------------------------------------
+#
+# Every value below checked live against sqlite3 3.51.0 during this
+# issue's own work, not reasoned about from memory.
+
+
+def test_like_escape_basic_percent_escaping():
+    """sqlite3: `select '10%' like '10!%' escape '!';` -> 1 (the `!`
+    before `%` makes it a literal percent, not a wildcard); `select
+    '10x' like '10!%' escape '!';` -> 0 (the input has no literal
+    `%`)."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_like(_lit("10%"), _lit("10!%"), escape=_lit("!")), _ROW, _SCHEMA) is True
+    assert evaluate(_like(_lit("10x"), _lit("10!%"), escape=_lit("!")), _ROW, _SCHEMA) is False
+
+
+def test_like_escape_basic_underscore_escaping():
+    """sqlite3: `select 'a_b' like 'a!_b' escape '!';` -> 1 (literal
+    underscore); `select 'axb' like 'a!_b' escape '!';` -> 0 (`_` no
+    longer means "any one character" once escaped)."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_like(_lit("a_b"), _lit("a!_b"), escape=_lit("!")), _ROW, _SCHEMA) is True
+    assert evaluate(_like(_lit("axb"), _lit("a!_b"), escape=_lit("!")), _ROW, _SCHEMA) is False
+
+
+def test_like_escape_escaping_the_escape_character_itself():
+    """sqlite3: `select 'a!b' like 'a!!b' escape '!';` -> 1 - pattern
+    `a!!b` with escape `!` means literal `a`, literal `!`, literal
+    `b`."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_like(_lit("a!b"), _lit("a!!b"), escape=_lit("!")), _ROW, _SCHEMA) is True
+
+
+def test_like_escape_at_end_of_pattern_is_unsatisfiable_not_a_literal():
+    """An escape character with nothing after it makes the pattern
+    unsatisfiable - not a no-op, not an error. sqlite3: `select 'a!'
+    like 'a!' escape '!';` -> 0 even though the strings are identical,
+    and `select 'aX' like 'a!' escape '!';` -> 0. A wrongly-lenient
+    implementation that treated a trailing escape as a literal `!`
+    would pass the first case."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_like(_lit("a!"), _lit("a!"), escape=_lit("!")), _ROW, _SCHEMA) is False
+    assert evaluate(_like(_lit("aX"), _lit("a!"), escape=_lit("!")), _ROW, _SCHEMA) is False
+
+
+def test_like_escape_before_an_ordinary_character_is_a_no_op():
+    """sqlite3: `select 'ab' like 'a!b' escape '!';` -> 1 - escaping a
+    character that needed no escaping just matches it literally."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_like(_lit("ab"), _lit("a!b"), escape=_lit("!")), _ROW, _SCHEMA) is True
+
+
+@pytest.mark.parametrize(
+    "text,pattern,escape,expected",
+    [
+        # sqlite3: `select 'a%b' like 'axb' escape 'X';` -> 0 - lowercase
+        # `x` in the pattern does not match uppercase escape `X`, so it
+        # stays an ordinary (ASCII-folded) letter and the input's `%`
+        # has nothing to match it against.
+        ("a%b", "axb", "X", False),
+        # sqlite3: `select 'aXb' like 'axb' escape 'X';` -> 1 - same
+        # reasoning: pattern's `x` is an ordinary, case-folded letter,
+        # matching input's `X` via the normal ASCII fold.
+        ("aXb", "axb", "X", True),
+        # sqlite3: `select 'a%b' like 'aXb' escape 'x';` -> 0 - escape
+        # recognition is exact in both directions.
+        ("a%b", "aXb", "x", False),
+        # sqlite3: `select 'a%b' like 'ax%b' escape 'X';` -> 0 -
+        # lowercase `x` isn't recognised as the uppercase escape, so the
+        # `%` right after it is untouched and remains a real wildcard
+        # (which `a%b`'s literal `%` at that position does not satisfy).
+        ("a%b", "ax%b", "X", False),
+        # Two more direct probes, escape recognition case-sensitive:
+        # sqlite3: `select 'a%' like 'aX%' escape 'x';` -> 0.
+        ("a%", "aX%", "x", False),
+        # sqlite3: `select 'a%' like 'ax%' escape 'x';` -> 1.
+        ("a%", "ax%", "x", True),
+    ],
+)
+def test_like_escape_recognition_is_case_sensitive_independent_of_ascii_fold(
+    text, pattern, escape, expected
+):
+    """Escape-character *recognition* inside the pattern is
+    case-sensitive / exact-codepoint, independent of `LIKE`'s own
+    ASCII case-fold of the matched text. `_like_pattern_to_regex` must
+    scan the *raw*, unfolded pattern text for escape occurrences - not
+    the ASCII-folded text `_eval_like` used to hand it before this
+    issue, which would have made escape recognition wrongly
+    case-insensitive."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_like(_lit(text), _lit(pattern), escape=_lit(escape)), _ROW, _SCHEMA)
+    assert result is expected
+
+
+def test_like_escape_preserves_dotall_for_a_newline_in_the_matched_text():
+    """`_like_pattern_to_regex`'s `re.DOTALL` flag (untested before
+    this issue, per #50's concurrent grooming) must survive the
+    ESCAPE-aware rewrite: `_`/`%` still match a newline, including when
+    an ESCAPE clause is present. sqlite3: `select ('a' || char(10) ||
+    '%') like 'a_!%' escape '!';` -> 1 (`_` matches the newline, `!%`
+    escapes the percent to a literal, so input `'a\\n%'` matches); and
+    `select ('a' || char(10) || 'x') like 'a_!%' escape '!';` -> 0 (no
+    trailing literal `%` in the input)."""
+    from historian.exec.expression import evaluate
+
+    assert (
+        evaluate(_like(_lit("a\n%"), _lit("a_!%"), escape=_lit("!")), _ROW, _SCHEMA) is True
+    )
+    assert (
+        evaluate(_like(_lit("a\nx"), _lit("a_!%"), escape=_lit("!")), _ROW, _SCHEMA) is False
+    )
+
+
+def test_like_escape_null_escape_operand_is_null():
+    """sqlite3: `select typeof('10%' LIKE '10!%' ESCAPE NULL);` ->
+    `null`, no error - even though the (missing) escape text could
+    never satisfy the length check, the NULL check comes first. Also
+    covers NULL left/NULL pattern combined with a NULL escape."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_like(_lit("10%"), _lit("10!%"), escape=_lit(None)), _ROW, _SCHEMA) is None
+    assert evaluate(_like(_lit(None), _lit("x"), escape=_lit(None)), _ROW, _SCHEMA) is None
+
+
+def test_like_escape_length_check_runs_even_when_left_or_pattern_is_null():
+    """sqlite3: `select null like 'x' escape 'ab';` and `select 'x'
+    like null escape 'ab';` both raise `ESCAPE expression must be a
+    single character` - the length check is not skipped just because
+    another operand is NULL; only a NULL *escape* operand itself
+    suppresses it (see the test above)."""
+    from historian.exec.expression import EvalError, evaluate
+
+    with pytest.raises(EvalError):
+        evaluate(_like(_lit(None), _lit("x"), escape=_lit("ab")), _ROW, _SCHEMA)
+    with pytest.raises(EvalError):
+        evaluate(_like(_lit("x"), _lit(None), escape=_lit("ab")), _ROW, _SCHEMA)
+
+
+@pytest.mark.parametrize("bad_escape", ["", "ab"])
+def test_like_escape_invalid_length_raises_eval_error_not_bare_exception(bad_escape):
+    """sqlite3's own wording, reused verbatim: `ESCAPE expression must
+    be a single character` - identical for both an empty string and a
+    2+ character escape, confirmed: `select '10%' like '10!%' escape
+    '';` and `select '10%' like '10!%' escape '!!';` both raise that
+    exact message. A structured `EvalError` (`sql/expression.py`'s own
+    class, same shape as `LexError`/`ParseError`/`BindError`), never a
+    bare Python exception."""
+    from historian.exec.expression import EvalError, evaluate
+
+    like = _like(_lit("10%"), _lit("10!%"), escape=_lit(bad_escape))
+    with pytest.raises(EvalError) as excinfo:
+        evaluate(like, _ROW, _SCHEMA)
+    assert "ESCAPE expression must be a single character" in str(excinfo.value)
+    assert excinfo.value.position is like.escape.position
+
+
+def test_like_escape_invalid_length_is_a_runtime_error_only_reachable_when_evaluated():
+    """The single-character check is deliberately raised from inside
+    `_eval_like` at evaluate() time, not at parse or bind time -
+    confirmed live: `EXPLAIN select '10%' LIKE '10!%' ESCAPE '!!';`
+    compiles cleanly in sqlite3, the failure only appears once the
+    statement is actually stepped. Building the `Like` node and parsing
+    it (already covered in tests/test_parser.py) never raises; only
+    calling `evaluate()` on it does."""
+    from historian.exec.expression import EvalError, evaluate
+
+    like = _like(_lit("10%"), _lit("10!%"), escape=_lit("!!"))
+    # Construction alone (the parse-time shape) raises nothing.
+    assert isinstance(like, Like)
+    with pytest.raises(EvalError):
+        evaluate(like, _ROW, _SCHEMA)
+
+
+def test_not_like_escape_composes_with_negation():
+    """sqlite3: `select '10%' not like '10!%' escape '!';` -> 0,
+    `select '10x' not like '10!%' escape '!';` -> 1 - `NOT LIKE ...
+    ESCAPE` feeds into the existing `values.not3` wrapping, no separate
+    reasoning path."""
+    from historian.exec.expression import evaluate
+
+    assert (
+        evaluate(_like(_lit("10%"), _lit("10!%"), negated=True, escape=_lit("!")), _ROW, _SCHEMA)
+        is False
+    )
+    assert (
+        evaluate(_like(_lit("10x"), _lit("10!%"), negated=True, escape=_lit("!")), _ROW, _SCHEMA)
+        is True
+    )
+
+
+def test_not_like_escape_invalid_length_still_raises_before_negation():
+    """An invalid escape length under `NOT LIKE` still raises
+    `EvalError` - the length check happens before negation, the same
+    as `NULL` propagation already does for plain `NOT LIKE`."""
+    from historian.exec.expression import EvalError, evaluate
+
+    like = _like(_lit("10%"), _lit("10!%"), negated=True, escape=_lit("!!"))
+    with pytest.raises(EvalError):
+        evaluate(like, _ROW, _SCHEMA)
+
+
+def test_like_escape_non_ascii_multibyte_single_codepoint_escape():
+    """"Single character" is counted the same way SQLite's own
+    `length()` counts it: Unicode code points, not UTF-8 bytes.
+    sqlite3: `select length('😀');` -> 1, even though `😀` is 4 bytes in
+    UTF-8. Confirmed both directions: `select '10😀%' LIKE '10😀é%'
+    ESCAPE '😀';` -> 0 (`😀` escapes `%` to... no: escapes the following
+    `é` to a literal, so the pattern needs a literal `é` the input
+    lacks) and `select '10%' LIKE '10😀%' ESCAPE '😀';` -> 1 (`😀`
+    escapes `%` to a literal, so the pattern becomes the literal string
+    `10%`)."""
+    from historian.exec.expression import evaluate
+
+    assert (
+        evaluate(_like(_lit("10😀%"), _lit("10😀é%"), escape=_lit("😀")), _ROW, _SCHEMA) is False
+    )
+    assert evaluate(_like(_lit("10%"), _lit("10😀%"), escape=_lit("😀")), _ROW, _SCHEMA) is True
+
+
+def test_like_escape_operand_is_an_arbitrary_expression_not_just_a_literal():
+    """#63's coercion applies to the escape operand exactly as it
+    already does for `left`/`pattern`: a comparison-result (`Bool3`)
+    escape operand goes through `coerce_to_value` before anything else
+    touches it, becoming SQLite's `1`/`0`/`NULL` rather than Python's
+    `True`/`False`/`None`. sqlite3: `select '10%' LIKE '10!%' ESCAPE
+    (1=1);` -> 0 (escape coerces to text `"1"`; pattern `10!%` with
+    escape `1` reinterprets its own `1` digit as the escape character,
+    escaping the `0`, leaving effective pattern `0!` + wildcard, which
+    `10%` does not start with) and `select '10%' LIKE '101%' ESCAPE
+    (1=1);` -> 0 (same escape `"1"`; pattern `101%` becomes fully
+    literal `0%`, which does not equal input `10%`). Also: `select '1'
+    like '11' escape (1=1);` -> 1."""
+    from historian.exec.expression import evaluate
+
+    comparison_true = _bin(Operator.EQ, _lit(1), _lit(1))
+    assert (
+        evaluate(_like(_lit("10%"), _lit("10!%"), escape=comparison_true), _ROW, _SCHEMA)
+        is False
+    )
+    assert (
+        evaluate(_like(_lit("10%"), _lit("101%"), escape=comparison_true), _ROW, _SCHEMA)
+        is False
+    )
+    assert evaluate(_like(_lit("1"), _lit("11"), escape=comparison_true), _ROW, _SCHEMA) is True
+
+
+# --- AND / OR: short-circuit evaluation, left to right (issue #51) ------
+#
+# SQLite evaluates AND/OR left to right and stops early - confirmed live
+# (this issue's own orchestrator correction):
+#
+#   create table t(p); insert into t values('a'),('b');
+#   select count(*) from t where p = 'zzz' and p like 'a' escape 'ab';
+#       -> 0   (FALSE left operand short-circuits; ESCAPE never runs)
+#   select count(*) from t where p like 'a' escape 'ab' and p = 'zzz';
+#       -> Error: ESCAPE expression must be a single character
+#   select count(*) from t where 1=1 or p like 'a' escape 'ab';
+#       -> 2   (TRUE left operand short-circuits; ESCAPE never runs)
+#   select count(*) from t where p like 'a' escape 'ab' or 1=1;
+#       -> Error
+#   select count(*) from t where 0=1 or p like 'a' escape 'ab';
+#       -> Error (FALSE does not short-circuit OR; right still runs)
+#
+# Before this issue, evaluate()'s And/Or branches evaluated both
+# operands unconditionally and then called and3/or3 - harmless until
+# ESCAPE became the first expression able to raise at runtime.
+
+_POISON_LIKE = _like(_lit("a"), _lit("a"), escape=_lit("ab"))  # invalid escape length
+
+
+def test_and_short_circuits_on_a_false_left_operand_right_never_evaluated():
+    """`FALSE AND <raises>` returns `False` without evaluating the
+    right operand at all."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(And(_FALSE, _POISON_LIKE, _POS), _ROW, _SCHEMA) is False
+
+
+@pytest.mark.parametrize("left", [_TRUE, _NULL])
+def test_and_does_not_short_circuit_on_a_true_or_null_left_operand(left):
+    """A `TRUE` or `NULL` left operand still evaluates (and can still
+    raise from) the right operand - three-valued logic, not a blanket
+    short-circuit that skips the right operand whenever the left one
+    is already decided-looking."""
+    from historian.exec.expression import EvalError, evaluate
+
+    with pytest.raises(EvalError):
+        evaluate(And(left, _POISON_LIKE, _POS), _ROW, _SCHEMA)
+
+
+def test_or_short_circuits_on_a_true_left_operand_right_never_evaluated():
+    """`TRUE OR <raises>` returns `True` without evaluating the right
+    operand at all."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(Or(_TRUE, _POISON_LIKE, _POS), _ROW, _SCHEMA) is True
+
+
+@pytest.mark.parametrize("left", [_FALSE, _NULL])
+def test_or_does_not_short_circuit_on_a_false_or_null_left_operand(left):
+    """A `FALSE` or `NULL` left operand still evaluates (and can still
+    raise from) the right operand."""
+    from historian.exec.expression import EvalError, evaluate
+
+    with pytest.raises(EvalError):
+        evaluate(Or(left, _POISON_LIKE, _POS), _ROW, _SCHEMA)
+
+
+def test_and_or_short_circuit_still_match_the_three_valued_truth_table_when_nothing_raises():
+    """The short-circuit change must not alter and3/or3's own
+    already-tested truth table (tests/test_values.py) for the ordinary
+    case where nothing raises - re-run here through evaluate() with a
+    non-poisoned right operand, guarding against an implementation that
+    short-circuits too eagerly (e.g. returning the left operand's own
+    coercion instead of falling through to and3/or3 whenever it isn't
+    poisoned)."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(And(_NULL, _FALSE, _POS), _ROW, _SCHEMA) is False
+    assert evaluate(And(_NULL, _TRUE, _POS), _ROW, _SCHEMA) is None
+    assert evaluate(And(_NULL, _NULL, _POS), _ROW, _SCHEMA) is None
+    assert evaluate(And(_TRUE, _TRUE, _POS), _ROW, _SCHEMA) is True
+    assert evaluate(Or(_NULL, _TRUE, _POS), _ROW, _SCHEMA) is True
+    assert evaluate(Or(_NULL, _FALSE, _POS), _ROW, _SCHEMA) is None
+    assert evaluate(Or(_NULL, _NULL, _POS), _ROW, _SCHEMA) is None
+    assert evaluate(Or(_FALSE, _FALSE, _POS), _ROW, _SCHEMA) is False
 
 
 # --- IN: per-element affinity, or3-folded, values.not3 for NOT IN -------

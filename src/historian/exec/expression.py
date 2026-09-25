@@ -246,13 +246,29 @@ def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
     if isinstance(expr, Is):
         return _eval_is(expr, row, schema)
     if isinstance(expr, And):
+        left_bool3 = coerce_to_bool3(evaluate(expr.left, row, schema))
+        if left_bool3 is False:
+            # Short-circuit (issue #51): SQLite evaluates AND left to
+            # right and stops once the left operand is FALSE, never
+            # touching the right - see the module docstring's "Short-
+            # circuit AND/OR" section. Exact under three-valued logic:
+            # and3(FALSE, x) is FALSE for every x, NULL included, so
+            # this changes nothing about the *result*, only whether the
+            # right operand's evaluate() call happens at all. A NULL
+            # left operand is not "decided" and still falls through.
+            return False
         return values.and3(
-            coerce_to_bool3(evaluate(expr.left, row, schema)),
+            left_bool3,
             coerce_to_bool3(evaluate(expr.right, row, schema)),
         )
     if isinstance(expr, Or):
+        left_bool3 = coerce_to_bool3(evaluate(expr.left, row, schema))
+        if left_bool3 is True:
+            # Short-circuit (issue #51): or3(TRUE, x) is TRUE for every
+            # x, NULL included - same reasoning as AND above, mirrored.
+            return True
         return values.or3(
-            coerce_to_bool3(evaluate(expr.left, row, schema)),
+            left_bool3,
             coerce_to_bool3(evaluate(expr.right, row, schema)),
         )
     if isinstance(expr, Not):
@@ -469,44 +485,136 @@ def _ascii_fold(text: str) -> str:
     return "".join(chr(ord(ch) + 32) if "A" <= ch <= "Z" else ch for ch in text)
 
 
-def _like_pattern_to_regex(pattern: str) -> re.Pattern[str]:
+def _like_pattern_to_regex(pattern: str, escape: str | None = None) -> re.Pattern[str]:
     """Compile a `LIKE` pattern (`%` any sequence including empty, `_`
     exactly one character) to a `re.fullmatch`-ready pattern. Every
     other character is escaped literally via `re.escape`, so the
     pattern text can never be interpreted as a regex metacharacter by
     accident. `re.DOTALL` so `_`/`%` match a newline too - `LIKE` has
-    no notion of "line"."""
+    no notion of "line" - confirmed against `sqlite3`: `select ('a' ||
+    char(10) || 'c') like 'a_c';` -> `1`. This still holds with an
+    `ESCAPE` clause present: `select ('a' || char(10) || '%') like
+    'a_!%' escape '!';` -> `1`.
+
+    *escape* (issue #51), when given, is a single character read from
+    *pattern* **before** any ASCII fold - `_eval_like` below passes the
+    caller's raw, un-folded pattern text, never `_ascii_fold`ed first,
+    because escape-character recognition is case-sensitive / exact-
+    codepoint even though `LIKE`'s *matched text* comparison is
+    ASCII-case-insensitive. Confirmed against `sqlite3`, all four
+    probes: `select 'a%b' like 'axb' escape 'X';` -> `0` (lowercase `x`
+    in the pattern is not recognised as uppercase escape `X`, so it
+    stays an ordinary letter); `select 'aXb' like 'axb' escape 'X';` ->
+    `1` (same: pattern's `x` is ordinary and ASCII-folds against input
+    `X`); `select 'a%b' like 'aXb' escape 'x';` -> `0`; `select 'a%b'
+    like 'ax%b' escape 'X';` -> `0`. Folding first (i.e. scanning
+    `_ascii_fold(pattern)` for the escape character) would make
+    recognition wrongly case-insensitive - this is why `_eval_like`
+    folds only the characters that end up literal, one at a time,
+    inside this function, rather than folding the whole pattern text up
+    front the way it still does for `left_text`.
+
+    An escape character immediately preceding `%`, `_`, or itself makes
+    that following character literal (confirmed: `select 'ab' like
+    'a!b' escape '!';` -> `1`; `select 'a!b' like 'a!!b' escape '!';`
+    -> `1`); immediately preceding any other character it is still a
+    no-op, matching that character literally, which the plain `else`
+    branch below already does once the escape has been consumed. An
+    escape character with nothing after it - at the very end of the
+    pattern - makes the whole pattern unsatisfiable, not a literal `!`
+    and not an error: confirmed, `select 'a!' like 'a!' escape '!';`
+    -> `0` even though the two strings are identical. `(?!)` is a
+    standard "never matches" regex idiom (a negative lookahead on the
+    empty string, which always matches, so the lookahead always
+    fails) - used here rather than raising, since an unsatisfiable
+    pattern is a valid `LIKE` outcome (`FALSE`), not a runtime error.
+    """
     pieces = []
-    for ch in pattern:
+    index = 0
+    length = len(pattern)
+    while index < length:
+        ch = pattern[index]
+        if escape is not None and ch == escape:
+            index += 1
+            if index >= length:
+                pieces.append("(?!)")  # trailing escape: unsatisfiable
+                break
+            pieces.append(re.escape(_ascii_fold(pattern[index])))
+            index += 1
+            continue
         if ch == "%":
             pieces.append(".*")
         elif ch == "_":
             pieces.append(".")
         else:
-            pieces.append(re.escape(ch))
+            pieces.append(re.escape(_ascii_fold(ch)))
+        index += 1
     return re.compile("".join(pieces), re.DOTALL)
 
 
 def _eval_like(expr: Like, row: Row, schema: Schema) -> Bool3:
-    """`LIKE` / `NOT LIKE`. Confirmed against `sqlite3`: unlike every
-    comparison above, `LIKE` never applies column affinity - both
-    operands are cast to their SQLite text representation
-    unconditionally (`n LIKE '5'` is `TRUE` for the INTEGER column
-    `n=5`; `5 LIKE 5`, two integer literals, is also `TRUE`). `NULL`
-    on either side makes the whole expression `NULL`
-    (`NULL LIKE anything`, `anything LIKE NULL`). `NOT LIKE` is
-    `values.not3` applied to the plain (un-negated) result - never a
-    separately reasoned-out negation - which is what keeps `NULL`
-    propagation correct through the negation for free.
+    """`LIKE` / `NOT LIKE` [`ESCAPE <expr>`] (the clause added by issue
+    #51). Confirmed against `sqlite3`: unlike every comparison above,
+    `LIKE` never applies column affinity - both operands are cast to
+    their SQLite text representation unconditionally (`n LIKE '5'` is
+    `TRUE` for the INTEGER column `n=5`; `5 LIKE 5`, two integer
+    literals, is also `TRUE`). `NULL` on either side makes the whole
+    expression `NULL` (`NULL LIKE anything`, `anything LIKE NULL`).
+    `NOT LIKE` is `values.not3` applied to the plain (un-negated)
+    result - never a separately reasoned-out negation - which is what
+    keeps `NULL` propagation correct through the negation for free.
+
+    The escape operand (when `expr.escape is not None`) goes through
+    the same `coerce_to_value(evaluate(...))` pipeline as `left`/
+    `pattern` (#63's coercion applies here too - `ESCAPE (1=1)` reads
+    as the text `'1'`, confirmed: `select '1' like '11' escape (1=1);`
+    -> `1`) and is evaluated **unconditionally**, before the combined
+    `NULL` check below - confirmed live, the single-character check
+    fires even when `left`/`pattern` is `NULL`: `select null like 'x'
+    escape 'ab';` and `select 'x' like null escape 'ab';` both raise
+    `ESCAPE expression must be a single character`, not `NULL`. A
+    `NULL` escape operand itself, though, makes the *whole* predicate
+    `NULL` with no error at all - confirmed: `select typeof('10%' LIKE
+    '10!%' ESCAPE NULL);` -> `null`, even though the missing escape
+    text could never pass the length check; the `NULL` check comes
+    first for that one specific operand.
+
+    "Single character" is counted the same way SQLite's own `length()`
+    counts it: Unicode code points (`len()` on a decoded `str`), not
+    UTF-8 bytes - confirmed: `select length('😀');` -> `1` although
+    `😀` is 4 bytes in UTF-8. An escape of the wrong length raises
+    `EvalError` at evaluate()-time (never at parse/bind time - see
+    `sql/parser.py`'s `_parse_optional_escape`, which never inspects
+    the escape operand's value) with `sqlite3`'s own wording, reused
+    verbatim: "ESCAPE expression must be a single character" - the
+    identical message for both empty and 2+-character escapes,
+    confirmed: `select '10%' like '10!%' escape '';` and `select '10%'
+    like '10!%' escape '!!';` raise the same text. This still applies
+    under `NOT LIKE`, before the negation, the same as `NULL`
+    propagation already does.
     """
     left = coerce_to_value(evaluate(expr.left, row, schema))
     pattern = coerce_to_value(evaluate(expr.pattern, row, schema))
-    if left is None or pattern is None:
+    escape_char: str | None = None
+    escape_is_null = False
+    if expr.escape is not None:
+        escape_value = coerce_to_value(evaluate(expr.escape, row, schema))
+        if escape_value is None:
+            escape_is_null = True
+        else:
+            escape_text = _coerce_to_text(escape_value)
+            if len(escape_text) != 1:
+                raise EvalError(
+                    "ESCAPE expression must be a single character",
+                    expr.escape.position,
+                )
+            escape_char = escape_text
+    if left is None or pattern is None or escape_is_null:
         result: Bool3 = None
     else:
         left_text = _ascii_fold(_coerce_to_text(left))
-        pattern_text = _ascii_fold(_coerce_to_text(pattern))
-        result = bool(_like_pattern_to_regex(pattern_text).fullmatch(left_text))
+        pattern_text = _coerce_to_text(pattern)
+        result = bool(_like_pattern_to_regex(pattern_text, escape_char).fullmatch(left_text))
     return values.not3(result) if expr.negated else result
 
 

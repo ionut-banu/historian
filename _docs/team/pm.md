@@ -49,7 +49,9 @@ Edge cases worth asking about in this project
 - What does the query return when nothing matches - zero rows, or an
   aggregate over zero rows? They are different answers.
 - What does SQLite do with NULL here? If the criteria and SQLite
-  disagree, SQLite wins and the criteria are wrong.
+  disagree, SQLite wins and the criteria are wrong. Check against
+  Python's bundled `sqlite3` module or `tests/oracle.py`, not the
+  system `sqlite3` CLI - see `_docs/process.md`, "The oracle".
 - Can a predicate in this task push down, and what happens when it
   cannot? Both paths need a criterion.
 

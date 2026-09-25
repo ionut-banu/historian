@@ -1575,21 +1575,80 @@ no error, even though its (missing) text could never pass the length
 check - confirmed: `select typeof('10%' LIKE '10!%' ESCAPE NULL);` ->
 `null`.
 
-`Like.escape` is bound the same way every other `Expr` field the
-binder does not explicitly walk is bound: not at all.
-`sql/binder.py`'s `_bind_expr` is an explicit `isinstance` chain, not
-a generic dataclass-field walk, and its `Like` branch (`dataclasses.
-replace(expr, left=..., pattern=...)`) was deliberately left
-unchanged rather than extended to also bind `expr.escape`. This is a
-known, accepted gap: an `ESCAPE <column-reference>` query is real
-`sqlite3` syntax that this issue does not support - the unbound
-`ColumnRef` would reach `exec/expression.py`'s `evaluate()` and hit
-its "unhandled expression node type" `AssertionError` rather than
-resolving. None of this issue's own acceptance criteria used a column
-reference as the escape operand (only literals, `||`, `substr(...)`,
-and a parenthesized comparison), so no test here exercises it, and
-`sql/binder.py` stays untouched end to end (`git diff --stat` shows no
-changes to it), matching the issue's own explicit constraint.
+**`Like.escape` is bound in `sql/binder.py`, correcting a wrong
+grooming claim.** The original grooming for this issue asserted
+`sql/binder.py` needed no change because `Like.escape` "is bound the
+same generic way every other `Expr` field already is." That is false:
+`_bind_expr` is an explicit `isinstance` chain, not a generic
+dataclass-field walk, and its `Like` branch (`dataclasses.replace(expr,
+left=..., pattern=...)`) never mentioned `escape` at all - a
+column-reference escape operand stayed a raw, unbound `ColumnRef` all
+the way to `exec/expression.py`'s `evaluate()`, which has no case for
+it and hit its defensive "unhandled expression node type"
+`AssertionError`. Confirmed live on the implementation branch, before
+this correction:
+
+    SELECT count(*) FROM blame WHERE 'a' LIKE 'a' ESCAPE author_name
+        sqlite3:   Error: ESCAPE expression must be a single character
+        historian: AssertionError: exec/expression.py: unhandled
+                    expression node type ColumnRef
+
+New, legal syntax (`ESCAPE <column-reference>` is real `sqlite3`
+syntax, and nothing in this issue's grammar work restricts the escape
+operand to a literal) that parsed and bound cleanly and then crashed
+with an internal assertion rather than a structured error - `cli.py`'s
+backstop reports that as "a bug in historian," not a query result, and
+exactly the class of bug the differential/`BindError`/`EvalError`
+taxonomy exists to prevent. `sql/binder.py`'s `Like` branch now binds
+`escape` exactly like `left`/`pattern` (`_bind_expr(expr.escape, ctx)
+if expr.escape is not None else None` - `None` passes through
+unchanged when no `ESCAPE` clause is present). Two other `Like`-
+specific branches in the same module - `_contains_aggregate` (used to
+classify a query as aggregate-or-not) and `_split_for_grouped_check`
+(used for `GROUP BY`/`HAVING` validation) - had the identical gap for
+the same reason and are fixed the same way, for the same reason: an
+aggregate call or an ungrouped bare column hidden inside an `ESCAPE`
+expression would otherwise silently evade both checks. All three
+changes are local to `Like`'s own branch in each function - no other
+node type's handling changed, and #84 (running concurrently) does not
+touch `sql/binder.py` at all, so there is nothing to conflict with.
+
+With `escape` now bound, a column-reference escape operand follows
+the same three rules already implemented and tested for a literal one,
+since `_eval_like` already evaluated `expr.escape` generically - the
+only thing that was broken was reaching this code with a *bound* tree
+at all. Confirmed live for all three: `create table t(x text, esc
+text);` with `insert into t values ('a!b','!'),(...,'!!'),(...,NULL)`:
+one character (`esc='!'`) is used as the escape (`select x like 'a!!b'
+escape esc from t;` -> `1`); a longer value (`esc='!!'`) raises the
+same `EvalError` a bad literal would (`select x like 'a!!b' escape esc
+from t;` raises "ESCAPE expression must be a single character"); a
+`NULL` value (`esc=NULL`) makes the result `NULL`, no error
+(`select typeof(x like 'a!!b' escape esc) from t;` -> `null`). An
+unknown column in `ESCAPE` (`ESCAPE nosuchcol`) now raises the
+binder's ordinary `BindError: no such column: nosuchcol` - confirmed
+it did not raise anything at bind time before this fix (the unbound
+`ColumnRef` was accepted silently, regardless of whether the name
+existed in the schema, and would only ever have surfaced as the
+generic `AssertionError` above once evaluated).
+
+`tests/test_binder.py`'s "LIKE ... ESCAPE: escape is bound like
+left/pattern" section pins all of this directly - confirmed via `git
+stash` that those tests fail with exactly the shapes above before this
+fix (an unbound `ColumnRef` where a `BoundColumnRef` was asserted, and
+"did not raise BindError" for the unknown-column case) and pass after.
+`tests/differential/test_blame.py`'s
+`test_like_escape_column_operand_reruns_the_coordinators_repro`
+re-runs the coordinator's own repro through the real end-to-end
+pipeline and confirms the symptom changed from the unstructured
+`AssertionError` to the correct, sqlite3-matching `EvalError`.
+`tests/test_expression.py`'s "LIKE ... ESCAPE with a column-reference
+operand" section covers the three per-row rules above at the
+`evaluate()` level, using `s` (text, one character) and `r` (real,
+three-character text after coercion) from that file's own shared
+`_SCHEMA`/`_ROW` fixture for the one-character and wrong-length cases
+(`blame` itself has no single-character column), plus a small local
+synthetic schema for the `NULL`-row-value case.
 
 **Short-circuit `AND`/`OR`, left to right - a correction discovered
 during this issue's own re-grooming.** The original grooming pass

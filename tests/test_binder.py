@@ -28,6 +28,7 @@ from historian.sql.ast import (
     BinaryOp,
     ColumnRef,
     FunctionCall,
+    Like,
     Literal,
     Operator,
     OrderDirection,
@@ -1640,3 +1641,70 @@ def test_distinct_without_order_by_and_grouped_binds_normally():
     bound = _bind("SELECT DISTINCT author_name, count(*) FROM blame GROUP BY author_name")
     assert bound.distinct is True
     assert len(bound.group_by) == 1
+
+
+# --- LIKE ... ESCAPE: escape is bound like left/pattern (issue #51 --------
+# --- follow-up) -------------------------------------------------------------
+#
+# The original grooming for #51 claimed `sql/binder.py` needed no
+# change, on the theory that `Like.escape` "is bound the same generic
+# way every other Expr field already is" - false: `_bind_expr`'s `Like`
+# branch is an explicit `dataclasses.replace(expr, left=..., pattern=
+# ...)` that never mentioned `escape` at all, so a column-reference
+# escape operand stayed a raw, unbound `ColumnRef` all the way to
+# `exec/expression.py`'s `evaluate()`, which has no case for it and
+# hits its defensive "unhandled expression node type" `AssertionError`
+# - confirmed live on this branch before this fix: `SELECT count(*)
+# FROM blame WHERE 'a' LIKE 'a' ESCAPE author_name` raised
+# `AssertionError`, not the `BindError`/`EvalError` a real historian
+# error is supposed to be. `_bind_expr`'s `Like` branch now binds
+# `escape` exactly like `left`/`pattern` (`None` passes through
+# unchanged - there is nothing to bind when no `ESCAPE` clause is
+# present).
+
+
+def test_like_escape_column_reference_binds_to_a_bound_column_ref():
+    """`ESCAPE author_name` must resolve to a `BoundColumnRef`, exactly
+    like `author_name` would anywhere else in the expression tree - not
+    stay an unbound `ColumnRef`, which is the shape that used to reach
+    `evaluate()` and trip its defensive `AssertionError`."""
+    bound = _bind("SELECT path FROM blame WHERE path LIKE 'x' ESCAPE author_name")
+    like = bound.where
+    assert isinstance(like, Like)
+    assert isinstance(like.escape, BoundColumnRef)
+    assert like.escape.offset == BLAME_SCHEMA.index_of("author_name")
+    assert like.escape.name == "author_name"
+
+
+def test_like_escape_unknown_column_is_a_bind_error_not_an_assertion_error():
+    """`ESCAPE nosuchcol` must raise the binder's own `BindError: no
+    such column: nosuchcol` - the same error any other unknown-column
+    reference in the query gets - not silently pass through unbound and
+    surface later as an `AssertionError` somewhere else entirely."""
+    with pytest.raises(BindError) as exc_info:
+        _bind("SELECT path FROM blame WHERE path LIKE 'x' ESCAPE nosuchcol")
+    assert str(exc_info.value) == "no such column: nosuchcol"
+
+
+def test_like_without_escape_still_binds_with_escape_none():
+    """The ordinary, no-`ESCAPE` case must still bind cleanly with
+    `escape` staying `None` - the fix only adds a branch for when
+    `expr.escape is not None`, never changes the no-`ESCAPE` path."""
+    bound = _bind("SELECT path FROM blame WHERE path LIKE 'x'")
+    like = bound.where
+    assert isinstance(like, Like)
+    assert like.escape is None
+
+
+def test_like_escape_arbitrary_expression_containing_a_column_still_binds():
+    """The escape operand can be more than a bare column reference -
+    `_bind_expr` recurses into it the same as any other expression tree,
+    so a column reference nested inside a larger escape expression
+    (here, concatenated with a literal) still resolves to a
+    `BoundColumnRef` at its own position in the tree."""
+    bound = _bind("SELECT path FROM blame WHERE path LIKE 'x' ESCAPE author_name || ''")
+    like = bound.where
+    assert isinstance(like, Like)
+    assert isinstance(like.escape, BinaryOp)
+    assert isinstance(like.escape.left, BoundColumnRef)
+    assert like.escape.left.name == "author_name"

@@ -2416,6 +2416,48 @@ def test_like_escape_non_ascii_multibyte_single_codepoint_escape(tiny_repo):
     _assert_differential(tiny_repo, "SELECT '10%' LIKE '10😀%' ESCAPE '😀' FROM blame")
 
 
+# --- LIKE ... ESCAPE with a column-reference operand (issue #51 follow-up) -
+#
+# The original grooming claimed `Like.escape` needed no binder change
+# ("bound the same generic way every other Expr field already is").
+# False: `sql/binder.py`'s `Like` branch never mentioned `escape`, so a
+# column-reference escape stayed unbound all the way to `evaluate()`.
+# Coordinator repro on this branch, before the binder fix:
+#
+#     SELECT count(*) FROM blame WHERE 'a' LIKE 'a' ESCAPE author_name
+#         sqlite3:   Error: ESCAPE expression must be a single character
+#         historian: AssertionError: exec/expression.py: unhandled
+#                     expression node type ColumnRef
+#
+# i.e. new, legal syntax that parsed cleanly and then crashed with an
+# internal assertion instead of a structured error - the CLI backstop
+# reports that as "a bug in historian, exit 4", not a query error.
+# `tests/test_binder.py`'s own "LIKE ... ESCAPE: escape is bound like
+# left/pattern" section pins the binder fix directly (confirmed there,
+# via `git stash`, that those tests fail with exactly this shape before
+# the fix and pass after); this test re-runs the coordinator's own
+# repro shape through the real end-to-end pipeline `run_historian`
+# uses, proving the *symptom* changed from an unstructured
+# `AssertionError` to the correct, sqlite3-matching `EvalError`.
+
+
+def test_like_escape_column_operand_reruns_the_coordinators_repro(tiny_repo):
+    """No author name in `tiny_repo` is exactly one character (`Ana
+    Petrova`, `Bo Lindqvist`), so `ESCAPE author_name` always raises
+    `EvalError` here - confirmed against sqlite3 with the equivalent
+    shape (`create table blame(path text, author_name text); insert
+    into blame values ('src/utils.py','Ana Petrova'), ('feature/
+    thing.py','Bo Lindqvist'); select count(*) from blame where 'a'
+    like 'a' escape author_name;` raises the identical "ESCAPE
+    expression must be a single character"). Before the binder fix this
+    raised `AssertionError` instead - a real historian bug, not a
+    result to match against SQLite - so this specifically asserts
+    `EvalError`, not merely "raises something"."""
+    with pytest.raises(EvalError) as excinfo:
+        run_historian("SELECT count(*) FROM blame WHERE 'a' LIKE 'a' ESCAPE author_name", tiny_repo)
+    assert "ESCAPE expression must be a single character" in str(excinfo.value)
+
+
 # --- LIKE ... ESCAPE and AND/OR short-circuit (issue #51, widened by --
 # --- the orchestrator's correction on this issue) -----------------------
 #

@@ -464,6 +464,39 @@ def test_multiplication_binds_tighter_than_addition():
     assert expr.right.op is Operator.MUL
 
 
+def test_percent_parses_at_multiplicative_precedence():
+    """`%` (issue #75) sits in `_MULTIPLICATIVE_OPERATORS` alongside
+    `*`/`/`, inside the existing `_parse_multiplicative` tier."""
+    expr = _select_expr("SELECT line_no % 2 FROM blame")
+    assert isinstance(expr, BinaryOp)
+    assert expr.op is Operator.MOD
+    assert expr.left == ColumnRef(table=None, name="line_no", position=expr.left.position)
+    assert expr.right == Literal(value=2, position=expr.right.position)
+
+
+def test_percent_binds_tighter_than_addition():
+    """`select 2 + 7 % 3;` -> 3, confirmed against sqlite3: only
+    possible as `2 + (7 % 3)`."""
+    expr = _select_expr("SELECT 2 + 7 % 3 FROM blame")
+    assert isinstance(expr, BinaryOp)
+    assert expr.op is Operator.ADD
+    assert expr.left == Literal(value=2, position=expr.left.position)
+    assert isinstance(expr.right, BinaryOp)
+    assert expr.right.op is Operator.MOD
+
+
+def test_percent_is_left_associative_with_star():
+    """`select 7 % 3 * 2;` -> 2, confirmed against sqlite3: only
+    possible as `(7 % 3) * 2`, left-associative within the
+    multiplicative tier."""
+    expr = _select_expr("SELECT 7 % 3 * 2 FROM blame")
+    assert isinstance(expr, BinaryOp)
+    assert expr.op is Operator.MUL
+    assert isinstance(expr.left, BinaryOp)
+    assert expr.left.op is Operator.MOD
+    assert expr.right == Literal(value=2, position=expr.right.position)
+
+
 def test_concat_binds_tighter_than_multiplication():
     """`select 'a' || 1 * 2;` -> 0, confirmed against sqlite3: matches
     `('a' || 1) * 2` (= 0, numeric affinity of 'a1' is 0), not
@@ -989,10 +1022,10 @@ def test_group_by_ordinal_is_a_plain_integer_literal():
 
 
 def test_group_by_expression():
-    """`GROUP BY` on an expression, not just a bare column - historian
-    has no `%` operator (issue #75; no prior issue lexes or parses it,
-    and this issue's own file list does not touch `lexer.py`), so
-    `line_no + 1` stands in for the same "not a bare column" shape."""
+    """`GROUP BY` on an expression, not just a bare column. `line_no +
+    1` stands in for this general "not a bare column" shape; the `%`
+    operator (issue #75) gets its own dedicated differential case in
+    `tests/differential/test_blame.py`."""
     stmt = _parse("SELECT line_no FROM blame GROUP BY line_no + 1")
     assert isinstance(stmt.group_by[0], BinaryOp)
     assert stmt.group_by[0].op is Operator.ADD

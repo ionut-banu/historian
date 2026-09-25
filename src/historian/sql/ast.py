@@ -139,6 +139,7 @@ class Operator(Enum):
     SUB = auto()  # -
     MUL = auto()  # *
     DIV = auto()  # /
+    MOD = auto()  # %
     CONCAT = auto()  # ||
     EQ = auto()  # =
     NE = auto()  # <> or !=

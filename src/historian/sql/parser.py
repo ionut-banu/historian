@@ -203,6 +203,7 @@ _ADDITIVE_OPERATORS: dict[TokenType, Operator] = {
 _MULTIPLICATIVE_OPERATORS: dict[TokenType, Operator] = {
     TokenType.STAR: Operator.MUL,
     TokenType.SLASH: Operator.DIV,
+    TokenType.PERCENT: Operator.MOD,
 }
 
 

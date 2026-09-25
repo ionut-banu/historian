@@ -87,7 +87,14 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from historian import values
-from historian.exec.expression import EvalError, coerce_to_bool3, coerce_to_value, evaluate
+from historian.exec.expression import (
+    EvalError,
+    arithmetic_operand,
+    coerce_to_bool3,
+    coerce_to_value,
+    evaluate,
+    try_numeric_affinity,
+)
 from historian.schema import Column, ColumnType, Row, Schema
 from historian.sql.ast import Expr
 from historian.sql.binder import BoundColumnRef, BoundSelectItem
@@ -259,34 +266,33 @@ _SUM_INT64_MIN = -9223372036854775808
 _SUM_INT64_MAX = 9223372036854775807
 
 
-def _sum_add(total: values.Value, value: values.Value, position: Position) -> values.Value:
-    """One running-total step for `sum` only (never `avg` - see
-    `_Accumulator.step`'s own `avg` branch, which accumulates
-    independently and never raises). Both operands are already
-    non-NULL `Value`s.
+def _sum_add(total: int, value: int) -> tuple[int, bool]:
+    """One running-total step for `sum`'s *exact* integer accumulator
+    only (never `avg`, which accumulates independently as a float and
+    never raises - see `_Accumulator.step`'s own `avg` branch).
 
-    While both `total` and `value` are `int`, the addition is exact
-    Python `int` arithmetic, checked against int64 bounds afterward -
-    confirmed against `sqlite3`: `sum` over two copies of int64's own
-    max raises `integer overflow`, it does not wrap and does not
-    promote. The moment either operand is a `float`, this switches to
-    float addition permanently (a later `int` value added to an
-    already-`float` total promotes through Python's own `int + float`)
-    and never raises again from that point on - `sqlite3`'s own `sum()`
-    switches to a floating accumulator the instant a REAL value is
-    seen and stops checking for integer overflow, matching #60's own
-    "sum of a mix of integer and real returns real" edge case.
+    Corrected per issue #88, which fixes a bug #60 shipped: this no
+    longer raises. It returns the new exact total - Python's `int` is
+    unbounded, so nothing here ever actually overflows - and whether
+    *this step's* total left SQLite's int64 range. It does not matter
+    whether a later step's total comes back into range; overflow is
+    recorded by the caller (`_Accumulator._sum_overflowed`, latched
+    permanently once set) and only ever turned into an `EvalError` at
+    `finish()` time, and only if no non-integer-classified value (a
+    REAL, or TEXT that is not a clean whole-string integer) was seen
+    anywhere in the aggregate's input - confirmed against `sqlite3`
+    3.51.0 directly (issue #88's own grooming, correcting #60's
+    "order-dependent asymmetry" description): a value that permanently
+    switches the running total to float suppresses the overflow check
+    for the rest of the aggregate regardless of whether it arrives
+    before or after the overflowing addition, and an overflow that
+    happens while every value is still integer-classified stays an
+    error even if a later addition would bring the exact total back
+    within int64 range.
     """
-    if isinstance(total, int) and isinstance(value, int):
-        result = total + value
-        if not (_SUM_INT64_MIN <= result <= _SUM_INT64_MAX):
-            raise EvalError(
-                "integer overflow computing sum(...) - sqlite3 raises here too, "
-                "rather than wrapping or promoting to REAL",
-                position,
-            )
-        return result
-    return float(total) + float(value)
+    new_total = total + value
+    overflowed = not (_SUM_INT64_MIN <= new_total <= _SUM_INT64_MAX)
+    return new_total, overflowed
 
 
 class _Accumulator:
@@ -304,27 +310,52 @@ class _Accumulator:
 
     `self._distinct_seen` (issue #84) is a `set` of `values.order_key`
     results, `None` when `call.distinct` is `False` - mirroring
-    `self._extreme`/`self._sum`'s own "`None` until seen" style, except
-    this one stays `None` for the whole call's life rather than being
-    populated lazily. Consulted only in the `count(<expr>)`, `sum`, and
-    `avg` branches of `step()` below: before counting/summing/
-    accumulating a non-NULL value, its `order_key` is checked against
-    the set; already present means the value's SQL-equal group has
-    already contributed and the whole step is skipped (no count, no
-    sum, no running total change), otherwise the key is recorded and
-    the step proceeds exactly as it would without `DISTINCT`. NULLs
-    are excluded (the existing `is None` checks below) before this
-    gate is ever reached, so a `NULL` argument value never touches the
-    dedup set. `min`/`max` never consult it - removing a duplicate can
-    never change which value is most extreme, so those two branches
-    are byte-for-byte what they were before this issue.
+    `self._extreme`'s own "`None` until seen" style, except this one
+    stays `None` for the whole call's life rather than being populated
+    lazily. Consulted only in the `count(<expr>)`, `sum`, and `avg`
+    branches of `step()` below: before counting/summing/accumulating a
+    non-NULL value, its `order_key` is checked against the set -
+    always on the *raw* value `evaluate()`/`coerce_to_value()` produced,
+    never on a coerced-for-arithmetic version of it (issue #88: `'3'`
+    and `3` carry different storage-class ranks and must not merge just
+    because both would coerce to the number `3`) - already present
+    means the value's SQL-equal group has already contributed and the
+    whole step is skipped (no count, no sum, no running total change),
+    otherwise the key is recorded and the step proceeds exactly as it
+    would without `DISTINCT`. NULLs are excluded (the existing `is
+    None` checks below) before this gate is ever reached, so a `NULL`
+    argument value never touches the dedup set. `min`/`max` never
+    consult it - removing a duplicate can never change which value is
+    most extreme, so those two branches are byte-for-byte what they
+    were before this issue.
+
+    `sum`/`avg` over TEXT (issue #88): both reuse `exec/expression.py`'s
+    `try_numeric_affinity` (whole-string numeric-affinity
+    classification) and `arithmetic_operand` (leading-prefix coercion)
+    rather than duplicating either parser (#53). `sum` classifies each
+    value with `try_numeric_affinity` first: a plain `INTEGER`, or TEXT
+    whose entire trimmed string is integer-shaped, stays on the exact
+    `self._sum_int` int64 path (`self._sum_overflowed` latches if a
+    step's exact total leaves int64 range); anything else - a `REAL`,
+    or TEXT that is not a clean whole-string integer - is added to
+    `self._sum_float` via `arithmetic_operand`'s leading-prefix
+    coercion and latches `self._sum_saw_non_integer`. `finish()` raises
+    only at the very end, and only if `self._sum_overflowed` and not
+    `self._sum_saw_non_integer` - never mid-accumulation, and never
+    un-latched by a later value bringing the total back in range. `avg`
+    needs none of `sum`'s classification: every value goes through
+    `arithmetic_operand` and accumulates as a float unconditionally.
     """
 
     def __init__(self, call: AggregateCall) -> None:
         self._call = call
         self._count = 0  # count(*)/count(): every row, NULL or not
         self._non_null_count = 0  # count(<expr>), and avg's denominator
-        self._sum: values.Value = None  # sum's running total; None until the first non-NULL value
+        self._sum_seen = False  # sum: whether any non-NULL value has been accumulated yet
+        self._sum_int = 0  # sum's exact integer running total (issue #88)
+        self._sum_float = 0.0  # sum's running float total, kept in parallel with _sum_int
+        self._sum_overflowed = False  # issue #88: latched once a step's exact total leaves int64 range
+        self._sum_saw_non_integer = False  # issue #88: latched by any REAL, or TEXT that isn't a clean whole-string integer
         self._avg_total = 0.0  # avg's own running total - always float, never raises
         self._extreme: values.Value = None  # min/max's running extreme; None until the first non-NULL value
         self._distinct_seen: set | None = set() if call.distinct else None
@@ -370,9 +401,28 @@ class _Accumulator:
             return
         self._non_null_count += 1
         if call.kind == "sum":
-            self._sum = value if self._sum is None else _sum_add(self._sum, value, call.position)
+            # issue #88: classify by whole-string numeric affinity
+            # first. A plain int, or TEXT whose entire trimmed string
+            # is integer-shaped, stays on the exact int64 path; a
+            # float classification (an ordinary REAL, or TEXT whose
+            # whole string is a well-formed real, e.g. '3.0') and a
+            # str classification (TEXT with no whole-string numeric
+            # reading at all, e.g. '3abc'/'abc'/'') are both
+            # "non-integer" and contribute via the leading-prefix
+            # coercion instead - confirmed against sqlite3 (issue #88's
+            # own grooming).
+            self._sum_seen = True
+            classified = try_numeric_affinity(value)
+            if isinstance(classified, int):
+                self._sum_int, overflowed = _sum_add(self._sum_int, classified)
+                if overflowed:
+                    self._sum_overflowed = True
+                self._sum_float += float(classified)
+            else:
+                self._sum_saw_non_integer = True
+                self._sum_float += float(arithmetic_operand(value))
         elif call.kind == "avg":
-            self._avg_total += value
+            self._avg_total += float(arithmetic_operand(value))
         elif call.kind == "min":
             if self._extreme is None or values.order_key(value) < values.order_key(self._extreme):
                 self._extreme = value
@@ -387,7 +437,22 @@ class _Accumulator:
         if call.kind == "count":
             return self._count if call.arg is None else self._non_null_count
         if call.kind == "sum":
-            return self._sum  # None (NULL) if no non-NULL value was ever seen
+            if not self._sum_seen:
+                return None  # NULL: no non-NULL value was ever seen
+            # issue #88: raise only here, at the very end - never
+            # mid-accumulation - and only if the exact integer total
+            # left int64 range at some point *and* every value was
+            # integer-classified. A non-integer value anywhere (before
+            # or after the overflowing addition) permanently suppresses
+            # this check; the flag is never un-latched by a later value
+            # bringing the exact total back into range.
+            if self._sum_overflowed and not self._sum_saw_non_integer:
+                raise EvalError(
+                    "integer overflow computing sum(...) - sqlite3 raises here too, "
+                    "rather than wrapping or promoting to REAL",
+                    call.position,
+                )
+            return self._sum_float if self._sum_saw_non_integer else self._sum_int
         if call.kind == "avg":
             # Real-typed unconditionally, even when the division is
             # exact (confirmed against sqlite3: avg(2,4,6) is 4.0, not

@@ -1700,3 +1700,75 @@ deliberately avoid a constant-false conjunct for this reason, using
 only the unconditional shapes confirmed above (bare `LIKE`, `LIKE` on
 the left of `AND`/`OR`, and the non-constant short-circuit shape where
 a real column decides the left operand).
+
+2026-09-25 - correcting #60's sum overflow rule: it is not
+order-dependent, it is "any non-integer value, anywhere"
+
+Issue #88 (orchestrator comment, widening its scope over a bug #60
+shipped). #60's own grooming described `sum`'s int64-overflow/REAL-
+promotion interaction as order-dependent: "once a REAL has been seen,
+overflow isn't checked" - read from testing only `(int64max, 1)` and
+`(1.5, int64max, 1)`. Issue #88's re-grooming inherited the same
+framing, and the orchestrator repeated it again in PR #73's and #89's
+descriptions. None of the four checked the third order until this
+issue: `(int64max, 1, 1.5)` - the overflowing addition *before* the
+REAL, rather than after.
+
+Verified against `sqlite3 3.51.0` directly, all eight rows below:
+
+```
+int64max, 1               -> Error: integer overflow
+1.5, int64max, 1          -> 9.22337203685478e+18   (real)
+int64max, 1, 1.5          -> 9.22337203685478e+18   (real)
+int64max, 1, 'abc'        -> 9.22337203685478e+18   (real)
+int64max, 1, '3'          -> Error: integer overflow
+int64max, 1, -1           -> Error: integer overflow
+int64max, 1, -5           -> Error: integer overflow
+int64min, -1, 0.0         -> -9.22337203685478e+18  (real)
+```
+
+The rule is not about *order* at all. `sum` raises `integer overflow`
+if and only if (a) the exact integer running total left int64 range at
+some point, *and* (b) every non-`NULL` input was integer-classified
+(a plain `INTEGER`, or `TEXT` whose entire trimmed string is
+integer-shaped, per issue #88's own whole-string affinity
+classification). A `REAL`, or `TEXT` that is not a clean whole-string
+integer, appearing *anywhere* in the input - before the overflowing
+addition or after it - permanently suppresses the check, and the
+result is the plain float sum instead. This is symmetric in position:
+`(1.5, int64max, 1)` and `(int64max, 1, 1.5)` both return the same
+REAL value, not one raising and the other not.
+
+The "permanent" half of the old description does still hold, just not
+for the reason given: once the exact integer total has left int64
+range with no non-integer value seen (`int64max, 1, -1` above), it
+stays an error even though `-1` brings the *exact* total back to
+`int64max`, in range. Overflow, once triggered, is never re-checked
+against a later total and never cleared by one - it is cleared only in
+the sense that it stops being checked at all, once a non-integer value
+arrives.
+
+`historian` on `main` before this issue got `(int64max, 1, 1.5)`
+wrong: `_sum_add` (`exec/operators.py`) raised `EvalError` the instant
+the `int64max + 1` step left int64 range, before it could ever see the
+`1.5` that comes next - the running total was a bare `Value` combining
+the "current sum" and "has anything overflowed yet" into one field
+with no way to defer the decision. Fixed by separating the exact
+integer accumulator (`_Accumulator._sum_int`), the parallel float
+accumulator (`_sum_float`), an `_sum_overflowed` latch, and an
+`_sum_saw_non_integer` latch into independent fields, and moving the
+raise from `_sum_add` (now a pure step function that never raises)
+into `_Accumulator.finish()`, evaluated once, after every row has been
+seen: raise iff `_sum_overflowed and not _sum_saw_non_integer`.
+
+Full-precision float check: SQLite 3.51.0's `sum()` may use
+compensated (Kahan-Babuska-Neumaira) summation internally for
+accuracy, so its REAL results were compared byte-for-byte against
+Python's, not merely by type. For every row in the table above, naive
+left-to-right `float` accumulation in the same order `sum` steps its
+rows (`total += float(value)` per value, no compensation) produced a
+double bit-identical to `sqlite3`'s own `printf('%.20g', ...)` output
+- confirmed via `decimal.Decimal` on both sides, not string
+comparison. No deviation was found for any input this issue's table
+covers; historian's plain running float total is sufficient and no
+compensated-summation algorithm was needed.

@@ -749,17 +749,16 @@ def test_sum_integer_overflow_raises_eval_error_not_wrap_or_promote():
 
 
 def test_sum_overflow_does_not_raise_once_a_real_value_has_been_seen():
-    """Confirmed against `sqlite3` (issue #60's own grooming: "two
-    copies of 9223372036854775807... and with one real added to force
-    promotion first - all three overflow attempts error the same
-    way")... except this specific ordering (REAL *first*, then a huge
-    integer) is exactly the case where sqlite3's own accumulator has
-    already switched to floating-point and stops checking for integer
-    overflow at all - confirmed directly: `select sum(n) from (select
-    1.0 as n union all select 9223372036854775807 union all select
-    9223372036854775807);` does not error. This is the asymmetric half
-    of `_sum_add`'s own docstring ("never raises again from that point
-    on") that the overflow test above cannot exercise by itself."""
+    """Confirmed against `sqlite3` directly: `select sum(n) from
+    (select 1.0 as n union all select 9223372036854775807 union all
+    select 9223372036854775807);` does not error, even though the
+    integer portion of the sum overflows int64 twice over. A REAL
+    value anywhere in the input permanently suppresses `sum`'s
+    overflow check (issue #88's `_sum_saw_non_integer` latch,
+    `_Accumulator.finish`) - see the overflow-table tests below for
+    the fuller set of orderings this rule covers, including the one
+    #60 originally shipped wrong (a REAL arriving *after* the
+    overflowing addition)."""
     rows: list[Row] = [
         ("a.py", 1.0, "e"),
         ("a.py", 9223372036854775807, "e"),

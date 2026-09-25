@@ -238,6 +238,64 @@ Correctness in this project is decided by SQLite, not by opinion. Every
 supported query runs through historian and through SQLite over the same
 data, and the results must be identical. See §1 of `_docs/spec.md`.
 
+The oracle is precisely SQLite as exposed by Python's bundled
+`sqlite3` module - the same module `tests/differential/conftest.py`
+uses to build the harness's SQLite side. Not the system `sqlite3`
+CLI. The module's current version, checked with:
+
+    uv run python3 -c "import sqlite3; print(sqlite3.sqlite_version)"
+
+is `3.50.4` (as of 2026-09-25). This can differ from `sqlite3
+--version`'s CLI build - `3.51.0`, an Apple-patched build, on the
+same machine - and the two are already different versions here.
+
+Reach the module directly for an ad hoc check instead of the CLI.
+For a query with no setup:
+
+    uv run python3 -c "import sqlite3; print(sqlite3.connect(':memory:').execute('SELECT ...').fetchone())"
+
+For a check that needs table setup first, use the helper,
+`tests/oracle.py` (issue #93), rather than chaining
+`executescript()` and `execute()` by hand inside a shell `-c`
+argument:
+
+    uv run python tests/oracle.py "<setup SQL>" "<query SQL>"
+    uv run python tests/oracle.py "<query SQL>"   # no setup
+
+It runs the setup (if given) through `executescript()` and the
+query through `execute()`, and prints each result value - with
+every `float` shown as both `repr()` and `.hex()` - plus the
+module's `sqlite_version` on the last line.
+
+The CLI is never the oracle for anything recorded as a decision -
+not in a comment, a `_docs/decisions.md` entry, or a test. It may
+still be run as a human's own casual scratch tool, but nothing
+written down as "confirmed against sqlite3" may come from it, for
+one concrete reason: it does not compute different values from the
+module - a 300-trial exact comparison (`sum(x) = <module repr>`
+inside SQL) found 0 mismatches - but its printed output cannot be
+trusted to show what it computed. Floats must be compared exactly,
+with `float.hex()` or equality inside SQL, never by reading printed
+text from either tool. The CLI prints floats at 15 significant
+digits by default, and its own `printf('%.20e')` pads with zeros
+after about 16 significant digits rather than printing real ones:
+
+    sqlite> select printf('%.20e', -1.8193757715275717e+299);
+    -1.81937577152757100000e+299
+
+That string looks like a different double from the module's
+`-1.8193757715275717e+299` (`...5710...` vs `...5717...`), but it
+is the same literal, padded - a display artifact, not a computation
+difference. See `_docs/decisions.md`, 2026-09-25, for the full
+evidence.
+
+Version-drift policy: whoever changes the Python toolchain this
+project resolves against (`uv`'s Python selection, or
+`requires-python` in `pyproject.toml`) updates the recorded module
+version above in the same commit - mirroring the rule that a
+decision contradicting the spec gets the spec edited alongside it.
+The CLI's own version needs no tracking here; it is not the oracle.
+
 Two consequences for the process:
 
 - QA runs the fuzzer with its own budget, larger than the engineer's.

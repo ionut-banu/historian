@@ -270,24 +270,39 @@ module's `sqlite_version` on the last line.
 The CLI is never the oracle for anything recorded as a decision -
 not in a comment, a `_docs/decisions.md` entry, or a test. It may
 still be run as a human's own casual scratch tool, but nothing
-written down as "confirmed against sqlite3" may come from it, for
-one concrete reason: it does not compute different values from the
-module - a 300-trial exact comparison (`sum(x) = <module repr>`
-inside SQL) found 0 mismatches - but its printed output cannot be
-trusted to show what it computed. Floats must be compared exactly,
-with `float.hex()` or equality inside SQL, never by reading printed
-text from either tool. The CLI prints floats at 15 significant
-digits by default, and its own `printf('%.20e')` pads with zeros
-after about 16 significant digits rather than printing real ones:
+written down as "confirmed against sqlite3" may come from it.
+Floats must be compared exactly, with `float.hex()` or equality
+inside SQL, never by reading printed text from either tool. The
+CLI prints floats at 15 significant digits by default, and its own
+`printf('%.20e')` pads with zeros after about 16 significant
+digits rather than printing real ones:
 
     sqlite> select printf('%.20e', -1.8193757715275717e+299);
     -1.81937577152757100000e+299
 
-That string looks like a different double from the module's
-`-1.8193757715275717e+299` (`...5710...` vs `...5717...`), but it
-is the same literal, padded - a display artifact, not a computation
-difference. See `_docs/decisions.md`, 2026-09-25, for the full
-evidence.
+That padded string can look like a different double from one shown
+in full precision - a real display hazard, worth knowing about, but
+a separate one from the rule below.
+
+Be deliberate about how a value reaches SQLite, in the module or
+the CLI alike. A value written as a SQL literal (`INSERT INTO t
+VALUES (1.5)`, `SELECT 1.5`) goes through SQLite's own text-to-
+double parser. A value bound as a parameter (`execute('... = ?',
+(1.5,))`) is Python's exact double, untouched. These are not
+always the same result: SQLite's literal parser is not correctly
+rounded on this platform for some large-exponent, 17-significant-
+digit values - measured directly, comparing `select <lit>` against
+Python's own `float(<lit>)` for literals of that shape, 1622 of
+10000 differ by one ULP, against 0 of 10000 for six-, fifteen-, or
+seventeen-digit literals at ordinary exponents and 0 of 10000 for
+plain decimals. See `_docs/decisions.md`, 2026-09-25, for the full
+measurement and a reproduction with a real query. A check that
+compares historian's answer against the oracle's must send the
+same values down the same path on both sides - the differential
+harness loads rows by binding, so it is unaffected, but a
+hand-written oracle check needs to say, to itself, which path it
+used, and use the same one historian's own literal or bound value
+would take.
 
 Version-drift policy: whoever changes the Python toolchain this
 project resolves against (`uv`'s Python selection, or

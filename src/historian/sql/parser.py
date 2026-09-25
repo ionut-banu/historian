@@ -550,8 +550,13 @@ class _Parser:
             elif token.type is TokenType.LIKE:
                 self._advance()
                 pattern = self._parse_relational()
+                escape = self._parse_optional_escape()
                 left = Like(
-                    left=left, pattern=pattern, negated=False, position=left.position
+                    left=left,
+                    pattern=pattern,
+                    negated=False,
+                    position=left.position,
+                    escape=escape,
                 )
             elif token.type is TokenType.IN:
                 self._advance()
@@ -592,8 +597,13 @@ class _Parser:
         if self._check(TokenType.LIKE):
             self._advance()
             pattern = self._parse_relational()
+            escape = self._parse_optional_escape()
             return Like(
-                left=left, pattern=pattern, negated=True, position=left.position
+                left=left,
+                pattern=pattern,
+                negated=True,
+                position=left.position,
+                escape=escape,
             )
         if self._check(TokenType.IN):
             self._advance()
@@ -609,6 +619,19 @@ class _Parser:
             "expected LIKE, IN or BETWEEN after NOT, found "
             f"{_describe(self._peek())}"
         )
+
+    def _parse_optional_escape(self) -> Expr | None:
+        """`[ESCAPE <expr>]`, trailing a `LIKE`/`NOT LIKE` pattern
+        (issue #51). The escape operand parses at tier 1
+        (`_parse_relational`), exactly like `pattern` itself - an
+        arbitrary expression, not restricted to a `STRING` literal.
+        Confirmed against `sqlite3` 3.51.0: `select '10%' like '10' ||
+        '!%' escape ('!');` and `select '10%' like '10!%' escape
+        substr('!x',1,1);` both run and return `1`. Returns `None` when
+        no `ESCAPE` clause is present."""
+        if not self._match(TokenType.ESCAPE):
+            return None
+        return self._parse_relational()
 
     def _parse_in_list(self) -> tuple[Expr, ...]:
         self._expect(TokenType.LPAREN, "'(' after IN")

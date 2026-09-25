@@ -1476,3 +1476,110 @@ def test_offset_rejects_arithmetic_expression():
 def test_offset_rejects_text_literal():
     with pytest.raises(BindError):
         _bind("SELECT path FROM blame LIMIT 5 OFFSET '2'")
+
+
+# --- DISTINCT (issue #78) --------------------------------------------------
+#
+# `distinct` is carried straight through from `SelectStatement.distinct`
+# with no name resolution of its own. The one thing DISTINCT changes
+# here is a narrowing on `ORDER BY`: once `stmt.distinct` is set, every
+# bare column an ORDER BY key touches must match a select-list item by
+# shape (exactly, or be built purely from select-list items) or it is
+# a BindError - reusing `_split_for_grouped_check` matched against the
+# select list instead of GROUP BY's keys. Justified by oracle
+# reliability, not historian's own determinism - see
+# `_docs/decisions.md`.
+
+
+def test_distinct_defaults_to_false():
+    bound = _bind("SELECT path FROM blame")
+    assert bound.distinct is False
+
+
+def test_distinct_flag_is_carried_through():
+    bound = _bind("SELECT DISTINCT path FROM blame")
+    assert bound.distinct is True
+
+
+def test_distinct_star_expands_normally():
+    bound = _bind("SELECT DISTINCT * FROM blame")
+    assert bound.distinct is True
+    assert [item.output_name for item in bound.select_list] == list(_BLAME_COLUMNS)
+
+
+def test_distinct_without_order_by_triggers_no_narrowing():
+    """No `ORDER BY` at all - the narrowing has nothing to check, and
+    `distinct` alone never raises."""
+    bound = _bind("SELECT DISTINCT author_name FROM blame")
+    assert bound.distinct is True
+
+
+def test_distinct_order_by_a_selected_column_is_legal():
+    bound = _bind("SELECT DISTINCT path, line_no FROM blame ORDER BY line_no")
+    assert isinstance(bound.order_by[0].expr, BoundColumnRef)
+
+
+def test_distinct_order_by_a_column_not_in_the_select_list_is_a_bind_error():
+    """The discriminating case this issue's own grooming verified live
+    against sqlite3 3.51.0: `create table u2(p,n); insert into u2
+    values('x',2),('x',1),('y',1); select distinct p from u2 order by
+    n;` returns `y` then `x` - but sqlite3's own answer here has no
+    documented, reproducible rule behind it (see `_docs/decisions.md`
+    for the full discriminating arithmetic), so historian raises
+    `BindError` instead of guessing at it."""
+    with pytest.raises(BindError):
+        _bind("SELECT DISTINCT path FROM blame ORDER BY line_no")
+
+
+def test_distinct_order_by_ordinal_is_always_legal():
+    """An ordinal already points at a select-list item verbatim, by
+    construction - no extra check needed, and this proves it."""
+    bound = _bind("SELECT DISTINCT path, line_no FROM blame ORDER BY 2")
+    assert isinstance(bound.order_by[0].expr, BoundColumnRef)
+    assert bound.order_by[0].expr.offset == BLAME_SCHEMA.index_of("line_no")
+
+
+def test_distinct_order_by_select_list_alias_is_legal():
+    """A select-list alias reference resolves (alias-first, #61's own
+    ORDER BY direction) to that item's own bound expression, which
+    trivially shape-matches itself."""
+    bound = _bind("SELECT DISTINCT path AS p FROM blame ORDER BY p")
+    assert isinstance(bound.order_by[0].expr, BoundColumnRef)
+    assert bound.order_by[0].expr.offset == BLAME_SCHEMA.index_of("path")
+
+
+def test_distinct_order_by_expression_built_purely_from_a_selected_column_is_legal():
+    bound = _bind("SELECT DISTINCT line_no FROM blame ORDER BY line_no + 1")
+    item = bound.order_by[0]
+    assert isinstance(item.expr, BinaryOp)
+    assert item.expr.op is Operator.ADD
+
+
+def test_distinct_order_by_aggregate_matching_select_list_aggregate_is_legal():
+    """`DISTINCT` combined with `GROUP BY`/aggregates: `ORDER BY
+    count(*)` matches the select list's own `count(*)` by shape."""
+    bound = _bind(
+        "SELECT DISTINCT author_name, count(*) FROM blame GROUP BY author_name "
+        "ORDER BY count(*)"
+    )
+    assert isinstance(bound.order_by[0].expr, FunctionCall)
+
+
+def test_distinct_order_by_group_key_not_in_select_list_is_a_bind_error():
+    """Stricter than the plain aggregate narrowing above it: `author_name`
+    *is* the GROUP BY key (so the aggregate-query narrowing alone would
+    accept it), but it is not itself a select-list item once DISTINCT
+    is present - `SELECT DISTINCT count(*)` never selects it - so the
+    DISTINCT narrowing rejects it even though the GROUP BY narrowing
+    would not."""
+    with pytest.raises(BindError):
+        _bind(
+            "SELECT DISTINCT count(*) FROM blame GROUP BY author_name "
+            "ORDER BY author_name"
+        )
+
+
+def test_distinct_without_order_by_and_grouped_binds_normally():
+    bound = _bind("SELECT DISTINCT author_name, count(*) FROM blame GROUP BY author_name")
+    assert bound.distinct is True
+    assert len(bound.group_by) == 1

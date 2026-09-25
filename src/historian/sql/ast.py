@@ -26,10 +26,14 @@ deliberately never imports.
 What v1's grammar does not need yet
 ------------------------------------
 
-`DISTINCT` and any `JOIN` have no node here - see issue #8's
-grooming. Adding a field to a frozen dataclass later is additive, not
-a rewrite, so there is nothing to pre-declare. `CASE` is deferred the
-same way, for a different reason: it is an independent
+Any `JOIN` has no node here - see issue #8's grooming. Adding a field
+to a frozen dataclass later is additive, not a rewrite, so there was
+nothing to pre-declare for it ahead of time. `DISTINCT` (issue #78)
+is exactly that kind of additive field: `SelectStatement.distinct` is
+a bare `bool`, `False` when the keyword is absent - `DISTINCT` has no
+operand of its own, it modifies the whole select list, so no new node
+type was needed for it either. `CASE` is deferred the same way, for a
+different reason: it is an independent
 keyword-delimited primary expression form that does not interact with
 precedence, so building it earlier than it is needed would buy
 nothing. `GROUP BY` and `HAVING` (issue #69) add `SelectStatement.
@@ -382,9 +386,17 @@ class OrderByItem:
 
 @dataclass(frozen=True)
 class SelectStatement(Stmt):
-    """`SELECT <select_list> FROM <from_table> [WHERE <where>]
+    """`SELECT [DISTINCT] <select_list> FROM <from_table> [WHERE <where>]
     [GROUP BY <group_by>] [HAVING <having>] [ORDER BY <order_by>]
     [LIMIT <limit> [OFFSET <offset>]]`.
+
+    `distinct` (issue #78) is `True` iff the query wrote `DISTINCT`
+    immediately after `SELECT`, `False` otherwise - a bare `bool`, not
+    a node of its own, since `DISTINCT` has no operand: it modifies
+    the whole select list, not one expression in it. Defaulted so
+    every existing direct construction of this dataclass (parser
+    tests building a `SelectStatement` by hand, binder tests bypassing
+    the parser) keeps working unchanged.
 
     `from_table` is a bare, unresolved table name - not a node of its
     own - and `where`/`having` are `None` when their clause is absent.
@@ -417,3 +429,4 @@ class SelectStatement(Stmt):
     limit: Expr | None
     offset: Expr | None
     position: Position
+    distinct: bool = False

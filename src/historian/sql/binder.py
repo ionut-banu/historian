@@ -338,7 +338,13 @@ class BoundSelectStatement:
     carrying the runtime meaning `exec/operators.py`'s `Limit` gives
     them. `None` when the corresponding clause is absent - `offset` is
     never set while `limit` is `None`, since §1's grammar has no bare
-    `OFFSET`.
+    `OFFSET`. `distinct` (issue #78) is carried straight through from
+    `SelectStatement.distinct` unchanged - `DISTINCT` names no table or
+    column, so there is nothing for this module to resolve about it;
+    it exists on the bound tree only so `plan/planner.py` knows
+    whether to insert a `Distinct` operator. See this module's own
+    "DISTINCT" section, below, for the one thing `distinct` *does*
+    affect here: a narrowing on `order_by`.
     """
 
     select_list: tuple[BoundSelectItem, ...]
@@ -350,6 +356,7 @@ class BoundSelectStatement:
     limit: int | None
     offset: int | None
     position: Position
+    distinct: bool = False
 
 
 # --- ASCII-only folding --------------------------------------------------
@@ -978,6 +985,36 @@ def _bind_order_by_item(
 # node, first check whether the whole subtree matches a GROUP BY key
 # by shape (`_expr_shape_equal`) - if so, that subtree is covered and
 # is never walked into for a bad bare column, whatever it contains.
+#
+# DISTINCT (issue #78) reuses this exact walk for a different question,
+# in `bind()` itself rather than a dedicated function here: when
+# `stmt.distinct` is set, every bare column an ORDER BY key touches
+# must match a select-list item by shape (exactly, or be built purely
+# from select-list items) - `_split_for_grouped_check(order_item.expr,
+# select_exprs)`, passing the bound select-list expressions in place
+# of `group_by`'s keys. An ordinal ORDER BY key needs no extra check:
+# it already resolves to the referenced select-list item's own bound
+# expression (`_bind_order_by_item`, above), which trivially
+# shape-matches itself as the first `group_keys` entry checked. A
+# select-list alias reference is the same story: `_resolve_name`
+# (`ctx.alias_first=True` for ORDER BY) already splices in that item's
+# own bound expression in its place.
+#
+# Confirmed against sqlite3 3.51.0 that this narrows what SQLite
+# itself accepts - `create table u2(p,n); insert into u2
+# values('x',2),('x',1),('y',1); select distinct p from u2 order by
+# n;` returns `y` then `x` in real SQLite, and this shape is a
+# `BindError` here instead. Unlike the GROUP BY-narrowing precedent
+# above, the justification is **not** "SQLite's own answer is an
+# unspecified internal choice" (2026-09-19's entry) restated for a new
+# clause - it is the oracle, not historian's own determinism:
+# historian's own pipeline (stable `Sort`, then a streaming
+# first-seen `Distinct`) is already fully deterministic for this shape
+# even without the narrowing, but SQLite's answer for it is not
+# reproducible from any documented rule, so matching it would mean
+# reverse-engineering an undocumented, version-fragile SQLite internal
+# and getting it wrong invisibly until the oracle disagrees. See
+# `_docs/decisions.md` for the discriminating arithmetic in full.
 
 
 def _split_for_grouped_check(
@@ -1250,6 +1287,26 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema] = TABLES) -> BoundSel
                     bad_column.position,
                     (),
                 )
+    # DISTINCT (issue #78): a narrowing on ORDER BY, symmetric to the
+    # grouped narrowing just above but matched against the *select
+    # list* instead of GROUP BY's keys - see the "DISTINCT" section
+    # comment above `_split_for_grouped_check` for the sqlite3
+    # evidence and the reasoning (oracle reliability, not historian's
+    # own determinism - `_docs/decisions.md`). Runs unconditionally
+    # whenever `stmt.distinct` is set, independent of whether the
+    # query aggregates at all - the two narrowings ask genuinely
+    # different questions and neither replaces the other.
+    if stmt.distinct:
+        select_exprs = tuple(item.expr for item in bound_items)
+        for order_item in bound_order_by:
+            _has_select_match, bad_column = _split_for_grouped_check(order_item.expr, select_exprs)
+            if bad_column is not None:
+                raise BindError(
+                    f"column {bad_column.name} must appear in the select list "
+                    "to be used in ORDER BY together with SELECT DISTINCT",
+                    bad_column.position,
+                    (),
+                )
     # LIMIT / OFFSET (issue #77): each is bound independently of
     # everything above - no interaction with GROUP BY/aggregation, no
     # select-list alias fallback (sqlite3 itself gives LIMIT/OFFSET
@@ -1270,4 +1327,5 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema] = TABLES) -> BoundSel
         limit=bound_limit,
         offset=bound_offset,
         position=stmt.position,
+        distinct=stmt.distinct,
     )

@@ -220,14 +220,17 @@ def test_unknown_column_exits_1(tiny_repo, capsys):
 
 
 def test_unimplemented_grammar_exits_1(tiny_repo, capsys):
-    """Grammar the parser already rejects outright (`DISTINCT` is not
-    yet implemented - #61's own follow-on, "12c", not this issue;
+    """Grammar the parser already rejects outright (any `JOIN` is not
+    yet implemented, per `sql/parser.py`'s own module docstring -
     `GROUP BY`/`HAVING` were this test's own example until issue #69
-    built them, `ORDER BY` until issue #61 built it, and `LIMIT` until
-    issue #77 built it - see `tests/differential/test_blame.py`'s own
-    `LIMIT`/`OFFSET` section for that grammar's coverage now) is a
+    built them, `ORDER BY` until issue #61 built it, `LIMIT` until
+    issue #77 built it, and `DISTINCT` until issue #78 built it - see
+    `tests/differential/test_blame.py`'s own `LIMIT`/`OFFSET` and
+    `DISTINCT` sections for that grammar's coverage now) is a
     `ParseError`, not a traceback."""
-    ret = cli.main(["-C", str(tiny_repo), "SELECT DISTINCT path FROM blame"])
+    ret = cli.main(
+        ["-C", str(tiny_repo), "SELECT path FROM blame JOIN blame ON path = path"]
+    )
 
     assert ret == 1
     captured = capsys.readouterr()

@@ -35,7 +35,7 @@ from historian.sql.ast import (
     UnaryOperator,
 )
 from historian.sql.lexer import Position, tokenize
-from historian.sql.parser import ParseError, parse
+from historian.sql.parser import ParseError, UnsupportedGrammarError, parse
 
 INT64_MAX = 9223372036854775807
 
@@ -1466,3 +1466,269 @@ def test_distinct_written_twice_is_a_parse_error():
     expression" rejection."""
     with pytest.raises(ParseError):
         _parse("SELECT DISTINCT DISTINCT path FROM blame")
+
+
+# --- Unsupported grammar (issue #24) ---------------------------------------
+#
+# §1's six reachable non-goals - subqueries, CTEs, window functions,
+# UNION/INTERSECT/EXCEPT, outer and cross joins, and correlated
+# anything (folded into the subquery check, see #24's grooming) - each
+# get their own `UnsupportedGrammarError` naming the feature and
+# pointing at §1, in place of the generic `ParseError` this grammar
+# would otherwise raise for the same unrecognised tokens. `INNER JOIN`
+# and plain `JOIN` are deliberately NOT part of this: they are v1
+# grammar phase 3 (§6) hasn't built yet, not a §1 non-goal, and must
+# keep raising the ordinary generic `ParseError` -
+# `tests/test_cli.py::test_unimplemented_grammar_exits_1` pins this
+# with a plain `JOIN` and must keep passing unmodified. Likewise
+# `NATURAL JOIN`, which §1's literal "outer and cross joins" wording
+# does not name.
+#
+# None of `WITH`/`UNION`/`INTERSECT`/`EXCEPT`/`OVER`/`LEFT`/`RIGHT`/
+# `FULL`/`OUTER`/`CROSS`/`NATURAL` are lexer keywords - all eleven lex
+# as plain `IDENTIFIER` - so every check here is by token *text* at a
+# specific grammar position, never by token type and never "this word
+# anywhere is an error". That is what keeps these checks from
+# colliding with the identifier-regression cases below, where the same
+# words are used as ordinary columns/aliases elsewhere in the grammar.
+
+
+def test_unsupported_grammar_error_is_a_parse_error():
+    """`UnsupportedGrammarError` must subclass `ParseError`, not a new
+    sibling exception - `cli.py`'s existing
+    `except (LexError, ParseError, BindError, EvalError)` clause,
+    locked in by issue #49 as covering exactly those four and no
+    others, must keep catching it via `isinstance` with zero changes
+    to `cli.py`."""
+    assert issubclass(UnsupportedGrammarError, ParseError)
+
+
+def test_unsupported_grammar_message_matches_spec_5_exactly():
+    """§5's own literal example, verbatim:
+
+        error: window functions are not supported
+          historian implements a subset of SQL. See the non-goals in
+          _docs/spec.md §1.
+
+    `cli.py` prints `f"error: {exc}"` unchanged, so `str(exc)` must be
+    exactly the two lines after `error: `."""
+    with pytest.raises(UnsupportedGrammarError) as exc_info:
+        _parse("SELECT count(*) OVER (ORDER BY path) FROM blame")
+    assert str(exc_info.value) == (
+        "window functions are not supported\n"
+        "  historian implements a subset of SQL. See the non-goals in\n"
+        "  _docs/spec.md §1."
+    )
+
+
+# CTEs -----------------------------------------------------------------
+
+
+def test_cte_with_is_unsupported_grammar():
+    with pytest.raises(UnsupportedGrammarError) as exc_info:
+        _parse("WITH x AS (SELECT 1) SELECT * FROM x")
+    message = str(exc_info.value)
+    assert "CTE" in message
+    assert "_docs/spec.md §1" in message
+
+
+# Subqueries -------------------------------------------------------------
+
+
+def test_subquery_in_parenthesised_expression_is_unsupported_grammar():
+    with pytest.raises(UnsupportedGrammarError) as exc_info:
+        _parse("SELECT * FROM blame WHERE path = (SELECT path FROM blame)")
+    assert "subquer" in str(exc_info.value)
+
+
+def test_subquery_in_in_list_is_unsupported_grammar():
+    with pytest.raises(UnsupportedGrammarError) as exc_info:
+        _parse("SELECT * FROM blame WHERE path IN (SELECT path FROM blame)")
+    assert "subquer" in str(exc_info.value)
+
+
+def test_subquery_in_from_is_unsupported_grammar():
+    with pytest.raises(UnsupportedGrammarError) as exc_info:
+        _parse("SELECT * FROM (SELECT * FROM blame)")
+    assert "subquer" in str(exc_info.value)
+
+
+def test_subquery_in_exists_is_unsupported_grammar_for_free():
+    """`EXISTS` is not a lexer keyword, so `EXISTS (SELECT ...)` parses
+    as an ordinary function call whose sole argument hits the same
+    `_parse_primary` check - no code of its own is needed for this
+    case."""
+    with pytest.raises(UnsupportedGrammarError) as exc_info:
+        _parse("SELECT * FROM blame WHERE EXISTS (SELECT 1 FROM blame)")
+    assert "subquer" in str(exc_info.value)
+
+
+def test_from_malformed_parenthesised_garbage_keeps_ordinary_parse_error():
+    """`FROM (garbage)` is not a subquery, just malformed - the
+    `FROM`-position check requires the token *after* `(` to be
+    `SELECT`, so this keeps today's ordinary "expected a table name"
+    message rather than the misleading subquery one."""
+    with pytest.raises(ParseError) as exc_info:
+        _parse("SELECT * FROM (garbage)")
+    assert not isinstance(exc_info.value, UnsupportedGrammarError)
+    assert "table name" in str(exc_info.value)
+
+
+# Window functions ---------------------------------------------------------
+
+
+def test_window_function_over_paren_clause_is_unsupported_grammar():
+    with pytest.raises(UnsupportedGrammarError) as exc_info:
+        _parse("SELECT count(*) OVER (ORDER BY path) FROM blame")
+    assert "window function" in str(exc_info.value)
+
+
+def test_window_function_over_named_window_is_unsupported_grammar():
+    with pytest.raises(UnsupportedGrammarError) as exc_info:
+        _parse("SELECT count(*) OVER win FROM blame")
+    assert "window function" in str(exc_info.value)
+
+
+def test_window_function_buried_in_larger_expression_is_unsupported_grammar():
+    """A call is not necessarily a whole top-level select item - the
+    check lives at the source of the call (`_parse_function_call`),
+    not the select-item fallthrough, so a buried call is caught too."""
+    with pytest.raises(UnsupportedGrammarError) as exc_info:
+        _parse("SELECT 1 + count(*) OVER (ORDER BY path) FROM blame")
+    assert "window function" in str(exc_info.value)
+
+
+# UNION / INTERSECT / EXCEPT ------------------------------------------------
+
+
+def test_union_is_unsupported_grammar_and_names_union():
+    with pytest.raises(UnsupportedGrammarError) as exc_info:
+        _parse("SELECT * FROM blame UNION SELECT * FROM blame")
+    assert "UNION" in str(exc_info.value)
+
+
+def test_intersect_is_unsupported_grammar_and_names_intersect():
+    with pytest.raises(UnsupportedGrammarError) as exc_info:
+        _parse("SELECT * FROM blame INTERSECT SELECT * FROM blame")
+    assert "INTERSECT" in str(exc_info.value)
+
+
+def test_except_is_unsupported_grammar_and_names_except():
+    with pytest.raises(UnsupportedGrammarError) as exc_info:
+        _parse("SELECT * FROM blame EXCEPT SELECT * FROM blame")
+    assert "EXCEPT" in str(exc_info.value)
+
+
+# Outer and cross joins ------------------------------------------------
+
+
+def test_left_join_is_unsupported_grammar():
+    with pytest.raises(UnsupportedGrammarError) as exc_info:
+        _parse("SELECT * FROM blame LEFT JOIN blame ON 1=1")
+    assert "outer and cross joins" in str(exc_info.value)
+
+
+def test_left_outer_join_is_unsupported_grammar():
+    with pytest.raises(UnsupportedGrammarError) as exc_info:
+        _parse("SELECT * FROM blame LEFT OUTER JOIN blame ON 1=1")
+    assert "outer and cross joins" in str(exc_info.value)
+
+
+def test_right_join_is_unsupported_grammar():
+    with pytest.raises(UnsupportedGrammarError) as exc_info:
+        _parse("SELECT * FROM blame RIGHT JOIN blame ON 1=1")
+    assert "outer and cross joins" in str(exc_info.value)
+
+
+def test_full_join_is_unsupported_grammar():
+    with pytest.raises(UnsupportedGrammarError) as exc_info:
+        _parse("SELECT * FROM blame FULL JOIN blame ON 1=1")
+    assert "outer and cross joins" in str(exc_info.value)
+
+
+def test_cross_join_is_unsupported_grammar():
+    with pytest.raises(UnsupportedGrammarError) as exc_info:
+        _parse("SELECT * FROM blame CROSS JOIN blame")
+    assert "outer and cross joins" in str(exc_info.value)
+
+
+def test_left_join_detection_is_case_insensitive():
+    """Matches the lexer's own `.upper()`-based keyword matching
+    (`sql/lexer.py`'s `_read_identifier`)."""
+    with pytest.raises(UnsupportedGrammarError):
+        _parse("select * from blame left join blame on 1=1")
+
+
+def test_natural_join_keeps_ordinary_parse_error():
+    """§1 says "outer and cross joins," not joins in general -
+    `NATURAL` (used alone) is neither, so it stays in the same bucket
+    as plain `JOIN`/`INNER JOIN`: v1 grammar not built yet, not a
+    permanent non-goal. Regression-tested explicitly so nobody later
+    "completes" join detection by sweeping `NATURAL` in."""
+    with pytest.raises(ParseError) as exc_info:
+        _parse("SELECT * FROM blame NATURAL JOIN blame")
+    assert not isinstance(exc_info.value, UnsupportedGrammarError)
+    assert "NATURAL" in str(exc_info.value)
+
+
+def test_plain_join_keeps_ordinary_parse_error():
+    """`JOIN` is v1 grammar phase 3 (§6) hasn't built yet, not a §1
+    non-goal - telling a user it is unsupported would be false."""
+    with pytest.raises(ParseError) as exc_info:
+        _parse("SELECT * FROM blame JOIN blame ON path = path")
+    assert not isinstance(exc_info.value, UnsupportedGrammarError)
+
+
+def test_inner_join_keeps_ordinary_parse_error():
+    """The trap: `INNER JOIN` looks like it belongs with the other
+    five, but §1's non-goal list says "outer and cross joins," not
+    joins in general, and `INNER JOIN` is declared v1 grammar (§6
+    phase 3) that simply hasn't been built yet."""
+    with pytest.raises(ParseError) as exc_info:
+        _parse("SELECT * FROM blame INNER JOIN blame ON 1=1")
+    assert not isinstance(exc_info.value, UnsupportedGrammarError)
+
+
+def test_bare_left_without_join_keeps_ordinary_parse_error():
+    """Future-proofing per the orchestrator's amendment: strategy 5
+    keys on the token sequence (`LEFT`/`RIGHT`/`FULL` followed by
+    `JOIN` or `OUTER JOIN`, `CROSS` followed by `JOIN`), not the bare
+    word - historian has no table aliases yet, so `FROM blame left`
+    is an ordinary trailing-garbage error today, and it must stay that
+    way so that adding table aliases later (`FROM blame left` as an
+    alias named `left`) does not silently become a false "outer and
+    cross joins are not supported" error with nothing to signal the
+    regression. This test is what would catch that."""
+    with pytest.raises(ParseError) as exc_info:
+        _parse("SELECT * FROM blame left")
+    assert not isinstance(exc_info.value, UnsupportedGrammarError)
+
+
+# Identifier regressions ----------------------------------------------------
+#
+# Every trigger word above used as an ordinary, unreserved identifier
+# somewhere other than the exact position that means the construct -
+# each must keep parsing with no error raised, exactly as before this
+# issue.
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT over FROM blame",
+        "SELECT count(over) FROM blame",
+        "SELECT count(*) FROM blame ORDER BY over",
+        "SELECT path AS union FROM blame",
+        "SELECT except FROM blame",
+        "SELECT path FROM blame WHERE left = 1",
+        "SELECT path AS left FROM blame",
+        "SELECT path FROM blame WHERE full = 1",
+        "SELECT path FROM blame WHERE outer = 1",
+        "SELECT path FROM blame WHERE cross = 1",
+        "SELECT path FROM blame WHERE natural = 1",
+        "SELECT path FROM blame WHERE with = 1",
+        "SELECT with FROM blame",
+    ],
+)
+def test_identifier_regression_still_parses(sql):
+    _parse(sql)  # must not raise

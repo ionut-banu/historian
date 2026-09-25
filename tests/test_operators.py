@@ -855,21 +855,17 @@ def test_distinct_empty_input_matches_the_all_null_case():
 def test_distinct_dedups_by_order_key_across_mixed_storage_classes():
     """Confirmed live over one column holding `1, 1.0, '1', NULL,
     NULL, 1`: `count(DISTINCT x)=2`, `sum(DISTINCT x)=2`,
-    `min(DISTINCT x)=1` (typeof integer), `max(DISTINCT x)='1'`
-    (typeof text) - the two numeric storage classes merge into one
-    distinct value, the TEXT `'1'` stays a separate one, and NULLs are
-    excluded before dedup even runs.
+    `avg(DISTINCT x)=1.0`, `min(DISTINCT x)=1` (typeof integer),
+    `max(DISTINCT x)='1'` (typeof text) - the two numeric storage
+    classes merge into one distinct value, the TEXT `'1'` stays a
+    separate one, and NULLs are excluded before dedup even runs.
 
-    `avg` is left out here (`sqlite3` itself gives `avg(DISTINCT
-    x)=1.0` for the same input): `sqlite3`'s `avg`/`sum` convert a
-    numeric-looking TEXT value to a number before adding it in,
-    accepting `'1'` the same as `1`. `_Accumulator`'s own `avg` branch
-    (`self._avg_total += value`) has never done that conversion, with
-    or without `DISTINCT` - it is a pre-existing gap in plain `avg`
-    over a TEXT argument, not something this issue's dedup-set change
-    introduces or is scoped to fix, and it is not reachable through
-    real `blame` data (no `blame` column ever mixes TEXT with
-    numeric)."""
+    `avg(DISTINCT x)=1.0` here (issue #88) because the two distinct
+    values that survive dedup are `1` (the numeric representative) and
+    `'1'` (TEXT) - `avg` now runs every accumulated value through
+    `exec/expression.py`'s leading-prefix coercion before adding it in
+    (`arithmetic_operand`), so `'1'` contributes `1.0` the same as `1`
+    does: `(1 + 1.0) / 2 = 1.0`."""
     rows: list[Row] = [
         ("a.py", 1, "e"),
         ("a.py", 1.0, "e"),
@@ -881,14 +877,15 @@ def test_distinct_dedups_by_order_key_across_mixed_storage_classes():
     calls = [
         _call("count", _col("line_no"), distinct=True),
         _call("sum", _col("line_no"), distinct=True),
+        _call("avg", _col("line_no"), distinct=True),
         _call("min", _col("line_no"), distinct=True),
         _call("max", _col("line_no"), distinct=True),
     ]
     (row,) = tuple(Aggregate(_agg_child(rows), calls).rows())
 
-    assert row == (2, 2, 1, "1")
-    assert type(row[2]) is int
-    assert type(row[3]) is str
+    assert row == (2, 2, 1.0, 1, "1")
+    assert type(row[3]) is int
+    assert type(row[4]) is str
 
 
 def test_distinct_sum_keeps_the_first_encountered_representative_int_then_float():
@@ -989,6 +986,257 @@ def test_distinct_count_star_is_unaffected_by_distinct_flag():
     (row,) = tuple(Aggregate(_agg_child(rows), [_call("count", arg=None, distinct=True)]).rows())
 
     assert row == (3,)
+
+
+# --- Aggregate sum/avg TEXT coercion and overflow (issue #88) ----------
+#
+# `sum`/`avg` over TEXT operands, reusing `exec/expression.py`'s own
+# `try_numeric_affinity` (whole-string numeric-affinity classification)
+# and `arithmetic_operand` (leading-prefix coercion) rather than a
+# second implementation - see that module for the parsers themselves.
+# Every expected value below was checked live against `sqlite3` 3.51.0
+# during this issue's grooming and again during implementation (see
+# issue #88's own comments for the transcripts) - not reasoned out.
+#
+# `sum`'s overflow rule (the widened part of this issue's scope, a bug
+# fix for #60): `sum` raises `integer overflow` if and only if the
+# exact integer running total left the int64 range at *any* point and
+# *every* non-NULL input classified as a clean whole-string integer.
+# A REAL, or TEXT that is not a clean whole-string integer, anywhere in
+# the input - before or after the overflow - permanently suppresses
+# the check and the result is the REAL sum instead. The check happens
+# once, at `finish()`, never mid-accumulation.
+
+
+def test_sum_of_whole_string_integer_text_stays_exact_integer():
+    """`sum('3'), sum('4')` (i.e. sum over two rows `'3'`, `'4'`) is
+    `7`, `type` `int` - confirmed against `sqlite3`: both are clean
+    whole-string integer-looking TEXT, so they stay on the exact int64
+    path exactly like plain `INTEGER` values, not forced to `float`."""
+    rows: list[Row] = [("a.py", "3", "e"), ("a.py", "4", "e")]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+    assert row == (7,)
+    assert type(row[0]) is int
+
+
+def test_sum_of_non_whole_string_text_becomes_real_via_leading_prefix():
+    """`sum('3abc')` over one row is `3.0`, `type` `float` - `'3abc'`
+    fails the whole-string classification (trailing `abc`), so it goes
+    through the leading-prefix coercion (`arithmetic_operand`, which
+    reads the leading `3`) and permanently flips the running total to
+    REAL - confirmed against `sqlite3`."""
+    rows: list[Row] = [("a.py", "3abc", "e")]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+    assert row == (3.0,)
+    assert type(row[0]) is float
+
+
+def test_sum_of_non_numeric_text_contributes_zero_but_still_flips_to_real():
+    """`sum('abc')` over one row is `0.0`, `type` `float` - no digit
+    anywhere in `'abc'`, so the leading-prefix coercion contributes
+    `0`, but the value still is not a clean whole-string integer, so
+    the result is still REAL, not the plain integer `0`."""
+    rows: list[Row] = [("a.py", "abc", "e")]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+    assert row == (0.0,)
+    assert type(row[0]) is float
+
+
+def test_sum_of_empty_string_contributes_zero_and_flips_to_real():
+    """`sum('')` over one row is `0.0`, `type` `float` - confirmed
+    against `sqlite3`: an empty string has no digits, contributes `0`,
+    and is not a clean whole-string integer either."""
+    rows: list[Row] = [("a.py", "", "e")]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+    assert row == (0.0,)
+    assert type(row[0]) is float
+
+
+def test_sum_of_real_looking_leading_prefix_text():
+    """`sum('3.5x')` over one row is `3.5`, `type` `float` - confirmed
+    against `sqlite3`: the leading-prefix scan reads `3.5` and stops at
+    `x`."""
+    rows: list[Row] = [("a.py", "3.5x", "e")]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+    assert row == (3.5,)
+    assert type(row[0]) is float
+
+
+def test_sum_of_negative_whole_string_integer_text_stays_exact_integer():
+    """`sum('-2')` over one row is `-2`, `type` `int` - confirmed
+    against `sqlite3`: a leading `-` is still a clean whole-string
+    integer."""
+    rows: list[Row] = [("a.py", "-2", "e")]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+    assert row == (-2,)
+    assert type(row[0]) is int
+
+
+def test_sum_of_whitespace_padded_whole_string_integer_text_stays_exact_integer():
+    """`sum(' 3')` over one row is `3`, `type` `int` - confirmed
+    against `sqlite3`: leading/trailing whitespace around a
+    whole-string integer is still clean."""
+    rows: list[Row] = [("a.py", " 3", "e")]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+    assert row == (3,)
+    assert type(row[0]) is int
+
+
+def test_sum_of_mixed_integer_and_whole_string_integer_text_stays_exact_integer():
+    """`sum` over `1`, `2`, `'3'` (plain `INTEGER`s mixed with a
+    whole-string-integer-looking TEXT) is `6`, `type` `int` - confirmed
+    against `sqlite3`. The case the original bug report's "any TEXT
+    forces REAL" phrasing gets wrong."""
+    rows: list[Row] = [("a.py", 1, "e"), ("a.py", 2, "e"), ("a.py", "3", "e")]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+    assert row == (6,)
+    assert type(row[0]) is int
+
+
+def test_avg_over_non_numeric_text_is_zero_real():
+    """`avg('abc'), avg('def')` (i.e. avg over two rows `'abc'`,
+    `'def'`) is `0.0` - confirmed against `sqlite3`: `avg` always
+    accumulates as float via the leading-prefix coercion, and neither
+    value has a digit."""
+    rows: list[Row] = [("a.py", "abc", "e"), ("a.py", "def", "e")]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("avg", _col("line_no"))]).rows())
+
+    assert row == (0.0,)
+    assert type(row[0]) is float
+
+
+def test_avg_over_mixed_integer_and_text_uses_leading_prefix_coercion():
+    """`avg` over `1`, `2`, `'3'` is `2.0` - confirmed against
+    `sqlite3`: `'3'` contributes `3` via the leading-prefix coercion,
+    same as `avg` over three plain integers `1, 2, 3`."""
+    rows: list[Row] = [("a.py", 1, "e"), ("a.py", 2, "e"), ("a.py", "3", "e")]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("avg", _col("line_no"))]).rows())
+
+    assert row == (2.0,)
+    assert type(row[0]) is float
+
+
+def test_distinct_sum_coerces_only_after_the_dedup_check_not_before():
+    """`sum(DISTINCT x)` over raw values `'3'`, `3` (one row each) is
+    `6`, `type` `int`, and `count(DISTINCT x)` over the same is `2` -
+    confirmed against `sqlite3`: `'3'` (TEXT storage class) and `3`
+    (INTEGER storage class) carry different `order_key`s and are not
+    deduped against each other, even though both would coerce to the
+    same number `3`. This proves DISTINCT's dedup check
+    (`_distinct_duplicate`) still runs on the raw, pre-coercion value -
+    coercing first and deduping second would wrongly merge them into
+    one distinct value and produce `3`, not `6`."""
+    rows: list[Row] = [("a.py", "3", "e"), ("a.py", 3, "e")]
+    calls = [_call("count", _col("line_no"), distinct=True), _call("sum", _col("line_no"), distinct=True)]
+    (row,) = tuple(Aggregate(_agg_child(rows), calls).rows())
+
+    assert row == (2, 6)
+    assert type(row[1]) is int
+
+
+# --- Aggregate sum overflow table (issue #88, widened scope) -----------
+#
+# Every row below is a live `sqlite3` 3.51.0 transcript from issue #88's
+# orchestrator comment, which corrects #60's own "order-dependent
+# asymmetry" description: `sum` raises `integer overflow` only at the
+# very end, and only if the exact integer total left int64 range at
+# any point *and* every input was integer-classified (a plain INTEGER
+# or a whole-string-integer-looking TEXT) - never if any REAL or
+# non-whole-string TEXT appeared anywhere, regardless of order.
+
+_INT64_MAX = 9223372036854775807
+_INT64_MIN = -9223372036854775808
+
+
+def test_sum_overflow_table_row_1_two_int64_max_raises():
+    """`int64max, 1` -> `Error: integer overflow`."""
+    rows: list[Row] = [("a.py", _INT64_MAX, "e"), ("a.py", 1, "e")]
+    with pytest.raises(EvalError):
+        list(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+
+def test_sum_overflow_table_row_2_real_before_overflow_suppresses_it():
+    """`1.5, int64max, 1` -> `9.22337203685478e+18` (real), no error -
+    the REAL arrives before the overflowing addition, matching #60's
+    own original test."""
+    rows: list[Row] = [("a.py", 1.5, "e"), ("a.py", _INT64_MAX, "e"), ("a.py", 1, "e")]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+    assert type(row[0]) is float
+    assert row[0] == 1.5 + float(_INT64_MAX) + 1.0
+
+
+def test_sum_overflow_table_row_3_real_after_overflow_still_suppresses_it():
+    """`int64max, 1, 1.5` -> `9.22337203685478e+18` (real), no error -
+    the REAL arrives *after* the overflowing addition. This is the row
+    historian's `main` branch gets wrong (it raises here, since
+    `_sum_add` used to raise the instant the int64+int64 step went out
+    of range, before it could see the 1.5 that comes next) - the bug
+    #60 shipped and this issue's widened scope fixes."""
+    rows: list[Row] = [("a.py", _INT64_MAX, "e"), ("a.py", 1, "e"), ("a.py", 1.5, "e")]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+    assert type(row[0]) is float
+    assert row[0] == float(_INT64_MAX) + 1.0 + 1.5
+
+
+def test_sum_overflow_table_row_4_non_clean_text_after_overflow_suppresses_it():
+    """`int64max, 1, 'abc'` -> `9.22337203685478e+18` (real), no error
+    - `'abc'` is not a clean whole-string integer, so it counts as
+    non-integer exactly like a REAL does."""
+    rows: list[Row] = [("a.py", _INT64_MAX, "e"), ("a.py", 1, "e"), ("a.py", "abc", "e")]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+    assert type(row[0]) is float
+    assert row[0] == float(_INT64_MAX) + 1.0 + 0.0
+
+
+def test_sum_overflow_table_row_5_whole_string_integer_text_does_not_suppress_overflow():
+    """`int64max, 1, '3'` -> `Error: integer overflow` - `'3'` is a
+    clean whole-string integer, so it does *not* count as "a
+    non-integer was seen" and the overflow from `int64max + 1` still
+    raises."""
+    rows: list[Row] = [("a.py", _INT64_MAX, "e"), ("a.py", 1, "e"), ("a.py", "3", "e")]
+    with pytest.raises(EvalError):
+        list(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+
+def test_sum_overflow_table_row_6_overflow_is_permanent_even_if_total_returns_to_range():
+    """`int64max, 1, -1` -> `Error: integer overflow` - the running
+    total goes out of range at `int64max + 1` and then `-1` would bring
+    the *exact* total back to `int64max`, in range, but the overflow
+    still raises: once triggered (with no non-integer value ever seen)
+    it is permanent, not re-checked against the final total."""
+    rows: list[Row] = [("a.py", _INT64_MAX, "e"), ("a.py", 1, "e"), ("a.py", -1, "e")]
+    with pytest.raises(EvalError):
+        list(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+
+def test_sum_overflow_table_row_7_overflow_permanent_with_a_second_integer_after():
+    """`int64max, 1, -5` -> `Error: integer overflow` - same as row 6,
+    a different in-range-again integer offset, still raises."""
+    rows: list[Row] = [("a.py", _INT64_MAX, "e"), ("a.py", 1, "e"), ("a.py", -5, "e")]
+    with pytest.raises(EvalError):
+        list(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+
+def test_sum_overflow_table_row_8_negative_overflow_with_a_real_suppresses_it():
+    """`int64min, -1, 0.0` -> `-9.22337203685478e+18` (real), no error
+    - the negative-direction mirror of row 2/3/4: an ordinary REAL
+    anywhere suppresses the overflow check, including on underflow."""
+    rows: list[Row] = [("a.py", _INT64_MIN, "e"), ("a.py", -1, "e"), ("a.py", 0.0, "e")]
+    (row,) = tuple(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
+
+    assert type(row[0]) is float
+    assert row[0] == float(_INT64_MIN) + -1.0 + 0.0
 
 
 # --- Aggregate (issue #69): the grouped path --------------------------------

@@ -1090,6 +1090,49 @@ def test_count_with_no_parens_content_equals_count_star(tiny_repo):
     _assert_differential(tiny_repo, "SELECT count() FROM blame")
 
 
+# --- Aggregate sum/avg over TEXT (issue #88) ----------------------------
+#
+# `sum`/`avg` over a non-numeric TEXT column used to raise (`sum`:
+# ValueError from `_sum_add`'s `float()` call; `avg`: TypeError from
+# `float += str`) instead of coercing like `sqlite3` does. Every blame
+# column but `line_no` is TEXT, and none of `path`, `line`, or
+# `author_name` ever looks numeric in real blame data, so `sum`/`avg`
+# over any of them is `0.0` against both engines.
+
+
+def test_aggregate_sum_over_a_never_numeric_text_column_is_zero_real(tiny_repo):
+    """`sum(path)` over the whole table is `(0.0,)` - confirmed against
+    `sqlite3`: no `path` value in the tiny-repo fixture has a numeric
+    leading prefix, so every row contributes `0`, and the result is
+    REAL rather than the plain integer `0` because `path` is TEXT and
+    never a clean whole-string integer."""
+    _assert_differential(tiny_repo, "SELECT sum(path) FROM blame")
+
+
+def test_aggregate_avg_over_a_never_numeric_text_column_is_zero_real(tiny_repo):
+    """`avg(author_name)` over the whole table is `(0.0,)` - confirmed
+    against `sqlite3`."""
+    _assert_differential(tiny_repo, "SELECT avg(author_name) FROM blame")
+
+
+def test_aggregate_sum_over_the_line_content_column_is_zero_real(tiny_repo):
+    """`sum(line)` over the whole table is `(0.0,)` - confirmed against
+    `sqlite3`. `line` is the blamed source line's own text content,
+    never numeric-looking in the tiny-repo fixture."""
+    _assert_differential(tiny_repo, "SELECT sum(line) FROM blame")
+
+
+def test_aggregate_sum_of_a_text_literal_leading_prefix(tiny_repo):
+    """`sum('3abc')` over the whole table is `(9.0,)` - a literal
+    argument, not a column, still reaches the same `_Accumulator.step`
+    path: `'3abc'` is not a clean whole-string integer, so its
+    leading-prefix contribution (`3`) is added as a float for every
+    row of the fixture, and the running total permanently flips to
+    REAL. Cheap to add since it needs no new fixture data - the row
+    count alone determines the answer."""
+    _assert_differential(tiny_repo, "SELECT sum('3abc') FROM blame")
+
+
 # --- Aggregate (issue #60): BindError cases, asserted directly ---------
 #
 # Unlike the section above, these never reach SQLite at all - historian

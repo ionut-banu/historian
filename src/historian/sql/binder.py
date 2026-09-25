@@ -661,7 +661,15 @@ def _bind_expr(expr: Expr, ctx: _Context) -> Expr:
     if isinstance(expr, Is):
         return dataclasses.replace(expr, left=_bind_expr(expr.left, ctx), right=_bind_expr(expr.right, ctx))
     if isinstance(expr, Like):
-        return dataclasses.replace(expr, left=_bind_expr(expr.left, ctx), pattern=_bind_expr(expr.pattern, ctx))
+        # #51: escape is an ordinary operand expression, bound the same
+        # way left/pattern already are - None passes through unchanged
+        # (no ESCAPE clause), since there is nothing to bind.
+        return dataclasses.replace(
+            expr,
+            left=_bind_expr(expr.left, ctx),
+            pattern=_bind_expr(expr.pattern, ctx),
+            escape=_bind_expr(expr.escape, ctx) if expr.escape is not None else None,
+        )
     if isinstance(expr, In):
         return dataclasses.replace(
             expr, left=_bind_expr(expr.left, ctx), values=tuple(_bind_expr(v, ctx) for v in expr.values)
@@ -711,7 +719,11 @@ def _contains_aggregate(expr: Expr) -> bool:
     if isinstance(expr, Is):
         return _contains_aggregate(expr.left) or _contains_aggregate(expr.right)
     if isinstance(expr, Like):
-        return _contains_aggregate(expr.left) or _contains_aggregate(expr.pattern)
+        return (
+            _contains_aggregate(expr.left)
+            or _contains_aggregate(expr.pattern)
+            or (expr.escape is not None and _contains_aggregate(expr.escape))
+        )
     if isinstance(expr, In):
         return _contains_aggregate(expr.left) or any(_contains_aggregate(v) for v in expr.values)
     if isinstance(expr, Between):
@@ -1058,7 +1070,14 @@ def _split_for_grouped_check(
     if isinstance(expr, Like):
         left_has, left_bad = _split_for_grouped_check(expr.left, group_keys)
         pattern_has, pattern_bad = _split_for_grouped_check(expr.pattern, group_keys)
-        return left_has or pattern_has, left_bad or pattern_bad
+        if expr.escape is not None:
+            escape_has, escape_bad = _split_for_grouped_check(expr.escape, group_keys)
+        else:
+            escape_has, escape_bad = False, None
+        return (
+            left_has or pattern_has or escape_has,
+            left_bad or pattern_bad or escape_bad,
+        )
     if isinstance(expr, In):
         has, bad = _split_for_grouped_check(expr.left, group_keys)
         for value in expr.values:

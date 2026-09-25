@@ -1447,6 +1447,67 @@ def test_like_escape_operand_is_an_arbitrary_expression_not_just_a_literal():
     assert evaluate(_like(_lit("1"), _lit("11"), escape=comparison_true), _ROW, _SCHEMA) is True
 
 
+# --- LIKE ... ESCAPE with a column-reference operand (issue #51 follow-up) -
+#
+# The coordinator's own repro on this branch: `SELECT count(*) FROM
+# blame WHERE 'a' LIKE 'a' ESCAPE author_name` used to raise
+# `AssertionError: exec/expression.py: unhandled expression node type
+# ColumnRef`, because `sql/binder.py`'s `Like` branch bound `left`/
+# `pattern` but silently left `expr.escape` as a raw, unbound
+# `ColumnRef` - a real bug, not the accepted gap the original grooming
+# claimed. `Like.escape` is now bound in `_bind_expr` exactly like
+# `left`/`pattern`, so a column-reference escape resolves to a
+# `BoundColumnRef` and reaches `evaluate()`'s normal `BoundColumnRef`
+# branch (`row[expr.offset]`) instead of its "unhandled expression node
+# type" defensive `AssertionError`. `blame` has no single-character
+# column, so the "one character" case below uses `_SCHEMA`'s own `s`
+# column (`t(n INTEGER, s TEXT, r REAL)`, `_ROW = (5, '5', 5.0)` - `s`
+# is the text `'5'`, one character) rather than a synthetic schema.
+# `tests/differential/test_blame.py`'s
+# `test_like_escape_column_operand_reruns_the_coordinators_repro` pins
+# the same fix end to end, through the real parser/binder/evaluator
+# pipeline the bug actually lived in - this section stays at the
+# `evaluate()` level, on a hand-built, already-bound tree.
+
+
+def test_like_escape_column_operand_one_character_is_used_as_the_escape():
+    """`s` (`_ROW`'s text column) is `'5'`, one character - confirmed
+    against sqlite3: `select '10%' like '105%' escape '5';` -> 1 (the
+    `5` before `%` makes it a literal percent, exactly like the `!`-
+    escape cases elsewhere in this file, just spelled with `s`'s own
+    row value instead of a literal)."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_like(_lit("10%"), _lit("105%"), escape=_col("s")), _ROW, _SCHEMA) is True
+
+
+def test_like_escape_column_operand_wrong_length_raises_eval_error():
+    """`r` (`_ROW`'s real column) coerces to the text `'5.0'`, three
+    characters - confirmed against sqlite3: `select '10%' like '105%'
+    escape '5.0';` raises `ESCAPE expression must be a single
+    character`. Same error here, from a column-valued escape rather
+    than a literal one."""
+    from historian.exec.expression import EvalError, evaluate
+
+    with pytest.raises(EvalError):
+        evaluate(_like(_lit("10%"), _lit("105%"), escape=_col("r")), _ROW, _SCHEMA)
+
+
+def test_like_escape_column_operand_null_row_value_is_null():
+    """sqlite3 (`t(x text, esc text)`, `esc=NULL`): `select typeof(x
+    like 'a!!b' escape esc) from t;` -> `null`, no error - the same
+    `NULL`-propagates rule as a literal `NULL` escape, now reached via
+    a column's actual row value rather than a `NULL` literal. Built
+    from a small synthetic schema/row (not `_SCHEMA`/`_ROW`, which has
+    no `NULL` column) purely for this one case."""
+    from historian.exec.expression import evaluate
+
+    schema = Schema(columns=(Column("x", ColumnType.TEXT), Column("esc", ColumnType.TEXT)))
+    row: Row = ("a!b", None)
+    esc_col = BoundColumnRef(offset=1, name="esc", position=_POS)
+    assert evaluate(_like(_lit("a!b"), _lit("a!!b"), escape=esc_col), row, schema) is None
+
+
 # --- AND / OR: short-circuit evaluation, left to right (issue #51) ------
 #
 # SQLite evaluates AND/OR left to right and stops early - confirmed live

@@ -1772,3 +1772,97 @@ double bit-identical to `sqlite3`'s own `printf('%.20g', ...)` output
 comparison. No deviation was found for any input this issue's table
 covers; historian's plain running float total is sufficient and no
 compensated-summation algorithm was needed.
+
+2026-09-25 - #88's "no compensated-summation algorithm was needed"
+was wrong for other inputs; `sum`/`avg` now port SQLite's own
+Kahan-Babuska-Neumaier accumulator, and `avg` shares `sum`'s
+accumulator instead of casting to float up front
+
+Issue #91. #88's own grooming (the entry directly above) checked
+naive `float` accumulation against `sqlite3` only for its own
+overflow-ordering table's eight rows and found no deviation there -
+correctly, for those particular inputs - and concluded no compensated
+summation was needed at all. That conclusion did not generalize:
+issue #91 found inputs (`0.1` summed 10 times; `1e16, 1.0, -1e16`; a
+large-magnitude mixed-exponent sum) where `sqlite3 3.51.0`'s `sum()`
+disagrees with naive left-to-right `float` accumulation bit-for-bit,
+because SQLite's own `sumStep`/`sumFinalize` (`src/func.c`) use
+Kahan-Babuska-Neumaier (KBN) compensated summation internally. Neither
+`math.fsum` nor Python's own compensated built-in `sum()` (3.12+) is a
+safe substitute - one row in the issue's verification table (case I,
+`1.2e6, -5.51e-6, 5.34e55, 4.22e21, -7.65e23, 8.9e57, -9.13e57, 5.55e0`)
+has naive, KBN, and `fsum` land on three distinct bit patterns
+simultaneously, and `fsum` is the *correctly-rounded* sum, which is
+provably not what `sqlite3`'s `sum()` computes. There is no
+approximation of SQLite's own algorithm that reproduces it exactly
+except the algorithm itself, so `exec/operators.py` now ports it
+step-for-step: `_kbn_step` (`kahanBabuskaNeumaierStep`), `_kbn_step_
+int64`/`_kbn_split_int64` (`kahanBabuskaNeumaierStepInt64`, splitting
+`|v| >= 2**52` into a multiple of 16384 plus a remainder so both
+halves convert to `double` exactly - computed with exact Python `int`
+arithmetic and an explicit sign fixup for C's truncating `%`, never
+`math.fmod`, which would convert the original value to `float` first
+and lose the precision the split exists to preserve), `_kbn_init`
+(`kahanBabuskaNeumaierInit`), and `_kbn_is_overflow`
+(`sqlite3IsOverflow`). One porting hazard worth recording: C's `pSum-
+>rErr += (s - t) + r` computes `(s - t) + r` as one unit *before*
+adding it to the old `rErr` - a left-to-right Python transliteration
+(`r_err + (s - t) + r`, evaluated as `(r_err + (s - t)) + r`) rounds
+differently once `rErr` and `s`/`r` are at very different magnitudes,
+and silently fails the very first row of this issue's own verification
+table. Caught by writing the table's tests before the port, per
+`_docs/team/software-engineer.md`.
+
+A second, unrelated bug surfaced during the same grooming and is fixed
+by the same refactor: `avg` is not a separately-implemented "cast
+every value to `float` and average" aggregate in SQLite - it shares
+`sum`'s own `xStep` (`sumStep`) outright, differing only in
+`xFinal`/`xValue`, so it keeps `sum`'s exact `iSum` running total for
+as long as possible too, converting to `double` only once, at
+finalize time (or at the same fold transition `sum` uses). historian's
+`avg` on `main` before this issue cast every value to `float`
+individually and summed those (`self._avg_total += float(arithmetic_
+operand(value))`, unconditionally, every row), which is wrong for
+integers past 2**53 because `float` is not distributive over integer
+addition: `avg(9007199254740993, 1)` returned `4503599627370496.0`
+on `main`, where `sqlite3` returns `4503599627370497.0`. Fixed by
+giving `sum` and `avg` the same shared step algorithm in `_Accumulator
+.step` (each `AggregateCall` still gets its own `_Accumulator`
+instance and its own independent state - only the algorithm is
+shared, not the state across calls), differing only in `finish()`:
+`sum` raises on `self._sum_overflowed and not self._sum_saw_non_
+integer` and returns the exact `self._sum_int` when the exact path was
+never abandoned; `avg` never raises and always divides by `self.
+_non_null_count`.
+
+#88's overflow rule itself (raise iff `self._sum_overflowed and not
+self._sum_saw_non_integer`, both latched permanently, neither ever
+un-latched) needed no change. SQLite's own `sumStep` actually
+live-clears `p->ovrfl = 0` on every non-integer value stepped while
+`p->approx` is already set, which reads as a different, more dynamic
+rule - but issue #91's grooming proved the two are exactly equivalent
+for every possible input sequence: an overflow can only occur while
+`p->approx`/`self._sum_approx` is still unset, which is only true
+before the first non-integer value anywhere in the input, so whenever
+any non-integer value appears at all, any overflow must have happened
+strictly before it and SQLite's own live-clearing step always
+suppresses it - the same outcome #88's simpler latch already produces
+without ever tracking *when* the non-integer value arrived relative to
+the overflow. Re-verified computationally and pinned with a regression
+test (case G in the verification table: `int64max, 1, 1.5` must not
+raise) after the refactor, since the refactor touches the same code
+paths #88 built.
+
+Every "Required" row of issue #91's verification table is asserted to
+actually fail under plain naive `float` accumulation, not merely to
+pass under the new code - proof each row exercises the fix rather than
+passing by coincidence. Two rows absent from the ported source
+material's own worked examples (F1-F3, G) were added during
+implementation (F4, F5) after those examples turned out not to
+distinguish a correctly-split `int64` conversion from an unsplit
+direct `float()` cast for the specific magnitudes involved (`int64max`/
+`int64min` happen to round-trip identically either way for those
+particular follow-on addends) - found by a randomized search over
+large integers and confirmed against `sqlite3` directly, so the
+`StepInt64`/`Init` split's own correctness has a test that actually
+depends on it.

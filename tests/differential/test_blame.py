@@ -1133,6 +1133,22 @@ def test_aggregate_sum_of_a_text_literal_leading_prefix(tiny_repo):
     _assert_differential(tiny_repo, "SELECT sum('3abc') FROM blame")
 
 
+def test_aggregate_avg_of_a_text_literal_leading_prefix(tiny_repo):
+    """`avg('3abc')` over the whole table is `(3.0,)` - confirmed
+    against `sqlite3`, independent of row count, since every row
+    contributes the identical leading-prefix value `3.0`. Unlike
+    `avg(author_name)` above (which is `0.0` under both the correct
+    leading-prefix scheme and a broken whole-string-affinity one, and
+    so cannot tell the two apart), `'3abc'` disagrees between the two
+    schemes - `0.0` under whole-string affinity (`'3abc'` is not a
+    clean whole-string number) versus `3.0` under the correct
+    leading-prefix coercion `arithmetic_operand` implements - so this
+    case is the one that actually exercises `avg`'s own coercion
+    choice, mirroring `test_aggregate_sum_of_a_text_literal_leading_
+    prefix` above for `sum`."""
+    _assert_differential(tiny_repo, "SELECT avg('3abc') FROM blame")
+
+
 # --- Aggregate (issue #60): BindError cases, asserted directly ---------
 #
 # Unlike the section above, these never reach SQLite at all - historian

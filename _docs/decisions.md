@@ -1485,3 +1485,159 @@ own input, inside `Aggregate`/`_Accumulator`, never touching
 `Project`/`Distinct`/the plan tree above `Aggregate`) and is
 deliberately out of this issue's scope, left for its own follow-up
 issue per the grooming note on #78.
+
+2026-09-25 - LIKE gains ESCAPE; implemented, not declined
+
+Re-groomed and routed to implement (issue #51), reversing the
+provisional "declined" framing an earlier pass gave it: `_docs/
+spec.md` §1's v1 grammar lists `LIKE` unqualified in its "Expressions"
+line, and the "Explicitly out of scope for v1" list (subqueries, CTEs,
+window functions, `UNION`/`INTERSECT`/`EXCEPT`, outer/cross joins,
+correlated anything, UDFs) never mentions `ESCAPE` - unlike `CASE`/
+`JOIN`, which were deferred by their own explicit grooming decisions
+even though §1's grammar line also lists `CASE`. The feature itself is
+small and self-contained: one optional clause on an operator (`LIKE`)
+that already exists end to end, confined to `sql/lexer.py` (one new
+keyword), `sql/ast.py` (`Like.escape`), `sql/parser.py`'s two existing
+`LIKE` branches, and `exec/expression.py`'s `_eval_like`/
+`_like_pattern_to_regex` - no new operator, no new table, no pushdown
+design, nothing `plan/`-level, and `sql/binder.py` ends up untouched
+(`Like.escape` is never bound - see below).
+
+`ESCAPE` became the lexer's 31st reserved keyword, matching `sqlite3`
+exactly: `create table t(escape text);` already fails there ("near
+"escape": syntax error"), i.e. `escape` was already reserved in the
+oracle. historian had no `ESCAPE` token at all, so `escape` unquoted
+was a legal bare identifier here before this issue - a real divergence
+this reservation closes rather than creates.
+
+All findings below were run live against `sqlite3` 3.51.0 during this
+issue's own implementation, not assumed from the grooming pass that
+preceded it:
+
+    sqlite> select '10%' like '10!%' escape '!';        -> 1
+    sqlite> select '10x' like '10!%' escape '!';         -> 0
+    sqlite> select 'a!' like 'a!' escape '!';             -> 0
+    sqlite> select 'aX' like 'a!' escape '!';             -> 0
+    sqlite> select 'ab' like 'a!b' escape '!';            -> 1
+    sqlite> select 'a!b' like 'a!!b' escape '!';          -> 1
+    sqlite> select 'a%b' like 'axb' escape 'X';           -> 0
+    sqlite> select 'aXb' like 'axb' escape 'X';           -> 1
+    sqlite> select 'a%b' like 'aXb' escape 'x';           -> 0
+    sqlite> select 'a%b' like 'ax%b' escape 'X';          -> 0
+    sqlite> select '10%' like '10!%' escape (1=1);        -> 0
+    sqlite> select '10%' like '101%' escape (1=1);        -> 0
+    sqlite> select '10😀%' like '10😀é%' escape '😀';       -> 0
+    sqlite> select '10%' like '10😀%' escape '😀';         -> 1
+    sqlite> select length('é'), length('😀');              -> 1|1
+    sqlite> select typeof('10%' LIKE '10!%' ESCAPE NULL); -> null
+    sqlite> select null like 'x' escape 'ab';   -- raises, not NULL
+    sqlite> select 'x' like null escape 'ab';   -- raises, not NULL
+    sqlite> select '10%' like '10!%' escape '!!';   -- raises
+    sqlite> select '10%' like '10!%' escape '';     -- raises
+    -- both: "ESCAPE expression must be a single character"
+
+Escape-character *recognition* inside the pattern is case-sensitive /
+exact-codepoint, independent of `LIKE`'s own ASCII fold of the matched
+text - the trap most likely to produce a silent oracle mismatch, since
+`_eval_like` ASCII-folded `pattern_text` *before* handing it to
+`_like_pattern_to_regex`, which would have scanned already-folded text
+for the escape character and made recognition wrongly
+case-insensitive. Fixed by scanning the pattern's raw, un-folded text
+for escape occurrences and ASCII-folding only the characters that end
+up literal, one at a time, inside `_like_pattern_to_regex` itself;
+`left_text` is still folded up front as before, since that half of the
+comparison is unaffected.
+
+"Single character" is counted the same way SQLite's own `length()`
+counts it: Unicode code points, not UTF-8 bytes (`😀` is 4 UTF-8 bytes
+and one code point in both). Python's `len()` on a decoded `str`
+already counts code points, so `len(escape_text) != 1` needed no
+special-casing.
+
+An escape character at the very end of the pattern, with nothing
+following it to escape, makes the pattern unsatisfiable - not a
+no-op, not an error. `_like_pattern_to_regex` compiles this case to
+`(?!)`, the standard "never matches" regex idiom, rather than treating
+the escape as a literal character or raising.
+
+The single-character length check is a **runtime** (`EvalError`)
+failure, never a parse- or bind-time one, and it fires whenever the
+escape operand's coerced text is not `NULL` and not exactly one code
+point - independent of whether `left`/`pattern` are themselves `NULL`.
+Confirmed live: `select null like 'x' escape 'ab';` and `select 'x'
+like null escape 'ab';` both raise, they do not quietly return `NULL`
+- so the escape operand is evaluated, and its length checked,
+unconditionally, before the combined `NULL`-propagation check that
+covers `left`/`pattern`/`escape` all being possibly-`NULL`. A `NULL`
+escape operand itself is the one case that *is* NULL-propagated with
+no error, even though its (missing) text could never pass the length
+check - confirmed: `select typeof('10%' LIKE '10!%' ESCAPE NULL);` ->
+`null`.
+
+`Like.escape` is bound the same way every other `Expr` field the
+binder does not explicitly walk is bound: not at all.
+`sql/binder.py`'s `_bind_expr` is an explicit `isinstance` chain, not
+a generic dataclass-field walk, and its `Like` branch (`dataclasses.
+replace(expr, left=..., pattern=...)`) was deliberately left
+unchanged rather than extended to also bind `expr.escape`. This is a
+known, accepted gap: an `ESCAPE <column-reference>` query is real
+`sqlite3` syntax that this issue does not support - the unbound
+`ColumnRef` would reach `exec/expression.py`'s `evaluate()` and hit
+its "unhandled expression node type" `AssertionError` rather than
+resolving. None of this issue's own acceptance criteria used a column
+reference as the escape operand (only literals, `||`, `substr(...)`,
+and a parenthesized comparison), so no test here exercises it, and
+`sql/binder.py` stays untouched end to end (`git diff --stat` shows no
+changes to it), matching the issue's own explicit constraint.
+
+**Short-circuit `AND`/`OR`, left to right - a correction discovered
+during this issue's own re-grooming.** The original grooming pass
+claimed `LIKE ... ESCAPE 'ab' AND 1=0` still errors "since the LIKE is
+evaluated first," which is wrong:
+
+    sqlite> create table t(p); insert into t values('a'),('b');
+    sqlite> select count(*) from t where p = 'zzz' and p like 'a' escape 'ab';
+    0
+    sqlite> select count(*) from t where p like 'a' escape 'ab' and p = 'zzz';
+    Error: ESCAPE expression must be a single character
+    sqlite> select count(*) from t where 1=1 or p like 'a' escape 'ab';
+    2
+    sqlite> select count(*) from t where p like 'a' escape 'ab' or 1=1;
+    Error
+    sqlite> select count(*) from t where 0=1 or p like 'a' escape 'ab';
+    Error
+
+SQLite evaluates `AND`/`OR` left to right and stops once the result is
+decided. historian's `evaluate()` (`exec/expression.py`) evaluated
+both operands of `And`/`Or` unconditionally before this issue - always
+harmless until `ESCAPE` became the first expression able to raise at
+runtime. Fixed by short-circuiting in `evaluate()` itself: `And`
+returns `FALSE` without evaluating its right operand once the left
+coerces to `FALSE`; `Or` returns `TRUE` without evaluating its right
+operand once the left coerces to `TRUE`. This is exact under
+three-valued logic - `and3(FALSE, x)` is `FALSE` and `or3(TRUE, x)` is
+`TRUE` for every `x`, `NULL` included - so it changes nothing about
+any *result*, only whether the right operand's `evaluate()` call
+happens at all. A `NULL` left operand is not "decided" either way and
+still evaluates the right, matching the table above (`0=1 OR ...`
+still raises, since `0=1` is `FALSE`, not `TRUE`, so `OR` does not
+short-circuit it).
+
+**What is not replicated: SQLite's constant-folding.** `select
+count(*) from t where p like 'a' escape 'ab' and 1=0;` returns `0`
+rows with **no error**, in either operand order, because SQLite's
+prepare-time optimizer removes the constant-false `1=0` conjunct
+before the query ever runs - confirmed live, both orders return `0`
+silently. This is not the same mechanism as the short-circuit above
+(which is a runtime evaluation-order property, present in every SQL
+engine's three-valued `AND`/`OR`); it is a query-plan rewrite specific
+to SQLite's optimizer, and nothing in `_docs/spec.md` commits
+historian to reproducing any particular optimizer's rewrites. historian
+does not fold constants, so `p like 'a' escape 'ab' and 1=0` still
+raises here where `sqlite3` returns `0` rows - a known, accepted
+difference. The differential and unit tests for the `EvalError` case
+deliberately avoid a constant-false conjunct for this reason, using
+only the unconditional shapes confirmed above (bare `LIKE`, `LIKE` on
+the left of `AND`/`OR`, and the non-constant short-circuit shape where
+a real column decides the left operand).

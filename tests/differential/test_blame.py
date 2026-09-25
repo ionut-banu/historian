@@ -414,6 +414,29 @@ def test_where_like_single_char_wildcard_requires_exactly_one_char(tiny_repo):
     _assert_differential(tiny_repo, "SELECT path FROM blame WHERE path LIKE 'src/utils_.py'")
 
 
+def test_where_like_wildcards_match_a_literal_newline(tiny_repo):
+    """`sqlite3 :memory: "select ('a' || char(10) || 'c') like 'a_c',
+    ('a' || char(10) || 'c') like 'a%c';"` -> `1|1` - `LIKE` has no
+    notion of "line", so `_`/`%` match a newline like any other
+    character. The embedded newline below is a raw newline between
+    the quotes, ordinary `STRING` token content per
+    `sql/lexer.py::_read_string` - no escape syntax needed - so every
+    row of `tiny_repo` matches this constant-`TRUE` predicate."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE ('a\nc') LIKE 'a_c'")
+
+
+def test_where_not_between_with_satisfied_low_and_null_high_bound(tiny_repo):
+    """`sqlite3 :memory: "create table blame(line_no integer); insert
+    into blame values (1),(1),(2); select count(*) from blame where
+    line_no NOT BETWEEN 1 AND NULL;"` -> `0`. `blame.line_no` is never
+    NULL and always `>= 1`, so the low bound (`line_no >= 1`) is
+    always TRUE and the high-bound literal `NULL` is what's under
+    test: `TRUE AND (line_no <= NULL)` = `TRUE AND NULL` = `NULL`, and
+    `NOT (NULL)` = `NULL` - dropped for every row, not kept. Also the
+    first differential coverage of `NOT BETWEEN` at all."""
+    _assert_differential(tiny_repo, "SELECT path FROM blame WHERE line_no NOT BETWEEN 1 AND NULL")
+
+
 def test_where_in(tiny_repo):
     _assert_differential(tiny_repo, "SELECT path FROM blame WHERE line_no IN (1, 2)")
 

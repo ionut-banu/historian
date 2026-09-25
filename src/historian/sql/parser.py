@@ -164,7 +164,7 @@ from historian.sql.ast import (
 )
 from historian.sql.lexer import Position, Token, TokenType
 
-__all__ = ["ParseError", "parse"]
+__all__ = ["ParseError", "UnsupportedGrammarError", "parse"]
 
 #: SQLite's int64 range. A decimal `INTEGER` literal whose digit text
 #: exceeds this becomes a `float` instead of an `int` - see the module
@@ -227,6 +227,46 @@ class ParseError(Exception):
     def __init__(self, message: str, position: Position) -> None:
         super().__init__(message)
         self.position = position
+
+
+def _unsupported_grammar_message(feature: str) -> str:
+    """The shared three-line message §5 shows for a permanently
+    out-of-scope construct, e.g.:
+
+        window functions are not supported
+          historian implements a subset of SQL. See the non-goals in
+          _docs/spec.md §1.
+
+    *feature* is a short phrase - "CTEs", "subqueries", "window
+    functions", one of "UNION"/"INTERSECT"/"EXCEPT", or "outer and
+    cross joins" - matching §1's own wording where §1 names the
+    construct directly (`_docs/spec.md` §1)."""
+    return (
+        f"{feature} are not supported\n"
+        "  historian implements a subset of SQL. See the non-goals in\n"
+        "  _docs/spec.md §1."
+    )
+
+
+class UnsupportedGrammarError(ParseError):
+    """One of §1's six reachable non-goals - subqueries, CTEs, window
+    functions, `UNION`/`INTERSECT`/`EXCEPT`, or outer/cross joins -
+    rather than v1 grammar that simply has not been built yet (which
+    stays a plain `ParseError`, e.g. `INNER JOIN` and plain `JOIN`,
+    v1 grammar §6 phase 3 hasn't built, or `NATURAL JOIN`, which §1's
+    literal "outer and cross joins" wording does not name).
+
+    Deliberately a subclass of `ParseError`, not a new sibling
+    exception (issue #24's grooming, correcting issue #8's original
+    proposal): `cli.py`'s `except (LexError, ParseError, BindError,
+    EvalError)` clause, a closed set fixed by issue #49, catches this
+    via `isinstance` with zero changes to `cli.py` - exit code `1`,
+    same as any other bad query, not `4`'s "a bug in historian"
+    backstop. See `_docs/spec.md` §3 ("Unsupported grammar") and §5
+    for the message shape this carries."""
+
+    def __init__(self, feature: str, position: Position) -> None:
+        super().__init__(_unsupported_grammar_message(feature), position)
 
 
 def parse(tokens: list[Token]) -> SelectStatement:
@@ -326,11 +366,28 @@ class _Parser:
     def _error(self, message: str) -> ParseError:
         return ParseError(message, self._peek().position)
 
+    def _unsupported(self, feature: str) -> UnsupportedGrammarError:
+        """`UnsupportedGrammarError` naming *feature*, positioned at
+        the current (not-yet-consumed) token - issue #24's six §1
+        non-goal detection sites all raise via this, mirroring
+        `_error`'s shape for the ordinary case."""
+        return UnsupportedGrammarError(feature, self._peek().position)
+
     def expect_end(self) -> None:
         """After a complete statement: consume an optional trailing
         `;`, then require `EOF`. Anything else - a second statement, an
         unconsumed clause this grammar does not implement - is
-        rejected here rather than silently ignored."""
+        rejected here rather than silently ignored.
+
+        `UNION`/`INTERSECT`/`EXCEPT` (issue #24) are checked first,
+        by token text since none of the three are lexer keywords: the
+        query is otherwise complete, so this is the only place they
+        can be recognised specifically rather than falling into the
+        generic "expected end of query" message below."""
+        if self._check(TokenType.IDENTIFIER):
+            word = self._peek().text.upper()
+            if word in ("UNION", "INTERSECT", "EXCEPT"):
+                raise self._unsupported(word)
         self._match(TokenType.SEMICOLON)
         if not self._check(TokenType.EOF):
             raise self._error(
@@ -340,6 +397,16 @@ class _Parser:
     # -- statement ----------------------------------------------------
 
     def parse_select_statement(self) -> SelectStatement:
+        # CTEs (issue #24): `WITH` is not a lexer keyword, so this is
+        # a text check, fired only when `WITH` is the very first token
+        # of the whole query - `parse_select_statement` is only ever
+        # called once, at the top level, never recursively for a
+        # subquery (those are rejected on sight in `_parse_primary`
+        # and the `FROM`-position check below, not by parsing a nested
+        # statement), so "first token of `parse_select_statement`"
+        # already means "first token of the query".
+        if self._check(TokenType.IDENTIFIER) and self._peek().text.upper() == "WITH":
+            raise self._unsupported("CTEs")
         start = self._expect(TokenType.SELECT, "SELECT").position
         distinct = self._match(TokenType.DISTINCT)
         select_list = self._parse_select_list()
@@ -358,7 +425,43 @@ class _Parser:
                 "requires AS before it"
             )
         self._expect(TokenType.FROM, "FROM")
+        # Subquery in FROM (issue #24): `FROM` expects a bare
+        # `IDENTIFIER` and never reaches `_parse_primary`'s own
+        # subquery check below, so this needs its own - fired only
+        # when `(` is *immediately* followed by the `SELECT` keyword,
+        # so `FROM (garbage)` (malformed, not a subquery) still falls
+        # through to the ordinary "expected a table name" message.
+        if self._check(TokenType.LPAREN) and self._peek(1).type is TokenType.SELECT:
+            raise self._unsupported("subqueries")
         from_table = self._expect(TokenType.IDENTIFIER, "a table name").text
+        # Outer and cross joins (issue #24, keyed on the token
+        # *sequence* per the orchestrator's amendment, not the bare
+        # word): historian has no table-alias grammar yet, so any
+        # identifier immediately after the bare table name is already
+        # a guaranteed error today. But `INNER JOIN` is v1 grammar not
+        # yet built, and joins usually bring aliases (`FROM blame b
+        # JOIN ...`) - if this fired on a bare `LEFT`/`RIGHT`/`FULL`/
+        # `CROSS` identifier here, adding table aliases later would
+        # silently turn `FROM blame left` (an alias named `left`) into
+        # a false "not supported" error with nothing to signal the
+        # regression. So: `LEFT`/`RIGHT`/`FULL` must be followed by
+        # `JOIN` or by `OUTER JOIN`, and `CROSS` must be followed by
+        # `JOIN` - `JOIN` is a reserved keyword, so the lookahead is
+        # unambiguous. A bare `LEFT` with no following `JOIN` falls
+        # through unchanged to today's ordinary error.
+        if self._check(TokenType.IDENTIFIER):
+            word = self._peek().text.upper()
+            if word in ("LEFT", "RIGHT", "FULL", "CROSS"):
+                after = self._peek(1)
+                if after.type is TokenType.JOIN:
+                    raise self._unsupported("outer and cross joins")
+                if (
+                    word != "CROSS"
+                    and after.type is TokenType.IDENTIFIER
+                    and after.text.upper() == "OUTER"
+                    and self._peek(2).type is TokenType.JOIN
+                ):
+                    raise self._unsupported("outer and cross joins")
         where: Expr | None = None
         if self._match(TokenType.WHERE):
             where = self._parse_expr()
@@ -736,6 +839,21 @@ class _Parser:
 
     def _parse_primary(self) -> Expr:
         token = self._peek()
+        if token.type is TokenType.SELECT:
+            # Subqueries (issue #24): every one of a parenthesised
+            # expression (`x = (SELECT ...)`), an `IN (...)` list
+            # value, and a function-call argument already funnels
+            # through here via `_parse_expr`, so this single check
+            # covers all three at once - and, as a consequence nobody
+            # had to build separately, `EXISTS (SELECT ...)` too:
+            # `EXISTS` is not a lexer keyword, so it parses as an
+            # ordinary function call whose sole argument hits this
+            # same check. "Correlated anything" is subsumed here too -
+            # v1 has no subquery grammar for anything to correlate
+            # from. The fourth site, `FROM (SELECT ...)`, does not
+            # reach `_parse_primary` at all - see the dedicated check
+            # in `parse_select_statement`.
+            raise self._unsupported("subqueries")
         if token.type is TokenType.INTEGER:
             self._advance()
             value = _int_literal_value(token.text)
@@ -826,27 +944,40 @@ class _Parser:
         `*` already is - arity and name validation happen later, not
         in the parser."""
         self._advance()  # LPAREN
+        call: Expr
         if self._check(TokenType.RPAREN):
             self._advance()
-            return FunctionCall(
+            call = FunctionCall(
                 name=name_token.text, args=(), position=name_token.position
             )
-        if self._check(TokenType.STAR):
+        elif self._check(TokenType.STAR):
             star_token = self._advance()
             self._expect(TokenType.RPAREN, "')'")
-            return FunctionCall(
+            call = FunctionCall(
                 name=name_token.text,
                 args=(Star(table=None, position=star_token.position),),
                 position=name_token.position,
             )
-        distinct = self._match(TokenType.DISTINCT)
-        args = [self._parse_expr()]
-        while self._match(TokenType.COMMA):
-            args.append(self._parse_expr())
-        self._expect(TokenType.RPAREN, "')'")
-        return FunctionCall(
-            name=name_token.text,
-            args=tuple(args),
-            position=name_token.position,
-            distinct=distinct,
-        )
+        else:
+            distinct = self._match(TokenType.DISTINCT)
+            args = [self._parse_expr()]
+            while self._match(TokenType.COMMA):
+                args.append(self._parse_expr())
+            self._expect(TokenType.RPAREN, "')'")
+            call = FunctionCall(
+                name=name_token.text,
+                args=tuple(args),
+                position=name_token.position,
+                distinct=distinct,
+            )
+        # Window functions (issue #24): checked right here, at the
+        # source of every call, rather than at the select-item
+        # fallthrough that used to surface this as a confusing
+        # "a select-list alias requires AS" error three levels up.
+        # `OVER` is not a lexer keyword, so this is a text check.
+        # Checking here (not only when the call is a whole top-level
+        # select item) also catches a call buried inside a larger
+        # expression, e.g. `1 + count(*) OVER (...)`.
+        if self._check(TokenType.IDENTIFIER) and self._peek().text.upper() == "OVER":
+            raise self._unsupported("window functions")
+        return call

@@ -644,7 +644,9 @@ def _eval_unary(expr: UnaryOp, row: Row, schema: Schema) -> Value:
 
 # --- BinaryOp: arithmetic, concatenation, comparison --------------------
 
-_ARITHMETIC_OPS = frozenset({Operator.ADD, Operator.SUB, Operator.MUL, Operator.DIV})
+_ARITHMETIC_OPS = frozenset(
+    {Operator.ADD, Operator.SUB, Operator.MUL, Operator.DIV, Operator.MOD}
+)
 
 #: One `values.py` comparison function per comparison `Operator`. All
 #: six take affinity-adjusted operands - see `_eval_binary` below.
@@ -924,6 +926,54 @@ def _squash_nan(result: float) -> float | None:
     return result
 
 
+def _int64_truncated(value: int | float) -> int:
+    """`value` truncated toward zero to an `int`, then clamped to
+    SQLite's `int64` range - the same conversion `CAST(x AS INTEGER)`
+    uses, and the REAL-operand half of `%`'s own contract (issue #75):
+    REAL operands are truncated toward zero and clamped to int64
+    *before* the remainder is computed. An `int` operand passes
+    through unchanged - it already fits, since every `Value` int is
+    kept within int64 range by `_int64_bounded` at the point it was
+    produced.
+
+    Mirrors `_int64_bounded`'s style but is not a variant of it:
+    `_int64_bounded` narrows an already-exact Python `int` that may
+    have overflowed int64 through arithmetic; this instead starts from
+    a `float` that may carry a fractional part and truncates it first.
+    `math.trunc()` on a `float`, not `int()` - both discard the
+    fractional part identically, but `math.trunc` reads as "the
+    conversion this function documents", while a bare `int()` reads as
+    an accident waiting to be un-clamped by a future edit. Unbounded
+    Python `int` throughout: `math.trunc(1e300)` is an exact (if huge)
+    Python integer, not a lossy cast, so the clamp below compares it
+    against `_INT64_MIN`/`_INT64_MAX` exactly rather than through a
+    second `float` conversion."""
+    if isinstance(value, int):
+        return value
+    truncated = math.trunc(value)
+    if truncated < _INT64_MIN:
+        return _INT64_MIN
+    if truncated > _INT64_MAX:
+        return _INT64_MAX
+    return truncated
+
+
+def _mod_result(remainder: int, is_real: bool) -> int | float:
+    """`%`'s remainder, in its final storage class. The remainder
+    itself is always computed as an exact `int` (`_int64_truncated`
+    narrows both operands to `int` first, and `_truncating_int_div`
+    stays in `int` throughout), but the storage class it is reported
+    in follows the *original* operands, not the truncated ones - REAL
+    if either was REAL, per issue #75.
+
+    The `float()` call here is the same "arithmetic result production"
+    exception `_int64_bounded` documents, not a comparison cast - see
+    the module docstring and
+    `test_no_stray_float_calls_outside_the_named_exceptions`, which
+    names this function as an allowed exception alongside it."""
+    return float(remainder) if is_real else remainder
+
+
 def _truncating_int_div(left: int, right: int) -> int:
     """`left / right`, truncated toward zero - C/SQLite semantics, not
     Python's `//`, which floors toward negative infinity and disagrees
@@ -941,7 +991,7 @@ def _truncating_int_div(left: int, right: int) -> int:
 
 
 def _arithmetic(op: Operator, left: Value, right: Value) -> Value:
-    """`+ - * /`. NULL propagates through every operator (`NULL + 1`
+    """`+ - * / %`. NULL propagates through every operator (`NULL + 1`
     is `NULL`). Division by zero - integer or float - is `None`
     directly, checked before any division is attempted: Python's `/`
     raises `ZeroDivisionError` for a zero denominator in both the
@@ -950,6 +1000,18 @@ def _arithmetic(op: Operator, left: Value, right: Value) -> Value:
     cannot be discovered by computing first and inspecting the result
     afterward the way the `Inf - Inf` family can (`_docs/spec.md`
     §3's own NaN note; `_docs/decisions.md`, 2026-08-31).
+
+    `%` (issue #75) is its own branch, not a variant of `DIV`'s: its
+    storage-class rule looks at the *original* (post-text-coercion)
+    operands - REAL if either was REAL - which must be captured before
+    `_int64_truncated` narrows a REAL operand to the `int` the C-style
+    remainder is computed from. Reuses `_truncating_int_div` exactly as
+    `DIV` does (`remainder = left - _truncating_int_div(left, right) *
+    right`), so no separate sign-fixup logic exists for `%` - a wrong
+    quotient sign in `_truncating_int_div` would break both operators
+    identically. The zero check is against the truncated divisor, not
+    the original value (`7 % 0.5` is `NULL`, since `0.5` truncates to
+    `0`), so `_int64_truncated` runs before that check, not after.
     """
     if left is None or right is None:
         return None
@@ -961,6 +1023,14 @@ def _arithmetic(op: Operator, left: Value, right: Value) -> Value:
         if isinstance(left_num, int) and isinstance(right_num, int):
             return _int64_bounded(_truncating_int_div(left_num, right_num))
         return _squash_nan(left_num / right_num)
+    if op is Operator.MOD:
+        is_real = isinstance(left_num, float) or isinstance(right_num, float)
+        left_int = _int64_truncated(left_num)
+        right_int = _int64_truncated(right_num)
+        if right_int == 0:
+            return None
+        remainder = left_int - _truncating_int_div(left_int, right_int) * right_int
+        return _mod_result(remainder, is_real)
     if isinstance(left_num, int) and isinstance(right_num, int):
         if op is Operator.ADD:
             exact = left_num + right_num

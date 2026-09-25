@@ -230,11 +230,21 @@ class AggregateCall:
     `sqlite3`). `position` is the call's own position, used only if
     `sum`'s running total overflows int64 (`_eval_sum_step` below) -
     the one way this operator raises.
+
+    `distinct` (issue #84) mirrors the bound `FunctionCall`'s own
+    field, threaded straight through by `plan/planner.py`'s
+    `_build_aggregate_call`. `_Accumulator.step` consults it for
+    `count`/`sum`/`avg` only - `min`/`max` never change under
+    deduplication, since removing a duplicate can never change which
+    value is most extreme, so it is accepted here (for every kind,
+    uniformly, since the planner does not special-case `min`/`max`)
+    but has no effect on those two.
     """
 
     kind: str
     arg: Expr | None
     position: Position
+    distinct: bool = False
 
 
 #: SQLite's `int64` bounds - `sum`'s own overflow check. Kept separate

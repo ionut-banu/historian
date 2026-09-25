@@ -251,8 +251,8 @@ def _count_star() -> FunctionCall:
     return FunctionCall(name="count", args=(Star(table=None, position=_POS),), position=_POS)
 
 
-def _func(name: str, *args) -> FunctionCall:
-    return FunctionCall(name=name, args=tuple(args), position=_POS)
+def _func(name: str, *args, distinct: bool = False) -> FunctionCall:
+    return FunctionCall(name=name, args=tuple(args), position=_POS, distinct=distinct)
 
 
 def test_plan_with_aggregate_inserts_aggregate_below_project_above_scan():
@@ -359,6 +359,55 @@ def test_plan_count_with_bare_column_argument_keeps_its_bound_expression():
     assert call.kind == "count"
     assert isinstance(call.arg, BoundColumnRef)
     assert call.arg.offset == _SCHEMA.index_of("line_no")
+
+
+# --- Aggregate DISTINCT (issue #84) -----------------------------------
+#
+# `_build_aggregate_call` threads `call.distinct` straight into the
+# `AggregateCall` it builds - the only planner change this issue makes.
+
+
+def test_plan_threads_distinct_true_into_the_aggregate_call():
+    """`SELECT count(DISTINCT line_no) FROM widgets`: the resulting
+    `AggregateCall.distinct` is `True`."""
+    source = _FakeSource([])
+    stmt = _stmt([_select_item(_func("count", _col("line_no"), distinct=True))], where=None)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    call = tree._child._calls[0]
+    assert call.kind == "count"
+    assert call.distinct is True
+
+
+def test_plan_without_distinct_keeps_the_aggregate_call_flag_false():
+    """The ordinary, non-`DISTINCT` case is unaffected - the default
+    `AggregateCall.distinct` is `False`."""
+    source = _FakeSource([])
+    stmt = _stmt([_select_item(_func("count", _col("line_no")))], where=None)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    call = tree._child._calls[0]
+    assert call.distinct is False
+
+
+def test_plan_min_max_distinct_threads_the_flag_too():
+    """`min`/`max(DISTINCT x)` also get `distinct=True` on their
+    `AggregateCall`, even though the accumulator itself ignores it for
+    these two kinds - the planner threads the flag uniformly for every
+    aggregate kind, per the settled design."""
+    source = _FakeSource([])
+    expr = _bin(
+        Op.ADD,
+        _func("min", _col("line_no"), distinct=True),
+        _func("max", _col("line_no"), distinct=True),
+    )
+    stmt = _stmt([_select_item(expr)], where=None)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert [call.distinct for call in tree._child._calls] == [True, True]
 
 
 def test_plan_aggregate_query_produces_correct_row_end_to_end():

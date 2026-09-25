@@ -243,7 +243,12 @@ def _build_aggregate_call(call: FunctionCall) -> AggregateCall:
     than a third copy of that module's own ASCII-only fold: the two can
     only disagree on a non-ASCII character, and a name that ASCII-folds
     to `count`/`sum`/`avg`/`min`/`max` is, by construction, already
-    pure ASCII letters differing from the target only in case."""
+    pure ASCII letters differing from the target only in case.
+
+    `distinct` (issue #84) is threaded straight through from the bound
+    `FunctionCall` unchanged - no per-kind logic here, since accepting
+    or ignoring it is `_Accumulator`'s concern (`exec/operators.py`),
+    not the planner's."""
     kind = call.name.lower()
     if kind == "count":
         if len(call.args) == 0:
@@ -254,7 +259,7 @@ def _build_aggregate_call(call: FunctionCall) -> AggregateCall:
     else:
         (only,) = call.args
         arg = only
-    return AggregateCall(kind=kind, arg=arg, position=call.position)
+    return AggregateCall(kind=kind, arg=arg, position=call.position, distinct=call.distinct)
 
 
 def _split_expr(expr: Expr, calls: list[AggregateCall], group_by: Sequence[Expr]) -> Expr:

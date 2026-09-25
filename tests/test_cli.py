@@ -239,6 +239,40 @@ def test_unimplemented_grammar_exits_1(tiny_repo, capsys):
     assert "traceback" not in captured.err.lower()
 
 
+def test_unsupported_grammar_exits_1_with_the_spec_5_message(tiny_repo, capsys):
+    """Issue #24: a §1 non-goal (here, a window function) raises
+    `UnsupportedGrammarError`, an `isinstance` of `ParseError`, so it
+    falls into `cli.py`'s existing exit-1 path with zero source changes
+    there - confirming the exception-class design actually reaches the
+    CLI boundary end to end, not just `sql/parser.py` in isolation.
+    Message text matches `_docs/spec.md` §5's own literal example."""
+    ret = cli.main(
+        ["-C", str(tiny_repo), "SELECT count(*) OVER (ORDER BY path) FROM blame"]
+    )
+
+    assert ret == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("error: window functions are not supported")
+    assert "_docs/spec.md §1" in captured.err
+    assert "traceback" not in captured.err.lower()
+
+
+def test_outer_join_exits_1_with_the_outer_and_cross_joins_message(tiny_repo, capsys):
+    """A second §1 non-goal shape end to end, distinct from the
+    window-function one above: `LEFT JOIN` names "outer and cross
+    joins", not "window functions"."""
+    ret = cli.main(
+        ["-C", str(tiny_repo), "SELECT * FROM blame LEFT JOIN blame ON 1=1"]
+    )
+
+    assert ret == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("error: outer and cross joins are not supported")
+    assert "_docs/spec.md §1" in captured.err
+
+
 def test_unknown_function_name_exits_1(tiny_repo, capsys):
     """`BindError` path, issue #60: `SELECT nonexistent_fn(path) FROM
     blame` is rejected at bind time now, not the old generic `EvalError`

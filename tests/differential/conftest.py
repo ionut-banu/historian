@@ -68,9 +68,10 @@ import sqlite3
 from collections.abc import Sequence
 from pathlib import Path
 
+from historian.catalog import SCAN_FACTORIES as _DEFAULT_TABLES
+from historian.catalog import SCHEMAS
 from historian.exec.operators import ScanSource
 from historian.plan.planner import ScanFactory
-from historian.plan.planner import TABLES as _DEFAULT_TABLES
 from historian.plan.planner import plan
 from historian.schema import Row, Schema
 from historian.sql.binder import bind
@@ -160,13 +161,21 @@ def run_historian(
     `exec.operators.Scan` do that, the same way `cli.py` leaves it to
     them.
 
-    `tables` defaults to `plan.planner`'s own `TABLES` catalog, exactly
-    as `cli.py` calls `plan()` with no `tables` argument. It is a
-    parameter (mirroring `plan()`'s own signature) only so
-    `test_loader_and_query_runner_are_two_independent_call_sites`
+    `tables` defaults to `historian.catalog.SCAN_FACTORIES` (issue
+    #35: `plan.planner` no longer has a `TABLES` of its own to default
+    to), exactly as `cli.py` passes `tables=SCAN_FACTORIES` to
+    `plan()`. It is a parameter (mirroring `plan()`'s own signature)
+    only so `test_loader_and_query_runner_are_two_independent_call_sites`
     below can substitute a spy `ScanSource` factory for the
     separation test; every case in this file that runs a real query
-    against a real repository uses the default.
+    against a real repository uses the default. `bind()`'s own
+    `catalog` argument below is always `historian.catalog.SCHEMAS`,
+    unconditionally - not threaded through `tables` - because every
+    case in this file, spy included, binds against the name "blame"
+    (`_SpySource` in `tests/differential/test_blame.py` is shaped
+    against `BLAME_SCHEMA` for exactly this reason), the same way
+    `cli.py` always calls `bind(stmt, catalog=SCHEMAS)` regardless of
+    which `tables` mapping `plan()` then receives.
 
     Neither this function nor `scan_all_rows`/`load_unfiltered` above
     catches `LexError`, `ParseError`, `BindError` or `EvalError` -
@@ -184,7 +193,7 @@ def run_historian(
     """
     tokens = tokenize(query)
     stmt = parse(tokens)
-    bound = bind(stmt)
+    bound = bind(stmt, catalog=SCHEMAS)
     tree = plan(bound, repo, tables=tables)
     return tree.schema, list(tree.rows())
 

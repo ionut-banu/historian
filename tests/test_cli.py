@@ -386,8 +386,8 @@ def _plan_that_raises_while_materializing(monkeypatch, exc_type):
     reproductions."""
     real_plan = cli.plan
 
-    def _wrapped_plan(bound, repo):
-        tree = real_plan(bound, repo)
+    def _wrapped_plan(bound, repo, tables):
+        tree = real_plan(bound, repo, tables=tables)
 
         def _boom() -> object:
             raise exc_type("injected-bug-marker: should never reach the user")

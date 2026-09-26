@@ -145,8 +145,8 @@ against `sqlite3` 3.51.0: `select STRASSE from t` (table `t(straße
 text)`) fails with "no such column: STRASSE", while `select STRAßE
 from t` succeeds - `ß` is left alone rather than folded to `SS`, which
 is exactly what `'straße'.upper() == 'STRASSE'` would wrongly do in
-Python. `_ascii_fold` below implements SQLite's rule directly: only
-the 26 ASCII letters move, nothing else is consulted.
+Python. `historian.ascii.ascii_fold` implements SQLite's rule
+directly: only the 26 ASCII letters move, nothing else is consulted.
 
 Resolution and error order
 ----------------------------
@@ -168,6 +168,7 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass
 
+from historian.ascii import ascii_fold
 from historian.schema import Schema
 from historian.sql.ast import (
     And,
@@ -351,22 +352,15 @@ class BoundSelectStatement:
 
 
 # --- ASCII-only folding --------------------------------------------------
-
-
-def _ascii_fold(text: str) -> str:
-    """Fold only the ASCII letters `A`-`Z` to `a`-`z`; leave every other
-    character - including every character outside ASCII - untouched.
-
-    This is SQLite's own identifier-matching rule, not Python's
-    Unicode-aware `str.lower()`. See the module docstring for the
-    `straße`/`STRASSE`/`STRAßE` evidence this must agree with.
-    """
-    return "".join(chr(ord(ch) + 32) if "A" <= ch <= "Z" else ch for ch in text)
+#
+# `ascii_fold` lives in `historian.ascii` (issue #53) - see this module's
+# own docstring's "ASCII-only case folding" section for the SQLite
+# evidence it implements.
 
 
 def _same_name(a: str, b: str) -> bool:
     """ASCII case-insensitive identifier equality."""
-    return _ascii_fold(a) == _ascii_fold(b)
+    return ascii_fold(a) == ascii_fold(b)
 
 
 # --- Binding context -------------------------------------------------------
@@ -550,7 +544,7 @@ def _validate_function_call(call: FunctionCall, ctx: _Context) -> None:
     the latter message would be actively misleading about what is
     actually wrong.
     """
-    name = _ascii_fold(call.name)
+    name = ascii_fold(call.name)
     if name not in _AGGREGATE_NAMES:
         raise BindError(
             f"no such function: {call.name}", call.position, tuple(sorted(_AGGREGATE_NAMES))

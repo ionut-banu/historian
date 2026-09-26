@@ -123,6 +123,7 @@ import math
 import re
 
 from historian import values
+from historian.ascii import ascii_fold, is_ascii_digit
 from historian.schema import ColumnType, Row, Schema
 from historian.sql.ast import (
     And,
@@ -143,7 +144,7 @@ from historian.sql.ast import (
 )
 from historian.sql.binder import BoundColumnRef
 from historian.sql.lexer import Position
-from historian.values import Bool3, Value
+from historian.values import INT64_MAX, INT64_MIN, Bool3, Value
 
 # The BoundColumnRef import above is the one place this module's import
 # graph is not literally subprocess-free, and it is worth being honest
@@ -175,14 +176,11 @@ __all__ = [
     "try_numeric_affinity",
 ]
 
-#: SQLite's `int64` bounds. This module's own constants - not imported
-#: from `sql/parser.py`'s private `_INT64_MAX`, which is off-limits for
-#: this issue and isn't exported anyway. Unlike the parser (which only
-#: ever needs the positive bound, to detect an overflowing literal),
-#: arithmetic here needs both: subtraction and negation can overflow
-#: toward either end.
-_INT64_MIN = -9223372036854775808
-_INT64_MAX = 9223372036854775807
+# `INT64_MIN`/`INT64_MAX` (`historian.values`, issue #53), imported
+# above: SQLite's `int64` bounds. Unlike the parser (which only ever
+# needs the positive bound, to detect an overflowing literal),
+# arithmetic here needs both - subtraction and negation can overflow
+# toward either end.
 
 #: ASCII whitespace this module's own numeric-text scanner skips before
 #: a number, in both the arithmetic (leading-prefix) and affinity
@@ -196,14 +194,6 @@ _INT64_MAX = 9223372036854775807
 #: this issue's criteria; the rest is a conservative, unverified
 #: default rather than a claim about SQLite's exact behaviour there.
 _NUMERIC_WHITESPACE = " \t\n\r\f"
-
-
-def _is_ascii_digit(ch: str) -> bool:
-    """True for `'0'`-`'9'` only. Never `str.isdigit()`, which is
-    `True` for non-ASCII digit-shaped characters - the exact bug fixed
-    in `sql/lexer.py` per `_docs/decisions.md` 2026-09-01, which this
-    module's own numeric-text scanner must not reintroduce."""
-    return "0" <= ch <= "9"
 
 
 class EvalError(Exception):
@@ -469,27 +459,16 @@ def _eval_in(expr: In, row: Row, schema: Schema) -> Bool3:
 
 
 # --- LIKE: unconditional text coercion, no affinity, ASCII-only fold ----
-
-
-def _ascii_fold(text: str) -> str:
-    """Fold only the ASCII letters `A`-`Z` to `a`-`z`; leave every
-    other character - including everything outside ASCII - untouched.
-    SQLite's own identifier- and `LIKE`-matching rule, not Python's
-    Unicode-aware `str.lower()` (confirmed against `sqlite3`: `'café'
-    LIKE 'CAFÉ'` is `FALSE`, the é/É pair is not folded).
-
-    Deliberately a second copy of `sql/binder.py`'s own `_ascii_fold`
-    rather than an import of it: importing `sql/binder.py` transitively
-    imports `historian.tables.blame` (for `BLAME_SCHEMA`), which
-    imports `subprocess` at module level - `sql/binder.py`'s own
-    docstring accepts that trade-off for itself, but this module's own
-    constraints are explicit (`AGENTS.md`'s "only scan operators touch
-    git"; this issue's own "no import of anything under tables/") and
-    that trade-off is not this module's to inherit. Three lines,
-    identical behaviour, kept in sync by inspection rather than a
-    shared dependency neither module already has a reason to need.
-    """
-    return "".join(chr(ord(ch) + 32) if "A" <= ch <= "Z" else ch for ch in text)
+#
+# `ascii_fold` (imported above, `historian.ascii`, issue #53): SQLite's
+# own identifier- and `LIKE`-matching rule, not Python's Unicode-aware
+# `str.lower()` (confirmed against `sqlite3`: `'café' LIKE 'CAFÉ'` is
+# `FALSE`, the é/É pair is not folded). Before this issue this module
+# kept its own second copy rather than importing `sql/binder.py`'s:
+# importing `sql/binder.py` transitively imports `historian.tables.
+# blame` (for `BLAME_SCHEMA`), which imports `subprocess` at module
+# level, which this module's own constraints ruled out. `historian.
+# ascii` has no such import, so that trade-off no longer applies.
 
 
 def _like_pattern_to_regex(pattern: str, escape: str | None = None) -> re.Pattern[str]:
@@ -505,7 +484,7 @@ def _like_pattern_to_regex(pattern: str, escape: str | None = None) -> re.Patter
 
     *escape* (issue #51), when given, is a single character read from
     *pattern* **before** any ASCII fold - `_eval_like` below passes the
-    caller's raw, un-folded pattern text, never `_ascii_fold`ed first,
+    caller's raw, un-folded pattern text, never `ascii_fold`ed first,
     because escape-character recognition is case-sensitive / exact-
     codepoint even though `LIKE`'s *matched text* comparison is
     ASCII-case-insensitive. Confirmed against `sqlite3`, all four
@@ -515,7 +494,7 @@ def _like_pattern_to_regex(pattern: str, escape: str | None = None) -> re.Patter
     `1` (same: pattern's `x` is ordinary and ASCII-folds against input
     `X`); `select 'a%b' like 'aXb' escape 'x';` -> `0`; `select 'a%b'
     like 'ax%b' escape 'X';` -> `0`. Folding first (i.e. scanning
-    `_ascii_fold(pattern)` for the escape character) would make
+    `ascii_fold(pattern)` for the escape character) would make
     recognition wrongly case-insensitive - this is why `_eval_like`
     folds only the characters that end up literal, one at a time,
     inside this function, rather than folding the whole pattern text up
@@ -546,7 +525,7 @@ def _like_pattern_to_regex(pattern: str, escape: str | None = None) -> re.Patter
             if index >= length:
                 pieces.append("(?!)")  # trailing escape: unsatisfiable
                 break
-            pieces.append(re.escape(_ascii_fold(pattern[index])))
+            pieces.append(re.escape(ascii_fold(pattern[index])))
             index += 1
             continue
         if ch == "%":
@@ -554,7 +533,7 @@ def _like_pattern_to_regex(pattern: str, escape: str | None = None) -> re.Patter
         elif ch == "_":
             pieces.append(".")
         else:
-            pieces.append(re.escape(_ascii_fold(ch)))
+            pieces.append(re.escape(ascii_fold(ch)))
         index += 1
     return re.compile("".join(pieces), re.DOTALL)
 
@@ -619,7 +598,7 @@ def _eval_like(expr: Like, row: Row, schema: Schema) -> Bool3:
     if left is None or pattern is None or escape_is_null:
         result: Bool3 = None
     else:
-        left_text = _ascii_fold(_coerce_to_text(left))
+        left_text = ascii_fold(_coerce_to_text(left))
         pattern_text = _coerce_to_text(pattern)
         result = bool(_like_pattern_to_regex(pattern_text, escape_char).fullmatch(left_text))
     return values.not3(result) if expr.negated else result
@@ -747,7 +726,7 @@ def _eval_unary(expr: UnaryOp, row: Row, schema: Schema) -> Value:
         and isinstance(expr.operand.value, float)
         and expr.operand.value == _INT64_MIN_MAGNITUDE_AS_FLOAT
     ):
-        return _INT64_MIN
+        return INT64_MIN
     operand = coerce_to_value(evaluate(expr.operand, row, schema))
     if operand is None:
         return None
@@ -918,6 +897,15 @@ def _scan_number(text: str, start: int) -> tuple[int | float, int] | None:
     `(value, end)`, `end` being the index in `text` just past the
     number, or `None` if no digit appears anywhere in the mantissa.
 
+    Deliberately a separate scanner from `sql/lexer.py`'s
+    `_read_number`, not merged into it (see that function's own
+    comment): this one accepts an exponent, because SQLite's own
+    text-to-number conversion does, while the lexer must reject one
+    for now. Merging the two, or teaching the lexer exponents, is
+    issue #6 (v2 backlog) - confirmed still out of scope by issue
+    #53's own grooming, which only moved the two int64-bound and
+    ASCII-predicate duplicates, not this one.
+
     Deliberately not `float(x)`/`int(x)` on arbitrary input: those
     accept forms SQLite's text-to-number conversion does not recognise
     as numeric at all - `float("0x10")` raises, `float("inf")`
@@ -938,14 +926,14 @@ def _scan_number(text: str, start: int) -> tuple[int | float, int] | None:
     if i < n and text[i] in "+-":
         i += 1
     has_digits = False
-    while i < n and _is_ascii_digit(text[i]):
+    while i < n and is_ascii_digit(text[i]):
         i += 1
         has_digits = True
     is_float = False
     if i < n and text[i] == ".":
         i += 1
         is_float = True
-        while i < n and _is_ascii_digit(text[i]):
+        while i < n and is_ascii_digit(text[i]):
             i += 1
             has_digits = True
     if not has_digits:
@@ -957,7 +945,7 @@ def _scan_number(text: str, start: int) -> tuple[int | float, int] | None:
         if j < n and text[j] in "+-":
             j += 1
         exponent_digits_start = j
-        while j < n and _is_ascii_digit(text[j]):
+        while j < n and is_ascii_digit(text[j]):
             j += 1
         if j > exponent_digits_start:
             exponent_end = j
@@ -1026,7 +1014,7 @@ def _int64_bounded(exact: int) -> int | float:
     names this function as the third legitimate exception beyond the
     issue's own two.
     """
-    if _INT64_MIN <= exact <= _INT64_MAX:
+    if INT64_MIN <= exact <= INT64_MAX:
         return exact
     return float(exact)
 
@@ -1061,15 +1049,15 @@ def _int64_truncated(value: int | float) -> int:
     an accident waiting to be un-clamped by a future edit. Unbounded
     Python `int` throughout: `math.trunc(1e300)` is an exact (if huge)
     Python integer, not a lossy cast, so the clamp below compares it
-    against `_INT64_MIN`/`_INT64_MAX` exactly rather than through a
+    against `INT64_MIN`/`INT64_MAX` exactly rather than through a
     second `float` conversion."""
     if isinstance(value, int):
         return value
     truncated = math.trunc(value)
-    if truncated < _INT64_MIN:
-        return _INT64_MIN
-    if truncated > _INT64_MAX:
-        return _INT64_MAX
+    if truncated < INT64_MIN:
+        return INT64_MIN
+    if truncated > INT64_MAX:
+        return INT64_MAX
     return truncated
 
 

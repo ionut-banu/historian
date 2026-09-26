@@ -20,6 +20,11 @@ Layout
   imports each table directly and builds the `SCHEMAS`/
   `SCAN_FACTORIES` views the binder and planner consume. Imported
   only by `cli.py` and by tests that want the real catalog.
+- `src/historian/ascii.py` - the two ASCII-only text predicates
+  (`is_ascii_digit`, `ascii_fold`) SQLite uses in place of Python's
+  Unicode-aware rules. Imports nothing beyond the stdlib, so every
+  layer - lexer, binder, expression evaluator - can import it without
+  creating a cycle or pulling in git/subprocess.
 - `tests/` - pytest tests, one file per module under test
 - `tests/extraction/` - tests checking the git-backed tables against
   `git` itself, e.g. `test_blame.py`

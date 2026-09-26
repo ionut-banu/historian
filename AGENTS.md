@@ -16,6 +16,10 @@ Commands
 Layout
 
 - `src/historian/` - the package (importable as `historian`)
+- `src/historian/catalog.py` - the table catalog: the one module that
+  imports each table directly and builds the `SCHEMAS`/
+  `SCAN_FACTORIES` views the binder and planner consume. Imported
+  only by `cli.py` and by tests that want the real catalog.
 - `tests/` - pytest tests, one file per module under test
 - `tests/extraction/` - tests checking the git-backed tables against
   `git` itself, e.g. `test_blame.py`

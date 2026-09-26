@@ -72,6 +72,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum, auto
 
+from historian.ascii import is_ascii_digit
+
 __all__ = [
     "KEYWORD_TYPES",
     "LexError",
@@ -275,17 +277,9 @@ def tokenize(source: str) -> list[Token]:
 _WHITESPACE = " \t\r\f"
 
 
-def _is_ascii_digit(char: str) -> bool:
-    """Is *char* one of `0`-`9`? Plain codepoint comparison, not
-    `str.isdigit()` - that also accepts non-ASCII digit-shaped characters
-    (superscripts, Arabic-Indic digits, ...) that SQLite does not treat as
-    numeric. See _docs/decisions.md, 2026-09-01."""
-    return "0" <= char <= "9"
-
-
 def _is_ascii_letter(char: str) -> bool:
     """Is *char* one of `a`-`z` or `A`-`Z`? Plain codepoint comparison,
-    matching `_is_ascii_digit`."""
+    matching `historian.ascii.is_ascii_digit`."""
     return ("a" <= char <= "z") or ("A" <= char <= "Z")
 
 
@@ -312,7 +306,7 @@ def _is_identifier_char(char: str) -> bool:
     """
     if char == "":
         return False
-    return _is_identifier_start(char) or _is_ascii_digit(char)
+    return _is_identifier_start(char) or is_ascii_digit(char)
 
 
 class _Lexer:
@@ -386,9 +380,9 @@ class _Lexer:
             return self._read_string(start)
         if char == '"':
             return self._read_quoted_identifier(start)
-        if _is_ascii_digit(char):
+        if is_ascii_digit(char):
             return self._read_number(start)
-        if char == "." and _is_ascii_digit(self._peek(1)):
+        if char == "." and is_ascii_digit(self._peek(1)):
             return self._read_number(start)
         if _is_identifier_start(char):
             return self._read_identifier(start)
@@ -450,14 +444,23 @@ class _Lexer:
     _GLUE_EXCLUDED = frozenset({"e", "E", "x", "X", "_"})
 
     def _read_number(self, start: Position) -> Token:
+        # Deliberately a separate scanner from `exec/expression.py`'s
+        # `_scan_number`, not merged into it: this one tokenizes a bare
+        # numeric literal in SQL text and must reject an exponent (see
+        # the module docstring's "Not in this module" section), while
+        # `_scan_number` is text-to-number coercion for arithmetic and
+        # accepts one, because SQLite's own text-to-number conversion
+        # does. Merging them, or teaching this one exponents/hex, is
+        # issue #6 (v2 backlog) - see issue #53's own grooming, which
+        # confirmed the two stay separate on purpose.
         chars: list[str] = []
         is_real = False
-        while _is_ascii_digit(self._peek()):
+        while is_ascii_digit(self._peek()):
             chars.append(self._advance())
         if self._peek() == ".":
             is_real = True
             chars.append(self._advance())
-            while _is_ascii_digit(self._peek()):
+            while is_ascii_digit(self._peek()):
                 chars.append(self._advance())
 
         glue = self._peek()

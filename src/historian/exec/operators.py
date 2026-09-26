@@ -100,6 +100,7 @@ from historian.schema import Column, ColumnType, Row, Schema
 from historian.sql.ast import Expr
 from historian.sql.binder import BoundColumnRef, BoundSelectItem
 from historian.sql.lexer import Position
+from historian.values import INT64_MAX, INT64_MIN
 
 __all__ = [
     "Aggregate",
@@ -255,16 +256,16 @@ class AggregateCall:
     distinct: bool = False
 
 
-#: SQLite's `int64` bounds - `sum`'s own overflow check. Kept separate
-#: from `exec/expression.py`'s `_int64_bounded` (arithmetic's int64
-#: rule *promotes to REAL* on overflow, `_docs/decisions.md`,
-#: 2026-09-01) because `sum`'s rule is different and confirmed against
-#: `sqlite3` directly (issue #60's own grooming): a purely-integer
-#: running total that overflows int64 raises - it does not wrap and it
-#: does not silently promote to a float the way ordinary arithmetic
-#: does.
-_SUM_INT64_MIN = -9223372036854775808
-_SUM_INT64_MAX = 9223372036854775807
+#: `INT64_MIN`/`INT64_MAX` (`historian.values`, issue #53) - `sum`'s
+#: own overflow check, imported above. Kept a distinct check from
+#: `exec/expression.py`'s `_int64_bounded` (arithmetic's int64 rule
+#: *promotes to REAL* on overflow, `_docs/decisions.md`, 2026-09-01)
+#: because `sum`'s rule is different and confirmed against `sqlite3`
+#: directly (issue #60's own grooming): a purely-integer running total
+#: that overflows int64 raises - it does not wrap and it does not
+#: silently promote to a float the way ordinary arithmetic does. Only
+#: the two bound *numbers* were ever duplicated between the two
+#: modules; this function's own decision (raise vs. promote) is not.
 
 
 def _sum_add(total: int, value: int) -> tuple[int, bool]:
@@ -312,7 +313,7 @@ def _sum_add(total: int, value: int) -> tuple[int, bool]:
     range.
     """
     new_total = total + value
-    overflowed = not (_SUM_INT64_MIN <= new_total <= _SUM_INT64_MAX)
+    overflowed = not (INT64_MIN <= new_total <= INT64_MAX)
     return new_total, overflowed
 
 

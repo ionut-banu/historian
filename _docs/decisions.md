@@ -2145,3 +2145,103 @@ subprocess` statement, which stayed `False` throughout this entire
 bug (the violation was transitive, via `BLAME_SCHEMA`), so it gave
 false confidence in both directions and had no reason to survive next
 to a test that actually catches the failure mode.
+
+2026-09-26 - `_ascii_fold`/`_is_ascii_digit` merged into a new
+`historian/ascii.py`; the int64 bound moved into `historian/values.py`;
+the two number scanners stay separate, pending #6
+
+Issue #53. Three small helpers were each defined more than once:
+`_ascii_fold` in `sql/binder.py` and `exec/expression.py`;
+`_is_ascii_digit` in `sql/lexer.py` and `exec/expression.py`; and
+SQLite's int64 bound in three places - `sql/parser.py`'s `_INT64_MAX`
+(the positive bound only, for a decimal literal that overflows),
+`exec/expression.py`'s `_INT64_MIN`/`_INT64_MAX` (both bounds, since
+arithmetic can overflow toward either end), and `exec/operators.py`'s
+`_SUM_INT64_MIN`/`_SUM_INT64_MAX` (the same two numbers again, under a
+third pair of names, for `sum`'s own overflow check). Each of the two
+text predicates had a documented reason for its second copy at the
+time: `#35`'s original layering fix meant `sql/lexer.py` and
+`exec/expression.py` could not import `sql/binder.py` without pulling
+`historian.tables.blame` (and therefore `subprocess`) transitively.
+That reason is gone now that `#35`/`#52` are merged into
+`historian/catalog.py`, which is exactly why this issue stands on its
+own: the trade-off that justified the duplication no longer exists,
+so nothing is left to reconcile except giving each helper one home.
+
+Both `_ascii_fold` copies were read side by side before merging them -
+byte-for-byte identical
+(`return "".join(chr(ord(ch) + 32) if "A" <= ch <= "Z" else ch for ch
+in text)` in both) - so this was a pure dedup, not a behaviour
+reconciliation. There was nothing to decide about *which* copy's
+behaviour to keep.
+
+New home: `historian/ascii.py`, a leaf module with no imports beyond
+the stdlib, holding `is_ascii_digit` and `ascii_fold`. Neither
+`values.py` ("comparison and three-valued logic" per its own
+docstring) nor `schema.py` (row shape) is the right home for a
+text-classification rule that has nothing to do with either concern -
+stretching either module's documented scope to fit these two functions
+would be a worse fit than a new, narrowly-scoped module. Because
+`historian/ascii.py` imports nothing, every current and future
+consumer - the lexer, the binder, the expression evaluator - can
+import it with no cycle and no risk of dragging in git/subprocess,
+which is also why it needed no `#35`-style layering fix of its own.
+
+The int64 bound went to `historian/values.py` instead, alongside it
+rather than into `historian/ascii.py`: `INT64_MIN`/`INT64_MAX` are a
+property of `Value`'s own `int` variant (SQLite's INTEGER storage
+class is int64), which `values.py` already documents, not a text-
+classification rule. `sql/parser.py` now imports only `INT64_MAX` (it
+never sees a negative literal - the lexer always emits a leading `-`
+as its own `MINUS` token); `exec/expression.py` imports both, since
+subtraction and negation can overflow toward either end; and
+`exec/operators.py` imports both for `_sum_add`'s own overflow check.
+`_sum_add` itself - the decision to raise on overflow rather than
+promote to `float`, per #60/#91 - did not move and did not change;
+only the two magic numbers underneath it moved.
+
+`exec/expression.py`'s `_INT64_MIN_MAGNITUDE_AS_FLOAT = 9223372036854775808.0`
+was deliberately left alone: it is `2**63` as a `float`, a distinct
+constant used only to detect a negated literal spelling of
+`INT64_MIN` (`-9223372036854775808` lexes as unary minus applied to
+the literal `9223372036854775808`, one past `INT64_MAX`), not another
+copy of either bound. The guard test below was written to name-check
+this directly, not just trust that nobody would confuse the two.
+
+The one real divergence in this area was never `_ascii_fold` - it is
+the two *number scanners*: `sql/lexer.py`'s `_read_number` (tokenizing
+a bare numeric literal) rejects an exponent, while
+`exec/expression.py`'s `_scan_number` (text-to-number coercion for
+arithmetic/affinity) accepts one, because SQLite's own text-to-number
+conversion does. That gap is issue #6 (v2 backlog: lexer scientific
+notation and hex literals) and stays out of scope here - merging the
+two scanners would also have to teach the lexer an exponent grammar,
+which is a grammar change, not a refactor. The two functions instead
+each gained a short comment naming the other and issue #6, so whoever
+picks up #6 finds both scanners from either one. The divergence is
+already pinned by two existing tests, left unchanged:
+`tests/test_expression.py::test_arithmetic_text_coercion_exponent_form_is_always_real`
+and
+`tests/differential/test_blame.py::test_scientific_notation_glue_still_hits_the_bare_alias_parse_error`.
+
+Guard test: `tests/test_shared_primitives.py` greps `src/historian/`
+directly (not via import) for `def ascii_fold(`, `def
+is_ascii_digit(`, and a module-level assignment to a name ending
+`INT64_MIN`/`INT64_MAX`, asserting each occurs exactly once and lands
+in the right new home file. The assignment check needed to be more
+precise than the issue's own suggested `INT64_M(IN|AX)\s*=`, which
+would also match a *comparison* such as `INT64_MAX == x` sitting at
+the start of a line - the regex actually used,
+`^[A-Z_]*INT64_M(IN|AX)\s*(:[^=]*)?=(?!=)` with `re.MULTILINE`, adds
+the trailing `(?!=)` to exclude `==` and anchors to a line-initial run
+of uppercase letters/underscores so a *use* of the name
+(`if value > _INT64_MAX:`) can never match (the line does not begin
+with the name). The same anchoring is what keeps it off
+`_INT64_MIN_MAGNITUDE_AS_FLOAT = 9223372036854775808.0`: after
+matching `INT64_M` + `MIN`, that name continues with
+`_MAGNITUDE_AS_FLOAT` before any `=`, and the only path the regex has
+past the bound name is an optional group that must start with a
+literal `:` (a type annotation), which cannot swallow
+`_MAGNITUDE_AS_FLOAT` - so the match fails to reach an `=` at all.
+Verified directly, both as source-scanning tests and as standalone
+regex-example tests independent of the source tree.

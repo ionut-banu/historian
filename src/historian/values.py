@@ -148,6 +148,8 @@ import math
 
 __all__ = [
     "Bool3",
+    "INT64_MAX",
+    "INT64_MIN",
     "Value",
     "and3",
     "eq",
@@ -174,6 +176,21 @@ Value = None | int | float | str
 #: The result of a SQL predicate: ``True``, ``False`` or ``None``,
 #: meaning ``TRUE``, ``FALSE`` and ``NULL``.
 Bool3 = bool | None
+
+#: The legal range of ``Value``'s ``int`` variant. SQLite's INTEGER
+#: storage class is a signed 64-bit integer, not Python's unbounded
+#: ``int``, so any ``int`` this module (or anything built on it) holds
+#: as a ``Value`` must fit here - a decimal literal or an arithmetic
+#: result outside this range becomes a ``float`` instead (see
+#: `_docs/decisions.md`, 2026-09-01). Issue #53: this is the one shared
+#: home for both bounds, a property of the type defined immediately
+#: above rather than of any particular caller's arithmetic - previously
+#: three separate copies (`sql/parser.py`'s literal-overflow check,
+#: `exec/expression.py`'s arithmetic-overflow check, and
+#: `exec/operators.py`'s ``sum``-overflow check) each defined their own
+#: copy of one or both numbers.
+INT64_MIN = -9223372036854775808
+INT64_MAX = 9223372036854775807
 
 # Storage-class ranks, in SQLite's ordering: NULL < numeric < TEXT.
 _RANK_NULL = 0

@@ -10,19 +10,24 @@ the query used is quoted above each group, matching `tests/
 test_parser.py`'s convention.
 
 `_bind` binds real parsed SQL against the real `blame` schema, via
-`historian.sql.binder.TABLES` (`{"blame": BLAME_SCHEMA}`) - the same
-catalog `bind()` defaults to. A few tests instead bind a hand-built
-`SelectStatement` against a synthetic single-column schema (for the
-ASCII-folding case, where blame has no non-ASCII column) or a
-hand-built AST bypassing the parser entirely (for the defensive
-`Star`-in-a-bad-position backstop, since real SQL cannot construct
-that shape once #31 is fixed - see the issue's own grooming notes).
+`historian.catalog.SCHEMAS` (`{"blame": BLAME_SCHEMA}`) - the real
+catalog `bind()`'s required `catalog` parameter is given in
+production (issue #35: `sql/binder.py` no longer owns or defaults to
+a real catalog itself; `historian/catalog.py` does, and this test
+file is one of the few callers allowed to import it, per that issue's
+design). A few tests instead bind a hand-built `SelectStatement`
+against a synthetic single-column schema (for the ASCII-folding case,
+where blame has no non-ASCII column) or a hand-built AST bypassing the
+parser entirely (for the defensive `Star`-in-a-bad-position backstop,
+since real SQL cannot construct that shape once #31 is fixed - see the
+issue's own grooming notes).
 """
 
 import dataclasses
 
 import pytest
 
+from historian.catalog import SCHEMAS
 from historian.schema import Column, ColumnType, Schema
 from historian.sql.ast import (
     BinaryOp,
@@ -39,7 +44,6 @@ from historian.sql.ast import (
     UnaryOperator,
 )
 from historian.sql.binder import (
-    TABLES,
     BindError,
     BoundColumnRef,
     BoundSelectStatement,
@@ -58,19 +62,21 @@ _BLAME_COLUMNS = ("path", "line_no", "line", "commit_hash", "author_name", "auth
 
 
 def _bind(sql: str) -> BoundSelectStatement:
-    return bind(parse(tokenize(sql)))
+    return bind(parse(tokenize(sql)), SCHEMAS)
 
 
 # --- The catalog -------------------------------------------------------------
 
 
 def test_tables_catalog_is_exactly_blame():
-    """`sql/binder.py` exposes `TABLES: dict[str, Schema]` seeded with
-    exactly `{"blame": BLAME_SCHEMA}`, importing rather than
-    redefining the schema - per the issue's own coordination note with
-    #11's grooming."""
-    assert TABLES == {"blame": BLAME_SCHEMA}
-    assert TABLES["blame"] is BLAME_SCHEMA
+    """`historian.catalog.SCHEMAS` - the catalog `bind()` is actually
+    called with in production (`cli.py`), and the one this file's own
+    `_bind` helper uses - is seeded with exactly `{"blame":
+    BLAME_SCHEMA}`, importing rather than redefining the schema - per
+    the issue's own coordination note with #11's grooming, carried
+    forward by #35's `historian/catalog.py`."""
+    assert SCHEMAS == {"blame": BLAME_SCHEMA}
+    assert SCHEMAS["blame"] is BLAME_SCHEMA
 
 
 # --- FROM-table resolution, case-insensitive and ASCII-only ------------------
@@ -109,7 +115,7 @@ def test_no_such_table_error_position_is_select_statement_position():
     to give a future renderer (#18)."""
     stmt = parse(tokenize("SELECT path FROM ghost"))
     with pytest.raises(BindError) as exc_info:
-        bind(stmt)
+        bind(stmt, SCHEMAS)
     assert exc_info.value.position == stmt.position
 
 
@@ -332,7 +338,7 @@ def test_no_such_column_error_carries_column_ref_position():
     stmt = parse(tokenize("SELECT authr_name FROM blame"))
     ref = stmt.select_list[0].expr
     with pytest.raises(BindError) as exc_info:
-        bind(stmt)
+        bind(stmt, SCHEMAS)
     assert exc_info.value.position == ref.position
 
 
@@ -504,7 +510,7 @@ def test_star_with_alias_raises_defensive_error():
         position=_POS,
     )
     with pytest.raises(BindError):
-        bind(stmt)
+        bind(stmt, SCHEMAS)
 
 
 def test_star_in_general_expression_position_raises_defensive_error():
@@ -525,7 +531,7 @@ def test_star_in_general_expression_position_raises_defensive_error():
         position=_POS,
     )
     with pytest.raises(BindError):
-        bind(stmt)
+        bind(stmt, SCHEMAS)
 
 
 def test_qualified_star_as_function_argument_raises_defensive_error():
@@ -547,7 +553,7 @@ def test_qualified_star_as_function_argument_raises_defensive_error():
         position=_POS,
     )
     with pytest.raises(BindError):
-        bind(stmt)
+        bind(stmt, SCHEMAS)
 
 
 def test_star_as_non_sole_function_argument_raises_defensive_error():
@@ -573,7 +579,7 @@ def test_star_as_non_sole_function_argument_raises_defensive_error():
         position=_POS,
     )
     with pytest.raises(BindError):
-        bind(stmt)
+        bind(stmt, SCHEMAS)
 
 
 def test_count_star_passed_through_unexpanded():
@@ -780,20 +786,22 @@ def test_min_max_distinct_bind_successfully_with_the_flag_set():
 
 
 # --- No git, no subprocess needed to exercise this module --------------------
-
-
-def test_binder_module_does_not_import_subprocess_directly():
-    """`bind()` and everything it calls are tested entirely against
-    in-memory `Schema`/`SelectStatement` values above, with no
-    repository present - per `AGENTS.md`'s "only scan operators touch
-    git". This module does not itself write `import subprocess` (it
-    only transitively imports a module that does, via `BLAME_SCHEMA` -
-    see the module docstring's own note on that trade-off), so
-    `subprocess` never appears as a name bound directly in its own
-    namespace."""
-    import historian.sql.binder as binder_module
-
-    assert "subprocess" not in vars(binder_module)
+#
+# `bind()` and everything it calls are tested entirely against
+# in-memory `Schema`/`SelectStatement` values above, with no
+# repository present - per `AGENTS.md`'s "only scan operators touch
+# git". The real, fresh-interpreter guard for that promise -
+# `import historian.sql.binder` must never put `subprocess` into
+# `sys.modules` - lives in `tests/test_layering.py`
+# (`test_binder_alone_does_not_import_subprocess`), not here: a check
+# against `vars(binder_module)` in this same pytest process only ever
+# asks "does this module itself write a top-level `import subprocess`
+# statement", which stayed true throughout #35's bug (a transitive
+# import via `from historian.tables.blame import BLAME_SCHEMA` still
+# put `subprocess` in `sys.modules`, just under a different module's
+# name in `vars()`) - it would have kept passing with the bug present
+# and would keep passing after the fix, either way giving false
+# confidence about the property that actually matters.
 
 
 # --- GROUP BY / HAVING (issue #69) ----------------------------------------

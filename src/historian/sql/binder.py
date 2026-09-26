@@ -2,17 +2,22 @@
 
 The fourth stage of the pipeline in `_docs/spec.md` §3
 ("binder     AST + resolved columns, errors for unknown names").
-Consumes the `SelectStatement` `sql/parser.py` builds and the table
-catalog this module owns, resolves every table and column reference
-against them, and produces a new tree in which every column reference
-is a zero-based integer offset into a `Row` - never a name
+Consumes the `SelectStatement` `sql/parser.py` builds and a table
+catalog passed in by the caller (`bind()`'s required `catalog`
+parameter), resolves every table and column reference against them,
+and produces a new tree in which every column reference is a
+zero-based integer offset into a `Row` - never a name
 `exec/expression.py` (#12) would need to look up per row, per §3's
 "column references resolve to integer offsets at bind time rather
 than by name at runtime."
 
-Issue #9. Implements the binder half of §3's pipeline plus the
-table-catalog half of §2 that `schema.py` and `tables/blame.py` both
-leave to this module (see both modules' docstrings).
+Issue #9. Implements the binder half of §3's pipeline. This module
+does not build the real table catalog itself (issue #35) -
+`historian/catalog.py` does, from direct imports of each table
+module, and only `cli.py` and tests that want the real catalog import
+it. `bind()`'s `catalog` parameter is what lets this module resolve
+names against `blame` (or any fake schema, in tests) without ever
+importing `historian.tables.blame` or `subprocess` itself.
 
 Not in this module
 -------------------
@@ -186,7 +191,6 @@ from historian.sql.ast import (
     UnaryOperator,
 )
 from historian.sql.lexer import Position
-from historian.tables.blame import BLAME_SCHEMA
 
 __all__ = [
     "BindError",
@@ -194,21 +198,8 @@ __all__ = [
     "BoundOrderByItem",
     "BoundSelectItem",
     "BoundSelectStatement",
-    "TABLES",
     "bind",
 ]
-
-#: The table catalog: FROM-clause name -> `Schema`. Phase 1 has exactly
-#: one table. `BLAME_SCHEMA` is imported from `historian.tables.blame`
-#: rather than redefined here, per that module's own docstring and the
-#: #9/#11 grooming coordination comment. Note: importing it transitively
-#: imports `tables/blame.py`, which imports `subprocess` at module
-#: level - the module is merely imported, never invoked, so no git
-#: repository or subprocess call is needed to exercise this module, but
-#: this file's own import graph is not literally subprocess-free. That
-#: trade-off was made by the grooming decision this catalog implements,
-#: not revisited here.
-TABLES: dict[str, Schema] = {"blame": BLAME_SCHEMA}
 
 #: The v1 aggregate registry (issue #60): every `FunctionCall` name
 #: this grammar can legally bind, ASCII-folded. v1 has no scalar
@@ -1161,16 +1152,20 @@ def _bind_select_item(item: SelectItem, ctx: _Context) -> list[BoundSelectItem]:
 # --- Entry point -------------------------------------------------------------
 
 
-def bind(stmt: SelectStatement, catalog: dict[str, Schema] = TABLES) -> BoundSelectStatement:
+def bind(stmt: SelectStatement, catalog: dict[str, Schema]) -> BoundSelectStatement:
     """Resolve every table and column reference in `stmt` against
     `catalog`, and expand `SELECT *` / `table.*`.
 
     Raises `BindError` - never returns `None`/`False` - on the first
     name that does not resolve, in the order documented in the module
     docstring: the FROM table, then the select list left to right,
-    then WHERE. `catalog` defaults to `TABLES`, the module's own
-    table catalog, but is a parameter (not hardcoded) so tests can
-    bind against a synthetic schema with no dependency on `blame`.
+    then WHERE. `catalog` is required, not defaulted: this module
+    never imports `historian.tables.blame` or `historian.catalog`
+    itself (issue #35 - AGENTS.md's "no git and no subprocess
+    imports" for everything above the scan operators), so it has no
+    real catalog of its own to fall back to. Callers that want the
+    real `blame` table pass `historian.catalog.SCHEMAS` explicitly -
+    `cli.py` is the one production call site that does.
     """
     ctx = _resolve_table(stmt, catalog)
     bound_items: list[BoundSelectItem] = []

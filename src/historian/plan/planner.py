@@ -28,26 +28,31 @@ The table -> scan-factory mapping
 
 Grooming settled this as the one real design decision here, because
 phase 2 (`_docs/spec.md` §2: `commits`, `commit_files`, `refs`,
-`tree`) repeats it five more times. `TABLES` maps a catalog table name
-to a *factory* - `Callable[[Path], ScanSource]` - not to a
-pre-constructed scan, because a scan needs the repository path and
-that path is not known until `plan()` is called. `plan()` takes this
-mapping as a parameter with a default, mirroring `sql/binder.py`'s own
-`bind(stmt, catalog=TABLES)` precedent exactly: `tests/test_planner.py`
-overrides it with a fake `ScanSource` factory and exercises no git
-subprocess at all, while `cli.py` calls `plan()` with no `tables`
-argument and gets the real `{"blame": BlameScan}` default. `cli.py`
-therefore never imports `tables/blame.py` itself - only this module
-does, and only to build that default.
+`tree`) repeats it five more times. `ScanFactory` (`Callable[[Path],
+ScanSource]`) is what a catalog table name maps to - a factory rather
+than a pre-constructed scan, because a scan needs the repository path
+and that path is not known until `plan()` is called. `plan()`'s
+`tables: dict[str, ScanFactory]` parameter is required, not defaulted
+(issue #35): `tests/test_planner.py` passes a fake `ScanSource`
+factory and exercises no git subprocess at all, while `cli.py` passes
+`historian.catalog.SCAN_FACTORIES`, the real `{"blame": BlameScan}`
+mapping. This module itself never imports `tables/blame.py` or
+`historian.catalog` - `ScanFactory`'s own definition only names the
+`ScanSource` protocol from `exec/operators.py`, never a concrete table
+module, so it carries no import cost. `historian/catalog.py` is the
+one place a table's scan factory is built from a real import; only
+`cli.py` and tests that want the real catalog import it.
 
-This mirrors, and does not fix, the layering gap #35 already tracks:
-importing this module (to reach its own default `TABLES`) transitively
-imports `tables/blame.py`, which imports `subprocess` at module level.
-`AGENTS.md`'s "no git and no subprocess" promise for the planner is
-therefore about *behaviour* (this module never calls a scan's `.scan()`
-itself, never shells out, and is fully testable with a fake source and
-no repository - see `tests/test_planner.py`), not about the import
-graph, which #35 is already the place to fix.
+This also closes the layering gap #35 tracked: before this issue,
+importing this module (to reach its own hardcoded `TABLES` default)
+transitively imported `tables/blame.py`, which imports `subprocess` at
+module level, merely by being imported - not by anything this module's
+own behaviour did. `AGENTS.md`'s "no git and no subprocess" promise
+for the planner is now true of both the *behaviour* (this module never
+calls a scan's `.scan()` itself, never shells out, and is fully
+testable with a fake source and no repository - see `tests/
+test_planner.py`) and the *import graph* (this module imports neither
+`historian.tables.blame` nor `subprocess`, directly or indirectly).
 
 `Scan` gets nothing to negotiate
 ------------------------------------
@@ -99,23 +104,17 @@ from historian.sql.ast import (
     UnaryOp,
 )
 from historian.sql.binder import BoundColumnRef, BoundOrderByItem, BoundSelectItem, BoundSelectStatement
-from historian.tables.blame import BlameScan
 
-__all__ = ["ScanFactory", "TABLES", "plan"]
+__all__ = ["ScanFactory", "plan"]
 
 #: A table's entry in the catalog: given the repository path, produce
 #: the `ScanSource` `Scan` will adapt. A factory rather than a
 #: ready-made instance, because the repository path is only known at
-#: `plan()` time.
+#: `plan()` time. Names only the `ScanSource` protocol from
+#: `exec/operators.py` - never a concrete table module - so this type
+#: alias carries no import cost; the real catalog lives in
+#: `historian/catalog.py`, not here.
 ScanFactory = Callable[[Path], ScanSource]
-
-#: The table catalog: FROM-clause name -> `ScanFactory`. Phase 1 has
-#: exactly one table, matching `sql/binder.py`'s own `TABLES`
-#: (name -> `Schema`) - the two catalogs are keyed identically by
-#: design, but are deliberately two separate dicts (one maps to a
-#: `Schema`, this one to a factory), not one dict serving both call
-#: sites.
-TABLES: dict[str, ScanFactory] = {"blame": BlameScan}
 
 
 # --- The aggregate/scalar split (issue #60, extended by #69) ----------------
@@ -361,16 +360,18 @@ def _split_order_by(
     )
 
 
-def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory] = TABLES) -> Operator:
+def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory]) -> Operator:
     """Build the operator tree for *stmt*, a repository at *repo*.
 
     `tables` maps `stmt.from_table` (already resolved against
     `sql/binder.py`'s own catalog, so the lookup here cannot fail for
     any statement `bind()` actually produced) to the factory that
-    builds this query's `ScanSource`. Defaults to this module's own
-    `TABLES`, but is a parameter - never hardcoded - so it can be
-    swapped for a fake in tests with no repository and no git
-    subprocess, per this module's own docstring.
+    builds this query's `ScanSource`. Required, not defaulted (issue
+    #35): this module has no real catalog of its own to fall back to,
+    since it never imports `historian.tables.blame` or `historian.
+    catalog`. Tests pass a fake factory with no repository and no git
+    subprocess, per this module's own docstring; `cli.py` passes
+    `historian.catalog.SCAN_FACTORIES`.
 
     Tree shape, per `_docs/spec.md` §3 and issue #78's own acceptance
     criteria (extending #61's/#69's/#77's): `Scan -> Filter (WHERE) ->

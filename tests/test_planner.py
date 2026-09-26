@@ -19,8 +19,11 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
+import pytest
+
+from historian.catalog import SCAN_FACTORIES
 from historian.exec.operators import Aggregate, Distinct, Filter, Limit, Project, Scan, Sort
-from historian.plan.planner import TABLES, plan
+from historian.plan.planner import plan
 from historian.schema import Column, ColumnType, Row, Schema
 from historian.sql.ast import BinaryOp, FunctionCall, Literal, OrderDirection, Operator as Op, Star
 from historian.sql.binder import BoundColumnRef, BoundOrderByItem, BoundSelectItem, BoundSelectStatement, bind
@@ -209,28 +212,34 @@ def test_plan_without_where_projects_every_row():
     assert list(tree.rows()) == [("a.py",), ("b.py",)]
 
 
-# --- the table -> scan-factory mapping is a parameter with a default ------
+# --- the table -> scan-factory mapping is a required parameter ------------
 
 
-def test_tables_parameter_defaults_to_blame_scan():
-    """Mirrors `sql/binder.py`'s `bind(stmt, catalog=TABLES)`
-    precedent exactly (acceptance criterion #2): `plan`'s `tables`
-    parameter defaults to the module's own `TABLES`, mapping `"blame"`
-    to the real `BlameScan` factory - checked here by identity, with
-    no repository and no git subprocess run, since nothing calls
-    `.scan()`."""
-    assert TABLES == {"blame": BlameScan}
+def test_tables_parameter_is_required():
+    """Issue #35: `plan()`'s `tables` parameter has no hardcoded real
+    default any more - this module never imports `tables/blame.py` or
+    `historian.catalog` itself, so it has no real catalog to fall back
+    to. Calling it with no `tables` argument is a `TypeError` (missing
+    required argument), not a silent fallback to an empty or stale
+    catalog."""
+    stmt = _stmt([_select_item(_col("path"))], where=None, from_table="blame")
+
+    with pytest.raises(TypeError):
+        plan(stmt, Path("/nonexistent"))
 
 
-def test_plan_uses_default_tables_catalog_when_none_given():
-    """Calling `plan()` with no `tables` argument at all resolves
-    `"blame"` against the module-level default and constructs a real
-    `BlameScan` bound to the given repo path - proven without ever
-    calling `.rows()`, so no git subprocess runs."""
+def test_plan_against_the_real_catalog_builds_a_real_blame_scan():
+    """The real catalog - `historian.catalog.SCAN_FACTORIES`, built
+    from a direct import of `tables/blame.py` - is not this file's
+    concern to construct (this module never imports `historian.tables.
+    blame` or `historian.catalog` itself, matching the module
+    docstring's own claim), but a caller that does pass it in gets a
+    real `BlameScan` bound to the given repo path back - proven
+    without ever calling `.rows()`, so no git subprocess runs."""
     stmt = _stmt([_select_item(_col("path"))], where=None, from_table="blame")
     repo = Path("/nonexistent/for/this/test")
 
-    tree = plan(stmt, repo)
+    tree = plan(stmt, repo, tables=SCAN_FACTORIES)
 
     assert isinstance(tree, Project)
     assert isinstance(tree._child, Scan)

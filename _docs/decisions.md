@@ -2041,3 +2041,107 @@ no change and the other five call sites are untouched. The three
 test_parser.py` were widened from a substring check to the full exact
 message text, so a regression back to the bare-keyword phrasing is
 actually caught rather than merely still containing the keyword.
+
+2026-09-26 - one `historian/catalog.py`, not two hand-kept table
+dicts or a self-registering registry; #52 folded into #35 as the same
+fix
+
+Issues #35 and #52, closed by the same PR. Before this issue,
+`sql/binder.py` and `plan/planner.py` each hardcoded their own real
+table catalog - `TABLES = {"blame": BLAME_SCHEMA}` and `TABLES =
+{"blame": BlameScan}` - built by importing `historian.tables.blame`
+directly, and defaulted `bind()`'s `catalog` and `plan()`'s `tables`
+parameters to them. That had two separate costs: merely *importing*
+the binder or the planner - never mind running a query - put
+`subprocess` into `sys.modules` (`tables/blame.py` imports it at
+module level to shell out to `git`), violating AGENTS.md's "the
+parser, the planner and the executor are plain Python with no git and
+no subprocess imports"; and the two catalogs were independent dicts
+with nothing to stop them naming a different set of tables, a
+divergence that would have surfaced as a bare `KeyError` reaching a
+user rather than a clean error (#52, interacting with #49).
+
+The chosen design: `historian/catalog.py` is the one new module that
+imports each table module directly and builds one literal `TABLES:
+dict[str, TableDef]`, pairing a `Schema` and a `ScanFactory` per
+table. `SCHEMAS` and `SCAN_FACTORIES` - what the binder and the
+planner actually consume - are dict comprehensions *over*
+`TABLES.items()`, not copies someone keeps in sync by hand, so they
+cannot list different table names from each other by construction,
+not merely by a test that happens to check both today. `bind()`'s
+`catalog` and `plan()`'s `tables` parameters lost their hardcoded
+defaults and became required - an empty-dict or lazily-imported
+default would only relocate the same import-timing accident into a
+different function, not remove it. `cli.py` became the composition
+root: the only production module that imports `historian.catalog`,
+passing `SCHEMAS`/`SCAN_FACTORIES` into `bind()`/`plan()` explicitly.
+`sql/binder.py` and `plan/planner.py` no longer import
+`historian.tables.*` or `subprocess`, directly or indirectly, and
+neither does `exec/expression.py` or `exec/operators.py` (both
+inherited the violation solely by importing names out of
+`sql/binder.py`, so fixing the binder's chain fixed both for free -
+confirmed by a fresh-interpreter test naming each module separately,
+`tests/test_layering.py`).
+
+Two other designs were considered and rejected:
+
+- **Lazy `import subprocess` inside `tables/blame.py`.** Makes a
+  fresh-interpreter `subprocess`-absence test pass, but leaves the
+  actual layering violation untouched: the binder and the planner
+  would still import `tables/blame.py` directly and hardcode
+  `{"blame": ...}` each, so #52's divergence risk stays completely
+  unaddressed, and a phase-2 table still means hand-editing two files.
+  It makes the architectural claim true only by an accident of when
+  one particular `import subprocess` line happens to run - exactly
+  the phrase #35 was filed to fix, not paper over.
+- **Scans self-registering into a catalog by import side effect**
+  (each table module calls something like `catalog.register("blame",
+  ...)` at its own import time, with some import-everything step
+  making that run). Rejected for two reasons. First, something still
+  has to import every table module for its registration to run - the
+  same "what imports the tables" question the explicit design answers
+  directly, except a registration design answers it implicitly, by
+  relying on Python's import-executes-top-level-code behaviour as the
+  wiring mechanism itself. That is exactly what AGENTS.md's "no
+  metaclasses, no dynamic dispatch tricks, no clever descriptors...
+  portable to Rust later" rule warns against: a Rust port has no
+  equivalent for "importing a module has the side effect of
+  registering it into a global table" without reaching for something
+  like the `inventory` or `ctor` crates, themselves considered a smell
+  in idiomatic Rust for this exact reason. Second, it reintroduces the
+  import-order hazard the explicit design avoids for free - a registry
+  populated by side effects can be read before every table has
+  registered into it, with nothing preventing that ordering by
+  construction; it would have to be enforced by convention (import all
+  tables first) or by a test, whereas `historian/catalog.py`'s literal
+  dict, built top to bottom in one expression, cannot be read
+  half-built. The explicit dict is the more honest reading of this
+  option's actual intent (the planner depends on an abstraction,
+  `historian.catalog`, rather than reaching into `tables/blame.py`
+  itself) without the side-effect machinery, and it translates
+  directly to a Rust `HashMap` or `match` built once in an equivalent
+  `catalog.rs`, which a registration pattern would not.
+
+`historian/catalog.py` itself still imports `tables/blame.py`, and
+therefore still imports `subprocess` transitively - unavoidable, and
+not the bug this issue fixes. Something concrete has to name every
+table's schema and scan class; the fix is confining where that name
+is allowed to appear (only `cli.py` and tests that want the real
+catalog), not making the import vanish from the codebase.
+
+Guard tests proved themselves against the bug, not just the fix:
+`tests/test_layering.py`'s fresh-interpreter checks were run against
+the pre-fix code first and confirmed to fail (naming the binder's and
+the planner's chains independently), then a working fix was
+temporarily broken twice more by hand - reintroducing each of the two
+`tables/blame.py` imports one at a time, and hand-editing
+`SCAN_FACTORIES`'s derivation to drop `"blame"` while leaving
+`SCHEMAS` alone - confirming each mutation was caught by the guard
+that specifically names it, before being reverted.
+`tests/test_binder.py::test_binder_module_does_not_import_subprocess_directly`
+was removed rather than kept alongside the new guards: it only ever
+checked `vars(binder_module)` for a directly-written `import
+subprocess` statement, which stayed `False` throughout this entire
+bug (the violation was transitive, via `BLAME_SCHEMA`), so it gave
+false confidence in both directions and had no reason to survive next
+to a test that actually catches the failure mode.

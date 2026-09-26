@@ -163,15 +163,17 @@ from historian.sql.ast import (
     UnaryOperator,
 )
 from historian.sql.lexer import Position, Token, TokenType
+from historian.values import INT64_MAX
 
 __all__ = ["ParseError", "UnsupportedGrammarError", "parse"]
 
-#: SQLite's int64 range. A decimal `INTEGER` literal whose digit text
-#: exceeds this becomes a `float` instead of an `int` - see the module
-#: docstring and `_docs/decisions.md`, 2026-09-01. The lexer never
-#: emits a signed `INTEGER` token (a leading `-` is always its own
-#: `MINUS` token), so there is no negative bound to check here.
-_INT64_MAX = 9223372036854775807
+# `INT64_MAX` (`historian.values`, issue #53): a decimal `INTEGER`
+# literal whose digit text exceeds this becomes a `float` instead of
+# an `int` - see the module docstring and `_docs/decisions.md`,
+# 2026-09-01. The lexer never emits a signed `INTEGER` token (a
+# leading `-` is always its own `MINUS` token), so there is no
+# negative bound to check here - unlike `exec/expression.py`, which
+# needs `INT64_MIN` too.
 
 #: How many `(`, `NOT`, or unary `+`/`-` tokens may run together before
 #: `_parse_primary`/`_parse_not`/`_parse_unary` (below) give up and
@@ -317,7 +319,7 @@ def _int_literal_value(text: str) -> int | float:
     `UnaryOp`'s docstring in `sql/ast.py`.
     """
     value = int(text)
-    if value > _INT64_MAX:
+    if value > INT64_MAX:
         return float(text)
     return value
 

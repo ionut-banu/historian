@@ -1443,6 +1443,81 @@ def test_bare_column_group_key_keeps_its_source_affinity_in_having(awkward_repo)
     assert list(rows) == [(3, 2)]
 
 
+# --- LIKE ... ESCAPE joins the shape-equal/split walks (issue #101) ----
+#
+# `escape` was missing from `sql/binder.py`'s `_expr_shape_equal`,
+# `plan/planner.py`'s own copy of it, and `plan/planner.py`'s
+# `_split_expr` - three of the six hand-written expression walks that
+# #51 should have given an `escape` branch alongside `left`/`pattern`.
+# The two BindError cases this bug also causes (a `LIKE ... ESCAPE`
+# select-list/HAVING expression that no longer shape-matches its
+# GROUP BY key once `escape` is compared) are asserted directly in
+# `tests/test_binder.py` instead of here - the fixed behavior there is
+# a `BindError`, not a row SQLite would return (see that file's own
+# comment on why: SQLite's answer is a non-deterministic arbitrary-row
+# read historian deliberately refuses to reproduce).
+
+
+def test_like_escape_identical_on_both_sides_of_group_by_still_groups(awkward_repo):
+    """Regression guard, as a differential case too: the identical
+    `LIKE ... ESCAPE` expression (same escape operand in the select
+    list and the GROUP BY key) still shape-matches and groups
+    normally - oracle `(0, 12)`, one whole-table group since no path
+    in `awkward_repo` matches the escaped, now-literal `%` pattern."""
+    query = (
+        "SELECT path LIKE 'c%' ESCAPE 'c', count(*) FROM blame "
+        "GROUP BY path LIKE 'c%' ESCAPE 'c'"
+    )
+    _assert_differential(awkward_repo, query)
+    _, rows = run_historian(query, awkward_repo)
+    assert list(rows) == [(0, 12)]
+
+
+def test_split_expr_like_escape_column_matching_group_key_with_aggregate(awkward_repo):
+    """`_split_expr`'s `Like` branch must rewrite `escape` recursively
+    like `left`/`pattern` - here `line_no` (the GROUP BY key) doubles
+    as the escape operand, so it must resolve against `Aggregate`'s
+    group-key output column rather than stay a raw pre-aggregation row
+    offset. Oracle-confirmed (`3.45.1`, matching this project's
+    resolved module version)."""
+    query = (
+        "SELECT line_no, count(*), 'x%' LIKE ('x' || line_no || '%') ESCAPE line_no "
+        "FROM blame GROUP BY line_no"
+    )
+    _assert_differential(awkward_repo, query)
+    _, rows = run_historian(query, awkward_repo)
+    assert list(rows) == [(1, 5, 1), (2, 2, 1), (3, 2, 1), (4, 1, 1), (5, 1, 1), (6, 1, 1)]
+
+
+def test_split_expr_like_escape_column_matching_group_key_without_aggregate(awkward_repo):
+    """The same case with no `count(*)` in the select list at all -
+    before this fix, `escape` stayed an unrewritten raw row offset and
+    `exec/expression.py`'s `evaluate()` read it against `Aggregate`'s
+    output row shape, tripping an uncaught `IndexError` (CLI exit code
+    4)."""
+    query = (
+        "SELECT line_no, 'x%' LIKE ('x' || line_no || '%') ESCAPE line_no "
+        "FROM blame GROUP BY line_no"
+    )
+    _assert_differential(awkward_repo, query)
+    _, rows = run_historian(query, awkward_repo)
+    assert list(rows) == [(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1)]
+
+
+def test_split_expr_like_escape_aggregate_call_is_routed_to_aggregate(awkward_repo):
+    """An aggregate call as the `ESCAPE` operand is legal SQLite and
+    must be split into its own `Aggregate` slot like any other
+    aggregate call - before this fix, `_split_expr`'s `Like` branch
+    left it as a raw `FunctionCall` and `exec/expression.py` rejected
+    it with `EvalError`."""
+    query = (
+        "SELECT count(*), 'x%' LIKE 'x%' ESCAPE count(*) FROM blame GROUP BY line_no"
+    )
+    _assert_differential(awkward_repo, query)
+    _, rows = run_historian(query, awkward_repo)
+    assert list(rows) == [(5, 1), (2, 1), (2, 1), (1, 1), (1, 1), (1, 1)]
+
+
 # --- GROUP BY / HAVING (issue #69): BindError cases, asserted directly -
 
 

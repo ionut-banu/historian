@@ -1716,3 +1716,53 @@ def test_like_escape_arbitrary_expression_containing_a_column_still_binds():
     assert isinstance(like.escape, BinaryOp)
     assert isinstance(like.escape.left, BoundColumnRef)
     assert like.escape.left.name == "author_name"
+
+
+# --- LIKE ... ESCAPE: escape joins `_expr_shape_equal`'s Like branch --------
+# --- (issue #101) ------------------------------------------------------
+#
+# #51 threaded `escape` through binding (above) and #51/#108's own
+# `_contains_aggregate`/`_split_for_grouped_check` walks already compare
+# it. `_expr_shape_equal`'s `Like` branch was the one left comparing
+# only `negated`/`left`/`pattern` - so a `LIKE ... ESCAPE` select-list
+# or HAVING expression that differs from a GROUP BY key only in its
+# escape operand silently shape-matched that key. Once `escape` joins
+# the comparison, both queries below no longer shape-match their
+# GROUP BY key, so they fall into the pre-existing "not a GROUP BY key,
+# not an aggregate" narrowing (`_check_grouped_select_list`/HAVING's own
+# check) instead of returning wrong rows - not SQLite's own answer,
+# which historian deliberately does not reproduce (see the module
+# docstring's determinism note): confirmed live, simulating the fix
+# in-process against the real binder, that both raise this exact
+# `BindError` once only `_expr_shape_equal`'s `Like` branch is patched.
+
+
+def test_like_escape_select_list_differing_only_in_escape_from_group_key_is_a_bind_error():
+    with pytest.raises(
+        BindError,
+        match=r"column path must appear in the GROUP BY clause or be used in an aggregate function",
+    ):
+        _bind("SELECT path LIKE 'c%' ESCAPE 'c', count(*) FROM blame GROUP BY path LIKE 'c%'")
+
+
+def test_like_escape_having_differing_only_in_escape_from_group_key_is_a_bind_error():
+    with pytest.raises(
+        BindError,
+        match=r"column path must appear in the GROUP BY clause or be used in an aggregate function",
+    ):
+        _bind(
+            "SELECT count(*) FROM blame GROUP BY path LIKE 'c%' "
+            "HAVING path LIKE 'c%' ESCAPE 'c'"
+        )
+
+
+def test_like_escape_identical_on_both_sides_still_matches_its_group_key():
+    """Regression guard: the fix must not overcorrect into treating
+    every `LIKE ... ESCAPE` as unequal to itself - the identical
+    expression (same escape operand on both sides) still shape-matches
+    its GROUP BY key and binds without error."""
+    bound = _bind(
+        "SELECT path LIKE 'c%' ESCAPE 'c', count(*) FROM blame "
+        "GROUP BY path LIKE 'c%' ESCAPE 'c'"
+    )
+    assert len(bound.group_by) == 1

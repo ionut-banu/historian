@@ -23,9 +23,10 @@ import pytest
 
 from historian.catalog import SCAN_FACTORIES
 from historian.exec.operators import Aggregate, Distinct, Filter, Limit, Project, Scan, Sort
+from historian.plan import planner
 from historian.plan.planner import plan
 from historian.schema import Column, ColumnType, Row, Schema
-from historian.sql.ast import BinaryOp, FunctionCall, Literal, OrderDirection, Operator as Op, Star
+from historian.sql.ast import BinaryOp, FunctionCall, Like, Literal, OrderDirection, Operator as Op, Star
 from historian.sql.binder import BoundColumnRef, BoundOrderByItem, BoundSelectItem, BoundSelectStatement, bind
 from historian.sql.lexer import Position, tokenize
 from historian.sql.parser import parse
@@ -1076,3 +1077,88 @@ def test_distinct_with_order_by_and_limit_through_the_real_pipeline_end_to_end()
     tree = plan(bound, Path("/nonexistent"), tables={"t3": lambda repo: source})
 
     assert list(tree.rows()) == [("a", 1), ("b", 2), ("a", 3)]
+
+
+# --- LIKE ... ESCAPE joins this module's own `_expr_shape_equal` -------
+# --- and `_split_expr` (issue #101) -------------------------------------
+#
+# `plan/planner.py` keeps its own independent copy of
+# `sql/binder.py`'s `_expr_shape_equal` (`_group_key_index`'s own
+# dependency) - a black-box query alone cannot prove this copy's `Like`
+# branch was fixed, since the binder's own copy (`tests/test_binder.py`)
+# already rejects the same query first. Pinned directly here instead.
+
+
+def test_expr_shape_equal_like_differing_only_in_escape_is_not_equal():
+    with_escape = Like(
+        left=_col("path"),
+        pattern=_lit("c%"),
+        negated=False,
+        position=_POS,
+        escape=_lit("c"),
+    )
+    without_escape = Like(
+        left=_col("path"),
+        pattern=_lit("c%"),
+        negated=False,
+        position=_POS,
+        escape=None,
+    )
+    assert planner._expr_shape_equal(with_escape, without_escape) is False
+
+
+def test_expr_shape_equal_like_with_different_escape_operands_is_not_equal():
+    escape_c = Like(
+        left=_col("path"), pattern=_lit("c%"), negated=False, position=_POS, escape=_lit("c")
+    )
+    escape_x = Like(
+        left=_col("path"), pattern=_lit("c%"), negated=False, position=_POS, escape=_lit("x")
+    )
+    assert planner._expr_shape_equal(escape_c, escape_x) is False
+
+
+def test_expr_shape_equal_like_with_identical_escape_operands_is_equal():
+    a = Like(left=_col("path"), pattern=_lit("c%"), negated=False, position=_POS, escape=_lit("c"))
+    b = Like(left=_col("path"), pattern=_lit("c%"), negated=False, position=_POS, escape=_lit("c"))
+    assert planner._expr_shape_equal(a, b) is True
+
+
+def test_plan_split_expr_like_escape_column_matching_group_key_reads_from_aggregate_output():
+    """`_split_expr`'s `Like` branch must rewrite `escape` recursively
+    exactly like `left`/`pattern` - here `line_no` (the GROUP BY key)
+    used as the escape operand must resolve to a `BoundColumnRef`
+    reading `Aggregate`'s group-key output column (offset 0), not stay
+    a raw pre-aggregation row offset."""
+    group_by = (_col("line_no"),)
+    like = Like(
+        left=_lit("x%"),
+        pattern=_bin(Op.CONCAT, _lit("x"), _col("line_no")),
+        negated=False,
+        position=_POS,
+        escape=_col("line_no"),
+    )
+    calls: list = []
+    split = planner._split_expr(like, calls, group_by)
+    assert isinstance(split, Like)
+    assert isinstance(split.escape, BoundColumnRef)
+    assert split.escape.offset == 0
+
+
+def test_plan_split_expr_like_escape_aggregate_call_gets_routed_to_aggregate():
+    """An aggregate call as the `ESCAPE` operand must be split into its
+    own `Aggregate` slot like any other aggregate call, not left as a
+    `FunctionCall` for `exec/expression.py` to reject."""
+    like = Like(
+        left=_lit("x%"),
+        pattern=_lit("x%"),
+        negated=False,
+        position=_POS,
+        escape=FunctionCall(name="count", args=(), position=_POS, distinct=False),
+    )
+    calls: list = []
+    split = planner._split_expr(like, calls, group_by=())
+    assert isinstance(split, Like)
+    assert isinstance(split.escape, BoundColumnRef)
+    assert split.escape.offset == 0
+    assert len(calls) == 1
+    assert calls[0].kind == "count"

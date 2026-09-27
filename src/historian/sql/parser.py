@@ -136,6 +136,29 @@ ordinary deeply-parenthesised input SQLite itself accepts, and a value
 high enough to match SQLite's declared limit would let genuine
 recursion exhaust Python's real call stack before the counter ever
 fires.
+
+A leading run of `(` does not always close as a run of `)` in one
+place - `((1) + 1)` closes its second `(` right after `1`, then its
+first `(` only after `+ 1` (issue #100). `_parse_primary`'s LPAREN
+branch still consumes the whole leading run with a loop (cheap, no
+stack cost, bounded by `_MAX_NESTING_DEPTH`) and still parses the
+first inner term with one `_parse_expr` call, but now closes only as
+many `)` as are immediately available and, if some are still owed,
+calls `_continue_expr` to resume precedence-climbing from what has
+been parsed so far - a fixed, small number of Python stack frames per
+call, looped rather than recursed, so a long run that closes this way
+(`_docs/decisions.md`, 2026-09-27, calls this shape a "linear chain")
+is just as cheap as the pure case and reaches the same
+`_MAX_NESTING_DEPTH`. Only when resuming needs a fresh operand that is
+*itself* a separately-staggered `(` run - reached through
+`_continue_expr`'s direct calls into the tighter precedence methods,
+which bypass `_parse_expr`'s own counter - does this cost real,
+unbounded-by-default stack, since the outer LPAREN branch is still on
+the stack waiting for that operand. The LPAREN branch now counts
+itself on `self._depth` for its own entire duration (open to final
+return, including every resume iteration), not only for its one
+`_parse_expr` call, closing that gap - see `_docs/decisions.md`,
+2026-09-27, for how this was found and what it measures to.
 """
 
 from __future__ import annotations
@@ -604,16 +627,73 @@ class _Parser:
         finally:
             self._depth -= 1
 
-    def _parse_or(self) -> Expr:
-        left = self._parse_and()
+    def _consume_available_rparens(self, at_most: int) -> int:
+        """Consume up to *at_most* `)` tokens, stopping at the first
+        token that is not one - used by `_parse_primary`'s LPAREN
+        branch, which never knows in advance how many of a leading
+        run's opens close at the current position. Returns how many
+        were actually consumed (0..at_most)."""
+        closed = 0
+        while closed < at_most and self._check(TokenType.RPAREN):
+            self._advance()
+            closed += 1
+        return closed
+
+    def _continue_expr(self, left: Expr) -> Expr:
+        """Resume precedence-climbing from *left*, an already fully-
+        reduced value - as if it had just come back out of
+        `_parse_primary` with control flowing back up through every
+        tighter-to-loosest level looking for further operators.
+
+        Only `_parse_primary`'s LPAREN branch calls this, and only
+        when a leading run of `(` did not all close at the same point
+        (issue #100): after that run's one `_parse_expr` call returns
+        and as many `)` as are immediately available are consumed,
+        some may still be owed - which means the rest of the enclosing
+        expression (further operators, then more `)`) is still part of
+        the same group. The ordinary recursive-descent chain cannot
+        express "come back later for the rest of this expression" on
+        its own - each precedence method commits to fetching its left
+        operand from the next-tighter level exactly once - so this
+        method drives the same tightest-to-loosest sequence explicitly
+        instead, one call per level, each accepting *left* as a
+        starting point rather than parsing a fresh one.
+
+        Costs a small, fixed number of Python stack frames regardless
+        of how many parens the caller still owes - it never recurses
+        into itself - so calling it repeatedly from a loop (as
+        `_parse_primary` does) does not accumulate stack depth the way
+        genuine per-paren recursion would. See `_docs/decisions.md`,
+        2026-09-27, for the depth this was measured to sustain.
+
+        Order matters and mirrors the module docstring's precedence
+        table exactly, tightest first: `||` binds tighter than `*`/`/`,
+        which bind tighter than binary `+`/`-`, and so on up through
+        `OR`. `NOT` (prefix) and unary `+`/`-` are deliberately absent
+        - both only ever apply at the *start* of a term, and *left* is
+        never at the start of one.
+        """
+        left = self._parse_concat(left)
+        left = self._parse_multiplicative(left)
+        left = self._parse_additive(left)
+        left = self._parse_relational(left)
+        left = self._parse_comparison(left)
+        left = self._parse_and(left)
+        left = self._parse_or(left)
+        return left
+
+    def _parse_or(self, left: Expr | None = None) -> Expr:
+        if left is None:
+            left = self._parse_and()
         while self._check(TokenType.OR):
             self._advance()
             right = self._parse_and()
             left = Or(left=left, right=right, position=left.position)
         return left
 
-    def _parse_and(self) -> Expr:
-        left = self._parse_not()
+    def _parse_and(self, left: Expr | None = None) -> Expr:
+        if left is None:
+            left = self._parse_not()
         while self._check(TokenType.AND):
             self._advance()
             right = self._parse_not()
@@ -642,7 +722,7 @@ class _Parser:
             node = Not(operand=node, position=position)
         return node
 
-    def _parse_comparison(self) -> Expr:
+    def _parse_comparison(self, left: Expr | None = None) -> Expr:
         """Comparison tier 2: `=  <>  !=  IS [NOT]  LIKE  IN  BETWEEN`,
         each optionally preceded by `NOT` for `LIKE`/`IN`/`BETWEEN`
         (that `NOT` is this operator's own modifier, not the general
@@ -652,8 +732,13 @@ class _Parser:
         (`1 = 1 = 1`, `1 IN (1,2) = 1` are both valid and confirmed
         against `sqlite3` during grooming), so after building one
         tier-2 node the loop checks again for another.
+
+        *left*, when given, is an already-fully-reduced value to
+        resume climbing from instead of parsing a fresh one via
+        `_parse_relational` - see `_continue_expr`.
         """
-        left = self._parse_relational()
+        if left is None:
+            left = self._parse_relational()
         while True:
             token = self._peek()
             if token.type in (TokenType.EQ, TokenType.NE):
@@ -773,9 +858,13 @@ class _Parser:
         high = self._parse_relational()
         return low, high
 
-    def _parse_relational(self) -> Expr:
-        """Comparison tier 1: `<  <=  >  >=`."""
-        left = self._parse_additive()
+    def _parse_relational(self, left: Expr | None = None) -> Expr:
+        """Comparison tier 1: `<  <=  >  >=`.
+
+        *left*, when given, resumes from an already-reduced value
+        instead of parsing a fresh one - see `_continue_expr`."""
+        if left is None:
+            left = self._parse_additive()
         while True:
             op = _RELATIONAL_OPERATORS.get(self._peek().type)
             if op is None:
@@ -784,9 +873,13 @@ class _Parser:
             right = self._parse_additive()
             left = BinaryOp(op=op, left=left, right=right, position=left.position)
 
-    def _parse_additive(self) -> Expr:
-        """Binary `+`/`-`."""
-        left = self._parse_multiplicative()
+    def _parse_additive(self, left: Expr | None = None) -> Expr:
+        """Binary `+`/`-`.
+
+        *left*, when given, resumes from an already-reduced value
+        instead of parsing a fresh one - see `_continue_expr`."""
+        if left is None:
+            left = self._parse_multiplicative()
         while True:
             op = _ADDITIVE_OPERATORS.get(self._peek().type)
             if op is None:
@@ -795,9 +888,13 @@ class _Parser:
             right = self._parse_multiplicative()
             left = BinaryOp(op=op, left=left, right=right, position=left.position)
 
-    def _parse_multiplicative(self) -> Expr:
-        """`*`/`/`."""
-        left = self._parse_concat()
+    def _parse_multiplicative(self, left: Expr | None = None) -> Expr:
+        """`*`/`/`.
+
+        *left*, when given, resumes from an already-reduced value
+        instead of parsing a fresh one - see `_continue_expr`."""
+        if left is None:
+            left = self._parse_concat()
         while True:
             op = _MULTIPLICATIVE_OPERATORS.get(self._peek().type)
             if op is None:
@@ -806,11 +903,15 @@ class _Parser:
             right = self._parse_concat()
             left = BinaryOp(op=op, left=left, right=right, position=left.position)
 
-    def _parse_concat(self) -> Expr:
+    def _parse_concat(self, left: Expr | None = None) -> Expr:
         """`||`, binding tighter than `*`/`/` - confirmed against
         `sqlite3` during grooming (`'a' || 1 + 1` is `1`, matching
-        `('a' || 1) + 1`, not `'a' || (1 + 1)` which is `'a2'`)."""
-        left = self._parse_unary()
+        `('a' || 1) + 1`, not `'a' || (1 + 1)` which is `'a2'`).
+
+        *left*, when given, resumes from an already-reduced value
+        instead of parsing a fresh one - see `_continue_expr`."""
+        if left is None:
+            left = self._parse_unary()
         while self._check(TokenType.CONCAT):
             self._advance()
             right = self._parse_unary()
@@ -884,11 +985,29 @@ class _Parser:
             # A run of `(` is stripped with a loop, not by recursing
             # once per paren: `(expr)` produces no AST node of its own
             # (`inner` is returned unchanged below), so however many
-            # parens wrap one expression, only one `_parse_expr` call
-            # is needed for its contents. Bounded by
+            # parens open together, only one `_parse_expr` call is
+            # needed for whatever comes right after them. Bounded by
             # `_MAX_NESTING_DEPTH`, not `_MAX_RECURSION_DEPTH` - the
             # module docstring explains why this one form gets the
             # much larger limit.
+            #
+            # But a run of leading `(` does not always close as a run
+            # of trailing `)` in one place - `((1) + 1)` closes its
+            # second `(` right after `1`, then its first `(` only after
+            # `+ 1` - issue #100, correcting the 2026-09-01 decisions.md
+            # entry's "behaviourally identical" claim (see the new
+            # entry dated 2026-09-27). So after the one `_parse_expr`
+            # call, this closes as many `)` as are immediately
+            # available; if that is not all of them, the still-open
+            # count is not an error - it means the rest of the
+            # enclosing expression (more operators, then more `)`)
+            # still belongs to this same group, so `_continue_expr`
+            # resumes precedence-climbing from what has been parsed so
+            # far and this loops until every opened paren is closed.
+            # `_continue_expr` costs a handful of Python stack frames
+            # per call, not one per paren still owed - see its own
+            # docstring - so this stays loop-driven, not recursive,
+            # for however many opens the leading run had.
             depth = 0
             while self._check(TokenType.LPAREN):
                 paren = self._advance()
@@ -899,10 +1018,54 @@ class _Parser:
                         f"(max {_MAX_NESTING_DEPTH} levels of parentheses)",
                         paren.position,
                     )
-            inner = self._parse_expr()
-            for _ in range(depth):
-                self._expect(TokenType.RPAREN, "')'")
-            return inner
+            # `_MAX_RECURSION_DEPTH` guards genuine recursion, and this
+            # branch can now genuinely recurse in a way the pure batch
+            # loop above never does: once a leading run does not close
+            # all at once, `_continue_expr` (below) fetches an operator's
+            # right operand by calling straight into the tighter
+            # precedence methods, bypassing `_parse_expr`'s own depth
+            # counter - if that operand is itself a fresh, separately-
+            # staggered `(` run, parsing it re-enters this very branch
+            # while the *current* invocation is still on the Python call
+            # stack, waiting inside the `while closed < depth` loop
+            # below. That is real per-invocation stack cost, same as any
+            # other genuine recursion, and nothing else was counting it
+            # - confirmed by construction (see `_docs/decisions.md`,
+            # 2026-09-27): chaining that shape enough times raised a bare
+            # `RecursionError` around 1000 levels before this guard was
+            # added, with `self._depth` (as touched by the one
+            # `_parse_expr` call below) never exceeding 2. So this
+            # branch counts itself on `self._depth` for its *entire*
+            # duration - open to final return, including every resume
+            # iteration - not only for the one `_parse_expr` call for
+            # its first inner term.
+            self._depth += 1
+            if self._depth > _MAX_RECURSION_DEPTH:
+                self._depth -= 1
+                raise ParseError(
+                    "expression nested too deeply "
+                    f"(max {_MAX_RECURSION_DEPTH} levels of parentheses, "
+                    "IN, or function-call nesting)",
+                    token.position,
+                )
+            try:
+                inner = self._parse_expr()
+                closed = self._consume_available_rparens(depth)
+                while closed < depth:
+                    before = self._index
+                    inner = self._continue_expr(inner)
+                    closed += self._consume_available_rparens(depth - closed)
+                    if self._index == before:
+                        # Neither an operator continuing the expression
+                        # nor a ')' was found - the remaining opens can
+                        # never close. Malformed input, e.g. a missing
+                        # ')'.
+                        raise self._error(
+                            f"expected ')', found {_describe(self._peek())}"
+                        )
+                return inner
+            finally:
+                self._depth -= 1
         if token.type is TokenType.IDENTIFIER:
             return self._parse_identifier_primary()
         raise self._error(f"expected expression, found {_describe(token)}")

@@ -892,6 +892,64 @@ def test_real_column_affinity_behaves_identically_to_integer_column():
     assert evaluate(_bin(Operator.EQ, _col("r"), _lit("5abc")), _ROW, _SCHEMA) is False
 
 
+#: Issue #99: an `Aggregate`-output-shaped schema, where a bare
+#: `BoundColumnRef` points at a column declared `None` - no affinity,
+#: the declared type of an aggregate result or computed `GROUP BY` key.
+#: One row: `(21, 12, 2.5)`.
+_NO_AFFINITY_SCHEMA = Schema(
+    columns=(
+        Column("sum_1", None),
+        Column("count_2", None),
+        Column("avg_3", None),
+    )
+)
+_NO_AFFINITY_ROW: Row = (21, 12, 2.5)
+
+
+def _no_affinity_col(name: str) -> BoundColumnRef:
+    return BoundColumnRef(offset=_NO_AFFINITY_SCHEMA.index_of(name), name=name, position=_POS)
+
+
+def test_bare_column_ref_to_a_no_affinity_column_is_not_coerced_to_text():
+    """sqlite3 (awkward fixture, issue #99): `sum(line_no) > 3` is true
+    for `café.py`'s 21. A `None`-declared column contributes no
+    affinity, and neither does the literal, so `21 > 3` compares as
+    plain integers - not `'21' > '3'` as the old `TEXT` placeholder
+    made it."""
+    from historian.exec.expression import evaluate
+
+    expr = _bin(Operator.GT, _no_affinity_col("sum_1"), _lit(3))
+    assert evaluate(expr, _NO_AFFINITY_ROW, _NO_AFFINITY_SCHEMA) is True
+
+
+def test_bare_column_ref_to_a_no_affinity_column_does_not_convert_a_text_literal():
+    """sqlite3: `count(*) = '12'` -> 0 and `avg(line_no) = '2.5'` -> 0
+    (issue #99) - with no affinity on either side, `'12'` stays text
+    and a number never equals a text value."""
+    from historian.exec.expression import evaluate
+
+    count_eq = _bin(Operator.EQ, _no_affinity_col("count_2"), _lit("12"))
+    avg_eq = _bin(Operator.EQ, _no_affinity_col("avg_3"), _lit("2.5"))
+    assert evaluate(count_eq, _NO_AFFINITY_ROW, _NO_AFFINITY_SCHEMA) is False
+    assert evaluate(avg_eq, _NO_AFFINITY_ROW, _NO_AFFINITY_SCHEMA) is False
+
+
+def test_no_affinity_column_still_takes_the_other_operands_affinity():
+    """A no-affinity operand is still subject to the *other* side's
+    affinity, exactly like a literal or computed expression. sqlite3
+    (`t(s TEXT)`, one row `'5'`): `SELECT s, count(*) FROM t GROUP BY
+    s HAVING s = count(*) + 4` -> `('5', 1)` - `TEXT`-declared `s`
+    against the no-affinity integer `5` compares as text `'5' = '5'`.
+    Uses a mixed schema so one side is a real `TEXT` column and the
+    other is `None`."""
+    from historian.exec.expression import evaluate
+
+    schema = Schema(columns=(Column("s", ColumnType.TEXT), Column("k", None)))
+    s_ref = BoundColumnRef(offset=0, name="s", position=_POS)
+    k_ref = BoundColumnRef(offset=1, name="k", position=_POS)
+    assert evaluate(_bin(Operator.EQ, s_ref, k_ref), ("5", 5), schema) is True
+
+
 # --- Comparisons: all six operators wire through affinity too -----------
 #
 # sqlite3 (`n INT`, `n=5`): `n < '10'` -> 1, `n > '3'` -> 1

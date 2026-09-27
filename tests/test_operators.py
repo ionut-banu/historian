@@ -781,14 +781,22 @@ def test_count_star_and_count_paren_are_identical():
     assert tuple(result.rows()) == ((2,),)
 
 
-def test_aggregate_schema_declares_count_integer_and_avg_real():
-    """Not load-bearing (no `HAVING` yet to compare against it - #69),
-    but documented rather than arbitrary: `count`'s output column is
-    declared `INTEGER`, `avg`'s is declared `REAL`."""
-    result = Aggregate(_agg_child([]), [_call("count"), _call("avg", _col("line_no"))])
+def test_aggregate_schema_declares_no_affinity_for_every_aggregate_kind():
+    """Issue #99: an aggregate call's result has no column affinity in
+    SQLite, whatever its kind, so `Aggregate`'s output column for it is
+    declared `None` ("no affinity"), never one of `ColumnType`'s three
+    real table affinities - `count` is not `INTEGER`, `avg` is not
+    `REAL`, and `sum`/`min`/`max` are not the old `TEXT` placeholder."""
+    calls = [
+        _call("count"),
+        _call("sum", _col("line_no")),
+        _call("avg", _col("line_no")),
+        _call("min", _col("line_no")),
+        _call("max", _col("path")),
+    ]
+    result = Aggregate(_agg_child([]), calls)
 
-    assert result.schema.columns[0].type is ColumnType.INTEGER
-    assert result.schema.columns[1].type is ColumnType.REAL
+    assert [c.type for c in result.schema.columns] == [None, None, None, None, None]
 
 
 def test_aggregate_consumes_child_rows_exactly_once():
@@ -1677,7 +1685,22 @@ def test_grouped_aggregate_schema_has_group_columns_before_aggregate_columns():
     assert [c.name for c in result.schema.columns] == ["path", "line_no", "count_1"]
     assert result.schema.columns[0].type is ColumnType.TEXT
     assert result.schema.columns[1].type is ColumnType.INTEGER
-    assert result.schema.columns[2].type is ColumnType.INTEGER
+    assert result.schema.columns[2].type is None  # issue #99: no affinity
+
+
+def test_grouped_aggregate_schema_bare_column_key_keeps_source_type_computed_key_has_none():
+    """Issue #99: a bare-column `GROUP BY` key keeps its source column's
+    declared type (the regression guard - unchanged by #99), while a
+    computed key such as `line_no + 10` has no affinity at all (`None`),
+    not the old `TEXT` placeholder."""
+    result = Aggregate(
+        _agg_child([]),
+        [],
+        group_by=[_col("line_no"), _bin(Op.ADD, _col("line_no"), _lit(10))],
+    )
+
+    assert result.schema.columns[0].type is ColumnType.INTEGER
+    assert result.schema.columns[1].type is None
 
 
 def test_grouped_aggregate_consumes_each_child_row_exactly_once():

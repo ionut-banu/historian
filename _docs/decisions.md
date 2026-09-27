@@ -2245,3 +2245,51 @@ literal `:` (a type annotation), which cannot swallow
 `_MAGNITUDE_AS_FLOAT` - so the match fails to reach an `=` at all.
 Verified directly, both as source-scanning tests and as standalone
 regex-example tests independent of the source tree.
+
+2026-09-27 - "no affinity" is `Column.type is None`, not a fourth
+`ColumnType` member; aggregate results and computed `GROUP BY` keys
+declare it
+
+Issue #99. `Aggregate`'s output schema declared `count` `INTEGER`,
+`avg` `REAL`, and `sum`/`min`/`max` and every computed `GROUP BY` key
+a `TEXT` placeholder. Harmless until `HAVING` (#69) and select-list
+comparisons started reading those declared types through
+`exec/expression.py`'s `_affinity_of`: `plan/planner.py`'s
+`_split_expr` rewrites each aggregate call and computed key into a
+bare `BoundColumnRef` into `Aggregate`'s output, indistinguishable by
+shape from a real column, so the placeholder was applied as a real
+affinity. `HAVING sum(line_no) > 3` compared `'21' > '3'` as text;
+`count(*) = '12'` converted `'12'` to `12`. SQLite gives both an
+aggregate result and a computed expression no affinity at all.
+
+Options considered for spelling "no affinity":
+
+- A fourth `ColumnType` member (`NONE`/`BLOB`). Rejected: every reader
+  of `ColumnType` - including the differential harness's `CREATE
+  TABLE`, which emits `column.type.value` verbatim - would take it for
+  a fourth affinity a table may declare, which §2 forbids.
+- A separate flag on `Column` (`has_affinity: bool`). Rejected: two
+  fields that can disagree (`type=INTEGER, has_affinity=False`), with
+  `type` then meaningless half the time.
+- Teaching `_affinity_of` about provenance (a new bound-node type, or
+  a flag on `BoundColumnRef`). Rejected: #99 scopes `_split_expr`'s
+  rewrite out, and it would make `exec/expression.py` care which
+  operator produced a row, which it deliberately does not.
+- `Column.type: ColumnType | None`, `None` meaning no affinity.
+  Chosen. `_affinity_of` already returned `ColumnType | None` with
+  exactly that meaning for literals and computed expressions, so it
+  needed no logic change at all - it reads the declared type off the
+  schema as before, and a `None`-declared column now behaves in a
+  comparison exactly like any other no-affinity operand. It is also
+  the plainest possible Rust translation, `Option<ColumnType>`.
+
+`ColumnType`'s three members keep exactly their old meaning; no
+table's schema changes, and a table column is never declared `None`.
+A bare-column `GROUP BY` key still copies its source column's type, so
+`GROUP BY line_no HAVING line_no = '3'` still converts `'3'` to `3`.
+
+Not changed here: `Project`'s computed-column `TEXT` placeholder in
+`_project_column`. Nothing evaluates an expression against `Project`'s
+output (no subqueries, and `Sort` sits below `Project`), so it is not
+load-bearing today; if that changes it should become `None` by the
+same rule.

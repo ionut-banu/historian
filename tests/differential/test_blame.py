@@ -1348,6 +1348,99 @@ def test_group_by_after_where_matching_zero_rows_is_zero_groups(tiny_repo):
     )
 
 
+
+# --- GROUP BY / HAVING: aggregate results and computed keys carry no
+# affinity (issue #99) -------------------------------------------------
+#
+# Every case runs against the existing `awkward_repo` (12 blame rows,
+# `line_no` 1..6). An aggregate result or a computed `GROUP BY` key can
+# exceed one digit (`sum(line_no)` over `café.py` is 21, `line_no + 10`
+# is 11..16) even though no raw `line_no` does - that is what lets text
+# order and numeric order disagree here without touching any fixture
+# (#109 stays open for the bare-column case). Every expected value was
+# confirmed against the oracle before the fix landed.
+
+
+def test_having_sum_compares_numerically_against_an_integer_literal(awkward_repo):
+    """Oracle: `('café.py', 21)` and `('no_newline.txt', 6)`. Before
+    #99, `sum`'s declared `TEXT` placeholder made this `'21' > '3'`,
+    false, dropping `café.py`."""
+    query = "SELECT path, sum(line_no) FROM blame GROUP BY path HAVING sum(line_no) > 3 ORDER BY path"
+    _assert_differential(awkward_repo, query)
+    _, rows = run_historian(query, awkward_repo)
+    assert list(rows) == [("café.py", 21), ("no_newline.txt", 6)]
+
+
+def test_having_sum_with_no_group_by_is_one_whole_table_group(awkward_repo):
+    """Oracle: `(12,)`. Before #99 historian returned zero rows."""
+    query = "SELECT count(*) FROM blame HAVING sum(line_no) > 9"
+    _assert_differential(awkward_repo, query)
+    _, rows = run_historian(query, awkward_repo)
+    assert list(rows) == [(12,)]
+
+
+def test_having_computed_group_key_compares_numerically_less_than(awkward_repo):
+    """Oracle: zero rows - `11..16 < 9` is false for all six groups.
+    Before #99 the computed key was declared `TEXT`, `9` became `'9'`,
+    and every group passed as `'11' < '9'`."""
+    query = "SELECT count(*) FROM blame GROUP BY line_no + 10 HAVING line_no + 10 < 9"
+    _assert_differential(awkward_repo, query)
+    _, rows = run_historian(query, awkward_repo)
+    assert list(rows) == []
+
+
+def test_having_computed_group_key_compares_numerically_greater_than(awkward_repo):
+    """The positive variant of the case above: oracle keeps all six
+    groups (`11..16 > 9`). Under the old `TEXT` placeholder, `'11' >
+    '9'` was false and this returned nothing."""
+    query = (
+        "SELECT line_no + 10, count(*) FROM blame GROUP BY line_no + 10 "
+        "HAVING line_no + 10 > 9"
+    )
+    _assert_differential(awkward_repo, query)
+    _, rows = run_historian(query, awkward_repo)
+    assert list(rows) == [(11, 5), (12, 2), (13, 2), (14, 1), (15, 1), (16, 1)]
+
+
+def test_count_result_is_not_coerced_against_a_text_literal(awkward_repo):
+    """Oracle: `(0,)`. Before #99 `count`'s declared `INTEGER` gave it
+    numeric affinity, `'12'` became `12`, and this returned `(1,)`."""
+    query = "SELECT count(*) = '12' FROM blame"
+    _assert_differential(awkward_repo, query)
+    _, rows = run_historian(query, awkward_repo)
+    assert list(rows) == [(0,)]
+
+
+def test_avg_min_max_results_are_not_coerced_against_text_literals(awkward_repo):
+    """Oracle: `(0, 0, 0)`. Before #99 `avg`'s declared `REAL` coerced
+    `'2.5'` to a number and `min`/`max`'s `TEXT` placeholder coerced
+    the computed `1`/`6` to text, giving `(1, 1, 1)`."""
+    query = "SELECT avg(line_no) = '2.5', min(line_no) = '1', max(line_no) = '6' FROM blame"
+    _assert_differential(awkward_repo, query)
+    _, rows = run_historian(query, awkward_repo)
+    assert list(rows) == [(0, 0, 0)]
+
+
+def test_grouped_sum_result_against_a_text_literal_uses_storage_class_order(awkward_repo):
+    """Oracle: five `0`s - with no affinity on either side, an integer
+    is always less than any text value, so `sum(line_no) > '3'` is
+    false for every group, including `café.py`'s 21."""
+    query = "SELECT sum(line_no) > '3' FROM blame GROUP BY path"
+    _assert_differential(awkward_repo, query)
+    _, rows = run_historian(query, awkward_repo)
+    assert list(rows) == [(0,)] * 5
+
+
+def test_bare_column_group_key_keeps_its_source_affinity_in_having(awkward_repo):
+    """Regression guard: a bare-column key is still `line_no`, still
+    `INTEGER`, so `'3'` is converted to `3` - oracle `(3, 2)`, the same
+    answer before and after #99."""
+    query = "SELECT line_no, count(*) FROM blame GROUP BY line_no HAVING line_no = '3'"
+    _assert_differential(awkward_repo, query)
+    _, rows = run_historian(query, awkward_repo)
+    assert list(rows) == [(3, 2)]
+
+
 # --- GROUP BY / HAVING (issue #69): BindError cases, asserted directly -
 
 

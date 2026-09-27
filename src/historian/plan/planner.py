@@ -202,10 +202,13 @@ def _expr_shape_equal(a: Expr, b: Expr) -> bool:
             and _expr_shape_equal(a.right, b.right)
         )
     if isinstance(a, Like):
+        if (a.escape is None) != (b.escape is None):
+            return False
         return (
             a.negated == b.negated
             and _expr_shape_equal(a.left, b.left)
             and _expr_shape_equal(a.pattern, b.pattern)
+            and (a.escape is None or _expr_shape_equal(a.escape, b.escape))
         )
     if isinstance(a, In):
         return (
@@ -306,6 +309,7 @@ def _split_expr(expr: Expr, calls: list[AggregateCall], group_by: Sequence[Expr]
             expr,
             left=_split_expr(expr.left, calls, group_by),
             pattern=_split_expr(expr.pattern, calls, group_by),
+            escape=None if expr.escape is None else _split_expr(expr.escape, calls, group_by),
         )
     if isinstance(expr, In):
         return dataclasses.replace(

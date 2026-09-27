@@ -21,17 +21,19 @@ for each, per #59's Spec section): `ORDER BY`, `GROUP BY`, `HAVING`,
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterator, Sequence
 
 import pytest
 
+from historian.catalog import SCHEMAS
 from historian.exec.expression import EvalError
 from historian.exec.operators import ScanSource
 from historian.plan.planner import ScanFactory
 from historian.schema import Row
-from historian.sql.binder import BindError
-from historian.sql.lexer import LexError
-from historian.sql.parser import ParseError
+from historian.sql.binder import BindError, bind
+from historian.sql.lexer import LexError, tokenize
+from historian.sql.parser import ParseError, parse
 from historian.tables.blame import BLAME_SCHEMA, BlameScan
 
 from differential.conftest import (
@@ -2997,6 +2999,130 @@ def test_arithmetic_on_a_nested_predicate_operand(tiny_repo):
 def test_unary_minus_on_a_nested_predicate_operand(tiny_repo):
     """sqlite3: `select -(1=1);` -> -1."""
     _assert_differential(tiny_repo, "SELECT -(1=1) FROM blame")
+
+
+# --- A leading run of `(` closing at different points (issue #100) --------
+#
+# `sql/parser.py`'s LPAREN branch used to require a whole leading run
+# of `(` to close as an immediate run of `)`, which broke on exactly
+# the shape this section covers: an outer `(` that wraps more than one
+# already-parenthesised inner term. Every case here runs the wrapped
+# and unwrapped forms of the same predicate through `_assert_differential`
+# - proving each independently agrees with SQLite - and, since `(expr)`
+# produces no AST node of its own either before or after this fix, also
+# asserts the two forms bind to the *identical* predicate (`position`
+# aside): with no distinct AST, there is nothing for `plan()` or a
+# future pushdown split to tell apart, so identical bound predicates is
+# the strongest form "pushes down (or falls back to Filter) exactly as
+# the unwrapped form does" can take today - `exec/operators.py`'s `Scan`
+# always calls `source.scan(pushed=())` unconditionally (M4's
+# negotiation, spec §6 items 13-14, does not exist yet - see
+# `plan/planner.py`'s own module docstring), so "pushdown enabled" and
+# "pushdown disabled" are the same call for both forms regardless, the
+# same reasoning `conftest.py`'s
+# `test_loader_and_query_runner_are_two_independent_call_sites` already
+# relies on.
+#
+# Real paths from `tiny_repo`'s own blame rows (see `test_where_or`
+# above for `feature/thing.py`/`src/utils.py`, and this file's own
+# WHERE section for `line_no`) - not the illustrative `README.md`/
+# `AGENTS.md` names from issue #100's own grooming, which do not exist
+# in this fixture.
+
+
+def _bound_where(query: str) -> object:
+    """Parse, tokenize and bind *query*, returning its `WHERE`
+    expression - asserted present, exactly like this file's own
+    `_where` convention in `tests/test_parser.py` would, but against
+    the real catalog (`historian.catalog.SCHEMAS`), matching
+    `differential/conftest.py`'s own `run_historian`."""
+    bound = bind(parse(tokenize(query)), catalog=SCHEMAS)
+    assert bound.where is not None
+    return bound.where
+
+
+def _strip_positions(node: object) -> object:
+    """*node* (any `sql/ast.py`/`sql/binder.py` frozen-dataclass Expr
+    tree) with every `position` field replaced by `None`, recursing
+    into nested dataclasses and tuples of them.
+
+    Two independently-parsed occurrences of "the same" expression
+    never carry equal `position`s - the wrapped and unwrapped forms of
+    a predicate start at different offsets in their own query strings,
+    even where every other field agrees - so comparing the raw bound
+    trees for equality would always fail on `position` alone and prove
+    nothing. This is generic over any node shape in the hierarchy
+    rather than hardcoded to `Or`/`BinaryOp`, since it has no reason to
+    know which nodes this issue's cases happen to produce.
+    """
+    if dataclasses.is_dataclass(node) and not isinstance(node, type):
+        changes = {
+            field.name: (
+                None if field.name == "position" else _strip_positions(getattr(node, field.name))
+            )
+            for field in dataclasses.fields(node)
+        }
+        return dataclasses.replace(node, **changes)  # type: ignore[type-var]
+    if isinstance(node, tuple):
+        return tuple(_strip_positions(item) for item in node)
+    return node
+
+
+def _assert_wrapping_parens_are_transparent(wrapped: str, unwrapped: str) -> None:
+    """The predicates *wrapped* and *unwrapped* bind to the identical
+    expression tree, ignoring position - i.e. the extra parens really
+    did produce no AST node of their own."""
+    assert _strip_positions(_bound_where(wrapped)) == _strip_positions(_bound_where(unwrapped))
+
+
+def test_where_or_wrapped_in_extra_parens_matches_unwrapped(tiny_repo):
+    """`SELECT count(*) FROM blame WHERE ((path = 'feature/thing.py')
+    OR (path = 'src/utils.py'))` - today (before this fix): `error:
+    expected ')', found 'OR'`. All 3 of `tiny_repo`'s rows match, since
+    `feature/thing.py` and `src/utils.py` are its only two paths."""
+    wrapped = (
+        "SELECT count(*) FROM blame WHERE "
+        "((path = 'feature/thing.py') OR (path = 'src/utils.py'))"
+    )
+    unwrapped = (
+        "SELECT count(*) FROM blame WHERE "
+        "(path = 'feature/thing.py') OR (path = 'src/utils.py')"
+    )
+    _assert_differential(tiny_repo, wrapped)
+    _assert_differential(tiny_repo, unwrapped)
+    _assert_wrapping_parens_are_transparent(wrapped, unwrapped)
+
+
+def test_where_single_comparison_wrapped_in_extra_parens_matches_unwrapped(tiny_repo):
+    """`SELECT count(*) FROM blame WHERE ((line_no) > 1)` - today:
+    `error: expected ')', found '>'`. Matches exactly one of
+    `tiny_repo`'s 3 rows (`src/utils.py`, line 2)."""
+    wrapped = "SELECT count(*) FROM blame WHERE ((line_no) > 1)"
+    unwrapped = "SELECT count(*) FROM blame WHERE line_no > 1"
+    _assert_differential(tiny_repo, wrapped)
+    _assert_differential(tiny_repo, unwrapped)
+    _assert_wrapping_parens_are_transparent(wrapped, unwrapped)
+
+
+def test_having_wrapped_in_extra_parens_matches_unwrapped(tiny_repo):
+    """`SELECT count(*) FROM blame HAVING ((count(*)) > 1)` - today:
+    `error: expected ')', found '>'`. `tiny_repo` has 3 rows in total,
+    so the whole-table count is 3 and the `HAVING` passes."""
+    wrapped = "SELECT count(*) FROM blame HAVING ((count(*)) > 1)"
+    unwrapped = "SELECT count(*) FROM blame HAVING count(*) > 1"
+    _assert_differential(tiny_repo, wrapped)
+    _assert_differential(tiny_repo, unwrapped)
+
+
+def test_where_or_wrapped_in_extra_parens_matching_nothing_returns_zero_count(tiny_repo):
+    """`SELECT count(*) FROM blame WHERE ((path = 'no-such-file'))` ->
+    `0` (oracle-confirmed via `uv run python tests/oracle.py "CREATE
+    TABLE blame(path TEXT)" "SELECT count(*) FROM blame WHERE
+    ((path = 'zzz-no-such-file'))"` -> `0`) - the aggregate over zero
+    matching rows, not an error and not an empty result set."""
+    _assert_differential(
+        tiny_repo, "SELECT count(*) FROM blame WHERE ((path = 'no-such-file'))"
+    )
 
 
 # --- Known disagreements deliberately not included here ----------------

@@ -395,6 +395,16 @@ and never the second. Affinity belongs to `exec/expression.py`, which
 has the AST (so it knows which side is a column reference) and the
 operator's schema (so it knows the declared type).
 
+Only a table column has an affinity. An aggregate call's result
+(`count`, `sum`, `avg`, `min`, `max`) and a computed expression -
+including a computed `GROUP BY` key such as `line_no + 10` - have
+none, even where the planner turns them into a column reference into
+`Aggregate`'s output row. That output schema declares such a column's
+type as `None`, "no affinity", never one of the three table affinities
+of §2, so `HAVING sum(line_no) > 3` compares integers and `count(*) =
+'12'` is false. A bare-column `GROUP BY` key keeps its source column's
+affinity. See `_docs/decisions.md`, 2026-09-27.
+
 This matters more than one odd case suggests: `blame.line_no` is the
 only non-`TEXT` column in phase 1, and §4's fuzzer is weighted toward
 comparisons between different types - so this is a mismatch it will

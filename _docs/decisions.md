@@ -2293,3 +2293,121 @@ Not changed here: `Project`'s computed-column `TEXT` placeholder in
 output (no subqueries, and `Sort` sits below `Project`), so it is not
 load-bearing today; if that changes it should become `None` by the
 same rule.
+
+2026-09-27 - A leading run of `(` is closed incrementally, not all at
+once; correcting the 2026-09-01 entry's "behaviourally identical"
+claim
+
+Issue #100, filed `from: review` against the 2026-09-01 "Deeply
+nested expressions raise ParseError, not RecursionError" entry, whose
+last line claimed "the loop-based paren handling is behaviourally
+identical to the recursive version it replaces." False:
+`_parse_primary`'s LPAREN branch stripped a whole leading run of `(`
+and then demanded that same count of `)` in a row immediately after
+parsing exactly one inner expression - correct only when every paren
+in the run closes at the very end of that one term (`(((1)))`), wrong
+whenever an outer `(` in the run closes later, after more tokens
+(`((1) + 1)`, whose outer `)` comes after ` + 1`, not immediately
+after the inner `)`'s own close). `uv run historian` raised `error:
+expected ')', found '+'` on that exact input before this fix.
+Confirmed oracle-first throughout, against this checkout's `sqlite3
+3.45.1` (tracked separately by #117; none of this issue's cases are
+anywhere near a version boundary) via `uv run python tests/oracle.py`:
+`SELECT ((1) + 1)` -> `2`, `SELECT (((1) + 1) + 1)` -> `3`, `SELECT
+((1 + (2)) + 1)` -> `4`, `SELECT count(*) FROM blame WHERE ((path =
+'zzz-no-such-file'))` -> `0`.
+
+The fix, entirely in `sql/parser.py`
+
+Still one `_parse_expr` call for the leading run's first inner term -
+not one recursive call per paren, which the 2026-09-01 entry's own
+constraints (and issue #100's) rule out, since that would lower the
+pure-nesting shape's depth ceiling back toward Python's real
+recursion limit and reopen #8. But after that one call returns, the
+LPAREN branch now closes only as many `)` as are *immediately*
+available (`_consume_available_rparens`), and if some are still
+owed, resumes parsing rather than erroring: a new method,
+`_continue_expr`, drives the precedence chain's own tightest-to-
+loosest sequence explicitly - one call each to
+`_parse_concat`/`_parse_multiplicative`/`_parse_additive`/
+`_parse_relational`/`_parse_comparison`/`_parse_and`/`_parse_or`,
+every one of which grew an optional `left` parameter so it can resume
+from an already-reduced value instead of parsing a fresh one from the
+next-tighter level. `_parse_primary` loops - `_continue_expr`, then
+consume what closes, then check again - until every paren the run
+opened is closed or a full iteration makes no progress at all (raised
+as `ParseError`, not an infinite loop: `SELECT ((1) + 1 FROM blame`,
+missing its final `)`).
+
+Two things this fix deliberately does not change: parens still
+produce no AST node of their own (`inner` is returned unchanged,
+exactly as before), and the four depth-limit regression tests named
+in #100's acceptance criteria pass unmodified. The first is what lets
+`test_where_or_wrapped_in_extra_parens_matches_unwrapped` (`tests/
+differential/test_blame.py`) assert the wrapped and unwrapped forms
+of a `WHERE` predicate bind to the *identical* expression tree
+(position aside) rather than merely producing the same rows - with no
+distinct AST, pushdown (M4, not yet built - `exec/operators.py`'s
+`Scan` still calls `source.scan(pushed=())` unconditionally) has
+nothing to tell the two forms apart by either.
+
+What was actually measured, not assumed
+
+`_continue_expr` is a fixed, small sequence of direct calls - it never
+recurses into itself - so calling it repeatedly from `_parse_primary`'s
+own `while` loop costs no accumulating Python stack, the same property
+the 2026-09-01 loop already had. This was verified, not just argued,
+against two different mixed-nesting shapes, both added to `tests/
+test_parser.py`:
+
+- `_mixed_nested_parens` (issue #100's own named acceptance-criteria
+  shape: many leading opens, one inner literal, one `+ 1`, then the
+  matching closes all at the end - e.g. `(` * N + `1 + 1` + `)` * N):
+  the `+ 1` sits *before* any `)`, so the whole run still closes
+  together in one `_parse_expr` call and never touches
+  `_continue_expr` at all. Measured directly: parses up to
+  `_MAX_NESTING_DEPTH` (1000, same as pure nesting), raises
+  `ParseError` beyond it, and raises `ParseError` (never
+  `RecursionError`) at 20,000 - identical ceiling to the pure-nesting
+  case, because it is mechanically the same loop-based path.
+- `_staggered_batch_chain` (`levels` copies of `((1)+<prev>)`, each
+  one nested in the *previous* level's own operand position rather
+  than adjacent to its opening parens): this genuinely re-enters
+  `_parse_primary` from inside `_continue_expr`'s own operand fetch,
+  while the outer invocation is still on the Python call stack
+  waiting inside its `while closed < depth` loop. Measured directly,
+  *before* adding this entry's second fix below: a bare
+  `RecursionError` at 1000 levels, with `self._depth` (the counter
+  `_parse_expr` maintains) never exceeding 2 the whole time - because
+  `_continue_expr`'s operand fetches call straight into
+  `_parse_concat`/`_parse_multiplicative`/etc., bypassing
+  `_parse_expr`'s own increment entirely, so nothing was counting the
+  real stack cost of an outer LPAREN branch sitting on the stack
+  through an entire nested re-entry.
+
+The fix: `_parse_primary`'s LPAREN branch now increments `self._depth`
+(the same counter and the same `_MAX_RECURSION_DEPTH` = 50
+`_parse_expr` already uses) for its *own entire duration* - from
+before the first `_parse_expr` call to the branch's final `return`,
+covering every `_continue_expr` iteration - not only around that one
+inner call. Measured after the fix: `_staggered_batch_chain` parses
+up to 48 levels, raises `ParseError` at 49, and raises `ParseError`
+(never `RecursionError`) at 5,000. 48 is lower than the pure-nesting
+ceiling by roughly the same order of magnitude the 2026-09-01 entry's
+own "function-call arguments" figure (15 frames/level, `_MAX_
+RECURSION_DEPTH` = 50) already accepted as the cost of genuine
+recursion - this is a new instance of that same category, not a new
+kind of limit, and #100's own acceptance criteria only ask for "some
+depth comparable to today's pure-nesting ceiling," measured and
+recorded, not equal to it.
+
+Two depth regimes for one grammar feature, not a design flaw:
+`(((1)))` and `((1)+1)+1)...` both go through the same LPAREN branch,
+but only the second one ever pays for genuine recursion, and it pays
+only in proportion to how many times a staggered closing forces a
+*fresh* re-entry from an operand position rather than from the cheap
+batching loop. A fuzzer generating arbitrary paren nesting will
+overwhelmingly produce shapes closer to the first regime; #100's own
+"comparable to today's pure-nesting ceiling" phrasing already
+anticipated that the worst adversarial mixed shape would not, and
+should not, reach exactly 1000.

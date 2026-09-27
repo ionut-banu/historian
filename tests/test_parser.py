@@ -901,6 +901,81 @@ def test_no_traceback_reaches_caller_as_syntax_or_value_error():
             _parse(sql)
 
 
+# --- A leading run of `(` closing at different points (issue #100) --------
+#
+# `sql/parser.py`'s LPAREN branch in `_parse_primary` used to strip a
+# whole leading run of `(` and then demand that same count of `)` in a
+# row immediately afterward - correct only when every paren in the run
+# closes at the very end of the same inner term (`(((1)))`), and wrong
+# whenever an outer `(` in the run closes later, after other tokens
+# (`((1) + 1)`, whose outer `)` comes after ` + 1`, not immediately
+# after the inner `)`). Every expected value below was confirmed
+# against `uv run python tests/oracle.py`, per issue #100 and
+# `_docs/process.md`'s "The oracle" - not reasoned out by hand.
+
+
+def test_leading_two_parens_closing_separately_adds_correctly():
+    """`SELECT ((1) + 1)` -> `2` (oracle-confirmed). Today (before this
+    fix) this raised `error: expected ')', found '+'` - the outer `(`
+    was assumed to close immediately after the inner `(1)`, which it
+    does not."""
+    expr = _select_expr("SELECT ((1) + 1) FROM blame")
+    assert isinstance(expr, BinaryOp)
+    assert expr.op is Operator.ADD
+    assert expr.left == Literal(value=1, position=expr.left.position)
+    assert expr.right == Literal(value=1, position=expr.right.position)
+
+
+def test_three_leading_parens_each_closing_after_more_tokens():
+    """`SELECT (((1) + 1) + 1)` -> `3` (oracle-confirmed) - not special-
+    cased to exactly two leading parens: a third outer `(` closing
+    still later works the same way."""
+    expr = _select_expr("SELECT (((1) + 1) + 1) FROM blame")
+    assert isinstance(expr, BinaryOp)
+    assert expr.op is Operator.ADD
+    assert expr.right == Literal(value=1, position=expr.right.position)
+    inner = expr.left
+    assert isinstance(inner, BinaryOp)
+    assert inner.op is Operator.ADD
+    assert inner.left == Literal(value=1, position=inner.left.position)
+    assert inner.right == Literal(value=1, position=inner.right.position)
+
+
+def test_leading_parens_not_special_cased_to_the_outer_one_closing_last():
+    """`SELECT ((1 + (2)) + 1)` -> `4` (oracle-confirmed) - the *inner*
+    `(2)` here closes immediately (like the old pure-nesting case), but
+    it sits to the right of a `+` inside a leading run whose own outer
+    paren closes later, so this is not merely the two cases above
+    reordered."""
+    expr = _select_expr("SELECT ((1 + (2)) + 1) FROM blame")
+    assert isinstance(expr, BinaryOp)
+    assert expr.op is Operator.ADD
+    assert expr.right == Literal(value=1, position=expr.right.position)
+    inner = expr.left
+    assert isinstance(inner, BinaryOp)
+    assert inner.op is Operator.ADD
+    assert inner.left == Literal(value=1, position=inner.left.position)
+    assert inner.right == Literal(value=2, position=inner.right.position)
+
+
+def test_extra_unmatched_closing_paren_still_raises_parse_error():
+    """`SELECT (1 + 1)) FROM blame` (one extra, unmatched `)`) is
+    rejected by both engines - oracle: `sqlite3.OperationalError: near
+    ")": syntax error`. This fix must not make the parser more
+    permissive than SQLite, only less strict where it currently
+    disagrees by being *too* strict."""
+    with pytest.raises(ParseError):
+        _parse("SELECT (1 + 1)) FROM blame")
+
+
+def test_genuinely_missing_closing_paren_still_raises_parse_error():
+    """A leading run that never gets enough `)` at all - not merely
+    staggered - must still be a `ParseError`, not an infinite loop or a
+    silent wrong parse."""
+    with pytest.raises(ParseError):
+        _parse("SELECT ((1) + 1 FROM blame")
+
+
 # --- Nesting depth: no RecursionError may ever escape (issue #8, round 1) -
 #
 # QA found `parse()` crashing with a raw, unhandled `RecursionError`
@@ -976,6 +1051,99 @@ def test_absurdly_deep_nested_parens_raise_parse_error_not_recursion_error():
     anything a real query - or a fuzzer - would plausibly generate."""
     with pytest.raises(ParseError):
         _parse(_nested_parens(20_000))
+
+
+# --- Mixed nesting: no RecursionError may escape a staggered run either
+# (issue #100) --------------------------------------------------------------
+#
+# The pure-nesting shape above (`_nested_parens`) never exercises the new
+# staggered-close handling `_parse_primary`'s LPAREN branch gained for
+# issue #100, because every paren in it closes at the very end - the
+# exact case the loop-based fast path already covered before this
+# issue. Two different mixed shapes are tested below, because they
+# stress two different things:
+#
+# - `_mixed_nested_parens`: the shape issue #100's own acceptance
+#   criteria name directly - many leading opens, one inner literal, one
+#   `+ 1`, then the matching closes. The `+ 1` sits *before* any `)`,
+#   so the whole run still closes together and this stays on the cheap
+#   loop path - it reaches the same `_MAX_NESTING_DEPTH` ceiling as
+#   `_nested_parens` (measured directly below, not assumed).
+# - `_staggered_batch_chain`: each level's outer `(` deliberately does
+#   NOT close until after an operator, and that operator's other
+#   operand is the *next* level's own such group - reached only by
+#   genuinely re-entering `_parse_primary` while the current one is
+#   still on the stack (`_continue_expr`'s operand fetch bypasses
+#   `_parse_expr`'s own counter). This is real Python-stack recursion,
+#   bounded by `_MAX_RECURSION_DEPTH`, not `_MAX_NESTING_DEPTH` - see
+#   `_docs/decisions.md`, 2026-09-27, for how this was found (a bare
+#   `RecursionError` around 1000 levels before the LPAREN branch
+#   counted its own full duration) and what it measures to.
+
+
+def _mixed_nested_parens(depth: int) -> str:
+    """`depth` leading `(`, then `1 + 1`, then `depth` trailing `)` -
+    the exact shape issue #100's acceptance criteria describe: "many
+    opens, one inner literal, one `+ 1`, then the matching closes"."""
+    return f"SELECT {'(' * depth}1 + 1{')' * depth} FROM blame"
+
+
+def _staggered_batch_chain(levels: int) -> str:
+    """`levels` copies of `((1)+<prev>)`, nested in `<prev>`'s own
+    operand position rather than adjacent to each other's opening
+    parens - see the section comment above."""
+    expr = "1"
+    for _ in range(levels):
+        expr = f"((1)+{expr})"
+    return f"SELECT {expr} FROM blame"
+
+
+def test_mixed_nested_parens_up_to_max_depth_parse():
+    expr = _select_expr(_mixed_nested_parens(_MAX_NESTING_DEPTH))
+    assert isinstance(expr, BinaryOp)
+    assert expr.op is Operator.ADD
+    assert expr.left == Literal(value=1, position=expr.left.position)
+    assert expr.right == Literal(value=1, position=expr.right.position)
+
+
+def test_mixed_nested_parens_beyond_max_depth_raise_parse_error():
+    with pytest.raises(ParseError) as excinfo:
+        _parse(_mixed_nested_parens(_MAX_NESTING_DEPTH + 1))
+    assert isinstance(excinfo.value.position, Position)
+
+
+def test_absurdly_deep_mixed_nested_parens_raise_parse_error_not_recursion_error():
+    """No RecursionError may escape a staggered-but-still-loop-bounded
+    run either, at any depth."""
+    with pytest.raises(ParseError):
+        _parse(_mixed_nested_parens(20_000))
+
+
+def test_staggered_batch_chain_well_under_recursion_depth_parses():
+    """Measured directly: 48 levels of `_staggered_batch_chain` parse,
+    49 raise `ParseError` - see `_docs/decisions.md`, 2026-09-27. This
+    pins a level with margin under that boundary, not the boundary
+    itself, matching this file's existing convention for the
+    off-by-one-sensitive IN-list/function-call cases above."""
+    expr = _select_expr(_staggered_batch_chain(_MAX_RECURSION_DEPTH - 10))
+    assert isinstance(expr, BinaryOp)
+    assert expr.op is Operator.ADD
+
+
+def test_staggered_batch_chain_beyond_recursion_depth_raises_parse_error():
+    with pytest.raises(ParseError) as excinfo:
+        _parse(_staggered_batch_chain(_MAX_RECURSION_DEPTH))
+    assert isinstance(excinfo.value.position, Position)
+
+
+def test_absurdly_deep_staggered_batch_chain_raises_parse_error_not_recursion_error():
+    """The regression this issue's fix closes: before the LPAREN branch
+    counted its own full duration on `self._depth` (not only its one
+    `_parse_expr` call), this shape raised a bare `RecursionError`
+    around 1000 levels - confirmed directly against the pre-fix code
+    during this issue's implementation."""
+    with pytest.raises(ParseError):
+        _parse(_staggered_batch_chain(5_000))
 
 
 def test_not_chain_up_to_max_depth_parses():

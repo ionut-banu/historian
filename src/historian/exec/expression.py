@@ -621,7 +621,15 @@ def _affinity_of(expr: Expr, schema: Schema) -> ColumnType | None:
     """The affinity *expr* itself contributes to a comparison: the
     declared type of a bare `BoundColumnRef`, `None` for anything
     else - a literal, arithmetic, concatenation, or any other computed
-    expression, even one that merely mentions a column."""
+    expression, even one that merely mentions a column.
+
+    A bare `BoundColumnRef` can itself point at a column declared
+    `None` (issue #99): `Aggregate`'s output column for an aggregate
+    call or a computed `GROUP BY` key, which `plan/planner.py`'s
+    `_split_expr` rewrites into exactly the same node shape as a real
+    column reference. The answer is then `None` too - no affinity -
+    read straight from the schema, so this function never needs to
+    know which operator produced the row."""
     if isinstance(expr, BoundColumnRef):
         return schema.columns[expr.offset].type
     return None

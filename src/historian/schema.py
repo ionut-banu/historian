@@ -53,6 +53,10 @@ class ColumnType(Enum):
     differential harness's `CREATE TABLE` (M3) and the affinity
     coercion in `exec/expression.py` both want the SQLite keyword
     itself, not a translation step back to one.
+
+    "No affinity" is deliberately not a member: it is spelled as
+    ``Column.type is None`` (issue #99), so these three stay exactly
+    the affinities a table column can declare.
     """
 
     TEXT = "TEXT"
@@ -62,10 +66,26 @@ class ColumnType(Enum):
 
 @dataclass(frozen=True)
 class Column:
-    """One column of a `Schema`: its name and declared type."""
+    """One column of a `Schema`: its name and declared type.
+
+    ``type`` is ``None`` for a column with **no affinity** (issue #99):
+    SQLite gives an aggregate call's result (`count`, `sum`, `avg`,
+    `min`, `max`) and a computed, non-bare-column expression no column
+    affinity at all, so `Aggregate`'s output column for either is
+    declared ``None`` rather than being forced into one of
+    `ColumnType`'s three members. ``None`` is not a fourth affinity and
+    is never a *table* column's declared type - every table's schema
+    (`blame`'s included) still declares one of `TEXT`/`INTEGER`/`REAL`
+    per `_docs/spec.md` §2, and those three keep exactly the meaning
+    they always had. `exec/expression.py`'s `_affinity_of` already
+    returns ``ColumnType | None`` with ``None`` meaning "contributes no
+    affinity", so a ``None``-declared column behaves in a comparison
+    exactly like a literal or any other computed expression. See
+    `_docs/decisions.md`, 2026-09-27.
+    """
 
     name: str
-    type: ColumnType
+    type: ColumnType | None
 
 
 @dataclass(frozen=True)

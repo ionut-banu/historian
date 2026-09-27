@@ -682,33 +682,38 @@ class _Accumulator:
         raise AssertionError(f"exec/operators.py: unhandled aggregate kind {call.kind!r}")
 
 
-def _aggregate_output_type(kind: str) -> ColumnType:
+def _aggregate_output_type(kind: str) -> ColumnType | None:
     """The declared type `Aggregate`'s own output schema gives one
-    call's column. Not load-bearing the way a real table column's type
-    is - nothing compares against an `Aggregate` output column in this
-    issue's scope (no `HAVING` until #69) - documented rather than
-    arbitrary: `count` is always `INTEGER`, `avg` is always `REAL`
-    (confirmed above), and `sum`/`min`/`max` are whatever the actual
-    computed value turns out to be at runtime, which this schema cannot
-    know in advance - `TEXT` is `exec/operators.py`'s own existing
-    placeholder for exactly this situation (`_project_column`, below)."""
-    if kind == "count":
-        return ColumnType.INTEGER
-    if kind == "avg":
-        return ColumnType.REAL
-    return ColumnType.TEXT
+    call's column: always ``None``, "no affinity" (issue #99), for
+    every aggregate kind.
+
+    This is load-bearing: `HAVING`'s `Filter` (#69) and `Project`
+    evaluate comparisons against `Aggregate`'s output row, and
+    `exec/expression.py`'s `_affinity_of` reads this declared type for
+    the bare `BoundColumnRef` `plan/planner.py`'s `_split_expr`
+    rewrites each aggregate call into. SQLite gives an aggregate
+    result no affinity at all - confirmed against the oracle:
+    `count(*) = '12'` is 0 even though `count(*)` is 12, and `sum(x) >
+    3` compares as integers - so declaring `count` `INTEGER`, `avg`
+    `REAL`, or `sum`/`min`/`max` a `TEXT` placeholder (all three the
+    pre-#99 behaviour) made such comparisons coerce one side and give
+    a wrong answer. `kind` is kept as a parameter so the call site
+    stays explicit about what it is typing, even though every kind
+    currently gets the same answer."""
+    return None
 
 
-def _group_key_output_type(expr: Expr, child_schema: Schema) -> ColumnType:
+def _group_key_output_type(expr: Expr, child_schema: Schema) -> ColumnType | None:
     """The declared type `Aggregate`'s own output schema gives one
-    `group_by` key column - the same rule `_project_column` (below)
-    already uses for a `Project` output column: a bare
-    `BoundColumnRef` keeps its source column's declared type, and
-    every other expression shape gets the same documented `TEXT`
-    placeholder."""
+    `group_by` key column: a bare `BoundColumnRef` keeps its source
+    column's declared type (so `GROUP BY line_no HAVING line_no = '3'`
+    still converts `'3'` to `3`), and every other expression shape -
+    a computed key such as `line_no + 10` - is ``None``, "no
+    affinity" (issue #99), matching SQLite, where a computed
+    expression carries no affinity even when it mentions a column."""
     if isinstance(expr, BoundColumnRef):
         return child_schema.columns[expr.offset].type
-    return ColumnType.TEXT
+    return None
 
 
 def _group_key_name(index: int, expr: Expr) -> str:

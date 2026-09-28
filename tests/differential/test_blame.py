@@ -3872,3 +3872,204 @@ def test_where_or_wrapped_in_extra_parens_matching_nothing_returns_zero_count(ti
 # proving agreement on supported grammar, and there is never supposed
 # to be agreement here - #24 belongs with the parser's or CLI's own
 # unit tests, not a SQLite-agreement harness.
+
+
+# --- Expression depth (issue #107) ---------------------------------------
+#
+# SQLite accepts an expression tree up to height 1000
+# (`SQLITE_MAX_EXPR_DEPTH`) and rejects a taller one at prepare time with
+# "Expression tree is too large (maximum depth 1000)". Historian now
+# rejects the same trees at parse time (`sql/parser.py`'s
+# `_expr_height`) and evaluates every tree at or under the limit - which
+# before #107 crashed with `RecursionError` from about 330 terms up,
+# reported as "could not read repository", exit 3. Each accepted case
+# diffs rows against SQLite; each rejected case asserts both engines
+# refuse the query with SQLite's own message (the "both raise"
+# convention `test_aggregate_sum_of_text_int64_max_still_raises_integer_
+# overflow` uses). The boundaries themselves are read from the oracle
+# in `tests/test_parser.py`'s `test_expression_height_boundary_matches_
+# sqlite`. Left-nested `BETWEEN`/`IN` chains stay out until #137.
+
+_DEPTH_MESSAGE = "Expression tree is too large (maximum depth 1000)"
+
+
+def _chain(n: int, term: str = "1", op: str = "+") -> str:
+    return f" {op} ".join([term] * n)
+
+
+def _assert_both_reject_depth(repo, query: str) -> None:
+    import sqlite3
+
+    conn = load_unfiltered(BlameScan, repo, BLAME_SCHEMA, "blame")
+    try:
+        with pytest.raises(sqlite3.OperationalError) as sqlite_exc:
+            conn.execute(query).fetchall()
+    finally:
+        conn.close()
+    assert str(sqlite_exc.value) == _DEPTH_MESSAGE
+    with pytest.raises(ParseError) as historian_exc:
+        run_historian(query, repo)
+    assert str(historian_exc.value) == _DEPTH_MESSAGE
+
+
+_UTILS = "path = 'src/utils.py'"
+_NO_FILE = "path = 'zzz-no-such-file'"
+
+_DEEP_ACCEPTED = [
+    ("select-plus-600", f"SELECT {_chain(600)} FROM blame"),
+    ("select-plus-999", f"SELECT {_chain(999)} FROM blame"),
+    ("select-plus-1000", f"SELECT {_chain(1000)} FROM blame"),
+    ("select-plus-columns-1000", f"SELECT {_chain(1000, 'line_no')} FROM blame"),
+    ("select-concat-1000", f"SELECT {_chain(1000, chr(39) + 'a' + chr(39), '||')} FROM blame"),
+    ("select-eq-1000", f"SELECT {_chain(1000, 'line_no', '=')} FROM blame"),
+    ("select-lt-1000", f"SELECT {_chain(1000, 'line_no', '<')} FROM blame"),
+    ("select-and-1000", f"SELECT {_chain(1000, 'line_no', 'AND')} FROM blame"),
+    ("select-or-1000", f"SELECT {_chain(1000, 'line_no', 'OR')} FROM blame"),
+    ("select-like-1000", f"SELECT {_chain(1000, 'path', 'LIKE')} FROM blame"),
+    ("select-is-not-null-999", f"SELECT line_no{' IS NOT NULL' * 999} FROM blame"),
+    ("select-in-one-998", f"SELECT line_no{' IN (1)' * 998} FROM blame"),
+    ("select-unary-minus-terms-999", f"SELECT {_chain(999, '-line_no')} FROM blame"),
+    ("select-product-terms-999", f"SELECT {_chain(999, 'line_no * 2')} FROM blame"),
+    ("select-qualified-terms-999", f"SELECT {_chain(999, 'blame.line_no')} FROM blame"),
+    ("where-and-999", f"SELECT path, line_no FROM blame WHERE {_chain(999, _UTILS, 'AND')}"),
+    ("where-or-999", f"SELECT path, line_no FROM blame WHERE {_chain(998, _NO_FILE, 'OR')} OR {_UTILS}"),
+    ("where-plus-999", f"SELECT path, line_no FROM blame WHERE {_chain(999, 'line_no')} > 2"),
+    ("having-999", f"SELECT line_no, count(*) FROM blame GROUP BY line_no HAVING {_chain(999, 'line_no')} > 1"),
+    ("group-by-1000", f"SELECT count(*) FROM blame GROUP BY {_chain(1000, 'line_no')}"),
+    ("group-by-key-selected-1000", f"SELECT {_chain(1000, 'line_no')}, count(*) FROM blame GROUP BY {_chain(1000, 'line_no')}"),
+    ("distinct-1000", f"SELECT DISTINCT {_chain(1000, 'line_no')} FROM blame"),
+    ("aggregate-argument-999", f"SELECT max({_chain(999, 'line_no')}), sum({_chain(999, 'line_no')}) FROM blame"),
+    ("count-distinct-argument-999", f"SELECT count(DISTINCT {_chain(999, 'line_no')}) FROM blame"),
+    ("aggregate-terms-1000", f"SELECT {_chain(1000, 'count(*)')} FROM blame"),
+    ("in-list-item-column-chain-999", f"SELECT 2 IN ({_chain(999, 'line_no')}) FROM blame"),
+    ("in-list-item-constant-chain-998", f"SELECT line_no IN ({_chain(998)}) FROM blame"),
+    ("chain-is-null-999", f"SELECT ({_chain(999, 'line_no')}) IS NULL FROM blame"),
+    ("chain-in-one-999", f"SELECT ({_chain(999, 'line_no')}) IN (999) FROM blame"),
+    ("chain-between-999", f"SELECT ({_chain(999, 'line_no')}) BETWEEN 999 AND 1998 FROM blame"),
+    ("chain-like-999", f"SELECT ({_chain(999, 'line_no')}) LIKE '99%' FROM blame"),
+    ("between-high-bound-1000", f"SELECT line_no BETWEEN 0 AND ({_chain(1000)}) FROM blame"),
+    ("chain-and-zero-1000", f"SELECT ({_chain(1000, 'line_no')}) AND 0 FROM blame"),
+    ("empty-in-chain-3000", f"SELECT line_no{' IN ()' * 3000} FROM blame"),
+    ("where-alias-of-chain-999", f"SELECT {_chain(999, 'line_no')} AS c FROM blame WHERE c + {_chain(998, 'line_no')} > 0"),
+    ("zero-rows-where-and-999", f"SELECT 1 FROM blame WHERE {_chain(999, _NO_FILE, 'AND')}"),
+    ("empty-group-aggregate-999", f"SELECT count(*), max({_chain(999, 'line_no')}) FROM blame WHERE {_NO_FILE}"),
+    ("plus-chain-with-null-999", f"SELECT {_chain(500)} + NULL + {_chain(498)} FROM blame"),
+    ("and-chain-with-null-999", f"SELECT {_chain(500, '1', 'AND')} AND NULL AND {_chain(498, '1', 'AND')} FROM blame"),
+    ("and-chain-with-zero-999", f"SELECT {_chain(500, '1', 'AND')} AND 0 AND {_chain(498, '1', 'AND')} FROM blame"),
+]
+
+
+@pytest.mark.parametrize("query", [pytest.param(q, id=name) for name, q in _DEEP_ACCEPTED])
+def test_deep_expression_matches_sqlite(tiny_repo, query):
+    _assert_differential(tiny_repo, query)
+
+
+_DEEP_ORDERED = [
+    ("order-by-1000", f"SELECT line_no, path FROM blame ORDER BY {_chain(1000, 'line_no')}"),
+    ("order-by-alias-1000", f"SELECT line_no, {_chain(1000, 'line_no')} AS c FROM blame ORDER BY c"),
+]
+
+
+@pytest.mark.parametrize("query", [pytest.param(q, id=name) for name, q in _DEEP_ORDERED])
+def test_deep_order_by_matches_sqlite(tiny_repo, query):
+    _order(tiny_repo, query, key_positions=(0,))
+
+
+_DEEP_REJECTED = [
+    ("select-plus-1001", f"SELECT {_chain(1001)} FROM blame"),
+    ("where-and-1000", f"SELECT path FROM blame WHERE {_chain(1000, _UTILS, 'AND')}"),
+    ("where-or-1000", f"SELECT path FROM blame WHERE {_chain(999, _NO_FILE, 'OR')} OR {_UTILS}"),
+    ("having-1000", f"SELECT line_no FROM blame GROUP BY line_no HAVING {_chain(1000, 'line_no')} > 1"),
+    ("group-by-1001", f"SELECT count(*) FROM blame GROUP BY {_chain(1001, 'line_no')}"),
+    ("order-by-1001", f"SELECT line_no FROM blame ORDER BY {_chain(1001, 'line_no')}"),
+    ("order-by-alias-1001", f"SELECT {_chain(1001, 'line_no')} AS c FROM blame ORDER BY c"),
+    ("distinct-1001", f"SELECT DISTINCT {_chain(1001, 'line_no')} FROM blame"),
+    ("aggregate-argument-1000", f"SELECT max({_chain(1000, 'line_no')}) FROM blame"),
+    ("abs-argument-1000", f"SELECT abs({_chain(1000)}) FROM blame"),
+    ("select-in-one-999", f"SELECT line_no{' IN (1)' * 999} FROM blame"),
+    ("select-is-not-null-1000", f"SELECT line_no{' IS NOT NULL' * 1000} FROM blame"),
+    ("chain-is-null-1000", f"SELECT ({_chain(1000, 'line_no')}) IS NULL FROM blame"),
+    ("in-list-item-constant-chain-999", f"SELECT line_no IN ({_chain(999)}) FROM blame"),
+    ("between-high-bound-1001", f"SELECT line_no BETWEEN 0 AND ({_chain(1001)}) FROM blame"),
+    ("where-20000-terms", f"SELECT path FROM blame WHERE {_chain(20_000, _UTILS, 'AND')}"),
+    ("select-concat-1001", f"SELECT {_chain(1001, chr(39) + 'a' + chr(39), '||')} FROM blame"),
+    ("select-and-1001", f"SELECT {_chain(1001, 'line_no', 'AND')} FROM blame"),
+    ("where-plus-1000", f"SELECT path FROM blame WHERE {_chain(1000, 'line_no')} > 2"),
+    ("select-product-terms-1000", f"SELECT {_chain(1000, 'line_no * 2')} FROM blame"),
+    ("chain-in-one-1000", f"SELECT ({_chain(1000, 'line_no')}) IN (999) FROM blame"),
+    ("chain-between-1000", f"SELECT ({_chain(1000, 'line_no')}) BETWEEN 999 AND 1998 FROM blame"),
+    ("chain-like-1000", f"SELECT ({_chain(1000, 'line_no')}) LIKE '99%' FROM blame"),
+]
+
+
+@pytest.mark.parametrize("query", [pytest.param(q, id=name) for name, q in _DEEP_REJECTED])
+def test_too_deep_expression_is_rejected_by_both(tiny_repo, query):
+    _assert_both_reject_depth(tiny_repo, query)
+
+
+def test_abs_of_a_999_term_chain_is_within_the_limit(tiny_repo):
+    """The accepted half of the `abs(` boundary pair: SQLite answers it,
+    and historian gets past the height check and fails where it always
+    has for `abs` - binding, since no scalar function is implemented -
+    not with the depth error."""
+    query = f"SELECT abs({_chain(999)}) FROM blame"
+    conn = load_unfiltered(BlameScan, tiny_repo, BLAME_SCHEMA, "blame")
+    try:
+        assert conn.execute(query).fetchall() == [(999,)] * 3
+    finally:
+        conn.close()
+    with pytest.raises(BindError, match="no such function: abs"):
+        run_historian(query, tiny_repo)
+
+
+def _deep_pushdown_run(query: str, repo):
+    """Run *query* through the whole pipeline with a `blame` factory
+    that keeps its `BlameScan`; return (rows, the tree, the scan)."""
+    from historian.exec.operators import Filter, Scan, child_of
+    from historian.plan.optimizer import optimize
+    from historian.plan.planner import plan
+
+    built: list[BlameScan] = []
+
+    def factory(r):
+        source = BlameScan(r)
+        built.append(source)
+        return source
+
+    tree = optimize(plan(bind(parse(tokenize(query)), catalog=SCHEMAS), repo, tables={"blame": factory}))
+    rows = list(tree.rows())
+    node = tree
+    while not isinstance(node, Scan):
+        parent = node
+        node = child_of(node)
+    assert isinstance(parent, Filter), "the Filter above the Scan is never removed"
+    return rows, node, built[0]
+
+
+@pytest.mark.parametrize("pushable_first", [True, False], ids=["pushable-first", "pushable-last"])
+def test_deep_where_chain_pushes_the_path_term_and_keeps_the_filter(tiny_repo, pushable_first):
+    """A 999-term `WHERE` chain with one pushable `path = ...` term,
+    first or last: the planner splits it and the optimizer negotiates
+    999 terms without `RecursionError`, exactly one term is pushed, only
+    that path is blamed, the `Filter` stays, and the rows equal both
+    SQLite's and those of the same chain with the path term made
+    unpushable (`path || '' = ...`)."""
+    rest = _chain(998, "line_no > 0", "AND")
+    if pushable_first:
+        query = f"SELECT path, line_no FROM blame WHERE {_UTILS} AND {rest}"
+    else:
+        query = f"SELECT path, line_no FROM blame WHERE {rest} AND {_UTILS}"
+    unpushable = f"SELECT path, line_no FROM blame WHERE {rest} AND path || '' = 'src/utils.py'"
+
+    rows, scan_op, source = _deep_pushdown_run(query, tiny_repo)
+    assert len(scan_op.pushed()) == 1
+    assert source.blamed_paths == ["src/utils.py"]
+
+    reference_rows, reference_scan, reference_source = _deep_pushdown_run(unpushable, tiny_repo)
+    assert len(reference_scan.pushed()) == 0
+    assert reference_source.blamed_paths == ["feature/thing.py", "src/utils.py"]
+
+    assert rows
+    assert_rows_match(reference_rows, rows)
+    _assert_differential(tiny_repo, query)
+    _assert_differential(tiny_repo, unpushable)

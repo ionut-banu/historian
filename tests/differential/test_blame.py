@@ -1298,6 +1298,147 @@ def test_nonexistent_function_raises_bind_error(tiny_repo):
         run_historian("SELECT nonexistent_fn(path) FROM blame", tiny_repo)
 
 
+# --- Aggregate nesting and aliased-aggregate misuse (issue #102) -------
+#
+# Two shapes `sql/binder.py` used to let bind without error, both
+# rejected by `sqlite3` at prepare time regardless of how many rows
+# the query would otherwise touch: an aggregate call nested inside
+# another aggregate call's arguments, and a select-list alias to an
+# aggregate reached from somewhere other than a clause's own top-level
+# reference to it (typically: as another aggregate call's argument).
+# Before this fix, historian either crashed at runtime in
+# `exec/expression.py` (when at least one row reached the nested call)
+# or silently printed `0` rows at exit 0 (when none did) - both wrong,
+# since `sqlite3` rejects the query unconditionally, before running
+# anything. Every case below is confirmed against the oracle
+# (`uv run python tests/oracle.py ...`); none of these ever reaches
+# SQLite for a row result, so, like the section above, they are
+# asserted directly rather than diffed.
+
+
+def test_nested_aggregate_call_raises_bind_error(tiny_repo):
+    """`SELECT count(count(*)) FROM t` -> `sqlite3`: "misuse of
+    aggregate function count()". Before this fix, historian's select
+    list bound the inner `count(*)` successfully as an ordinary
+    aggregate call and only crashed later, in `exec/expression.py`,
+    once a row actually reached it (`tiny_repo` has rows, so this one
+    reproduced the crash, not the `BindError` this test now pins)."""
+    with pytest.raises(BindError):
+        run_historian("SELECT count(count(*)) FROM blame", tiny_repo)
+
+
+def test_nested_aggregate_call_with_no_rows_reaching_it_raises_bind_error(tiny_repo):
+    """The identical nesting, with a `WHERE` that lets zero rows
+    through (`tiny_repo`'s `line_no` never exceeds a handful of small
+    integers) - proves the rejection cannot be data-dependent. Before
+    this fix, historian printed a `0` row at exit 0, because nothing
+    ever reached the inner aggregate to crash on."""
+    with pytest.raises(BindError):
+        run_historian("SELECT count(count(*)) FROM blame WHERE line_no > 100000", tiny_repo)
+
+
+def test_aggregate_alias_used_as_where_operand_raises_bind_error(tiny_repo):
+    """`SELECT count(*) AS c FROM t WHERE line_no > 100 AND c > 1` ->
+    `sqlite3`: "misuse of aggregate: count()" - the alias `c` resolves
+    to an aggregate call, and `WHERE` never allows one, however it is
+    reached. `line_no > 0` (rather than the issue's own `> 100`, tuned
+    for a much larger repository) is the threshold that lets at least
+    one of `tiny_repo`'s rows through here, reproducing the runtime
+    crash this fix replaces with a `BindError`."""
+    with pytest.raises(BindError):
+        run_historian("SELECT count(*) AS c FROM blame WHERE line_no > 0 AND c > 1", tiny_repo)
+
+
+def test_aggregate_alias_used_as_where_operand_with_no_rows_reaching_it_raises_bind_error(
+    tiny_repo,
+):
+    """The identical alias-in-WHERE case, with a first conjunct that
+    lets zero rows through - proves this rejection, too, cannot be
+    data-dependent. Before this fix, historian printed a `0` row at
+    exit 0."""
+    with pytest.raises(BindError):
+        run_historian(
+            "SELECT count(*) AS c FROM blame WHERE line_no > 100000000 AND c > 1", tiny_repo
+        )
+
+
+def test_aggregate_alias_as_argument_to_another_aggregate_in_having_raises_bind_error(tiny_repo):
+    """`SELECT count(*) AS c FROM t HAVING count(c) > 0` -> `sqlite3`:
+    "misuse of aliased aggregate c". `c` is legal in `HAVING` used
+    directly (see the regression guards below) but not as another
+    aggregate call's own argument."""
+    with pytest.raises(BindError):
+        run_historian("SELECT count(*) AS c FROM blame HAVING count(c) > 0", tiny_repo)
+
+
+def test_aggregate_alias_as_argument_to_another_aggregate_in_order_by_raises_bind_error(
+    tiny_repo,
+):
+    """`SELECT count(*) AS c FROM t GROUP BY path ORDER BY count(c)` ->
+    `sqlite3`: "misuse of aliased aggregate c" - the identical rule,
+    in `ORDER BY`."""
+    with pytest.raises(BindError):
+        run_historian(
+            "SELECT count(*) AS c FROM blame GROUP BY path ORDER BY count(c)", tiny_repo
+        )
+
+
+def test_aggregate_alias_nested_in_one_operand_of_a_having_predicate_raises_bind_error(tiny_repo):
+    """`SELECT count(*) AS c FROM t GROUP BY path HAVING count(*) >
+    count(c)` -> `sqlite3`: "misuse of aliased aggregate c" - the
+    nesting is reached through one operand of a larger `HAVING`
+    predicate, not the whole clause, and must still be caught."""
+    with pytest.raises(BindError):
+        run_historian(
+            "SELECT count(*) AS c FROM blame GROUP BY path HAVING count(*) > count(c)", tiny_repo
+        )
+
+
+# Regression guards: each of these is legal SQL `sqlite3` accepts, and
+# must keep working exactly as it did before this fix - a naive "reject
+# any aggregate reached via alias" change could plausibly break any one
+# of them.
+
+
+def test_having_alias_to_aggregate_used_directly_still_works(tiny_repo):
+    """`c` used directly in `HAVING`, not nested in another call - both
+    engines accept this; must not regress."""
+    _assert_differential(
+        tiny_repo, "SELECT count(*) AS c FROM blame GROUP BY path HAVING c > 1 LIMIT 3"
+    )
+
+
+def test_order_by_alias_to_aggregate_used_directly_still_works(tiny_repo):
+    """`c` used directly in `ORDER BY`, not nested in another call -
+    both engines accept this; must not regress."""
+    _assert_differential(
+        tiny_repo, "SELECT path, count(*) AS c FROM blame GROUP BY path ORDER BY c DESC LIMIT 3"
+    )
+
+
+def test_select_list_alias_not_visible_to_other_select_items_stays_bind_error(tiny_repo):
+    """`SELECT count(*) AS c, count(c) FROM blame` stays a `BindError`
+    for the reason it already is one - "no such column: c" - confirmed
+    against the oracle that `sqlite3` gives the identical error,
+    because select-list aliases are invisible to each other
+    (`_docs/decisions.md`'s #32 "finding 3"). A naive nested-aggregate
+    fix could accidentally wire this path through the alias fallback
+    instead; it must not."""
+    with pytest.raises(BindError):
+        run_historian("SELECT count(*) AS c, count(c) FROM blame", tiny_repo)
+
+
+def test_group_by_nested_aggregate_via_alias_still_raises_bind_error(tiny_repo):
+    """`SELECT count(*) AS c FROM blame GROUP BY count(c)` stays a
+    `BindError` - `GROUP BY`'s own pre-existing re-check
+    (`_contains_aggregate` after binding a `GROUP BY` item) already
+    rejects any aggregate in a `GROUP BY` key, nested-via-alias or not
+    - out of scope for this issue, listed here only as a regression
+    guard against this fix accidentally changing that outcome."""
+    with pytest.raises(BindError):
+        run_historian("SELECT count(*) AS c FROM blame GROUP BY count(c)", tiny_repo)
+
+
 # --- GROUP BY / HAVING (issue #69) --------------------------------------
 #
 # `NULL`-valued group keys and mixed-storage-class key merging are

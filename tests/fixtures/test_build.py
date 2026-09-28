@@ -576,3 +576,46 @@ def test_tiny_repo_session_fixture_resolves_to_the_pinned_build(tiny_repo):
 
 def test_awkward_repo_session_fixture_resolves_to_the_pinned_build(awkward_repo):
     assert build._run_git(awkward_repo, ["rev-parse", "HEAD"]).strip() == build.AWKWARD_HEAD
+
+
+# ---------------------------------------------------------------------------
+# casefold (issue #122)
+# ---------------------------------------------------------------------------
+
+
+def test_casefold_lists_exactly_its_paths_in_ls_tree_order(tmp_path):
+    repo = build.build_casefold(tmp_path / "casefold")
+    raw = build._run_git_bytes(repo, ["ls-tree", "-rz", "HEAD", "--name-only"])
+    assert tuple(chunk.decode() for chunk in raw.split(b"\0") if chunk) == build.CASEFOLD_PATHS
+
+
+def test_casefold_has_paths_differing_only_by_ascii_and_non_ascii_case():
+    """The property the fixture exists for: `src/`, `SRC/`, `Src/` are
+    three distinct directories, and `straße/`, `STRAßE/`, `STRASSE/`
+    three more - distinct even on a case-insensitive file system,
+    because the builder never writes them to disk."""
+    tops = {path.split("/", 1)[0] for path in build.CASEFOLD_PATHS}
+    assert {"src", "SRC", "Src", "straße", "STRAßE", "STRASSE", "5"} <= tops
+
+
+def test_casefold_is_deterministic_and_matches_pinned_hash(tmp_path):
+    repo_a = build.build_casefold(tmp_path / "a")
+    repo_b = build.build_casefold(tmp_path / "b")
+    head_a = build._run_git(repo_a, ["rev-parse", "HEAD"]).strip()
+    assert head_a == build._run_git(repo_b, ["rev-parse", "HEAD"]).strip()
+    assert head_a == build.CASEFOLD_HEAD
+
+
+def test_verify_casefold_raises_when_a_path_is_missing(tmp_path):
+    repo = tmp_path / "missing-path"
+    build._init_repo(repo, branch="main")
+    for path in build.CASEFOLD_PATHS[:-1]:
+        blob = build._hash_blob(repo, f"content of {path}\n".encode())
+        build._run_git(repo, ["update-index", "--add", "--cacheinfo", f"100644,{blob},{path}"])
+    build._commit(repo, "initial", author=("Cas Fold", "cas@example.com"), timestamp=build._Clock().tick())
+    with pytest.raises(build.FixtureError, match="casefold"):
+        build._verify_casefold(repo)
+
+
+def test_casefold_repo_session_fixture_resolves_to_the_pinned_build(casefold_repo):
+    assert build._run_git(casefold_repo, ["rev-parse", "HEAD"]).strip() == build.CASEFOLD_HEAD

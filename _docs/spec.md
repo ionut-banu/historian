@@ -449,7 +449,8 @@ inputs no hand-written test would think to try.
 TEXT becomes a number in exactly one place, `exec/expression.py`'s
 `_scan_number`, for arithmetic's leading-prefix coercion, column
 affinity's whole-string coercion and `sum`/`avg`'s classification
-alike. A plain digit run - no `.`, no exponent - is `INTEGER` only if
+alike - the one exception is the integer value `%` reads, below. A
+plain digit run - no `.`, no exponent - is `INTEGER` only if
 it fits int64; otherwise it is `REAL` at that point, before any
 operator sees it, and a run too large for a double is `inf`:
 
@@ -461,6 +462,25 @@ operator sees it, and a run too large for a double is `inf`:
 
 This is conversion, not comparison, and does not weaken the rule
 above. See `_docs/decisions.md`, 2026-09-28.
+
+`%` reads each operand as an int64, not through `_scan_number`'s
+value. A REAL is truncated toward zero and clamped to int64, infinity
+included. TEXT is read the way SQLite's `sqlite3Atoi64` reads it:
+whitespace, an optional sign, then digits up to the first non-digit -
+never a `.` or an exponent - clamped to int64, and `0` if there are no
+digits. Whether the result is `REAL` still follows `_scan_number`'s
+class for that TEXT, so the value and the class come from different
+scans:
+
+```
+'1e3' % 7                1.0     REAL   (reads 1, class REAL)
+'1.5e2' % 7              1.0     REAL
+'1e400' % 3              1.0     REAL   (reads 1, never inf)
+('1e400'+0) % 3          1.0     REAL   (inf clamps to int64 max)
+'7abc' % 2               1       INTEGER
+```
+
+See `_docs/decisions.md`, 2026-09-28, issue #106.
 
 SQLite also has no NaN: `typeof(0.0/0.0)` is `null`, so a NaN can never
 be a stored value. A computed NaN reaching `order_key` would violate the

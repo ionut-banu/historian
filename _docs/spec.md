@@ -446,6 +446,22 @@ implementation is to compare the values directly and add nothing. Any
 in the expression evaluator's arithmetic path - breaks this silently, on
 inputs no hand-written test would think to try.
 
+TEXT becomes a number in exactly one place, `exec/expression.py`'s
+`_scan_number`, for arithmetic's leading-prefix coercion, column
+affinity's whole-string coercion and `sum`/`avg`'s classification
+alike. A plain digit run - no `.`, no exponent - is `INTEGER` only if
+it fits int64; otherwise it is `REAL` at that point, before any
+operator sees it, and a run too large for a double is `inf`:
+
+```
+'9223372036854775807' - 1        9223372036854775806     INTEGER
+'9223372036854775808' - 1        9.22337203685478e+18    REAL
+'999...9' + 0  (320 nines)       inf                     REAL
+```
+
+This is conversion, not comparison, and does not weaken the rule
+above. See `_docs/decisions.md`, 2026-09-28.
+
 SQLite also has no NaN: `typeof(0.0/0.0)` is `null`, so a NaN can never
 be a stored value. A computed NaN reaching `order_key` would violate the
 total order, which is a risk for the expression evaluator rather than

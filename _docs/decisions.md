@@ -2652,3 +2652,71 @@ correctly before this fix - that `FunctionCall` branch returns
 `(True, None)` unconditionally there regardless of name, so name
 casing was never load-bearing for those two callers - and still do
 after, unchanged.
+
+2026-09-28 - TEXT past int64 is REAL at conversion time, decided once
+in `_scan_number`
+
+Issue #105. `exec/expression.py`'s `_scan_number` is the one place
+TEXT becomes a number: arithmetic's leading-prefix coercion
+(`arithmetic_operand`), column affinity's whole-string coercion
+(`try_numeric_affinity`), and `sum`/`avg`'s classification in
+`exec/operators.py` (which calls those two) all go through it. For a
+plain digit run - no `.`, no exponent - it used to return
+`int(text)`, unbounded. Only an arithmetic *result* was ever bounded
+(`_int64_bounded`, 2026-09-01), so `'9223372036854775808' - 1`
+subtracted exactly and landed back inside int64 as the INTEGER
+`9223372036854775807`; `sum('9223372036854775808')` took `sum`'s exact
+integer path and raised `integer overflow`; and `'999...9' + 0` (320
+nines) crashed with `OverflowError`, because `float()` of a huge
+Python `int` raises where `float()` of the same digit text gives
+`inf`. A digit run past 4300 digits raised `ValueError` from `int()`
+itself (Python's int-string conversion limit).
+
+SQLite classifies at conversion time: a digit run is INTEGER only if
+it fits int64, else REAL, before any operator runs. Confirmed with
+`tests/oracle.py` (module `sqlite3` 3.45.1): `'9223372036854775808' -
+1` is `0x1.0000000000000p+63` REAL, `sum(...)` of it over 3 rows is
+`0x1.8000000000000p+64` REAL, the 320-nine and 5000-nine runs are
+`inf`, and `'9223372036854775807' - 1` / `'-9223372036854775808' + 0`
+stay INTEGER - sign, leading zeros (including 5000 of them) and
+surrounding whitespace do not move the boundary.
+
+The rule now lives at that single point. `_int64_digit_run` decides
+the range from the digit text alone: it strips the sign and leading
+zeros, rejects more than 19 significant digits without converting, and
+only then calls `int()` on at most 19 digits and compares against
+`INT64_MIN`/`INT64_MAX`. Out of range, `_scan_number` returns
+`float(number_text)` - the text, never a Python `int` - so a huge run
+overflows to `inf` and nothing raises. No caller bounds its own result
+any more for this case; `_int64_bounded` still bounds arithmetic
+results, which is a different overflow. The `float()` call stays inside
+`_scan_number`, already on the allowlist of
+`test_no_stray_float_calls_outside_the_named_exceptions`.
+
+`%` changes too, because it reaches TEXT through the same
+`arithmetic_operand`: a digit-run TEXT operand past int64 is now a
+REAL operand, truncated and clamped to int64 per #75. That matches
+`sqlite3` for a finite one - `'9223372036854775808' % 3` is `1.0` (was
+the INTEGER `2`, `2**63 % 3` unclamped), `5 % '9223372036854775808'`
+is `5.0` (was `5`), `'-9223372036854775809' % 7` is `-1.0` (was `-3`).
+For a run too large for a double, `%` used to return a wrong exact
+remainder (`'999...9' % 3` gave `0`; `sqlite3` gives `1.0`) and now
+reaches `_int64_truncated` with `inf` and raises `OverflowError` from
+`math.trunc` - the same crash `('1e400'+0) % 3` already has, which is
+#106's to fix, along with `%`'s own `sqlite3Atoi64`-style TEXT scan.
+
+Not matched: the last bit of the REAL for some long digit runs.
+`float(text)` is correctly rounded; `sqlite3`'s `sqlite3AtoF` is not.
+Measured on this machine (x86_64, module 3.45.1) with random 19-to-320
+digit runs bound as TEXT and converted by `? + 0`: 44 of 56400 differ
+from historian by one ULP. This is not new - before #105 such a run
+went `int(text)` then `float(exact)` in `_int64_bounded`, also
+correctly rounded - and the same gap already exists for TEXT with a
+`.` or an exponent, and for SQL literals (2026-09-25 entry). A Python
+emulation of 3.45.1's x86_64 path (keep 19-ish leading digits in a
+u64, scale by powers of ten in 80-bit long double, round to double)
+matched 9420 of 9420 samples, but that path is platform-specific
+(`long double` is `double` on aarch64, where SQLite uses a Dekker
+double-double path instead) and version-specific, so porting it is a
+decision for its own issue, not a side effect of this one. Every value
+#105's acceptance criteria name is an exact match.

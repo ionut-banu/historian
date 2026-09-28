@@ -1162,3 +1162,66 @@ def test_plan_split_expr_like_escape_aggregate_call_gets_routed_to_aggregate():
     assert split.escape.offset == 0
     assert len(calls) == 1
     assert calls[0].kind == "count"
+
+
+# --- Depth: the planner's walks do not recurse per tree level (#107) ----
+
+_DEEP = 5000
+
+
+def _deep_chain(n: int, leaf):
+    node = leaf()
+    for _ in range(n - 1):
+        node = _bin(Op.ADD, node, leaf())
+    return node
+
+
+def test_split_expr_over_a_deep_chain_of_aggregate_calls():
+    """Every aggregate call in a 5000-term chain gets its own slot, in
+    left-to-right order, and the chain is rebuilt around the slots."""
+    expr = _deep_chain(_DEEP, lambda: FunctionCall(name="count", args=(Star(None, _POS),), position=_POS))
+    calls: list = []
+    split = planner._split_expr(expr, calls, group_by=())
+    assert len(calls) == _DEEP
+    offsets = []
+    node = split
+    while isinstance(node, BinaryOp):
+        offsets.append(node.right.offset)
+        node = node.left
+    offsets.append(node.offset)
+    assert offsets[::-1] == list(range(_DEEP))
+
+
+def test_split_expr_replaces_a_deep_group_key_subtree():
+    """A deep GROUP BY key found as a subtree is replaced wholesale by a
+    reference to its group-key column."""
+    key = _deep_chain(1500, lambda: _col("line_no"))
+    expr = _bin(Op.ADD, key, _lit(1))
+    calls: list = []
+    split = planner._split_expr(expr, calls, group_by=(key,))
+    assert isinstance(split, BinaryOp)
+    assert isinstance(split.left, BoundColumnRef) and split.left.offset == 0
+    assert calls == []
+
+
+def test_expr_shape_equal_on_deep_trees():
+    a = _deep_chain(_DEEP, lambda: _col("line_no"))
+    b = _deep_chain(_DEEP, lambda: _col("line_no"))
+    c = _bin(Op.ADD, _deep_chain(_DEEP - 1, lambda: _col("line_no")), _col("path"))
+    assert planner._expr_shape_equal(a, b) is True
+    assert planner._expr_shape_equal(a, c) is False
+
+
+def test_plan_of_a_deep_where_select_and_order_by():
+    """`plan()` over a bound statement with 5000-level trees in WHERE,
+    the select list and ORDER BY runs and produces the right rows."""
+    select = (_select_item(_deep_chain(_DEEP, lambda: _lit(1))),)
+    where = _deep_chain(_DEEP, lambda: _col("line_no"))
+    stmt = _stmt(
+        select,
+        where=_bin(Op.GT, where, _lit(0)),
+        order_by=(BoundOrderByItem(expr=where, direction=OrderDirection.ASC, position=_POS),),
+    )
+    source = _FakeSource([("a.py", 1, None), ("b.py", 2, None)])
+    tree = plan(stmt, Path("/unused"), tables=_fake_tables(source))
+    assert list(tree.rows()) == [(_DEEP,), (_DEEP,)]

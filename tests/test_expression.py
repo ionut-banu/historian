@@ -2512,3 +2512,178 @@ def test_huge_digit_run_text_plus_zero_is_inf():
 
     result = evaluate(_bin(Operator.ADD, _lit("9" * 320), _lit(0)), _ROW, _SCHEMA)
     assert result == float("inf")
+
+
+# --- Depth: evaluate() does not recurse per tree level (issue #107) -----
+#
+# The parser now rejects any tree taller than SQLite's 1000, but a bound
+# tree can be taller than any one parsed expression (a select-list alias
+# spliced into WHERE doubles it), and evaluate() is a public function in
+# its own right. These trees are built by hand, far past 1000 levels,
+# and evaluated at the interpreter's default recursion limit. Expected
+# values are plain arithmetic/logic on the leaves, each checked against
+# sqlite3 3.45.1 (tests/oracle.py) at a height SQLite accepts:
+# `SELECT 1+1+...` (n terms) is n, a NULL anywhere makes it NULL, and
+# `1 AND ... AND 0 AND ...` is 0.
+
+_DEEP = 5000
+
+
+def _left_chain(n: int, make_node, leaf):
+    """A left-deep chain of *n* leaves joined by *make_node(left, right)*."""
+    node = leaf(0)
+    for i in range(1, n):
+        node = make_node(node, leaf(i))
+    return node
+
+
+def _at_depth(extra_frames: int, fn):
+    if extra_frames == 0:
+        return fn()
+    return _at_depth(extra_frames - 1, fn)
+
+
+def test_deep_addition_chain_evaluates_without_recursion_error():
+    from historian.exec.expression import evaluate
+
+    expr = _left_chain(_DEEP, lambda l, r: _bin(Operator.ADD, l, r), lambda i: _col("n"))
+    assert evaluate(expr, _ROW, _SCHEMA) == 5 * _DEEP
+
+
+def test_deep_addition_chain_evaluates_from_a_deep_call_stack():
+    """Nothing in evaluate() grows with the tree: it still works with
+    700 frames of the default 1000 already used by the caller."""
+    from historian.exec.expression import evaluate
+
+    expr = _left_chain(_DEEP, lambda l, r: _bin(Operator.ADD, l, r), lambda i: _lit(1))
+    assert _at_depth(700, lambda: evaluate(expr, _ROW, _SCHEMA)) == _DEEP
+
+
+def test_deep_right_nested_chain_evaluates():
+    from historian.exec.expression import evaluate
+
+    expr = _lit(1)
+    for _ in range(_DEEP - 1):
+        expr = _bin(Operator.SUB, _lit(1), expr)
+    # 1 - (1 - (1 - ... 1)): alternates, ending at 1 for an odd count.
+    assert evaluate(expr, _ROW, _SCHEMA) == (1 if _DEEP % 2 == 1 else 0)
+
+
+def test_deep_chain_with_a_null_is_null():
+    from historian.exec.expression import evaluate
+
+    expr = _left_chain(
+        _DEEP, lambda l, r: _bin(Operator.ADD, l, r), lambda i: _lit(None if i == _DEEP // 2 else 1)
+    )
+    assert evaluate(expr, _ROW, _SCHEMA) is None
+
+
+def test_deep_concat_chain():
+    from historian.exec.expression import evaluate
+
+    expr = _left_chain(_DEEP, lambda l, r: _bin(Operator.CONCAT, l, r), lambda i: _col("n"))
+    assert evaluate(expr, _ROW, _SCHEMA) == "5" * _DEEP
+
+
+def test_deep_comparison_chain_with_affinity():
+    """`n = '5' = 1 = 1 ...`: the first comparison applies n's INTEGER
+    affinity to '5' (TRUE, i.e. 1), every later one compares 1 = 1."""
+    from historian.exec.expression import coerce_to_value, evaluate
+
+    expr = _bin(Operator.EQ, _col("n"), _lit("5"))
+    for _ in range(_DEEP):
+        expr = _bin(Operator.EQ, expr, _lit(1))
+    assert coerce_to_value(evaluate(expr, _ROW, _SCHEMA)) == 1
+
+
+def test_deep_and_chain_short_circuits_on_the_leftmost_false():
+    """A FALSE leftmost leaf decides every AND above it without touching
+    a right operand - each right operand here is a FunctionCall, which
+    raises EvalError if it is ever evaluated."""
+    from historian.exec.expression import evaluate
+
+    call = FunctionCall(name="f", args=(), position=_POS)
+    expr = _lit(0)
+    for _ in range(_DEEP):
+        expr = And(left=expr, right=call, position=_POS)
+    assert evaluate(expr, _ROW, _SCHEMA) is False
+
+
+def test_deep_or_chain_short_circuits_on_the_leftmost_true():
+    from historian.exec.expression import evaluate
+
+    call = FunctionCall(name="f", args=(), position=_POS)
+    expr = _lit(1)
+    for _ in range(_DEEP):
+        expr = Or(left=expr, right=call, position=_POS)
+    assert evaluate(expr, _ROW, _SCHEMA) is True
+
+
+def test_deep_and_chain_evaluates_every_right_operand_when_not_decided():
+    """With a TRUE left side, AND does evaluate its right operand: a
+    FunctionCall on the deepest right raises EvalError."""
+    from historian.exec.expression import EvalError, evaluate
+
+    expr = _lit(1)
+    for i in range(_DEEP):
+        right = FunctionCall(name="f", args=(), position=_POS) if i == _DEEP - 1 else _lit(1)
+        expr = And(left=expr, right=right, position=_POS)
+    with pytest.raises(EvalError):
+        evaluate(expr, _ROW, _SCHEMA)
+
+
+@pytest.mark.parametrize(
+    "zero_or_null, expected",
+    [(0, False), (None, None)],
+    ids=["zero", "null"],
+)
+def test_deep_and_chain_of_ones_with_one_zero_or_null(zero_or_null, expected):
+    from historian.exec.expression import evaluate
+
+    expr = _left_chain(
+        _DEEP,
+        lambda l, r: And(left=l, right=r, position=_POS),
+        lambda i: _lit(zero_or_null if i == _DEEP // 2 else 1),
+    )
+    assert evaluate(expr, _ROW, _SCHEMA) is expected
+
+
+def test_deep_not_and_unary_chains():
+    from historian.exec.expression import evaluate
+
+    not_chain = _lit(1)
+    minus_chain = _col("n")
+    for _ in range(_DEEP + 1):
+        not_chain = Not(operand=not_chain, position=_POS)
+        minus_chain = _unary(UnaryOperator.NEG, minus_chain)
+    # An odd number of NOTs / minus signs.
+    assert evaluate(not_chain, _ROW, _SCHEMA) is False
+    assert evaluate(minus_chain, _ROW, _SCHEMA) == -5
+
+
+def test_deep_is_like_in_between_chains():
+    from historian.exec.expression import evaluate
+
+    is_chain = _col("n")
+    like_chain = _col("s")
+    in_chain = _lit(1)
+    for _ in range(_DEEP):
+        is_chain = _is(is_chain, _lit(None), negated=True)  # IS NOT NULL -> 1
+        like_chain = _like(like_chain, _lit("%"))  # anything LIKE '%' -> 1
+        # One element only: `IN` evaluates its left operand once per
+        # element (#137), so a two-element list at every level would be
+        # 2**5000 evaluations. 1 IN (1) -> 1, and so on up the chain.
+        in_chain = _in(in_chain, (_lit(1),))
+    assert evaluate(is_chain, _ROW, _SCHEMA) is True
+    assert evaluate(like_chain, _ROW, _SCHEMA) is True
+    assert evaluate(in_chain, _ROW, _SCHEMA) is True
+    # `BETWEEN` evaluates its operand twice (#137), so only a short
+    # chain here; the depth is in the operand of a long + chain instead.
+    short_between = _col("n")
+    for _ in range(10):
+        short_between = _between(short_between, _lit(0), _lit(10))
+    assert evaluate(short_between, _ROW, _SCHEMA) is True
+    deep_operand = _left_chain(_DEEP, lambda l, r: _bin(Operator.ADD, l, r), lambda i: _lit(1))
+    assert evaluate(_between(deep_operand, _lit(0), _lit(_DEEP)), _ROW, _SCHEMA) is True
+    assert evaluate(_in(_lit(_DEEP), (deep_operand,)), _ROW, _SCHEMA) is True
+    assert evaluate(_like(deep_operand, _lit(str(_DEEP))), _ROW, _SCHEMA) is True

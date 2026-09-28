@@ -632,6 +632,71 @@ def _validate_function_call(call: FunctionCall, ctx: _Context) -> None:
         )
 
 
+# --- Walking an expression tree without recursion (issue #107) --------------
+#
+# Every walk in this module over an expression tree is a loop over an
+# explicit stack - a plain list - rather than a function calling itself
+# once per level, in the same style as `plan/optimizer.py`'s
+# `split_conjuncts` (#121). The parser rejects any tree taller than
+# SQLite's own limit of 1000 (`sql/parser.py`'s `_expr_height`), but a
+# recursive walk here used one to three Python frames per level and
+# crashed with `RecursionError` well inside that limit, and a bound tree
+# can be taller than any parsed one (a select-list alias spliced into
+# `WHERE` roughly doubles it). An explicit stack does not grow Python's
+# stack at all, so what these walks can handle does not depend on the
+# recursion limit or on how deep the caller already is (`AGENTS.md`'s
+# determinism rule). `_operands` and `_with_operands` are the two
+# per-node-type tables every walk shares: what a node's children are,
+# left to right, and how to rebuild the node around new ones.
+
+
+def _operands(expr: Expr) -> tuple[Expr, ...]:
+    """*expr*'s direct sub-expressions, left to right - the order every
+    walk below visits them in, which is what keeps "the leftmost
+    unresolved name wins" (the module docstring's "Resolution and error
+    order") true without recursion. A leaf has none."""
+    if isinstance(expr, (Literal, ColumnRef, BoundColumnRef, Star)):
+        return ()
+    if isinstance(expr, FunctionCall):
+        return expr.args
+    if isinstance(expr, (UnaryOp, Not)):
+        return (expr.operand,)
+    if isinstance(expr, (BinaryOp, And, Or, Is)):
+        return (expr.left, expr.right)
+    if isinstance(expr, Like):
+        if expr.escape is None:
+            return (expr.left, expr.pattern)
+        return (expr.left, expr.pattern, expr.escape)
+    if isinstance(expr, In):
+        return (expr.left, *expr.values)
+    if isinstance(expr, Between):
+        return (expr.operand, expr.low, expr.high)
+    raise AssertionError(f"sql/binder.py: unhandled expression node type {type(expr).__name__}")
+
+
+def _with_operands(expr: Expr, operands: list[Expr]) -> Expr:
+    """*expr* rebuilt via `dataclasses.replace` with *operands* - one
+    per entry of `_operands(expr)`, in the same order - in place of its
+    own children."""
+    if isinstance(expr, FunctionCall):
+        return dataclasses.replace(expr, args=tuple(operands))
+    if isinstance(expr, (UnaryOp, Not)):
+        (operand,) = operands
+        return dataclasses.replace(expr, operand=operand)
+    if isinstance(expr, (BinaryOp, And, Or, Is)):
+        left, right = operands
+        return dataclasses.replace(expr, left=left, right=right)
+    if isinstance(expr, Like):
+        escape = operands[2] if expr.escape is not None else None
+        return dataclasses.replace(expr, left=operands[0], pattern=operands[1], escape=escape)
+    if isinstance(expr, In):
+        return dataclasses.replace(expr, left=operands[0], values=tuple(operands[1:]))
+    if isinstance(expr, Between):
+        operand, low, high = operands
+        return dataclasses.replace(expr, operand=operand, low=low, high=high)
+    raise AssertionError(f"sql/binder.py: unhandled expression node type {type(expr).__name__}")
+
+
 # --- General expression binding --------------------------------------------
 #
 # One case per `sql/ast.py` node type. Every type other than
@@ -647,106 +712,107 @@ def _bind_expr(expr: Expr, ctx: _Context) -> Expr:
     is set - off by default on the `_Context` every select-list item
     binds with (`_bind_select_item`), which is how aliases stay
     invisible to each other (finding 3); on for the `_Context` `bind()`
-    builds for `WHERE`. `ctx` carries the setting through every
-    recursive call below unchanged, so the fallback applies to a
-    `ColumnRef` at any depth in the tree, not only at the top.
+    builds for `WHERE`. `ctx` is the same for every node of the tree,
+    so the fallback applies to a `ColumnRef` at any depth in the tree,
+    not only at the top.
+
+    Not recursive (issue #107, see "Walking an expression tree without
+    recursion" above): *pending* holds `(node, operands_done)` pairs and
+    *results* the bound subtrees finished so far. A node is first seen
+    with `operands_done=False` - a leaf is bound on the spot; any other
+    node is pushed back with `operands_done=True`, then its operands in
+    reverse so they are bound left to right; seen again, it takes its
+    bound operands off *results* and is rebuilt around them. That is
+    the recursive version's order exactly: a `FunctionCall`'s name and
+    arity are checked before any argument is bound, and the nested-
+    aggregate check runs after all of them are.
     """
-    if isinstance(expr, Literal):
-        return expr
-    if isinstance(expr, ColumnRef):
-        if ctx.alias_fallback:
-            return _resolve_name(expr, ctx)
-        return _bind_column_ref(expr, ctx)
-    if isinstance(expr, Star):
-        # A whole, alias-less select-list item and count(*)'s sole
-        # unqualified argument are handled by their own callers before
-        # ever reaching here - see `_bind_select_item` and the
-        # `FunctionCall` case below. Any other position is exactly the
-        # parser-permissiveness backstop the grooming asked for: `* AS
-        # alias`, `*` inside a general expression, and `count(blame.*)`
-        # (a *qualified* star as a function argument) all reach this
-        # branch and are rejected here rather than crashing or
-        # silently mis-expanding.
-        raise BindError(
-            "* is only allowed as a whole select-list item or the sole argument to a function call",
-            expr.position,
-            (),
-        )
-    if isinstance(expr, FunctionCall):
-        # Issue #60: name/arity/WHERE-rejection, before anything else -
-        # see _validate_function_call and the module docstring's
-        # "Aggregate calls" section. Every FunctionCall past this point
-        # is a real, correctly-arity aggregate call.
-        _validate_function_call(expr, ctx)
-        if len(expr.args) == 1 and isinstance(expr.args[0], Star) and expr.args[0].table is None:
-            # count(*): passed through unexpanded. `*` here means "no
-            # columns", not "all columns" - see the module docstring.
-            # A *qualified* sole argument (count(blame.*)) does not
-            # take this path and falls through to the general Star
-            # rejection above.
-            return expr
-        bound_args = tuple(_bind_expr(arg, ctx) for arg in expr.args)
-        # Issue #102: an aggregate call can never be another aggregate
-        # call's own argument - `count(count(*))` is `sqlite3`'s own
-        # "misuse of aggregate function count()". This has to run after
-        # binding each argument, not on the raw AST, because a
-        # `ColumnRef` argument only reveals whether it secretly names
-        # an aggregate call once alias resolution (`_resolve_name`)
-        # has spliced that alias's own bound expression in - a bound
-        # argument that is itself a `FunctionCall`, whether written
-        # directly or reached through a select-list alias, is exactly
-        # what `_contains_aggregate` was already built to detect.
-        for raw_arg, bound_arg in zip(expr.args, bound_args):
-            if not _contains_aggregate(bound_arg):
-                continue
-            if isinstance(raw_arg, ColumnRef) and _find_alias_expr(raw_arg.name, ctx) is not None:
-                # Reached through a select-list alias - `sqlite3`'s own
-                # message names the alias, not the outer function:
-                # "misuse of aliased aggregate c".
-                raise BindError(
-                    f"misuse of aliased aggregate {raw_arg.name}", raw_arg.position, ()
-                )
+    pending: list[tuple[Expr, bool]] = [(expr, False)]
+    results: list[Expr] = []
+    while pending:
+        node, operands_done = pending.pop()
+        if operands_done:
+            first = len(results) - len(_operands(node))
+            bound_operands = results[first:]
+            del results[first:]
+            if isinstance(node, FunctionCall):
+                _check_no_nested_aggregate(node, bound_operands, ctx)
+            results.append(_with_operands(node, bound_operands))
+            continue
+        if isinstance(node, Literal):
+            results.append(node)
+            continue
+        if isinstance(node, ColumnRef):
+            if ctx.alias_fallback:
+                results.append(_resolve_name(node, ctx))
+            else:
+                results.append(_bind_column_ref(node, ctx))
+            continue
+        if isinstance(node, Star):
+            # A whole, alias-less select-list item and count(*)'s sole
+            # unqualified argument are handled by their own callers before
+            # ever reaching here - see `_bind_select_item` and the
+            # `FunctionCall` case below. Any other position is exactly the
+            # parser-permissiveness backstop the grooming asked for: `* AS
+            # alias`, `*` inside a general expression, and `count(blame.*)`
+            # (a *qualified* star as a function argument) all reach this
+            # branch and are rejected here rather than crashing or
+            # silently mis-expanding.
             raise BindError(
-                f"misuse of aggregate function {expr.name}(): aggregate function calls "
-                "cannot be nested",
-                raw_arg.position,
+                "* is only allowed as a whole select-list item or the sole argument to a function call",
+                node.position,
                 (),
             )
-        return dataclasses.replace(expr, args=bound_args)
-    if isinstance(expr, UnaryOp):
-        return dataclasses.replace(expr, operand=_bind_expr(expr.operand, ctx))
-    if isinstance(expr, Not):
-        return dataclasses.replace(expr, operand=_bind_expr(expr.operand, ctx))
-    if isinstance(expr, BinaryOp):
-        return dataclasses.replace(expr, left=_bind_expr(expr.left, ctx), right=_bind_expr(expr.right, ctx))
-    if isinstance(expr, And):
-        return dataclasses.replace(expr, left=_bind_expr(expr.left, ctx), right=_bind_expr(expr.right, ctx))
-    if isinstance(expr, Or):
-        return dataclasses.replace(expr, left=_bind_expr(expr.left, ctx), right=_bind_expr(expr.right, ctx))
-    if isinstance(expr, Is):
-        return dataclasses.replace(expr, left=_bind_expr(expr.left, ctx), right=_bind_expr(expr.right, ctx))
-    if isinstance(expr, Like):
-        # #51: escape is an ordinary operand expression, bound the same
-        # way left/pattern already are - None passes through unchanged
-        # (no ESCAPE clause), since there is nothing to bind.
-        return dataclasses.replace(
-            expr,
-            left=_bind_expr(expr.left, ctx),
-            pattern=_bind_expr(expr.pattern, ctx),
-            escape=_bind_expr(expr.escape, ctx) if expr.escape is not None else None,
+        if isinstance(node, BoundColumnRef):
+            raise AssertionError("sql/binder.py: a BoundColumnRef reached _bind_expr; it is already bound")
+        if isinstance(node, FunctionCall):
+            # Issue #60: name/arity/WHERE-rejection, before anything else -
+            # see _validate_function_call and the module docstring's
+            # "Aggregate calls" section. Every FunctionCall past this point
+            # is a real, correctly-arity aggregate call.
+            _validate_function_call(node, ctx)
+            if len(node.args) == 1 and isinstance(node.args[0], Star) and node.args[0].table is None:
+                # count(*): passed through unexpanded. `*` here means "no
+                # columns", not "all columns" - see the module docstring.
+                # A *qualified* sole argument (count(blame.*)) does not
+                # take this path and falls through to the general Star
+                # rejection above.
+                results.append(node)
+                continue
+        # #51: a LIKE's escape is an ordinary operand expression, bound
+        # the same way left/pattern already are - `_operands` leaves it
+        # out when there is no ESCAPE clause, so there is nothing to bind.
+        pending.append((node, True))
+        for operand in reversed(_operands(node)):
+            pending.append((operand, False))
+    (result,) = results
+    return result
+
+
+def _check_no_nested_aggregate(call: FunctionCall, bound_args: list[Expr], ctx: _Context) -> None:
+    """Issue #102: an aggregate call can never be another aggregate
+    call's own argument - `count(count(*))` is `sqlite3`'s own "misuse
+    of aggregate function count()". This has to run after binding each
+    argument, not on the raw AST, because a `ColumnRef` argument only
+    reveals whether it secretly names an aggregate call once alias
+    resolution (`_resolve_name`) has spliced that alias's own bound
+    expression in - a bound argument that is itself a `FunctionCall`,
+    whether written directly or reached through a select-list alias, is
+    exactly what `_contains_aggregate` was already built to detect."""
+    for raw_arg, bound_arg in zip(call.args, bound_args):
+        if not _contains_aggregate(bound_arg):
+            continue
+        if isinstance(raw_arg, ColumnRef) and _find_alias_expr(raw_arg.name, ctx) is not None:
+            # Reached through a select-list alias - `sqlite3`'s own
+            # message names the alias, not the outer function:
+            # "misuse of aliased aggregate c".
+            raise BindError(f"misuse of aliased aggregate {raw_arg.name}", raw_arg.position, ())
+        raise BindError(
+            f"misuse of aggregate function {call.name}(): aggregate function calls "
+            "cannot be nested",
+            raw_arg.position,
+            (),
         )
-    if isinstance(expr, In):
-        return dataclasses.replace(
-            expr, left=_bind_expr(expr.left, ctx), values=tuple(_bind_expr(v, ctx) for v in expr.values)
-        )
-    if isinstance(expr, Between):
-        return dataclasses.replace(
-            expr,
-            operand=_bind_expr(expr.operand, ctx),
-            low=_bind_expr(expr.low, ctx),
-            high=_bind_expr(expr.high, ctx),
-        )
-    raise AssertionError(f"sql/binder.py: unhandled expression node type {type(expr).__name__}")
 
 
 # --- GROUP BY / HAVING (issue #69) ------------------------------------------
@@ -763,41 +829,18 @@ def _bind_expr(expr: Expr, ctx: _Context) -> Expr:
 def _contains_aggregate(expr: Expr) -> bool:
     """Whether *expr* (already bound - every surviving `FunctionCall`
     is a real, validated aggregate call) contains an aggregate call
-    anywhere in its tree. Mirrors `_split_for_aggregate_check`'s own
-    node-type walk, boring and explicit rather than shared, since the
-    two ask different questions (that one also needs the first bad
-    bare column; this one only needs a boolean)."""
-    if isinstance(expr, FunctionCall):
-        return True
-    if isinstance(expr, (Literal, BoundColumnRef, Star)):
-        return False
-    if isinstance(expr, UnaryOp):
-        return _contains_aggregate(expr.operand)
-    if isinstance(expr, Not):
-        return _contains_aggregate(expr.operand)
-    if isinstance(expr, BinaryOp):
-        return _contains_aggregate(expr.left) or _contains_aggregate(expr.right)
-    if isinstance(expr, And):
-        return _contains_aggregate(expr.left) or _contains_aggregate(expr.right)
-    if isinstance(expr, Or):
-        return _contains_aggregate(expr.left) or _contains_aggregate(expr.right)
-    if isinstance(expr, Is):
-        return _contains_aggregate(expr.left) or _contains_aggregate(expr.right)
-    if isinstance(expr, Like):
-        return (
-            _contains_aggregate(expr.left)
-            or _contains_aggregate(expr.pattern)
-            or (expr.escape is not None and _contains_aggregate(expr.escape))
-        )
-    if isinstance(expr, In):
-        return _contains_aggregate(expr.left) or any(_contains_aggregate(v) for v in expr.values)
-    if isinstance(expr, Between):
-        return (
-            _contains_aggregate(expr.operand)
-            or _contains_aggregate(expr.low)
-            or _contains_aggregate(expr.high)
-        )
-    raise AssertionError(f"sql/binder.py: unhandled expression node type {type(expr).__name__}")
+    anywhere in its tree. A loop over an explicit stack of nodes still
+    to look at (issue #107); the order they are visited in does not
+    matter for a yes/no answer."""
+    pending: list[Expr] = [expr]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, FunctionCall):
+            return True
+        if isinstance(node, ColumnRef):
+            raise AssertionError("sql/binder.py: _contains_aggregate needs a bound tree")
+        pending.extend(_operands(node))
+    return False
 
 
 def _expr_shape_equal(a: Expr, b: Expr) -> bool:
@@ -808,7 +851,28 @@ def _expr_shape_equal(a: Expr, b: Expr) -> bool:
     every node's `position` differs. One boring `isinstance` branch
     per `sql/ast.py`/binder node type, matching this module's existing
     walk style; `type(a) is not type(b)` up front so two different
-    node shapes are never accidentally treated as equal."""
+    node shapes are never accidentally treated as equal.
+
+    A loop over an explicit stack of node pairs still to compare (issue
+    #107): each pair's own fields are compared, then its operand pairs
+    are pushed. Nothing here has a side effect, so the order the pairs
+    are compared in cannot change the answer."""
+    pending: list[tuple[Expr, Expr]] = [(a, b)]
+    while pending:
+        x, y = pending.pop()
+        if not _same_node_fields(x, y):
+            return False
+        x_operands = _operands(x)
+        y_operands = _operands(y)
+        if len(x_operands) != len(y_operands):
+            return False
+        pending.extend(zip(x_operands, y_operands))
+    return True
+
+
+def _same_node_fields(a: Expr, b: Expr) -> bool:
+    """`_expr_shape_equal` for one pair of nodes, children aside:
+    the same node type and the same non-child fields."""
     if type(a) is not type(b):
         return False
     if isinstance(a, Literal):
@@ -825,51 +889,19 @@ def _expr_shape_equal(a: Expr, b: Expr) -> bool:
         # name against `_AGGREGATE_NAMES`. Folding here rather than on
         # `FunctionCall.name` itself at bind time keeps the AST node's
         # `name` as written, which error messages ("no such function:
-        # {call.name}") still want to echo verbatim.
-        return (
-            ascii_fold(a.name) == ascii_fold(b.name)
-            and len(a.args) == len(b.args)
-            and all(_expr_shape_equal(x, y) for x, y in zip(a.args, b.args))
-        )
-    if isinstance(a, UnaryOp):
-        return a.op == b.op and _expr_shape_equal(a.operand, b.operand)
-    if isinstance(a, Not):
-        return _expr_shape_equal(a.operand, b.operand)
-    if isinstance(a, BinaryOp):
-        return a.op == b.op and _expr_shape_equal(a.left, b.left) and _expr_shape_equal(a.right, b.right)
-    if isinstance(a, And):
-        return _expr_shape_equal(a.left, b.left) and _expr_shape_equal(a.right, b.right)
-    if isinstance(a, Or):
-        return _expr_shape_equal(a.left, b.left) and _expr_shape_equal(a.right, b.right)
-    if isinstance(a, Is):
-        return (
-            a.negated == b.negated
-            and _expr_shape_equal(a.left, b.left)
-            and _expr_shape_equal(a.right, b.right)
-        )
+        # {call.name}") still want to echo verbatim. The argument
+        # count is compared by the caller, with the operands.
+        return ascii_fold(a.name) == ascii_fold(b.name)
+    if isinstance(a, (UnaryOp, BinaryOp)):
+        return a.op == b.op
+    if isinstance(a, (Not, And, Or)):
+        return True
     if isinstance(a, Like):
-        if (a.escape is None) != (b.escape is None):
-            return False
-        return (
-            a.negated == b.negated
-            and _expr_shape_equal(a.left, b.left)
-            and _expr_shape_equal(a.pattern, b.pattern)
-            and (a.escape is None or _expr_shape_equal(a.escape, b.escape))
-        )
-    if isinstance(a, In):
-        return (
-            a.negated == b.negated
-            and len(a.values) == len(b.values)
-            and _expr_shape_equal(a.left, b.left)
-            and all(_expr_shape_equal(x, y) for x, y in zip(a.values, b.values))
-        )
-    if isinstance(a, Between):
-        return (
-            a.negated == b.negated
-            and _expr_shape_equal(a.operand, b.operand)
-            and _expr_shape_equal(a.low, b.low)
-            and _expr_shape_equal(a.high, b.high)
-        )
+        # Whether an ESCAPE clause is present changes the operand
+        # count, which the caller compares.
+        return a.negated == b.negated
+    if isinstance(a, (Is, In, Between)):
+        return a.negated == b.negated
     raise AssertionError(f"sql/binder.py: unhandled expression node type {type(a).__name__}")
 
 
@@ -902,20 +934,26 @@ def _expr_shape_equal(a: Expr, b: Expr) -> bool:
 def _ordinal_value(expr: Expr) -> int | None:
     """The integer value of *expr* if it is a `GROUP BY`/`ORDER BY`
     ordinal - `None` for anything else, including any expression
-    containing a binary operator. Recurses through arbitrarily many
-    layers of unary `+`/`-` down to a bare integer `Literal`, applying
-    each layer's sign to the inner result - `-(-1)` unwraps as
-    `-(-(1))` = `-(-1)` = `1`, matching sqlite3's own ordinal reading,
-    not the arithmetic value of a doubly-negated *expression* (which
-    would also be `1` here, coincidentally; the point is this function
-    never evaluates arithmetic, it only walks node shapes)."""
-    if isinstance(expr, Literal) and isinstance(expr.value, int) and not isinstance(expr.value, bool):
-        return expr.value
-    if isinstance(expr, UnaryOp):
-        inner = _ordinal_value(expr.operand)
-        if inner is None:
-            return None
-        return inner if expr.op is UnaryOperator.POS else -inner
+    containing a binary operator. Unwraps arbitrarily many layers of
+    unary `+`/`-` down to a bare integer `Literal`, applying each
+    layer's sign to the inner result - `-(-1)` unwraps as `-(-(1))` =
+    `-(-1)` = `1`, matching sqlite3's own ordinal reading, not the
+    arithmetic value of a doubly-negated *expression* (which would also
+    be `1` here, coincidentally; the point is this function never
+    evaluates arithmetic, it only walks node shapes).
+
+    A loop, not recursion (issue #107): the unary chain is walked down
+    once, counting the minus signs, and the sign is applied at the
+    bottom - `- - ... 1` with 999 operators is ordinal -1 whatever the
+    caller's stack depth."""
+    negate = False
+    node = expr
+    while isinstance(node, UnaryOp):
+        if node.op is UnaryOperator.NEG:
+            negate = not negate
+        node = node.operand
+    if isinstance(node, Literal) and isinstance(node.value, int) and not isinstance(node.value, bool):
+        return -node.value if negate else node.value
     return None
 
 
@@ -1138,98 +1176,41 @@ def _split_for_grouped_check(
     aggregate call for the one caller where an aggregate call is
     required to match a select-list item rather than being exempt by
     virtue of being an aggregate at all.
+
+    A loop over an explicit stack (issue #107), visiting nodes in
+    pre-order, left to right - operands pushed in reverse - so "first"
+    means what it always has: the leftmost bad node. At every node the
+    whole subtree is first matched against every key; a match, an
+    aggregate call, a column and a literal are never walked into.
     """
+    has_aggregate = False
+    bad: Expr | None = None
+    pending: list[Expr] = [expr]
+    while pending:
+        node = pending.pop()
+        if _matches_any_key(node, group_keys):
+            continue
+        if isinstance(node, FunctionCall):
+            has_aggregate = True
+            if strict_function_calls and bad is None:
+                bad = node
+            continue
+        if isinstance(node, BoundColumnRef):
+            if bad is None:
+                bad = node
+            continue
+        if isinstance(node, ColumnRef):
+            raise AssertionError("sql/binder.py: _split_for_grouped_check needs a bound tree")
+        for operand in reversed(_operands(node)):
+            pending.append(operand)
+    return has_aggregate, bad
+
+
+def _matches_any_key(expr: Expr, group_keys: tuple[Expr, ...]) -> bool:
     for key in group_keys:
         if _expr_shape_equal(expr, key):
-            return False, None
-    if isinstance(expr, FunctionCall):
-        return True, expr if strict_function_calls else None
-    if isinstance(expr, BoundColumnRef):
-        return False, expr
-    if isinstance(expr, Literal):
-        return False, None
-    if isinstance(expr, Star):
-        return False, None
-    if isinstance(expr, UnaryOp):
-        return _split_for_grouped_check(
-            expr.operand, group_keys, strict_function_calls=strict_function_calls
-        )
-    if isinstance(expr, Not):
-        return _split_for_grouped_check(
-            expr.operand, group_keys, strict_function_calls=strict_function_calls
-        )
-    if isinstance(expr, BinaryOp):
-        left_has, left_bad = _split_for_grouped_check(
-            expr.left, group_keys, strict_function_calls=strict_function_calls
-        )
-        right_has, right_bad = _split_for_grouped_check(
-            expr.right, group_keys, strict_function_calls=strict_function_calls
-        )
-        return left_has or right_has, left_bad or right_bad
-    if isinstance(expr, And):
-        left_has, left_bad = _split_for_grouped_check(
-            expr.left, group_keys, strict_function_calls=strict_function_calls
-        )
-        right_has, right_bad = _split_for_grouped_check(
-            expr.right, group_keys, strict_function_calls=strict_function_calls
-        )
-        return left_has or right_has, left_bad or right_bad
-    if isinstance(expr, Or):
-        left_has, left_bad = _split_for_grouped_check(
-            expr.left, group_keys, strict_function_calls=strict_function_calls
-        )
-        right_has, right_bad = _split_for_grouped_check(
-            expr.right, group_keys, strict_function_calls=strict_function_calls
-        )
-        return left_has or right_has, left_bad or right_bad
-    if isinstance(expr, Is):
-        left_has, left_bad = _split_for_grouped_check(
-            expr.left, group_keys, strict_function_calls=strict_function_calls
-        )
-        right_has, right_bad = _split_for_grouped_check(
-            expr.right, group_keys, strict_function_calls=strict_function_calls
-        )
-        return left_has or right_has, left_bad or right_bad
-    if isinstance(expr, Like):
-        left_has, left_bad = _split_for_grouped_check(
-            expr.left, group_keys, strict_function_calls=strict_function_calls
-        )
-        pattern_has, pattern_bad = _split_for_grouped_check(
-            expr.pattern, group_keys, strict_function_calls=strict_function_calls
-        )
-        if expr.escape is not None:
-            escape_has, escape_bad = _split_for_grouped_check(
-                expr.escape, group_keys, strict_function_calls=strict_function_calls
-            )
-        else:
-            escape_has, escape_bad = False, None
-        return (
-            left_has or pattern_has or escape_has,
-            left_bad or pattern_bad or escape_bad,
-        )
-    if isinstance(expr, In):
-        has, bad = _split_for_grouped_check(
-            expr.left, group_keys, strict_function_calls=strict_function_calls
-        )
-        for value in expr.values:
-            value_has, value_bad = _split_for_grouped_check(
-                value, group_keys, strict_function_calls=strict_function_calls
-            )
-            has = has or value_has
-            bad = bad or value_bad
-        return has, bad
-    if isinstance(expr, Between):
-        op_has, op_bad = _split_for_grouped_check(
-            expr.operand, group_keys, strict_function_calls=strict_function_calls
-        )
-        low_has, low_bad = _split_for_grouped_check(
-            expr.low, group_keys, strict_function_calls=strict_function_calls
-        )
-        high_has, high_bad = _split_for_grouped_check(
-            expr.high, group_keys, strict_function_calls=strict_function_calls
-        )
-        return op_has or low_has or high_has, op_bad or low_bad or high_bad
-    raise AssertionError(f"sql/binder.py: unhandled expression node type {type(expr).__name__}")
+            return True
+    return False
 
 
 def _check_grouped_select_list(

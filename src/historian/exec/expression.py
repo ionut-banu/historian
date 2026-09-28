@@ -10,9 +10,12 @@ dependencies."*
 Consumes the bound tree `sql/binder.py` produces: `BoundColumnRef` for
 every column reference, every other node reused unchanged from
 `sql/ast.py` per that module's own docstring. `evaluate()` is a single
-recursive dispatcher, structured the same way `sql/binder.py`'s
-`_bind_expr` is - an explicit `isinstance` chain, no dynamic dispatch,
-no metaclasses (`AGENTS.md`).
+dispatcher, an explicit `isinstance` chain with no dynamic dispatch and
+no metaclasses (`AGENTS.md`). Since issue #107 it is a loop over an
+explicit work stack rather than a function calling itself per node, so
+Python's stack does not grow with the tree; the text below still says
+"recursive dispatch" for evaluating an operand from inside a node's
+own evaluation, which is what the work stack does, in the same order.
 
 `Value` or `Bool3`, decided by node shape, not calling context
 ------------------------------------------------------------------
@@ -71,11 +74,11 @@ and arithmetic/unary-minus's operand - still raised a bare `TypeError`
 one level deeper than either root. Issue #63 closes that gap the same
 structural way: `coerce_to_value` gains callers *inside* `evaluate()`'s
 own recursive dispatch, exactly mirroring how `coerce_to_bool3` already
-had one for `And`/`Or`/`Not` - `_evaluate_affinity_pair` wraps both of
+had one for `And`/`Or`/`Not` - `_affinity_pair` wraps both of
 its `evaluate()` calls in `coerce_to_value` before affinity is applied
 (fixing comparison, `IS`, `BETWEEN`, and `IN` in one shared chokepoint,
-since all four route their operands through it), and `_eval_binary`'s
-`||`/arithmetic branches, `_eval_like`, and `_eval_unary`'s `-` branch
+since all four route their operands through it), and `_finish_binary`'s
+`||`/arithmetic branches, `_finish_like`, and `_finish_negate`
 each do the same at their own call site. Still no `position` parameter:
 each of these already knows, structurally, that the operand it is about
 to hand to `values.eq`/`_coerce_to_text`/`arithmetic_operand` must be a
@@ -121,6 +124,7 @@ from __future__ import annotations
 
 import math
 import re
+from enum import Enum, auto
 
 from historian import values
 from historian.ascii import ascii_fold, is_ascii_digit
@@ -211,6 +215,25 @@ class EvalError(Exception):
         self.position = position
 
 
+class _Step(Enum):
+    """What `evaluate()` does with one entry of its work stack - see
+    `evaluate()`. `EVAL` starts a node; every other step finishes one
+    whose operands have already been evaluated onto the value stack."""
+
+    EVAL = auto()
+    FINISH_BINARY = auto()
+    FINISH_NEGATE = auto()
+    FINISH_IS = auto()
+    AND_AFTER_LEFT = auto()
+    FINISH_AND = auto()
+    OR_AFTER_LEFT = auto()
+    FINISH_OR = auto()
+    FINISH_NOT = auto()
+    FINISH_LIKE = auto()
+    FINISH_IN = auto()
+    FINISH_BETWEEN = auto()
+
+
 def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
     """Evaluate *expr* against *row*, described by *schema*.
 
@@ -218,65 +241,196 @@ def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
     `historian.values.Bool3` for a predicate-shaped one - see the
     module docstring for exactly which shapes are which and why that
     split is structural rather than context-driven.
+
+    Not recursive (issue #107): one loop over an explicit work stack of
+    `(step, node)` pairs and a value stack of finished results, so the
+    Python stack does not grow with the tree. A recursive walk crashed
+    with `RecursionError` from about 330 levels (three frames per level
+    for a comparison), well inside what SQLite itself evaluates, and a
+    bound tree can be taller still than any parsed one (a select-list
+    alias spliced into `WHERE`). `_Step.EVAL` on a node pushes a finish
+    step for it and then its operands, in reverse, so they are
+    evaluated left to right - the same order, operand for operand, as
+    the recursive version this replaces, which keeps which error is
+    raised first, and every short-circuit, unchanged:
+
+    - `AND`/`OR` evaluate the left operand, then decide
+      (`AND_AFTER_LEFT`/`OR_AFTER_LEFT`) whether the right one is
+      needed at all (issue #51).
+    - `IN` evaluates the left operand once per list element, paired
+      with that element, and not at all for `IN ()`; `BETWEEN`
+      evaluates its operand twice, once per bound (#137 tracks both).
+    - `LIKE` evaluates `left`, `pattern`, then `escape`, before any
+      check on the escape.
+
+    Each finish step is a plain function below (`_finish_binary`,
+    `_finish_like`, ...) over already-evaluated operands.
     """
-    if isinstance(expr, Literal):
-        return expr.value
-    if isinstance(expr, BoundColumnRef):
-        return row[expr.offset]
-    if isinstance(expr, Star):
+    work: list[tuple[_Step, Expr]] = [(_Step.EVAL, expr)]
+    results: list[Value | Bool3] = []
+    while work:
+        step, node = work.pop()
+        if step is _Step.EVAL:
+            _start(node, row, work, results)
+        elif step is _Step.FINISH_BINARY:
+            right = results.pop()
+            left = results.pop()
+            results.append(_finish_binary(node, left, right, schema))
+        elif step is _Step.FINISH_NEGATE:
+            results.append(_finish_negate(results.pop()))
+        elif step is _Step.FINISH_IS:
+            right = results.pop()
+            left = results.pop()
+            results.append(_finish_is(node, left, right, schema))
+        elif step is _Step.AND_AFTER_LEFT:
+            left_bool3 = coerce_to_bool3(results.pop())
+            if left_bool3 is False:
+                # Short-circuit (issue #51): SQLite evaluates AND left to
+                # right and stops once the left operand is FALSE, never
+                # touching the right - see the module docstring's "Short-
+                # circuit AND/OR" section. Exact under three-valued logic:
+                # and3(FALSE, x) is FALSE for every x, NULL included, so
+                # this changes nothing about the *result*, only whether the
+                # right operand is evaluated at all. A NULL left operand is
+                # not "decided" and still falls through.
+                results.append(False)
+            else:
+                results.append(left_bool3)
+                work.append((_Step.FINISH_AND, node))
+                work.append((_Step.EVAL, node.right))
+        elif step is _Step.FINISH_AND:
+            right_bool3 = coerce_to_bool3(results.pop())
+            left_bool3 = results.pop()
+            results.append(values.and3(left_bool3, right_bool3))
+        elif step is _Step.OR_AFTER_LEFT:
+            left_bool3 = coerce_to_bool3(results.pop())
+            if left_bool3 is True:
+                # Short-circuit (issue #51): or3(TRUE, x) is TRUE for every
+                # x, NULL included - same reasoning as AND above, mirrored.
+                results.append(True)
+            else:
+                results.append(left_bool3)
+                work.append((_Step.FINISH_OR, node))
+                work.append((_Step.EVAL, node.right))
+        elif step is _Step.FINISH_OR:
+            right_bool3 = coerce_to_bool3(results.pop())
+            left_bool3 = results.pop()
+            results.append(values.or3(left_bool3, right_bool3))
+        elif step is _Step.FINISH_NOT:
+            results.append(values.not3(coerce_to_bool3(results.pop())))
+        elif step is _Step.FINISH_LIKE:
+            escape = results.pop() if node.escape is not None else None
+            pattern = results.pop()
+            left = results.pop()
+            results.append(_finish_like(node, left, pattern, escape))
+        elif step is _Step.FINISH_IN:
+            count = 2 * len(node.values)
+            pairs = results[len(results) - count :]
+            del results[len(results) - count :]
+            results.append(_finish_in(node, pairs, schema))
+        elif step is _Step.FINISH_BETWEEN:
+            high = results.pop()
+            operand_for_high = results.pop()
+            low = results.pop()
+            operand_for_low = results.pop()
+            results.append(_finish_between(node, operand_for_low, low, operand_for_high, high, schema))
+        else:
+            raise AssertionError(f"exec/expression.py: unhandled evaluation step {step}")
+    (result,) = results
+    return result
+
+
+def _start(
+    node: Expr, row: Row, work: list[tuple[_Step, Expr]], results: list[Value | Bool3]
+) -> None:
+    """`evaluate()`'s `_Step.EVAL`: a leaf's value goes straight onto
+    *results*; any other node pushes its finish step onto *work*, then
+    its operands in reverse, so they come off the stack - and are
+    evaluated - left to right."""
+    if isinstance(node, Literal):
+        results.append(node.value)
+        return
+    if isinstance(node, BoundColumnRef):
+        results.append(row[node.offset])
+        return
+    if isinstance(node, Star):
         # The binder expands every Star before this module ever sees a
         # tree (per sql/binder.py's own docstring) - reaching here is
         # a "should never happen" bug upstream, not UX to design for.
         raise AssertionError(
             "exec/expression.py: a Star reached the evaluator; the binder must expand it first"
         )
-    if isinstance(expr, FunctionCall):
+    if isinstance(node, FunctionCall):
         raise EvalError(
-            f"{expr.name}(...) is not supported here: aggregate and scalar function calls are "
+            f"{node.name}(...) is not supported here: aggregate and scalar function calls are "
             "not evaluated by exec/expression.py (see its module docstring)",
-            expr.position,
+            node.position,
         )
-    if isinstance(expr, BinaryOp):
-        return _eval_binary(expr, row, schema)
-    if isinstance(expr, UnaryOp):
-        return _eval_unary(expr, row, schema)
-    if isinstance(expr, Is):
-        return _eval_is(expr, row, schema)
-    if isinstance(expr, And):
-        left_bool3 = coerce_to_bool3(evaluate(expr.left, row, schema))
-        if left_bool3 is False:
-            # Short-circuit (issue #51): SQLite evaluates AND left to
-            # right and stops once the left operand is FALSE, never
-            # touching the right - see the module docstring's "Short-
-            # circuit AND/OR" section. Exact under three-valued logic:
-            # and3(FALSE, x) is FALSE for every x, NULL included, so
-            # this changes nothing about the *result*, only whether the
-            # right operand's evaluate() call happens at all. A NULL
-            # left operand is not "decided" and still falls through.
-            return False
-        return values.and3(
-            left_bool3,
-            coerce_to_bool3(evaluate(expr.right, row, schema)),
-        )
-    if isinstance(expr, Or):
-        left_bool3 = coerce_to_bool3(evaluate(expr.left, row, schema))
-        if left_bool3 is True:
-            # Short-circuit (issue #51): or3(TRUE, x) is TRUE for every
-            # x, NULL included - same reasoning as AND above, mirrored.
-            return True
-        return values.or3(
-            left_bool3,
-            coerce_to_bool3(evaluate(expr.right, row, schema)),
-        )
-    if isinstance(expr, Not):
-        return values.not3(coerce_to_bool3(evaluate(expr.operand, row, schema)))
-    if isinstance(expr, Like):
-        return _eval_like(expr, row, schema)
-    if isinstance(expr, In):
-        return _eval_in(expr, row, schema)
-    if isinstance(expr, Between):
-        return _eval_between(expr, row, schema)
-    raise AssertionError(f"exec/expression.py: unhandled expression node type {type(expr).__name__}")
+    if isinstance(node, BinaryOp):
+        work.append((_Step.FINISH_BINARY, node))
+        work.append((_Step.EVAL, node.right))
+        work.append((_Step.EVAL, node.left))
+        return
+    if isinstance(node, UnaryOp):
+        if node.op is UnaryOperator.POS:
+            # `+x` is `x`, untouched - see `_finish_negate`'s docstring.
+            work.append((_Step.EVAL, node.operand))
+            return
+        if (
+            isinstance(node.operand, Literal)
+            and isinstance(node.operand.value, float)
+            and node.operand.value == _INT64_MIN_MAGNITUDE_AS_FLOAT
+        ):
+            # `-9223372036854775808` written in source - see
+            # `_finish_negate`'s docstring.
+            results.append(INT64_MIN)
+            return
+        work.append((_Step.FINISH_NEGATE, node))
+        work.append((_Step.EVAL, node.operand))
+        return
+    if isinstance(node, Is):
+        work.append((_Step.FINISH_IS, node))
+        work.append((_Step.EVAL, node.right))
+        work.append((_Step.EVAL, node.left))
+        return
+    if isinstance(node, And):
+        work.append((_Step.AND_AFTER_LEFT, node))
+        work.append((_Step.EVAL, node.left))
+        return
+    if isinstance(node, Or):
+        work.append((_Step.OR_AFTER_LEFT, node))
+        work.append((_Step.EVAL, node.left))
+        return
+    if isinstance(node, Not):
+        work.append((_Step.FINISH_NOT, node))
+        work.append((_Step.EVAL, node.operand))
+        return
+    if isinstance(node, Like):
+        work.append((_Step.FINISH_LIKE, node))
+        if node.escape is not None:
+            work.append((_Step.EVAL, node.escape))
+        work.append((_Step.EVAL, node.pattern))
+        work.append((_Step.EVAL, node.left))
+        return
+    if isinstance(node, In):
+        if not node.values:
+            # `IN ()` folds over zero elements: FALSE, and the left
+            # operand is never evaluated - see `_finish_in`.
+            results.append(values.not3(False) if node.negated else False)
+            return
+        work.append((_Step.FINISH_IN, node))
+        for element in reversed(node.values):
+            work.append((_Step.EVAL, element))
+            work.append((_Step.EVAL, node.left))
+        return
+    if isinstance(node, Between):
+        work.append((_Step.FINISH_BETWEEN, node))
+        work.append((_Step.EVAL, node.high))
+        work.append((_Step.EVAL, node.operand))
+        work.append((_Step.EVAL, node.low))
+        work.append((_Step.EVAL, node.operand))
+        return
+    raise AssertionError(f"exec/expression.py: unhandled expression node type {type(node).__name__}")
 
 
 # --- The Value/Bool3 coercion boundary (issues #38, #63) -------------------
@@ -298,11 +452,11 @@ def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
 # `BETWEEN`'s operand/low/high, `IN`'s left operand and each list element,
 # `||`'s two sides, `LIKE`'s two sides, and arithmetic/unary-minus's operand
 # - still raised a bare TypeError. `coerce_to_value` now has callers
-# *inside* evaluate()'s own recursive dispatch too: `_evaluate_affinity_pair`
+# *inside* evaluate()'s own recursive dispatch too: `_affinity_pair`
 # wraps both its `evaluate()` calls in `coerce_to_value` before affinity is
 # applied (one shared chokepoint fixing comparison, `IS`, `BETWEEN`, and
-# `IN`, since all four route their operands through it), and `_eval_binary`'s
-# `||`/arithmetic branches, `_eval_like`, and `_eval_unary`'s `-` branch each
+# `IN`, since all four route their operands through it), and `_finish_binary`'s
+# `||`/arithmetic branches, `_finish_like`, and `_finish_negate` each
 # add their own call, equally small. Same non-`position` reasoning as
 # `coerce_to_bool3`'s second caller below: each of these already knows,
 # structurally, that its own operand must be a `Value`, from the node it is
@@ -397,7 +551,14 @@ def coerce_to_bool3(result: Value | Bool3) -> Bool3:
     return arithmetic_operand(result) != 0
 
 
-def _eval_between(expr: Between, row: Row, schema: Schema) -> Bool3:
+def _finish_between(
+    expr: Between,
+    operand_for_low: Value | Bool3,
+    low: Value | Bool3,
+    operand_for_high: Value | Bool3,
+    high: Value | Bool3,
+    schema: Schema,
+) -> Bool3:
     """`x BETWEEN low AND high` is `values.and3(values.ge(x, low),
     values.le(x, high))`, per this issue's own criteria - not bespoke
     logic. Confirmed against `sqlite3`: `20 BETWEEN 30 AND NULL` is
@@ -405,9 +566,17 @@ def _eval_between(expr: Between, row: Row, schema: Schema) -> Bool3:
     `FALSE`, and `and3(FALSE, NULL)` is `FALSE`. Affinity is applied
     to each bound independently: `x`'s own affinity can interact
     differently with `low` and with `high`.
+
+    `evaluate()` has already evaluated, in this order, the operand, the
+    low bound, the operand again and the high bound (#137 tracks the
+    second evaluation of the operand).
     """
-    operand_low_left, operand_low_right = _evaluate_affinity_pair(expr.operand, expr.low, row, schema)
-    operand_high_left, operand_high_right = _evaluate_affinity_pair(expr.operand, expr.high, row, schema)
+    operand_low_left, operand_low_right = _affinity_pair(
+        expr.operand, operand_for_low, expr.low, low, schema
+    )
+    operand_high_left, operand_high_right = _affinity_pair(
+        expr.operand, operand_for_high, expr.high, high, schema
+    )
     result = values.and3(
         values.ge(operand_low_left, operand_low_right),
         values.le(operand_high_left, operand_high_right),
@@ -415,7 +584,7 @@ def _eval_between(expr: Between, row: Row, schema: Schema) -> Bool3:
     return values.not3(result) if expr.negated else result
 
 
-def _eval_in(expr: In, row: Row, schema: Schema) -> Bool3:
+def _finish_in(expr: In, pairs: list[Value | Bool3], schema: Schema) -> Bool3:
     """`x IN (v1, ..., vn)` is `values.or3` folded over each
     `values.eq(x, vi)`, per this issue's own criteria - not bespoke
     NULL-handling logic. Confirmed against `sqlite3`: `5 IN (5,
@@ -439,21 +608,28 @@ def _eval_in(expr: In, row: Row, schema: Schema) -> Bool3:
     once per element independently: `x IN ('5', 'abc')` still converts
     `'5'` and `'abc'` against `x`'s affinity individually, per the
     already-correct `test_in_applies_affinity_to_each_element_independently`.
-    `_evaluate_affinity_pair`'s `right_has_affinity=False` is the
+    `_affinity_pair`'s `right_has_affinity=False` is the
     single change this makes: `x`'s own affinity still applies to each
     element, the element's affinity never does.
 
-    This is genuinely different from `_eval_between`, not a case that
+    This is genuinely different from `_finish_between`, not a case that
     "tidying" the two onto one path would preserve: a `BETWEEN` bound
     is an independent RHS operand, symmetric with `=`, and keeps its
     own affinity. Confirmed against `sqlite3` for the identical
     operand shape, same row (`n = 1`): `'1' BETWEEN n AND n` -> `1`,
-    `'1' IN (n)` -> `0`. `_eval_between` is intentionally left calling
-    `_evaluate_affinity_pair` with its default `right_has_affinity=True`.
+    `'1' IN (n)` -> `0`. `_finish_between` is intentionally left calling
+    `_affinity_pair` with its default `right_has_affinity=True`.
+
+    *pairs* is what `evaluate()` produced for a non-empty list: the left
+    operand and then the element, once per element, in list order -
+    `[x, v1, x, v2, ...]`. `IN ()` never reaches here: `evaluate()`
+    answers it without evaluating the left operand at all.
     """
     result: Bool3 = False
-    for element in expr.values:
-        left, right = _evaluate_affinity_pair(expr.left, element, row, schema, right_has_affinity=False)
+    for index, element in enumerate(expr.values):
+        left, right = _affinity_pair(
+            expr.left, pairs[2 * index], element, pairs[2 * index + 1], schema, right_has_affinity=False
+        )
         result = values.or3(result, values.eq(left, right))
     return values.not3(result) if expr.negated else result
 
@@ -483,7 +659,7 @@ def _like_pattern_to_regex(pattern: str, escape: str | None = None) -> re.Patter
     'a_!%' escape '!';` -> `1`.
 
     *escape* (issue #51), when given, is a single character read from
-    *pattern* **before** any ASCII fold - `_eval_like` below passes the
+    *pattern* **before** any ASCII fold - `_finish_like` below passes the
     caller's raw, un-folded pattern text, never `ascii_fold`ed first,
     because escape-character recognition is case-sensitive / exact-
     codepoint even though `LIKE`'s *matched text* comparison is
@@ -495,7 +671,7 @@ def _like_pattern_to_regex(pattern: str, escape: str | None = None) -> re.Patter
     `X`); `select 'a%b' like 'aXb' escape 'x';` -> `0`; `select 'a%b'
     like 'ax%b' escape 'X';` -> `0`. Folding first (i.e. scanning
     `ascii_fold(pattern)` for the escape character) would make
-    recognition wrongly case-insensitive - this is why `_eval_like`
+    recognition wrongly case-insensitive - this is why `_finish_like`
     folds only the characters that end up literal, one at a time,
     inside this function, rather than folding the whole pattern text up
     front the way it still does for `left_text`.
@@ -538,7 +714,9 @@ def _like_pattern_to_regex(pattern: str, escape: str | None = None) -> re.Patter
     return re.compile("".join(pieces), re.DOTALL)
 
 
-def _eval_like(expr: Like, row: Row, schema: Schema) -> Bool3:
+def _finish_like(
+    expr: Like, left_result: Value | Bool3, pattern_result: Value | Bool3, escape_result: Value | Bool3
+) -> Bool3:
     """`LIKE` / `NOT LIKE` [`ESCAPE <expr>`] (the clause added by issue
     #51). Confirmed against `sqlite3`: unlike every comparison above,
     `LIKE` never applies column affinity - both operands are cast to
@@ -551,7 +729,7 @@ def _eval_like(expr: Like, row: Row, schema: Schema) -> Bool3:
     keeps `NULL` propagation correct through the negation for free.
 
     The escape operand (when `expr.escape is not None`) goes through
-    the same `coerce_to_value(evaluate(...))` pipeline as `left`/
+    the same `coerce_to_value` pipeline as `left`/
     `pattern` (#63's coercion applies here too - `ESCAPE (1=1)` reads
     as the text `'1'`, confirmed: `select '1' like '11' escape (1=1);`
     -> `1`) and is evaluated **unconditionally**, before the combined
@@ -578,13 +756,17 @@ def _eval_like(expr: Like, row: Row, schema: Schema) -> Bool3:
     like '10!%' escape '!!';` raise the same text. This still applies
     under `NOT LIKE`, before the negation, the same as `NULL`
     propagation already does.
+
+    The three operands arrive already evaluated by `evaluate()`, in the
+    order `left`, `pattern`, `escape` (*escape_result* is `None` when
+    there is no `ESCAPE` clause).
     """
-    left = coerce_to_value(evaluate(expr.left, row, schema))
-    pattern = coerce_to_value(evaluate(expr.pattern, row, schema))
+    left = coerce_to_value(left_result)
+    pattern = coerce_to_value(pattern_result)
     escape_char: str | None = None
     escape_is_null = False
     if expr.escape is not None:
-        escape_value = coerce_to_value(evaluate(expr.escape, row, schema))
+        escape_value = coerce_to_value(escape_result)
         if escape_value is None:
             escape_is_null = True
         else:
@@ -693,8 +875,10 @@ def try_numeric_affinity(value: Value) -> Value:
 _INT64_MIN_MAGNITUDE_AS_FLOAT = 9223372036854775808.0
 
 
-def _eval_unary(expr: UnaryOp, row: Row, schema: Schema) -> Value:
-    """Unary `+`/`-`.
+def _finish_negate(operand_result: Value | Bool3) -> Value:
+    """Unary `-`, over its already-evaluated operand; unary `+` and the
+    int64-minimum literal never get here - `evaluate()` handles both
+    itself (`_start`), for the reasons below.
 
     `-` performs real numeric negation, going through the same
     leading-prefix text coercion arithmetic uses (`-'5'` is `-5`,
@@ -727,15 +911,7 @@ def _eval_unary(expr: UnaryOp, row: Row, schema: Schema) -> Value:
     explicitly `.0`-spelled REAL literal of the same value, and
     `sql/ast.py` is out of scope for this issue).
     """
-    if expr.op is UnaryOperator.POS:
-        return evaluate(expr.operand, row, schema)
-    if (
-        isinstance(expr.operand, Literal)
-        and isinstance(expr.operand.value, float)
-        and expr.operand.value == _INT64_MIN_MAGNITUDE_AS_FLOAT
-    ):
-        return INT64_MIN
-    operand = coerce_to_value(evaluate(expr.operand, row, schema))
+    operand = coerce_to_value(operand_result)
     if operand is None:
         return None
     numeric = arithmetic_operand(operand)
@@ -751,7 +927,7 @@ _ARITHMETIC_OPS = frozenset(
 )
 
 #: One `values.py` comparison function per comparison `Operator`. All
-#: six take affinity-adjusted operands - see `_eval_binary` below.
+#: six take affinity-adjusted operands - see `_finish_binary` below.
 _COMPARISON_FNS = {
     Operator.EQ: values.eq,
     Operator.NE: values.ne,
@@ -762,59 +938,69 @@ _COMPARISON_FNS = {
 }
 
 
-def _eval_binary(expr: BinaryOp, row: Row, schema: Schema) -> Value | Bool3:
+def _finish_binary(
+    expr: BinaryOp, left_result: Value | Bool3, right_result: Value | Bool3, schema: Schema
+) -> Value | Bool3:
     if expr.op in _ARITHMETIC_OPS:
-        left = coerce_to_value(evaluate(expr.left, row, schema))
-        right = coerce_to_value(evaluate(expr.right, row, schema))
+        left = coerce_to_value(left_result)
+        right = coerce_to_value(right_result)
         return _arithmetic(expr.op, left, right)
     if expr.op is Operator.CONCAT:
-        left = coerce_to_value(evaluate(expr.left, row, schema))
-        right = coerce_to_value(evaluate(expr.right, row, schema))
+        left = coerce_to_value(left_result)
+        right = coerce_to_value(right_result)
         if left is None or right is None:
             return None
         return _coerce_to_text(left) + _coerce_to_text(right)
     if expr.op in _COMPARISON_FNS:
-        left, right = _evaluate_affinity_pair(expr.left, expr.right, row, schema)
+        left, right = _affinity_pair(expr.left, left_result, expr.right, right_result, schema)
         return _COMPARISON_FNS[expr.op](left, right)
     raise AssertionError(f"exec/expression.py: BinaryOp operator not yet handled: {expr.op}")
 
 
-def _evaluate_affinity_pair(
-    left_expr: Expr, right_expr: Expr, row: Row, schema: Schema, *, right_has_affinity: bool = True
+def _affinity_pair(
+    left_expr: Expr,
+    left_result: Value | Bool3,
+    right_expr: Expr,
+    right_result: Value | Bool3,
+    schema: Schema,
+    *,
+    right_has_affinity: bool = True,
 ) -> tuple[Value, Value]:
-    """Evaluate both sides of a comparison-shaped pair of operands
-    (`=`/`<>`/.../`IS`/`IS NOT`, each bound of `BETWEEN`) and apply
-    column affinity to the result. Shared by every predicate that goes
-    through "the identical affinity algorithm" as `=` - which is every
-    caller except `_eval_in`.
+    """Apply column affinity to both sides of a comparison-shaped pair
+    of operands (`=`/`<>`/.../`IS`/`IS NOT`, each bound of `BETWEEN`),
+    already evaluated by `evaluate()`. *left_expr*/*right_expr* are the
+    nodes that produced them, which is all affinity looks at (see
+    `_affinity_of`). Shared by every predicate that goes through "the
+    identical affinity algorithm" as `=` - which is every caller except
+    `_finish_in`.
 
     `right_has_affinity` (issue #47) is the explicit, structural
-    escape hatch `_eval_in` uses: SQLite's own rule is that the
+    escape hatch `_finish_in` uses: SQLite's own rule is that the
     right-hand side of `IN`/`NOT IN` *with a list* has no affinity at
     all, regardless of what kind of expression a given element is -
     unlike `=`/`IS`/`BETWEEN`, where each operand independently asks
-    `_affinity_of` the normal way. `_eval_in` passes
+    `_affinity_of` the normal way. `_finish_in` passes
     `right_has_affinity=False` for every element; every other caller
     takes the default and is unaffected. A plain keyword parameter,
     not a dynamic-dispatch trick (`AGENTS.md`), and it does not touch
-    `_eval_between`, which must keep applying each bound's own
-    affinity independently - see `_eval_in`'s docstring for the
+    `_finish_between`, which must keep applying each bound's own
+    affinity independently - see `_finish_in`'s docstring for the
     evidence that the two operators, though structurally identical
     here, are not supposed to behave alike."""
-    left = coerce_to_value(evaluate(left_expr, row, schema))
-    right = coerce_to_value(evaluate(right_expr, row, schema))
+    left = coerce_to_value(left_result)
+    right = coerce_to_value(right_result)
     right_affinity = _affinity_of(right_expr, schema) if right_has_affinity else None
     return _apply_affinity(left, _affinity_of(left_expr, schema), right, right_affinity)
 
 
-def _eval_is(expr: Is, row: Row, schema: Schema) -> bool:
+def _finish_is(expr: Is, left_result: Value | Bool3, right_result: Value | Bool3, schema: Schema) -> bool:
     """`IS` / `IS NOT`, including the `IS NULL` / `IS NOT NULL`
     spelling (`sql/ast.py`'s own docstring: `IS NULL` is `IS` against
     a `NULL` literal, not a separate node). Goes through the identical
     affinity algorithm as `=`/`<>` before calling `values.is_`/
     `values.is_not` - confirmed against `sqlite3`: `5 IS '5'` is
     `FALSE` like `5 = '5'`, but `n IS '5'` (INTEGER column) is `TRUE`."""
-    left, right = _evaluate_affinity_pair(expr.left, expr.right, row, schema)
+    left, right = _affinity_pair(expr.left, left_result, expr.right, right_result, schema)
     return values.is_not(left, right) if expr.negated else values.is_(left, right)
 
 
@@ -1040,7 +1226,7 @@ def arithmetic_operand(value: Value) -> int | float:
     own `_rank` and this module's own `_coerce_to_text` already use for
     the identical reason (issue #63): a raw Python `bool` must never
     reach arithmetic. Not reachable through `evaluate()` itself once
-    `_eval_binary`'s arithmetic branch and `_eval_unary`'s `-` branch
+    `_finish_binary`'s arithmetic branch and `_finish_negate`
     both call `coerce_to_value()` on their operand first - this guard
     exists so a future regression that removes either call-site
     coercion fails loudly (a `TypeError` here) rather than silently

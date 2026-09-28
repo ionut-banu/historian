@@ -37,7 +37,7 @@ to remain independently true once M4 lands (see the comment on
   only ever knows how to do one thing: call `.scan()` with nothing
   pushed.
 - Step 4 (`run_historian`) always goes through the real
-  `tokenize -> parse -> bind -> plan -> tree.rows()` pipeline
+  `tokenize -> parse -> bind -> plan -> optimize -> tree.rows()` pipeline
   `cli.py:main` uses - never constructing a `ScanSource` or calling
   `.scan()` itself; `plan()` and `Scan` do that internally.
 
@@ -72,6 +72,7 @@ from historian.catalog import SCAN_FACTORIES as _DEFAULT_TABLES
 from historian.catalog import SCHEMAS
 from historian.exec.operators import ScanSource
 from historian.plan.planner import ScanFactory
+from historian.plan.optimizer import optimize
 from historian.plan.planner import plan
 from historian.schema import Row, Schema
 from historian.sql.binder import bind
@@ -156,7 +157,7 @@ def run_historian(
     query: str, repo: Path, tables: dict[str, ScanFactory] = _DEFAULT_TABLES
 ) -> tuple[Schema, list[Row]]:
     """Step 4: reproduce `cli.py:main`'s own pipeline exactly -
-    `tokenize -> parse -> bind -> plan -> tree.rows()` - and never
+    `tokenize -> parse -> bind -> plan -> optimize -> tree.rows()` - and never
     construct a `ScanSource` or call `.scan()` itself; `plan()` and
     `exec.operators.Scan` do that, the same way `cli.py` leaves it to
     them.
@@ -194,7 +195,7 @@ def run_historian(
     tokens = tokenize(query)
     stmt = parse(tokens)
     bound = bind(stmt, catalog=SCHEMAS)
-    tree = plan(bound, repo, tables=tables)
+    tree = optimize(plan(bound, repo, tables=tables))
     return tree.schema, list(tree.rows())
 
 

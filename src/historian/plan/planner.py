@@ -18,10 +18,10 @@ so a second tree type plus a translation pass between them would be
 ceremony with no decision behind it. `plan()` therefore builds
 `exec/operators.py`'s actual `Operator` instances directly - `Scan`,
 optionally `Filter`, then `Project` - and returns that tree as-is.
-There is no separate optimize/rewrite step (that begins at M4, #13's
-own sibling "Scan capability negotiation and predicate splitting" -
-unrelated to this issue's number, next milestone's work): the tree
-`plan()` returns is exactly what `main()` iterates.
+The one rewrite step after it is `plan/optimizer.py`'s `optimize()`
+(issue #121, pushdown negotiation), which `cli.py` calls on this
+tree before iterating it; it records pushed terms on the tree's
+`Scan` and changes nothing else.
 
 The table -> scan-factory mapping
 ------------------------------------
@@ -54,16 +54,15 @@ testable with a fake source and no repository - see `tests/
 test_planner.py`) and the *import graph* (this module imports neither
 `historian.tables.blame` nor `subprocess`, directly or indirectly).
 
-`Scan` gets nothing to negotiate
+`Scan` is built with nothing pushed
 ------------------------------------
 
-`exec/operators.py`'s own `Scan` already documents that pushdown does
-not exist yet: every `Scan` calls `source.scan(pushed=())`,
-unconditionally, whatever `source.capabilities()` reports. This
-module does not change that - it never calls `capabilities()` and
-never builds a `Predicate` or `PushdownKind` (neither type exists
-yet). Predicate splitting and negotiation is M4 (§6 items 13-14), not
-this issue.
+Every `Scan` this module builds pushes nothing (`pushed=()`), whatever
+`source.capabilities()` reports - this module never calls
+`capabilities()` or `accepts()`. Splitting `WHERE` into terms and
+negotiating them with the scan is `plan/optimizer.py` (issue #121), a
+separate step over the finished tree, so a caller that skips it
+(`--no-pushdown`, #43) gets exactly this module's tree.
 """
 
 from __future__ import annotations

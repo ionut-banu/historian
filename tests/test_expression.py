@@ -468,6 +468,110 @@ def test_modulo_text_operand_goes_through_leading_prefix_coercion(text, expected
     assert type(result) is type(expected)
 
 
+# Issue #106: `%` reads a TEXT operand's integer value with its own
+# digit-stop scan (SQLite's `sqlite3Atoi64`, reached from
+# `OP_Remainder` via `sqlite3VdbeIntValue`), never accepting `.` or an
+# exponent, clamped to int64 - while the REAL-vs-INTEGER class still
+# comes from the general conversion (`numericType`). tests/oracle.py,
+# module sqlite3 3.45.1: `'1e3' % 7` -> 1.0, `'1.5e2' % 7` -> 1.0,
+# `'-1e2' % 7` -> -1.0, `'2E1' % 7` -> 2.0, `'1e2abc' % 7` -> 1.0,
+# `'1e400' % 3` -> 1.0, `'99999999999999999999e0' % 7` -> 0.0 (int64
+# max % 7), `'-9223372036854775808e0' % 7` -> -1.0, `'5e' % 3` -> 2
+# INTEGER, `'abc' % 5` -> 0 INTEGER.
+
+
+@pytest.mark.parametrize(
+    "text,expected_int,expected_is_real",
+    [
+        ("1e3", 1, True),
+        ("1.5e2", 1, True),
+        ("-1e2", -1, True),
+        ("2E1", 2, True),
+        ("1e2abc", 1, True),
+        ("1e400", 1, True),
+        ("99999999999999999999e0", 9223372036854775807, True),
+        ("-9223372036854775808e0", -9223372036854775808, True),
+        ("-99999999999999999999.5", -9223372036854775808, True),
+        ("  +12e1", 12, True),
+        (".5", 0, True),
+        ("5e", 5, False),
+        ("7abc", 7, False),
+        ("abc", 0, False),
+        ("", 0, False),
+        ("- 12", 0, False),
+        ("9223372036854775807", 9223372036854775807, False),
+        ("9223372036854775808", 9223372036854775807, True),
+        ("-9223372036854775809", -9223372036854775808, True),
+        pytest.param("9" * 320, 9223372036854775807, True, id="320-nines"),
+        pytest.param("0" * 5000 + "12", 12, False, id="5000-zeros-then-12"),
+    ],
+)
+def test_modulo_text_operand_scan_stops_at_the_first_non_digit(
+    text, expected_int, expected_is_real
+):
+    from historian.exec.expression import _modulo_text_operand
+
+    value, is_real = _modulo_text_operand(text)
+    assert value == expected_int
+    assert type(value) is int
+    assert is_real is expected_is_real
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("1e3", 1.0),
+        ("1.5e2", 1.0),
+        ("-1e2", -1.0),
+        ("2E1", 2.0),
+        ("1e2abc", 1.0),
+        ("1e400", 1.0),
+    ],
+)
+def test_modulo_text_operand_with_an_exponent_through_evaluate(text, expected):
+    """`text % 7` - the digit-stop value, reported REAL. Values from
+    tests/oracle.py, 3.45.1 (`'1e400' % 7` -> 1.0 likewise)."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.MOD, _lit(text), _lit(7)), _ROW, _SCHEMA)
+    assert result == expected
+    assert type(result) is float
+
+
+def test_int64_truncated_clamps_positive_infinity_to_int64_max():
+    from historian.exec.expression import _int64_truncated
+    from historian.values import INT64_MAX
+
+    assert _int64_truncated(float("inf")) == INT64_MAX
+
+
+def test_int64_truncated_clamps_negative_infinity_to_int64_min():
+    from historian.exec.expression import _int64_truncated
+    from historian.values import INT64_MIN
+
+    assert _int64_truncated(float("-inf")) == INT64_MIN
+
+
+@pytest.mark.parametrize(
+    "left,right,expected",
+    [
+        (float("inf"), 3, 1.0),
+        (5, float("inf"), 5.0),
+        (5, float("-inf"), 5.0),
+        (float("inf"), float("inf"), 0.0),
+    ],
+)
+def test_modulo_infinite_real_operand_clamps_instead_of_crashing(left, right, expected):
+    """tests/oracle.py, 3.45.1: `('1e400'+0) % 3` -> 1.0, `5 %
+    ('1e400'+0)` -> 5.0, `5 % (-('1e400'+0))` -> 5.0, `('1e400'+0) %
+    ('1e400'+0)` -> 0.0."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.MOD, _lit(left), _lit(right)), _ROW, _SCHEMA)
+    assert result == expected
+    assert type(result) is float
+
+
 def test_modulo_comparison_result_as_operand():
     """sqlite3: `select (1=1)%2;` -> 1. The same `coerce_to_value` path
     issue #63 added for the other arithmetic operators, routed through

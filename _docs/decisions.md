@@ -2720,3 +2720,40 @@ matched 9420 of 9420 samples, but that path is platform-specific
 double-double path instead) and version-specific, so porting it is a
 decision for its own issue, not a side effect of this one. Every value
 #105's acceptance criteria name is an exact match.
+
+2026-09-28 - `%` reads TEXT with its own digit-stop scan, and clamps
+infinity
+
+Issue #106. `%` (#75) took its operands from `arithmetic_operand`,
+the same general text-to-number conversion as `+ - * /`, so `'1e3' %
+7` computed `1000 % 7` and gave `6.0`. SQLite gives `1.0`. Its
+`OP_Remainder` classifies each operand with `numericType` (the
+general conversion, which is why the result is REAL) but takes the
+integer it divides from `sqlite3VdbeIntValue`, which for TEXT is
+`sqlite3Atoi64`: whitespace, sign, digits, stop at the first
+non-digit, clamp to int64. For a REAL it is `doubleToInt64`, which
+clamps infinity like any other out-of-range magnitude.
+
+So a `%` TEXT operand now goes through `_modulo_text_operand`, a
+sibling of `_scan_number` rather than a change to it: the class still
+comes from `_coerce_arithmetic_text`, the value from a digit-stop scan
+whose digit run is range-checked by `_int64_digit_run` (#105) and
+clamped by sign when it does not fit. `_scan_number`,
+`arithmetic_operand` and `+ - * /` are unchanged. Confirmed with
+`tests/oracle.py` (module `sqlite3` 3.45.1): `'1e3' % 7` is `1.0`,
+`'1.5e2' % 7` is `1.0`, `'-1e2' % 7` is `-1.0`, `'1e400' % 3` is
+`1.0`, `'99999999999999999999e0' % 7` is `0.0` (int64 max % 7),
+`'5e' % 3` is the INTEGER `2` (a dangling exponent is not one), and
+`'abc' % 5` is the INTEGER `0`.
+
+`_int64_truncated` now returns `INT64_MAX`/`INT64_MIN` for `+inf`/
+`-inf` before calling `math.trunc`, which raised `OverflowError` and
+reached the exit-4 backstop for `('1e400'+0) % 3` and, since #105,
+for a 320-digit TEXT run. NaN cannot reach it: `squash_nan` makes a
+NaN operand NULL first.
+
+Not changed: `_NUMERIC_WHITESPACE` omits `\v`, which `sqlite3Atoi64`
+and `sqlite3AtoF` both skip (`'\v12' % 5` is `2` in `sqlite3`). The
+new scan uses the same constant as `_scan_number` so the value and
+the class cannot disagree about where a number starts; widening it is
+a change to every TEXT conversion, not to `%`.

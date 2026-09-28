@@ -472,3 +472,281 @@ def test_broken_pipe_while_writing_exits_0_and_prints_nothing(tiny_repo, capsys,
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ""
+
+
+# --- RecursionError is an internal error, never a repository failure (#107)
+
+
+def test_recursion_error_is_an_internal_error_not_a_repository_failure(
+    tiny_repo, capsys, monkeypatch
+):
+    """`RecursionError` is a `RuntimeError`, so before #107 the
+    repository-failure clause caught it: "could not read repository",
+    exit 3. Injected rather than provoked, like #49's own tests, so it
+    does not depend on a real bug existing: it now reaches the internal-
+    error backstop, exit 4, with the fixed message and nothing else."""
+    _plan_that_raises_while_materializing(monkeypatch, RecursionError)
+
+    ret = cli.main(["-C", str(tiny_repo), "SELECT path FROM blame"])
+
+    assert ret == 4
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == _INTERNAL_ERROR_MESSAGE
+    assert "could not read repository" not in captured.err
+    assert "RecursionError" not in captured.err
+    assert "injected-bug-marker" not in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_recursion_error_clause_is_ordered_before_the_repository_clause():
+    """The `except RecursionError` clause must come before `except
+    (OSError, RuntimeError)`, or the latter wins; checked on the source,
+    with the reason stated beside it."""
+    import inspect
+
+    source = inspect.getsource(cli.main)
+    recursion = source.index("except RecursionError")
+    repository = source.index("except (OSError, RuntimeError)")
+    assert recursion < repository
+    assert "`RecursionError` is a `RuntimeError`" in source
+
+
+def test_missing_repository_still_exits_3_with_its_message(tmp_path, capsys):
+    missing = tmp_path / "does-not-exist"
+
+    ret = cli.main(["-C", str(missing), "SELECT path FROM blame"])
+
+    assert ret == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"error: could not read repository: {missing}\n"
+
+
+def test_directory_without_git_still_exits_3_with_its_message(tmp_path, capsys):
+    not_a_repo = tmp_path / "just-a-directory"
+    not_a_repo.mkdir()
+
+    ret = cli.main(["-C", str(not_a_repo), "SELECT path FROM blame"])
+
+    assert ret == 3
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"error: could not read repository: {not_a_repo}\n"
+
+
+# --- Expression depth (issue #107) -----------------------------------------
+#
+# Expected values below are the oracle's (`tests/oracle.py`, sqlite3
+# 3.45.1): a chain of n `1`s joined by `+` is n, up to 1000 terms; 1001
+# is "Expression tree is too large (maximum depth 1000)".
+
+_DEPTH_ERROR = "error: Expression tree is too large (maximum depth 1000)\n"
+
+
+def _plus_chain(n: int, term: str = "1") -> str:
+    return " + ".join([term] * n)
+
+
+@pytest.mark.parametrize("terms", [600, 999, 1000])
+def test_deep_plus_chain_returns_its_sum(tiny_repo, capsys, terms):
+    """The review's own shape: `SELECT 1+1+...+1` with 600 terms used to
+    exit 3 ("could not read repository") from a `RecursionError` in the
+    evaluator. `tiny` has 3 blame rows."""
+    ret = cli.main(["-C", str(tiny_repo), f"SELECT {_plus_chain(terms)} AS n FROM blame"])
+
+    assert ret == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.splitlines() == ["n", str(terms), str(terms), str(terms)]
+
+
+def test_1001_term_chain_exits_1_with_sqlites_message(tiny_repo, capsys):
+    ret = cli.main(["-C", str(tiny_repo), f"SELECT {_plus_chain(1001)} FROM blame"])
+
+    assert ret == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == _DEPTH_ERROR
+
+
+def test_20000_term_chain_exits_1_with_sqlites_message(tiny_repo, capsys):
+    ret = cli.main(["-C", str(tiny_repo), f"SELECT {_plus_chain(20_000)} FROM blame"])
+
+    assert ret == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == _DEPTH_ERROR
+
+
+def test_too_deep_query_is_rejected_before_the_repository_is_read(tmp_path, capsys):
+    """The height check is part of parsing, so it fails before any git
+    call: a missing repository is never even looked at - exit 1, not 3."""
+    missing = tmp_path / "no" / "such" / "dir"
+
+    ret = cli.main(["-C", str(missing), f"SELECT {_plus_chain(1001)} FROM blame"])
+
+    assert ret == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == _DEPTH_ERROR
+
+
+def test_order_by_999_unary_minus_is_an_out_of_range_ordinal(tiny_repo, capsys):
+    """`ORDER BY - - ... 1` (999 operators) is ordinal -1 - a `BindError`,
+    exit 1, never `RecursionError` or exit 3. SQLite rejects the query
+    earlier, with "parser stack overflow" (from 95 operators), so this
+    is a plain test rather than a differential one; historian keeps
+    #8's 1000-operator ceiling on purpose."""
+    ret = cli.main(["-C", str(tiny_repo), f"SELECT path FROM blame ORDER BY {'- ' * 999}1"])
+
+    assert ret == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "ORDER BY term out of range" in captured.err
+
+
+def test_order_by_998_unary_minus_is_ordinal_1(tiny_repo, capsys):
+    ret = cli.main(["-C", str(tiny_repo), f"SELECT path FROM blame ORDER BY {'- ' * 998}1"])
+
+    assert ret == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.splitlines() == ["path", "feature/thing.py", "src/utils.py", "src/utils.py"]
+
+
+def test_limit_998_unary_minus_is_limit_1(tiny_repo, capsys):
+    """An even number of operators is `LIMIT 1`: one row."""
+    ret = cli.main(["-C", str(tiny_repo), f"SELECT path FROM blame LIMIT {'- ' * 998}1"])
+
+    assert ret == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert len(captured.out.splitlines()) == 2
+
+
+def test_limit_999_unary_minus_is_one_level_too_deep(tiny_repo, capsys):
+    """SQLite puts `LIMIT`'s expression under a LIMIT node of its own, so
+    999 operators and a literal are height 1001 there: exit 1, the
+    height message."""
+    ret = cli.main(["-C", str(tiny_repo), f"SELECT path FROM blame LIMIT {'- ' * 999}1"])
+
+    assert ret == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == _DEPTH_ERROR
+
+
+@pytest.mark.parametrize("clause", ["ORDER BY", "LIMIT"])
+def test_1000_unary_minus_exits_1_with_the_height_message(tiny_repo, capsys, clause):
+    ret = cli.main(["-C", str(tiny_repo), f"SELECT path FROM blame {clause} {'- ' * 1000}1"])
+
+    assert ret == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == _DEPTH_ERROR
+
+
+def _oracle_scalar(expr: str):
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        return conn.execute(f"SELECT {expr}").fetchone()[0]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "long_ops, short_ops",
+    [
+        pytest.param("NOT " * 999, "NOT " * 93, id="not"),
+        pytest.param("- " * 999, "- " * 93, id="minus"),
+        pytest.param("+ " * 999, "+ " * 93, id="plus"),
+        # 500 minus signs in the long chain, 46 in the short one: both even.
+        pytest.param("- + " * 499 + "- ", "- + " * 46 + "+ ", id="mixed"),
+    ],
+)
+def test_999_operator_unary_chain_matches_the_oracles_short_chain(
+    tiny_repo, capsys, long_ops, short_ops
+):
+    """SQLite itself only accepts up to 94 of these operators (parser
+    stack overflow from 95), so the expected value is the oracle's
+    answer for a 93-operator chain with the same parity - every pair of
+    operators cancels."""
+    expected = _oracle_scalar(f"{short_ops}1")
+
+    ret = cli.main(["-C", str(tiny_repo), f"SELECT {long_ops}1 AS v FROM blame"])
+
+    assert ret == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.splitlines() == ["v", str(expected), str(expected), str(expected)]
+
+
+def test_deep_where_matching_nothing_prints_only_the_header(tiny_repo, capsys):
+    where = " AND ".join(["path = 'zzz-no-such-file'"] * 999)
+
+    ret = cli.main(["-C", str(tiny_repo), f"SELECT path FROM blame WHERE {where}"])
+
+    assert ret == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.splitlines() == ["path"]
+
+
+def test_deep_aggregate_over_zero_rows_is_one_row(tiny_repo, capsys):
+    query = (
+        f"SELECT count(*) AS c, max({_plus_chain(999, 'line_no')}) AS m "
+        "FROM blame WHERE path = 'zzz-no-such-file'"
+    )
+
+    ret = cli.main(["-C", str(tiny_repo), query])
+
+    assert ret == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert [line.split() for line in captured.out.splitlines()] == [["c", "m"], ["0", "NULL"]]
+
+
+def _call_at_depth(extra_frames: int, fn):
+    """Call *fn* with *extra_frames* more Python frames already on the
+    stack than the caller had."""
+    if extra_frames == 0:
+        return fn()
+    return _call_at_depth(extra_frames - 1, fn)
+
+
+@pytest.mark.parametrize(
+    "query, expected_exit",
+    [
+        # Accepted, and the deepest shape there is: a 999-term alias
+        # spliced into a 999-term WHERE expression, a bound tree ~2000
+        # levels tall.
+        pytest.param(
+            f"SELECT {_plus_chain(999, 'line_no')} AS c FROM blame "
+            f"WHERE c + {_plus_chain(998, 'line_no')} > 0 ORDER BY {_plus_chain(1000, 'line_no')}",
+            0,
+            id="accepted",
+        ),
+        pytest.param(f"SELECT {_plus_chain(1001)} FROM blame", 1, id="rejected"),
+    ],
+)
+def test_outcome_does_not_depend_on_the_callers_stack_depth(tiny_repo, capsys, query, expected_exit):
+    """AGENTS.md: the same repository and query always give the same
+    result. Run from the test's own depth and from 200 frames deeper,
+    at the interpreter's default recursion limit: identical exit code,
+    stdout and stderr."""
+    outcomes = []
+    for extra in (0, 200):
+        ret = _call_at_depth(extra, lambda: cli.main(["-C", str(tiny_repo), query]))
+        captured = capsys.readouterr()
+        outcomes.append((ret, captured.out, captured.err))
+    assert outcomes[0] == outcomes[1]
+    assert outcomes[0][0] == expected_exit
+    if expected_exit == 0:
+        assert outcomes[0][2] == ""
+        assert len(outcomes[0][1].splitlines()) == 4  # header + tiny's 3 rows
+    else:
+        assert outcomes[0][1] == ""
+        assert outcomes[0][2] == _DEPTH_ERROR

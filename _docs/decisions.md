@@ -2605,3 +2605,50 @@ alike - that is not itself a select-list item or built purely from one
 is now named alongside the bullet's other four shapes, with its own
 sentence explaining why it is the one of the five `sqlite3` does not
 itself reject at prepare time.
+
+2026-09-28 - #103 round 2: aggregate shape-matching is ASCII-case-
+insensitive, like every other function-name comparison in this engine
+
+QA (comment #5869548584 on issue #103) found that the fix recorded in
+the entry just above introduced a real regression: `_expr_shape_equal`'s
+`FunctionCall` branch compared `a.name == b.name` on the raw,
+un-folded text the parser stored, never lower-cased the way
+`_validate_function_call` already folds a name before checking it
+against `_AGGREGATE_NAMES`. With `strict_function_calls=True`, that
+made shape-matching case-sensitive for the one caller that needs it to
+work: `SELECT DISTINCT author_name, COUNT(*) FROM blame GROUP BY
+author_name, path ORDER BY count(*) DESC` (select list spells it
+`COUNT`, `ORDER BY` spells it `count`) raised `BindError`, even though
+the aggregate *is* selected and the sort key *is* fully determined by
+the output row - confirmed against the oracle (`tests/oracle.py`,
+`sqlite3` 3.45.1) that SQLite accepts the query and returns 2 rows,
+since no SQL engine distinguishes function-name case at all. This is
+squarely the failure mode #78's own decision exists to avoid causing -
+a sort key genuinely determined by the output row was being rejected.
+
+Fixed by folding both operands through `historian.ascii.ascii_fold`
+inside the `FunctionCall` branch of `_expr_shape_equal` - in both
+copies, `sql/binder.py`'s and `plan/planner.py`'s (the module docstring
+on the latter already explains why it is a second, independent copy
+rather than a shared import) - rather than normalizing
+`FunctionCall.name` itself once at bind time. Folding at comparison
+time was chosen as the more explicit, boring fix: `FunctionCall.name`
+is also read verbatim in `no such function: {call.name}` and `misuse of
+aggregate function {call.name}(): ...` error messages elsewhere in
+`sql/binder.py`, and normalizing the stored value would change what
+those messages echo back to whoever wrote the query, for no benefit -
+folding only at the point where two names are being compared for
+equality keeps every other reader of `.name` exactly as it was, the
+same way `_validate_function_call` already folds its own local copy
+without touching the AST node.
+
+Confirmed against the oracle both before and after the fix that this
+does not disturb the two callers matched against `GROUP BY` keys
+instead of the select list: `SELECT author_name, COUNT(*) FROM blame
+GROUP BY author_name HAVING count(*) > 1` (mismatched case, HAVING) and
+`SELECT path, COUNT(*) FROM blame GROUP BY path ORDER BY count(*)`
+(mismatched case, non-DISTINCT GROUP BY/ORDER BY) already bound and ran
+correctly before this fix - that `FunctionCall` branch returns
+`(True, None)` unconditionally there regardless of name, so name
+casing was never load-bearing for those two callers - and still do
+after, unchanged.

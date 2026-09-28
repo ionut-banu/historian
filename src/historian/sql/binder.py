@@ -818,8 +818,16 @@ def _expr_shape_equal(a: Expr, b: Expr) -> bool:
     if isinstance(a, Star):
         return a.table == b.table
     if isinstance(a, FunctionCall):
+        # Function names are ASCII-case-insensitive in SQLite - `COUNT`
+        # in the select list and `count` in `ORDER BY` name the same
+        # aggregate - so shape equality folds them the same way
+        # `_validate_function_call` already does when it resolves a
+        # name against `_AGGREGATE_NAMES`. Folding here rather than on
+        # `FunctionCall.name` itself at bind time keeps the AST node's
+        # `name` as written, which error messages ("no such function:
+        # {call.name}") still want to echo verbatim.
         return (
-            a.name == b.name
+            ascii_fold(a.name) == ascii_fold(b.name)
             and len(a.args) == len(b.args)
             and all(_expr_shape_equal(x, y) for x, y in zip(a.args, b.args))
         )

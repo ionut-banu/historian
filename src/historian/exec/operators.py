@@ -33,8 +33,8 @@ from each other - they merely happen to satisfy it, which is the point.
 No `git`, no `subprocess` (`AGENTS.md`) - this module never imports
 `tables/blame.py`. `Scan` adapts any object shaped like `ScanSource`
 below (`tables/blame.py`'s `BlameScan` is one, but this module never
-imports or names it) - see `Scan`'s own docstring for how that
-adaptation is deliberately limited in this issue.
+imports or names it) - see `Scan`'s own docstring for how the terms
+it pushes are decided elsewhere, by `plan/optimizer.py` (#121).
 
 Determinism (`AGENTS.md`, spec §3): neither `Filter` nor `Project` may
 reorder, deduplicate, or otherwise introduce non-deterministic
@@ -109,11 +109,14 @@ __all__ = [
     "Filter",
     "Limit",
     "Operator",
+    "Predicate",
     "Project",
+    "PushdownKind",
     "Scan",
     "ScanSource",
     "Sort",
     "SortKey",
+    "child_of",
 ]
 
 
@@ -128,46 +131,95 @@ class Operator(Protocol):
     def rows(self) -> Iterator[Row]: ...
 
 
+#: A pushdown capability label a scan declares in `capabilities()`
+#: (spec §2: `capabilities() -> set[PushdownKind]`). Each table names
+#: its own kinds - `blame`'s will be about `path` (#122) - so this is
+#: a plain string rather than one shared enum every table would have
+#: to extend. The optimizer never interprets a kind; it only asks
+#: whether the set is empty (see `plan/optimizer.py`).
+PushdownKind = str
+
+#: One conjunctive term of a bound `WHERE` predicate, offered to and
+#: pushed into a scan (spec §2: `scan(pushed: list[Predicate])`). It
+#: is exactly the bound AST subexpression - no second predicate
+#: representation - so a scan recognises the shapes it can use by the
+#: same explicit `isinstance` checks `exec/expression.py` evaluates
+#: them by. Its `BoundColumnRef` offsets index the scan's own
+#: `schema`, because only the `WHERE` `Filter` directly above a `Scan`
+#: is ever negotiated.
+Predicate = Expr
+
+
 class ScanSource(Protocol):
     """The interface a table's scan implementation exposes for `Scan`
-    to wrap - exactly `tables/blame.py`'s `BlameScan` shape, confirmed
-    against the merged code: `schema` is a plain class attribute,
-    `capabilities()` takes no arguments and returns a `set` of
-    pushdown-kind labels, and `scan()`'s one parameter is spelled and
-    defaulted exactly `pushed: Sequence[object] = ()`. Structural, not
+    to wrap (spec §2, "The scan capability contract"). Structural, not
     nominal - nothing under `tables/` needs to know this `Protocol`
-    exists, and this module never imports `tables/blame.py` itself."""
+    exists, and this module never imports `tables/blame.py` itself.
+
+    - `schema`: the columns every row from `scan()` has.
+    - `capabilities()`: the pushdown kinds this scan can use at all.
+      Empty means "never offer me anything" - the optimizer then calls
+      neither `accepts()` nor anything else, so a source with no
+      capabilities (`blame` before #122, every test fake that predates
+      #121) need not implement `accepts()` meaningfully.
+    - `accepts(term)`: the per-term negotiation (issue #121). `True`
+      means the scan will use *term* to do less work when it is later
+      passed in `pushed`. It must be a pure answer about *term*'s
+      shape - no I/O, no dependence on which other terms were offered
+      - and it promises only a superset: the `Filter` above the scan
+      still enforces the term (spec §2, `_docs/decisions.md`
+      2026-08-24).
+    - `scan(pushed)`: every row, or - for accepted terms in `pushed` -
+      a superset of the rows matching all of them. `pushed` only ever
+      holds terms this source accepted, in offered order.
+    """
 
     schema: Schema
 
-    def capabilities(self) -> set[str]: ...
+    def capabilities(self) -> set[PushdownKind]: ...
 
-    def scan(self, pushed: Sequence[object] = ()) -> Iterator[Row]: ...
+    def accepts(self, term: Predicate) -> bool: ...
+
+    def scan(self, pushed: Sequence[Predicate] = ()) -> Iterator[Row]: ...
 
 
 class Scan:
     """Adapts any `ScanSource`-shaped object into the `Operator` shape.
 
-    Pushdown - predicate splitting and capability negotiation - is
-    spec §6 M4, items 13 and 14, and does not exist yet: there is no
-    planner here to split a `WHERE` clause into conjunctive terms, and
-    no negotiation step to offer them to `capabilities()`. So `Scan`
-    can only ever do the one thing that is always correct regardless of
-    what the source can push down: ask for nothing. Every call is
-    `source.scan(pushed=())`, unconditionally - `capabilities()` is
-    never even called here, because this issue has nothing to offer it
-    yet. A future planner (#13) negotiates; this `Scan` never does.
+    `pushed` - the terms `scan()` is called with - starts empty, and
+    `plan/planner.py` always builds a `Scan` that way. Deciding what
+    to push is the optimizer's job (`plan/optimizer.py`, issue #121),
+    not this operator's: it records the accepted terms here with
+    `set_pushed()`, and `rows()` hands them to `source.scan()`
+    verbatim. A tree the optimizer never touched (`--no-pushdown`,
+    #43) therefore calls `source.scan(pushed=())`, exactly as before
+    #121. `Scan` itself never calls `capabilities()` or `accepts()`.
     """
 
-    def __init__(self, source: ScanSource) -> None:
+    def __init__(self, source: ScanSource, pushed: Sequence[Predicate] = ()) -> None:
         self._source = source
+        self._pushed: tuple[Predicate, ...] = tuple(pushed)
         self.schema = source.schema
+
+    def source(self) -> ScanSource:
+        """The wrapped source, for the optimizer to negotiate with."""
+        return self._source
+
+    def pushed(self) -> tuple[Predicate, ...]:
+        """The terms `rows()` passes to `source.scan()`, in order."""
+        return self._pushed
+
+    def set_pushed(self, pushed: Sequence[Predicate]) -> None:
+        """Replace the pushed terms - the optimizer's one write into
+        the tree. Only terms `source.accepts()` returned `True` for
+        belong here; the `Filter` above still enforces every term."""
+        self._pushed = tuple(pushed)
 
     def rows(self) -> Iterator[Row]:
         # `yield from` keeps this exactly as lazy as `source.scan()`
         # itself - for `BlameScan`, already a generator (#11) - rather
         # than materializing anything here.
-        yield from self._source.scan(pushed=())
+        yield from self._source.scan(pushed=self._pushed)
 
 
 class Filter:
@@ -203,6 +255,11 @@ class Filter:
         # A predicate can only remove rows, never add, rename, or
         # retype a column - the output schema is exactly the child's.
         self.schema = child.schema
+
+    def predicate(self) -> Expr:
+        """The predicate this `Filter` enforces - read by the
+        optimizer, never replaced by it."""
+        return self._predicate
 
     def rows(self) -> Iterator[Row]:
         child_schema = self._child.schema
@@ -1100,3 +1157,28 @@ class Distinct:
                 continue
             seen.add(key)
             yield row
+
+
+def child_of(op: Operator) -> Operator | None:
+    """The one input operator of *op*, or `None` for a `Scan` (a
+    leaf). Every phase 1 operator has at most one child, so the tree
+    is a chain; this is how `plan/optimizer.py` walks it without
+    reaching into another module's private attributes. An explicit
+    `isinstance` chain, one branch per operator class (AGENTS.md: no
+    dynamic dispatch) - phase 3's `HashJoin`, with two children, will
+    need its own accessor rather than a branch here."""
+    if isinstance(op, Scan):
+        return None
+    if isinstance(op, Filter):
+        return op._child
+    if isinstance(op, Aggregate):
+        return op._child
+    if isinstance(op, Project):
+        return op._child
+    if isinstance(op, Sort):
+        return op._child
+    if isinstance(op, Limit):
+        return op._child
+    if isinstance(op, Distinct):
+        return op._child
+    raise AssertionError(f"exec/operators.py: unhandled operator type {type(op).__name__}")

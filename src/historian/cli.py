@@ -116,6 +116,7 @@ from pathlib import Path
 
 from historian.catalog import SCAN_FACTORIES, SCHEMAS
 from historian.exec.expression import EvalError
+from historian.plan.optimizer import optimize
 from historian.plan.planner import plan
 from historian.schema import Row, Schema
 from historian.sql.binder import BindError, bind
@@ -199,9 +200,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     in-process, per this issue's own constraint - no test spawns a
     `historian` subprocess.
 
-    Runs the full pipeline - lex, parse, bind, plan, materialize every
-    row from the resulting operator tree, then render and write the
-    table - inside one `try`. A query that fails at any stage
+    Runs the full pipeline - lex, parse, bind, plan, optimize (#121),
+    materialize every row from the resulting operator tree, then
+    render and write the table - inside one `try`. A query that fails at any stage
     (including mid-evaluation, for `EvalError`, or while rendering)
     prints nothing to stdout at all, which is also what keeps "the
     header line printed, or nothing" true rather than a partial table
@@ -237,7 +238,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         tokens = tokenize(args.query)
         stmt = parse(tokens)
         bound = bind(stmt, catalog=SCHEMAS)
-        tree = plan(bound, repo, tables=SCAN_FACTORIES)
+        tree = optimize(plan(bound, repo, tables=SCAN_FACTORIES))
         rows = list(tree.rows())
         sys.stdout.write(_render_table(tree.schema, rows))
     except (LexError, ParseError, BindError, EvalError) as exc:

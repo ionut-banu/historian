@@ -246,23 +246,28 @@ class BlameScan:
     def capabilities(self) -> set[str]:
         """Which pushdown kinds this scan can use.
 
-        Always empty. `blame`'s path/author/time pushdown (spec §2's
-        table) is M4's job (#13/#14, "Scan capability negotiation and
-        predicate splitting") - this issue shapes `capabilities()`'s
-        and `scan()`'s call convention per §2 without inventing the
-        `PushdownKind`/`Predicate` types that negotiation needs, per
-        the grooming decision on #11. An empty set here is not a
-        placeholder pending that work; it is simply true today - this
-        scan does not yet know how to use a predicate to do less work.
+        Always empty. `blame`'s `path` pushdown (spec §2's table) is
+        #122; until then this scan does not know how to use a
+        predicate to do less work, so `plan/optimizer.py` (#121) never
+        offers it a term. An empty set here is not a placeholder; it is
+        simply true today.
         """
         return set()
+
+    def accepts(self, term: object) -> bool:
+        """Whether this scan would use *term* (one conjunctive `WHERE`
+        term) to do less work - the per-term half of the scan
+        capability contract (#121). Always `False`, matching
+        `capabilities()`; the optimizer does not even ask while that
+        set is empty. #122 gives it real answers for `path` terms."""
+        return False
 
     def scan(self, pushed: Sequence[object] = ()) -> Iterator[Row]:
         """Yield every `blame` row at `HEAD`, streamed file by file.
 
         `pushed` is accepted per §2's ``scan(pushed)`` call convention
         and is provably ignored: `capabilities()` returns an empty set,
-        so a future planner (#13) never has anything accepted to pass
+        so the optimizer (#121) never has anything accepted to pass
         here, and this method does not inspect `pushed`'s contents at
         all - every path `list_paths` reports is always blamed,
         whatever `pushed` is. Rows are streamed (a generator), never

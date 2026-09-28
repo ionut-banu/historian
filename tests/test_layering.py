@@ -55,6 +55,7 @@ def test_pipeline_modules_together_do_not_import_subprocess():
         "historian.sql.parser",
         "historian.sql.binder",
         "historian.plan.planner",
+        "historian.plan.optimizer",
         "historian.exec.expression",
         "historian.exec.operators",
         "historian.values",
@@ -87,6 +88,14 @@ def test_planner_alone_does_not_import_subprocess():
     blame import BlameScan` feeding its own hardcoded `TABLES`
     default. Fixing the binder's chain alone does not fix this one."""
     result = _run_import_check("historian.plan.planner")
+    assert result.returncode == 0, result.stderr
+
+
+def test_optimizer_alone_does_not_import_subprocess():
+    """`plan/optimizer.py` (issue #121) sits at the planner's layer:
+    it negotiates with a scan only through `exec/operators.py`'s
+    `ScanSource` protocol and never imports a table module."""
+    result = _run_import_check("historian.plan.optimizer")
     assert result.returncode == 0, result.stderr
 
 

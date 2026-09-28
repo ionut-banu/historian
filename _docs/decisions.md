@@ -2451,3 +2451,54 @@ attributes. The `Filter` is read, never replaced: the predicate
 object left in it is the one `plan()` put there. Term splitting uses
 an explicit stack, not recursion, so a long left-deep `AND` chain is
 not bounded by Python's recursion limit.
+
+2026-09-28 - blame's path pushdown: one shape function, candidates
+from ls-tree, the evaluator's own LIKE fold
+
+Issue #122. `BlameScan` declares `path_eq`, `path_in` and
+`path_like_prefix` and accepts only the shapes spec §2 lists, with
+text literals only. A numeric literal is rejected even though TEXT
+affinity would turn `path = 5` into `path = '5'`: that conversion is
+`exec/expression.py`'s, and a second copy in the scan is a second
+place for it to be wrong. Rejecting is always safe; the `Filter`
+still answers correctly.
+
+`accepts()` and `scan()` share one function that reads a term's shape
+into a selection (exact literals, or a prefix). Two separate readings
+could drift apart, so that a term accepted by one is narrowed wrongly
+by the other. A term that function does not recognise narrows
+nothing, even when handed to `scan()` directly.
+
+The candidates are always a sub-list of `git ls-tree`'s output, never
+the query's literals, so `git blame` is never run on a path that is
+not tracked, and there is no failure from it to handle. A `LIKE`
+prefix is compared through `historian.ascii.ascii_fold` on both sides
+- the function `exec/expression.py`'s `LIKE` uses - because SQLite
+folds ASCII case in `LIKE` and nothing else. A case-sensitive check
+would drop matching rows (`SRC/b.py` for `LIKE 'src/%'`), and
+`str.lower()` would add rows the `Filter` then rejects (`CAFÉ%`
+selecting `café.py`), which is only wasted work but disagrees with
+the evaluator about what matches.
+
+`IN` blames in the list's own order, deduplicated; `=` and `LIKE`
+keep `ls-tree` order; several pushed terms narrow one after another,
+the first fixing the order. Row order without `ORDER BY` is still a
+function of the repository and the query alone (spec §3), so this
+stays deterministic. It does mean `--no-pushdown` (#43) can return
+the same rows in a different order, which is allowed: only the
+multiset is promised without `ORDER BY`.
+
+The work record is three plain attributes on the scan -
+`blamed_paths`, `git_invocations` (every `git` process, `ls-tree`
+included) and `tracked_path_count` (for `--stats`' "12 of 4,013",
+#42) - reset when `scan()` is called rather than at its first row, so
+a caller that never iterates still sees a fresh record.
+
+The case-folding criteria needed paths differing only by case, which
+neither `tiny` nor `awkward` has, and adding them there would change
+every existing differential case's rows. So `tests/fixtures/build.py`
+gained a fourth fixture, `casefold`, built the same way and pinned by
+HEAD hash. Its paths go into the index from blobs rather than through
+the working tree, because `src/`, `SRC/` and `Src/` are one directory
+on a case-insensitive file system and the build would otherwise
+depend on the machine. Spec §4's fixture list is updated alongside.

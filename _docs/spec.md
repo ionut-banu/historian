@@ -215,6 +215,15 @@ Pushdown:
 | `path LIKE 'prefix%'` | blame files under the prefix |
 | anything else | residual filter |
 
+Each literal must be a text literal, and a `LIKE` pattern's only
+wildcard a single trailing `%` with no `NOT` and no `ESCAPE`; `NOT
+IN`, a `NULL` or numeric literal, and a comparison with another column
+are "anything else". Candidates are always taken from `ls-tree`'s own
+output, never from the literals, so an untracked path is never
+blamed. A `LIKE` prefix is matched ASCII-case-insensitively, exactly
+as SQLite's `LIKE` is. Rows come in `ls-tree` order, except that
+`path IN (...)` blames in the list's own order.
+
 `author_name`, `commit_hash`, `authored_at`, and `line_no` cannot push
 down: a line's author is unknown until the file has been blamed.
 
@@ -619,7 +628,7 @@ the fixture repository as defense in depth. Without this, hashes and
 branch names differ per contributor machine, hash assertions are
 flaky, and no reported failure reproduces on anyone else's machine.
 
-Three fixtures:
+Four fixtures:
 
 - **tiny** — a handful of commits, two authors, a rename, a deletion,
   and a merge. The default for most tests, small enough to reason
@@ -631,6 +640,12 @@ Three fixtures:
   porcelain output.
 - **large** — generated, hundreds of commits. Benchmarks only, never
   correctness.
+- **casefold** — one commit of paths differing only by letter case:
+  ASCII (`src/`, `SRC/`, `Src/`) and non-ASCII (`straße/`, `STRAßE/`,
+  `STRASSE/`), plus a path spelled `5`. Exists for `blame`'s `LIKE`
+  prefix pushdown, which must fold exactly what SQLite's `LIKE`
+  folds. Its paths are written straight into the index, never to
+  disk, so a case-insensitive file system cannot merge them.
 
 The fixture builder asserts what it built. A fixture that silently
 stops containing a merge commit takes a whole class of tests with it.

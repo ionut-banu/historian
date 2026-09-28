@@ -1080,6 +1080,22 @@ def _bind_order_by_item(
 # (`ctx.alias_first=True` for ORDER BY) already splices in that item's
 # own bound expression in its place.
 #
+# Issue #103: an aggregate call is a bare "key touch" too, and the
+# DISTINCT narrowing above needs it held to the same "must itself
+# shape-match" rule a bare column already gets - unlike the three
+# GROUP BY-keyed callers above, where an aggregate call is never
+# required to equal a particular key (it is what makes a bare column
+# under it exempt in the first place). `_split_for_grouped_check`'s
+# `strict_function_calls` parameter, default `False`, switches that
+# one branch: `False` (every existing caller) keeps today's "any
+# aggregate call is fine wherever it sits" behaviour; `True` (the
+# DISTINCT caller alone) treats an aggregate call that does not itself
+# shape-match one of the given keys as the "bad" node the walk
+# reports back, exactly as a bare column would be - so `bad` can now
+# be the offending `FunctionCall` itself, not only a `BoundColumnRef`,
+# and callers that pass `True` branch on its type to phrase the
+# `BindError`.
+#
 # Confirmed against sqlite3 3.51.0 that this narrows what SQLite
 # itself accepts - `create table u2(p,n); insert into u2
 # values('x',2),('x',1),('y',1); select distinct p from u2 order by
@@ -1098,17 +1114,28 @@ def _bind_order_by_item(
 
 
 def _split_for_grouped_check(
-    expr: Expr, group_keys: tuple[Expr, ...]
-) -> tuple[bool, BoundColumnRef | None]:
+    expr: Expr, group_keys: tuple[Expr, ...], *, strict_function_calls: bool = False
+) -> tuple[bool, Expr | None]:
     """`(does expr contain an aggregate call anywhere outside a
-    covered GROUP BY key, the first bare BoundColumnRef found outside
-    both every aggregate call's own arguments and every covered
-    GROUP BY key - or None)`."""
+    covered GROUP BY key, the first bad node found outside both every
+    aggregate call's own arguments and every covered GROUP BY key - or
+    None)`.
+
+    The "bad" node is a bare `BoundColumnRef` for every caller. When
+    `strict_function_calls` is `True` (the DISTINCT/ORDER BY caller in
+    `bind()` alone - issue #103), a `FunctionCall` that does not itself
+    shape-match one of `group_keys` is bad too, reported as that
+    `FunctionCall` itself rather than `None` - the same "must equal a
+    given key" rule a bare column already gets, extended to an
+    aggregate call for the one caller where an aggregate call is
+    required to match a select-list item rather than being exempt by
+    virtue of being an aggregate at all.
+    """
     for key in group_keys:
         if _expr_shape_equal(expr, key):
             return False, None
     if isinstance(expr, FunctionCall):
-        return True, None
+        return True, expr if strict_function_calls else None
     if isinstance(expr, BoundColumnRef):
         return False, expr
     if isinstance(expr, Literal):
@@ -1116,30 +1143,56 @@ def _split_for_grouped_check(
     if isinstance(expr, Star):
         return False, None
     if isinstance(expr, UnaryOp):
-        return _split_for_grouped_check(expr.operand, group_keys)
+        return _split_for_grouped_check(
+            expr.operand, group_keys, strict_function_calls=strict_function_calls
+        )
     if isinstance(expr, Not):
-        return _split_for_grouped_check(expr.operand, group_keys)
+        return _split_for_grouped_check(
+            expr.operand, group_keys, strict_function_calls=strict_function_calls
+        )
     if isinstance(expr, BinaryOp):
-        left_has, left_bad = _split_for_grouped_check(expr.left, group_keys)
-        right_has, right_bad = _split_for_grouped_check(expr.right, group_keys)
+        left_has, left_bad = _split_for_grouped_check(
+            expr.left, group_keys, strict_function_calls=strict_function_calls
+        )
+        right_has, right_bad = _split_for_grouped_check(
+            expr.right, group_keys, strict_function_calls=strict_function_calls
+        )
         return left_has or right_has, left_bad or right_bad
     if isinstance(expr, And):
-        left_has, left_bad = _split_for_grouped_check(expr.left, group_keys)
-        right_has, right_bad = _split_for_grouped_check(expr.right, group_keys)
+        left_has, left_bad = _split_for_grouped_check(
+            expr.left, group_keys, strict_function_calls=strict_function_calls
+        )
+        right_has, right_bad = _split_for_grouped_check(
+            expr.right, group_keys, strict_function_calls=strict_function_calls
+        )
         return left_has or right_has, left_bad or right_bad
     if isinstance(expr, Or):
-        left_has, left_bad = _split_for_grouped_check(expr.left, group_keys)
-        right_has, right_bad = _split_for_grouped_check(expr.right, group_keys)
+        left_has, left_bad = _split_for_grouped_check(
+            expr.left, group_keys, strict_function_calls=strict_function_calls
+        )
+        right_has, right_bad = _split_for_grouped_check(
+            expr.right, group_keys, strict_function_calls=strict_function_calls
+        )
         return left_has or right_has, left_bad or right_bad
     if isinstance(expr, Is):
-        left_has, left_bad = _split_for_grouped_check(expr.left, group_keys)
-        right_has, right_bad = _split_for_grouped_check(expr.right, group_keys)
+        left_has, left_bad = _split_for_grouped_check(
+            expr.left, group_keys, strict_function_calls=strict_function_calls
+        )
+        right_has, right_bad = _split_for_grouped_check(
+            expr.right, group_keys, strict_function_calls=strict_function_calls
+        )
         return left_has or right_has, left_bad or right_bad
     if isinstance(expr, Like):
-        left_has, left_bad = _split_for_grouped_check(expr.left, group_keys)
-        pattern_has, pattern_bad = _split_for_grouped_check(expr.pattern, group_keys)
+        left_has, left_bad = _split_for_grouped_check(
+            expr.left, group_keys, strict_function_calls=strict_function_calls
+        )
+        pattern_has, pattern_bad = _split_for_grouped_check(
+            expr.pattern, group_keys, strict_function_calls=strict_function_calls
+        )
         if expr.escape is not None:
-            escape_has, escape_bad = _split_for_grouped_check(expr.escape, group_keys)
+            escape_has, escape_bad = _split_for_grouped_check(
+                expr.escape, group_keys, strict_function_calls=strict_function_calls
+            )
         else:
             escape_has, escape_bad = False, None
         return (
@@ -1147,16 +1200,26 @@ def _split_for_grouped_check(
             left_bad or pattern_bad or escape_bad,
         )
     if isinstance(expr, In):
-        has, bad = _split_for_grouped_check(expr.left, group_keys)
+        has, bad = _split_for_grouped_check(
+            expr.left, group_keys, strict_function_calls=strict_function_calls
+        )
         for value in expr.values:
-            value_has, value_bad = _split_for_grouped_check(value, group_keys)
+            value_has, value_bad = _split_for_grouped_check(
+                value, group_keys, strict_function_calls=strict_function_calls
+            )
             has = has or value_has
             bad = bad or value_bad
         return has, bad
     if isinstance(expr, Between):
-        op_has, op_bad = _split_for_grouped_check(expr.operand, group_keys)
-        low_has, low_bad = _split_for_grouped_check(expr.low, group_keys)
-        high_has, high_bad = _split_for_grouped_check(expr.high, group_keys)
+        op_has, op_bad = _split_for_grouped_check(
+            expr.operand, group_keys, strict_function_calls=strict_function_calls
+        )
+        low_has, low_bad = _split_for_grouped_check(
+            expr.low, group_keys, strict_function_calls=strict_function_calls
+        )
+        high_has, high_bad = _split_for_grouped_check(
+            expr.high, group_keys, strict_function_calls=strict_function_calls
+        )
         return op_has or low_has or high_has, op_bad or low_bad or high_bad
     raise AssertionError(f"sql/binder.py: unhandled expression node type {type(expr).__name__}")
 
@@ -1387,15 +1450,33 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema]) -> BoundSelectStatem
     # whenever `stmt.distinct` is set, independent of whether the
     # query aggregates at all - the two narrowings ask genuinely
     # different questions and neither replaces the other.
+    #
+    # Issue #103: `strict_function_calls=True` here (and only here) -
+    # an aggregate call touched by the ORDER BY key must itself
+    # shape-match a select-list item the same way a bare column must,
+    # so a `FunctionCall` that does not match comes back as `bad` too,
+    # not only a `BoundColumnRef`. This is the one caller of
+    # `_split_for_grouped_check` matched against the select list
+    # rather than `GROUP BY`'s keys, so it is also the one place an
+    # aggregate call is not automatically exempt.
     if stmt.distinct:
         select_exprs = tuple(item.expr for item in bound_items)
         for order_item in bound_order_by:
-            _has_select_match, bad_column = _split_for_grouped_check(order_item.expr, select_exprs)
-            if bad_column is not None:
+            _has_select_match, bad = _split_for_grouped_check(
+                order_item.expr, select_exprs, strict_function_calls=True
+            )
+            if isinstance(bad, FunctionCall):
                 raise BindError(
-                    f"column {bad_column.name} must appear in the select list "
+                    f"aggregate {bad.name}(...) must appear in the select list "
                     "to be used in ORDER BY together with SELECT DISTINCT",
-                    bad_column.position,
+                    bad.position,
+                    (),
+                )
+            if bad is not None:
+                raise BindError(
+                    f"column {bad.name} must appear in the select list "
+                    "to be used in ORDER BY together with SELECT DISTINCT",
+                    bad.position,
                     (),
                 )
     # LIMIT / OFFSET (issue #77): each is bound independently of

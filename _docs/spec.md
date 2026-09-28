@@ -569,12 +569,20 @@ Four kinds, all of them the user's fault and none of them tracebacks:
   an aggregate call nested inside another aggregate call's arguments,
   an aggregate reached through a select-list alias somewhere other
   than a clause's own direct reference to it, a `HAVING` on a
-  non-aggregate query, or a bare column that is neither a `GROUP BY`
-  key nor inside an aggregate call. SQLite itself rejects all of
-  these at prepare time, before running anything, so this is not a
-  historian-only invention - it is binding error like any other,
-  raised deterministically and never left for `exec/expression.py`
-  to discover at runtime from an actual row.
+  non-aggregate query, a bare column that is neither a `GROUP BY`
+  key nor inside an aggregate call, or - once `SELECT DISTINCT` is
+  present - an `ORDER BY` key, bare column or aggregate call alike,
+  that is not itself a select-list item or built purely from one.
+  SQLite itself rejects the first four of these at prepare time,
+  before running anything, so those are not a historian-only
+  invention. The last is: SQLite accepts that query and picks an
+  answer from its own unspecified internals, with no documented,
+  reproducible rule behind which row wins, so historian rejects the
+  shape outright rather than risk copying an undocumented internal
+  it cannot verify against (`_docs/decisions.md`, 2026-09-25). Either
+  way it is a binding error like any other, raised deterministically
+  and never left for `exec/expression.py` to discover at runtime from
+  an actual row.
 
 Do not invent runtime type errors. SQLite is permissive - comparing a
 string to an integer is a valid comparison with a defined answer, not

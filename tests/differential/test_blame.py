@@ -2642,6 +2642,58 @@ def test_distinct_order_by_expression_built_from_selected_column_is_legal(tiny_r
     assert rows
 
 
+def test_distinct_order_by_unselected_aggregate_raises_bind_error(awkward_repo):
+    """Issue #103, the exact gap the M3 milestone review found (diff
+    `6517c67..53a9f0d`): `count(*)` is never selected, so this is a
+    `BindError` here - confirmed live against the oracle (loading
+    `awkward_repo`'s own unfiltered blame rows through sqlite3 3.45.1)
+    that SQLite itself does *not* reject this query, returning `Sam
+    Lee` then `Zoë Müller` - the opposite order from what historian
+    printed before this fix (`Zoë Müller` then `Sam Lee`, exit 0, no
+    error). This is #78's own already-decided divergence
+    (`_docs/decisions.md`, 2026-09-25): an ORDER BY key SQLite's answer
+    for has no documented, reproducible rule behind it is rejected
+    outright rather than guessed at."""
+    with pytest.raises(BindError):
+        run_historian(
+            "SELECT DISTINCT author_name FROM blame GROUP BY author_name, path "
+            "ORDER BY count(*) DESC",
+            awkward_repo,
+        )
+
+
+def test_distinct_order_by_unselected_aggregate_raises_bind_error_even_with_always_false_where(
+    awkward_repo,
+):
+    """The check is bind-time and data-independent, the same discipline
+    #102 established for nested-aggregate rejection: it fires before
+    any row is read, whether or not a row would ever reach the
+    aggregate - unlike the silent zero-row exit 0 this raised before
+    the fix."""
+    with pytest.raises(BindError):
+        run_historian(
+            "SELECT DISTINCT author_name FROM blame WHERE line_no > 100000 "
+            "GROUP BY author_name, path ORDER BY count(*) DESC",
+            awkward_repo,
+        )
+
+
+def test_distinct_order_by_unselected_aggregate_nested_in_expression_raises_bind_error(
+    awkward_repo,
+):
+    """The same shape with the unselected aggregate nested inside a
+    larger expression - confirmed against the oracle that sqlite3
+    likewise does not reject `count(*) + 0` and gives the same `Sam
+    Lee`, `Zoë Müller` order historian's own fix must refuse to guess
+    at."""
+    with pytest.raises(BindError):
+        run_historian(
+            "SELECT DISTINCT author_name FROM blame GROUP BY author_name, path "
+            "ORDER BY count(*) + 0 DESC",
+            awkward_repo,
+        )
+
+
 # --- Known disagreements that raise before producing rows --------------
 #
 # #25, #32 and #51 are open design questions ("whether it should stay

@@ -1645,6 +1645,57 @@ def test_distinct_order_by_group_key_not_in_select_list_is_a_bind_error():
         )
 
 
+def test_distinct_order_by_unselected_aggregate_is_a_bind_error():
+    """Issue #103: the gap the M3 milestone review found.
+    `_split_for_grouped_check`'s `FunctionCall` branch used to return
+    "contains an aggregate, no bad column" for *any* function call,
+    unconditionally - correct for the GROUP BY-keyed callers, wrong
+    here, where an aggregate call must itself shape-match a
+    select-list item like any other ORDER BY key touch. `count(*)` is
+    never selected, so this must raise `BindError` the same way a bare
+    unselected column already does."""
+    with pytest.raises(BindError):
+        _bind(
+            "SELECT DISTINCT author_name FROM blame GROUP BY author_name, path "
+            "ORDER BY count(*) DESC"
+        )
+
+
+def test_distinct_order_by_unselected_aggregate_is_a_bind_error_even_with_always_false_where():
+    """The check is bind-time and data-independent (the same discipline
+    #102 established for nested-aggregate rejection): it must fire
+    before any row is read, whether or not a row would ever reach the
+    aggregate."""
+    with pytest.raises(BindError):
+        _bind(
+            "SELECT DISTINCT author_name FROM blame WHERE line_no > 100000 "
+            "GROUP BY author_name, path ORDER BY count(*) DESC"
+        )
+
+
+def test_distinct_order_by_unselected_aggregate_nested_in_an_expression_is_a_bind_error():
+    """The unselected aggregate does not have to be the whole ORDER BY
+    key - `count(*) + 0` still contains it, and the walk must find it
+    inside the arithmetic rather than only at the top level."""
+    with pytest.raises(BindError):
+        _bind(
+            "SELECT DISTINCT author_name FROM blame GROUP BY author_name, path "
+            "ORDER BY count(*) + 0 DESC"
+        )
+
+
+def test_distinct_order_by_aggregate_alias_expression_built_purely_from_select_list_is_legal():
+    """Positive case not covered by any existing binder test before this
+    issue: `c + 1` is built purely from the selected aggregate's own
+    alias `c`, so it must stay legal, the same "built purely from"
+    allowance the bare-column case already gets."""
+    bound = _bind(
+        "SELECT DISTINCT author_name, count(*) AS c FROM blame "
+        "GROUP BY author_name, path ORDER BY c + 1 DESC"
+    )
+    assert isinstance(bound.order_by[0].expr, BinaryOp)
+
+
 def test_distinct_without_order_by_and_grouped_binds_normally():
     bound = _bind("SELECT DISTINCT author_name, count(*) FROM blame GROUP BY author_name")
     assert bound.distinct is True

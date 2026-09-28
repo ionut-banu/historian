@@ -2502,3 +2502,39 @@ HEAD hash. Its paths go into the index from blobs rather than through
 the working tree, because `src/`, `SRC/` and `Src/` are one directory
 on a case-insensitive file system and the build would otherwise
 depend on the machine. Spec §4's fixture list is updated alongside.
+
+2026-09-28 - nested aggregates and aliased-aggregate misuse are
+BindErrors, not runtime crashes or silent zero rows
+
+Issue #102. `count(count(*))` and an aggregate reached through a
+select-list alias somewhere other than a clause's own direct
+reference to it (typically another aggregate call's argument, as in
+`HAVING count(c) > 0` with `c` aliasing `count(*)`) used to bind
+without error and fail later, data-dependently: a runtime `EvalError`
+from `exec/expression.py` when at least one row reached the bad call,
+a silent `0` rows at exit 0 when none did. `sqlite3` rejects both
+unconditionally at prepare time ("misuse of aggregate function
+count()" and "misuse of aliased aggregate c" respectively, confirmed
+against the oracle), and now so does historian, at bind time, before
+either engine would touch a row.
+
+Two checks, both reusing the existing `_contains_aggregate` walk
+rather than a new one: `_bind_expr`'s `FunctionCall` branch rejects
+any bound argument that itself contains an aggregate call, whether
+written directly (`count(count(*))`) or spliced in through
+`_resolve_name`'s alias substitution (`count(c)`); and `_resolve_name`
+itself rejects a resolved candidate (real column or alias) that
+contains an aggregate call whenever `ctx.reject_aggregates` is set -
+the same flag `_validate_function_call` already uses to reject a
+literal aggregate call written directly in `WHERE`, extended to catch
+one reached through an alias instead (`WHERE c > 1`). Both checks run
+after the argument or reference is already bound, since an alias only
+reveals what it points at once resolved - checking the raw AST would
+miss the alias case entirely.
+
+This surfaced a gap in spec §3's "Errors" enumeration: it named three
+kinds and did not name aggregate misuse as its own kind, even though
+the binder has treated it as `BindError` since #60/#69. §3 gets a
+fourth bullet, in this same commit, naming it explicitly - not a
+change in behaviour, a description catching up to code that already
+existed.

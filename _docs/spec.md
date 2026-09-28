@@ -564,6 +564,17 @@ Three kinds, all of them the user's fault and none of them tracebacks:
 - **Unsupported grammar** says the feature is not supported and points
   at the non-goals in §1. A query using a window function gets told
   window functions are out of scope, not a syntax error.
+- **Aggregate misuse** covers a `FunctionCall` that is structurally
+  illegal regardless of what it names or what data it would touch -
+  an aggregate call nested inside another aggregate call's arguments,
+  an aggregate reached through a select-list alias somewhere other
+  than a clause's own direct reference to it, a `HAVING` on a
+  non-aggregate query, or a bare column that is neither a `GROUP BY`
+  key nor inside an aggregate call. SQLite itself rejects all of
+  these at prepare time, before running anything, so this is not a
+  historian-only invention - it is binding error like any other,
+  raised deterministically and never left for `exec/expression.py`
+  to discover at runtime from an actual row.
 
 Do not invent runtime type errors. SQLite is permissive - comparing a
 string to an integer is a valid comparison with a defined answer, not

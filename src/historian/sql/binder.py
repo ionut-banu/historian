@@ -54,6 +54,39 @@ rejected outright - `WHERE count(*) > 1` is `BindError`, matching
 `sqlite3`'s own "misuse of aggregate function" rejection, though not
 its wording (§3's Errors section does not require that).
 
+Two more aggregate-misuse shapes, closed by issue #102, follow the
+same "reject at bind time, unconditionally" rule rather than waiting
+to see whether any row would actually reach the trouble:
+
+- **Nesting.** An aggregate call cannot be another aggregate call's
+  argument (`count(count(*))`) - `sqlite3` calls this "misuse of
+  aggregate function count()". `_bind_expr`'s `FunctionCall` branch
+  checks every bound argument, after binding it, for an aggregate call
+  anywhere in its tree (`_contains_aggregate`) and raises immediately
+  if one is found - this is why the check has to run *after* the
+  argument is bound rather than on the raw AST: an argument that is a
+  `ColumnRef` to a select-list alias only reveals whether it is
+  secretly an aggregate call once `_resolve_name` has spliced the
+  alias's own bound expression in.
+- **An alias to an aggregate, reached other than directly.** Every
+  clause that lets a select-list alias stand in for a real column
+  (`_resolve_name`, above) allows a bare reference to an aliased
+  aggregate to be used exactly where a real aggregate call could be
+  used directly (`HAVING c > 1`, `ORDER BY c`) - but never anywhere
+  else, most importantly never as *another* aggregate call's own
+  argument (`HAVING count(c) > 0`, where `c` aliases `count(*)`) and
+  never in `WHERE` at all, however it is reached (`WHERE c > 1`). The
+  nesting case above already catches the former once the alias is
+  spliced in, since the substituted subtree is exactly a `FunctionCall`
+  now. The latter - `WHERE`, or `ORDER BY` before the query is known to
+  aggregate - is caught in `_resolve_name` itself: once the winning
+  candidate is chosen (real column or alias), a `ctx.reject_aggregates`
+  clause raises if that candidate's tree contains an aggregate call,
+  the same rejection `_validate_function_call` already gives a
+  *literal* aggregate call written directly in such a clause. Both
+  checks read only `_contains_aggregate` over an already-bound
+  subtree - no new walk, no change to what nesting itself means.
+
 A second, separate check lives in `bind()` itself, after the whole
 select list is bound: when any select-list item's expression contains
 an aggregate call anywhere, every item is walked for a bare column
@@ -504,11 +537,31 @@ def _resolve_name(ref: ColumnRef, ctx: _Context) -> Expr:
     else:
         first, second = column_match, alias_match
     if first is not None:
-        return first
-    if second is not None:
-        return second
+        resolved = first
+    elif second is not None:
+        resolved = second
+    else:
+        raise BindError(f"no such column: {ref.name}", ref.position, ctx.schema.names)
 
-    raise BindError(f"no such column: {ref.name}", ref.position, ctx.schema.names)
+    # Issue #102: a real column is never an aggregate call, so this
+    # only ever fires for the alias branch - a bare reference to a
+    # select-list alias that turns out to name an aggregate call,
+    # reached in a clause where an aggregate is never legal at all
+    # (`ctx.reject_aggregates`, the same flag `_validate_function_call`
+    # already checks for a *literal* aggregate call written directly
+    # here). `WHERE c > 1` (c aliasing `count(*)`) is exactly this -
+    # `sqlite3`'s own "misuse of aggregate: count()", confirmed against
+    # the oracle - and it must be rejected unconditionally, before any
+    # row is ever considered, the same way the literal-call case
+    # already is.
+    if ctx.reject_aggregates and _contains_aggregate(resolved):
+        raise BindError(
+            f"misuse of aggregate: aliased column {ref.name} refers to an aggregate call, "
+            "which is not allowed here",
+            ref.position,
+            (),
+        )
+    return resolved
 
 
 def _bind_star(star: Star, ctx: _Context) -> list[BoundColumnRef]:
@@ -632,7 +685,34 @@ def _bind_expr(expr: Expr, ctx: _Context) -> Expr:
             # take this path and falls through to the general Star
             # rejection above.
             return expr
-        return dataclasses.replace(expr, args=tuple(_bind_expr(arg, ctx) for arg in expr.args))
+        bound_args = tuple(_bind_expr(arg, ctx) for arg in expr.args)
+        # Issue #102: an aggregate call can never be another aggregate
+        # call's own argument - `count(count(*))` is `sqlite3`'s own
+        # "misuse of aggregate function count()". This has to run after
+        # binding each argument, not on the raw AST, because a
+        # `ColumnRef` argument only reveals whether it secretly names
+        # an aggregate call once alias resolution (`_resolve_name`)
+        # has spliced that alias's own bound expression in - a bound
+        # argument that is itself a `FunctionCall`, whether written
+        # directly or reached through a select-list alias, is exactly
+        # what `_contains_aggregate` was already built to detect.
+        for raw_arg, bound_arg in zip(expr.args, bound_args):
+            if not _contains_aggregate(bound_arg):
+                continue
+            if isinstance(raw_arg, ColumnRef) and _find_alias_expr(raw_arg.name, ctx) is not None:
+                # Reached through a select-list alias - `sqlite3`'s own
+                # message names the alias, not the outer function:
+                # "misuse of aliased aggregate c".
+                raise BindError(
+                    f"misuse of aliased aggregate {raw_arg.name}", raw_arg.position, ()
+                )
+            raise BindError(
+                f"misuse of aggregate function {expr.name}(): aggregate function calls "
+                "cannot be nested",
+                raw_arg.position,
+                (),
+            )
+        return dataclasses.replace(expr, args=bound_args)
     if isinstance(expr, UnaryOp):
         return dataclasses.replace(expr, operand=_bind_expr(expr.operand, ctx))
     if isinstance(expr, Not):

@@ -161,6 +161,51 @@ ScanFactory = Callable[[Path], ScanSource]
 # reason to know which.
 
 
+def _operands(expr: Expr) -> tuple[Expr, ...]:
+    """*expr*'s direct sub-expressions, left to right - this module's
+    own copy of `sql/binder.py`'s table of the same name (issue #107),
+    kept here for the same reason `_expr_shape_equal` is (see its
+    docstring). A leaf has none."""
+    if isinstance(expr, (Literal, BoundColumnRef, Star)):
+        return ()
+    if isinstance(expr, FunctionCall):
+        return expr.args
+    if isinstance(expr, (UnaryOp, Not)):
+        return (expr.operand,)
+    if isinstance(expr, (BinaryOp, And, Or, Is)):
+        return (expr.left, expr.right)
+    if isinstance(expr, Like):
+        if expr.escape is None:
+            return (expr.left, expr.pattern)
+        return (expr.left, expr.pattern, expr.escape)
+    if isinstance(expr, In):
+        return (expr.left, *expr.values)
+    if isinstance(expr, Between):
+        return (expr.operand, expr.low, expr.high)
+    raise AssertionError(f"plan/planner.py: unhandled expression node type {type(expr).__name__}")
+
+
+def _with_operands(expr: Expr, operands: list[Expr]) -> Expr:
+    """*expr* rebuilt via `dataclasses.replace` with *operands* - one
+    per entry of `_operands(expr)`, in the same order - in place of its
+    own children."""
+    if isinstance(expr, (UnaryOp, Not)):
+        (operand,) = operands
+        return dataclasses.replace(expr, operand=operand)
+    if isinstance(expr, (BinaryOp, And, Or, Is)):
+        left, right = operands
+        return dataclasses.replace(expr, left=left, right=right)
+    if isinstance(expr, Like):
+        escape = operands[2] if expr.escape is not None else None
+        return dataclasses.replace(expr, left=operands[0], pattern=operands[1], escape=escape)
+    if isinstance(expr, In):
+        return dataclasses.replace(expr, left=operands[0], values=tuple(operands[1:]))
+    if isinstance(expr, Between):
+        operand, low, high = operands
+        return dataclasses.replace(expr, operand=operand, low=low, high=high)
+    raise AssertionError(f"plan/planner.py: unhandled expression node type {type(expr).__name__}")
+
+
 def _expr_shape_equal(a: Expr, b: Expr) -> bool:
     """Structural equality between two already-bound expressions,
     ignoring `position` - mirrors `sql/binder.py`'s own
@@ -170,7 +215,30 @@ def _expr_shape_equal(a: Expr, b: Expr) -> bool:
     Kept as this module's own copy rather than importing a private
     name across modules - `sql/binder.py`'s `_bind_expr`/`plan/
     planner.py`'s `_split_expr` are already two independent, mirrored
-    walks of the same shape for the same reason."""
+    walks of the same shape for the same reason.
+
+    A loop over an explicit stack of node pairs (issue #107), not
+    recursion: each pair's own fields are compared, then its operand
+    pairs are pushed. Nothing here has a side effect, so the order the
+    pairs are compared in cannot change the answer."""
+    pending: list[tuple[Expr, Expr]] = [(a, b)]
+    while pending:
+        x, y = pending.pop()
+        if not _same_node_fields(x, y):
+            return False
+        x_operands = _operands(x)
+        y_operands = _operands(y)
+        if len(x_operands) != len(y_operands):
+            return False
+        pending.extend(zip(x_operands, y_operands))
+    return True
+
+
+def _same_node_fields(a: Expr, b: Expr) -> bool:
+    """`_expr_shape_equal` for one pair of nodes, children aside: the
+    same node type and the same non-child fields. The operand count
+    (a function's arguments, an `IN` list's length, whether `LIKE` has
+    an `ESCAPE`) is compared by the caller."""
     if type(a) is not type(b):
         return False
     if isinstance(a, Literal):
@@ -184,50 +252,13 @@ def _expr_shape_equal(a: Expr, b: Expr) -> bool:
         # now does (issue #103 round 2) - function names are ASCII-
         # case-insensitive in SQLite, and a `GROUP BY`/select-list pair
         # spelled `COUNT`/`count` must still match by shape here too.
-        return (
-            ascii_fold(a.name) == ascii_fold(b.name)
-            and len(a.args) == len(b.args)
-            and all(_expr_shape_equal(x, y) for x, y in zip(a.args, b.args))
-        )
-    if isinstance(a, UnaryOp):
-        return a.op == b.op and _expr_shape_equal(a.operand, b.operand)
-    if isinstance(a, Not):
-        return _expr_shape_equal(a.operand, b.operand)
-    if isinstance(a, BinaryOp):
-        return a.op == b.op and _expr_shape_equal(a.left, b.left) and _expr_shape_equal(a.right, b.right)
-    if isinstance(a, And):
-        return _expr_shape_equal(a.left, b.left) and _expr_shape_equal(a.right, b.right)
-    if isinstance(a, Or):
-        return _expr_shape_equal(a.left, b.left) and _expr_shape_equal(a.right, b.right)
-    if isinstance(a, Is):
-        return (
-            a.negated == b.negated
-            and _expr_shape_equal(a.left, b.left)
-            and _expr_shape_equal(a.right, b.right)
-        )
-    if isinstance(a, Like):
-        if (a.escape is None) != (b.escape is None):
-            return False
-        return (
-            a.negated == b.negated
-            and _expr_shape_equal(a.left, b.left)
-            and _expr_shape_equal(a.pattern, b.pattern)
-            and (a.escape is None or _expr_shape_equal(a.escape, b.escape))
-        )
-    if isinstance(a, In):
-        return (
-            a.negated == b.negated
-            and len(a.values) == len(b.values)
-            and _expr_shape_equal(a.left, b.left)
-            and all(_expr_shape_equal(x, y) for x, y in zip(a.values, b.values))
-        )
-    if isinstance(a, Between):
-        return (
-            a.negated == b.negated
-            and _expr_shape_equal(a.operand, b.operand)
-            and _expr_shape_equal(a.low, b.low)
-            and _expr_shape_equal(a.high, b.high)
-        )
+        return ascii_fold(a.name) == ascii_fold(b.name)
+    if isinstance(a, (UnaryOp, BinaryOp)):
+        return a.op == b.op
+    if isinstance(a, (Not, And, Or)):
+        return True
+    if isinstance(a, (Is, Like, In, Between)):
+        return a.negated == b.negated
     raise AssertionError(f"plan/planner.py: unhandled expression node type {type(a).__name__}")
 
 
@@ -269,66 +300,49 @@ def _build_aggregate_call(call: FunctionCall) -> AggregateCall:
 
 
 def _split_expr(expr: Expr, calls: list[AggregateCall], group_by: Sequence[Expr]) -> Expr:
-    key_index = _group_key_index(expr, group_by)
-    if key_index is not None:
-        return BoundColumnRef(offset=key_index, name=f"group_{key_index + 1}", position=expr.position)
-    if isinstance(expr, FunctionCall):
-        slot = len(group_by) + len(calls)
-        calls.append(_build_aggregate_call(expr))
-        return BoundColumnRef(offset=slot, name=expr.name, position=expr.position)
-    if isinstance(expr, Literal):
-        return expr
-    if isinstance(expr, BoundColumnRef):
-        return expr
-    if isinstance(expr, UnaryOp):
-        return dataclasses.replace(expr, operand=_split_expr(expr.operand, calls, group_by))
-    if isinstance(expr, Not):
-        return dataclasses.replace(expr, operand=_split_expr(expr.operand, calls, group_by))
-    if isinstance(expr, BinaryOp):
-        return dataclasses.replace(
-            expr,
-            left=_split_expr(expr.left, calls, group_by),
-            right=_split_expr(expr.right, calls, group_by),
-        )
-    if isinstance(expr, And):
-        return dataclasses.replace(
-            expr,
-            left=_split_expr(expr.left, calls, group_by),
-            right=_split_expr(expr.right, calls, group_by),
-        )
-    if isinstance(expr, Or):
-        return dataclasses.replace(
-            expr,
-            left=_split_expr(expr.left, calls, group_by),
-            right=_split_expr(expr.right, calls, group_by),
-        )
-    if isinstance(expr, Is):
-        return dataclasses.replace(
-            expr,
-            left=_split_expr(expr.left, calls, group_by),
-            right=_split_expr(expr.right, calls, group_by),
-        )
-    if isinstance(expr, Like):
-        return dataclasses.replace(
-            expr,
-            left=_split_expr(expr.left, calls, group_by),
-            pattern=_split_expr(expr.pattern, calls, group_by),
-            escape=None if expr.escape is None else _split_expr(expr.escape, calls, group_by),
-        )
-    if isinstance(expr, In):
-        return dataclasses.replace(
-            expr,
-            left=_split_expr(expr.left, calls, group_by),
-            values=tuple(_split_expr(v, calls, group_by) for v in expr.values),
-        )
-    if isinstance(expr, Between):
-        return dataclasses.replace(
-            expr,
-            operand=_split_expr(expr.operand, calls, group_by),
-            low=_split_expr(expr.low, calls, group_by),
-            high=_split_expr(expr.high, calls, group_by),
-        )
-    raise AssertionError(f"plan/planner.py: unhandled expression node type {type(expr).__name__}")
+    """*expr* with every `GROUP BY`-key match and every aggregate call
+    replaced by a reference into `Aggregate`'s output row, appending
+    each call's `AggregateCall` to *calls* - see the section comment
+    above.
+
+    Not recursive (issue #107): *pending* holds `(node, operands_done)`
+    pairs and *results* the rewritten subtrees finished so far, the
+    same shape as `sql/binder.py`'s `_bind_expr`. A node is first seen
+    with `operands_done=False`: a key match, an aggregate call or a
+    leaf is rewritten on the spot; any other node is pushed back with
+    `operands_done=True`, then its operands in reverse, so they are
+    visited left to right - which is what keeps *calls* in left-to-
+    right order, each call's slot the one the recursive version gave
+    it."""
+    pending: list[tuple[Expr, bool]] = [(expr, False)]
+    results: list[Expr] = []
+    while pending:
+        node, operands_done = pending.pop()
+        if operands_done:
+            first = len(results) - len(_operands(node))
+            rewritten = results[first:]
+            del results[first:]
+            results.append(_with_operands(node, rewritten))
+            continue
+        key_index = _group_key_index(node, group_by)
+        if key_index is not None:
+            results.append(
+                BoundColumnRef(offset=key_index, name=f"group_{key_index + 1}", position=node.position)
+            )
+            continue
+        if isinstance(node, FunctionCall):
+            slot = len(group_by) + len(calls)
+            calls.append(_build_aggregate_call(node))
+            results.append(BoundColumnRef(offset=slot, name=node.name, position=node.position))
+            continue
+        if isinstance(node, (Literal, BoundColumnRef)):
+            results.append(node)
+            continue
+        pending.append((node, True))
+        for operand in reversed(_operands(node)):
+            pending.append((operand, False))
+    (result,) = results
+    return result
 
 
 def _split_select_list(

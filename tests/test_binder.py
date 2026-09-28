@@ -1834,3 +1834,178 @@ def test_like_escape_identical_on_both_sides_still_matches_its_group_key():
         "GROUP BY path LIKE 'c%' ESCAPE 'c'"
     )
     assert len(bound.group_by) == 1
+
+
+# --- Depth: binding does not recurse per tree level (issue #107) -----------
+#
+# The parser now rejects any expression taller than SQLite's 1000, but
+# the binder's walks must not depend on that - a bound tree can be about
+# twice as tall as any parsed one (a select-list alias spliced into
+# WHERE), and `bind()` accepts hand-built statements. These trees are
+# built directly as ASTs, far past 1000 levels, and bound at the
+# interpreter's default recursion limit.
+
+_DEEP = 5000
+
+
+def _deep_stmt(*, select=None, where=None, group_by=(), having=None, order_by=(), limit=None):
+    from historian.sql.ast import OrderByItem
+
+    items = select if select is not None else (SelectItem(expr=ColumnRef(None, "path", _POS), alias=None, position=_POS),)
+    return SelectStatement(
+        select_list=items,
+        from_table="blame",
+        where=where,
+        group_by=group_by,
+        having=having,
+        order_by=tuple(OrderByItem(expr=e, direction=OrderDirection.ASC, position=_POS) for e in order_by),
+        limit=limit,
+        offset=None,
+        position=_POS,
+    )
+
+
+def _deep_plus(n: int, leaf):
+    node = leaf()
+    for _ in range(n - 1):
+        node = BinaryOp(op=Operator.ADD, left=node, right=leaf(), position=_POS)
+    return node
+
+
+def _chain_depth(expr) -> int:
+    depth = 0
+    while isinstance(expr, BinaryOp):
+        expr = expr.left
+        depth += 1
+    return depth
+
+
+def test_deep_where_chain_binds():
+    from historian.sql.ast import And
+
+    term = BinaryOp(op=Operator.EQ, left=ColumnRef(None, "path", _POS), right=Literal("x", _POS), position=_POS)
+    where = term
+    for _ in range(_DEEP):
+        where = And(left=where, right=term, position=_POS)
+    bound = bind(_deep_stmt(where=where), SCHEMAS)
+    node = bound.where
+    count = 0
+    while isinstance(node, And):
+        assert isinstance(node.right.left, BoundColumnRef)
+        node = node.left
+        count += 1
+    assert count == _DEEP
+    assert isinstance(node.left, BoundColumnRef)
+
+
+def test_deep_alias_spliced_into_where_binds():
+    """A select-list alias naming a deep chain, referenced from a deep
+    WHERE chain: the bound WHERE is as tall as both together."""
+    alias_expr = _deep_plus(_DEEP, lambda: ColumnRef(None, "line_no", _POS))
+    select = (SelectItem(expr=alias_expr, alias="c", position=_POS),)
+    leaves = iter([ColumnRef(None, "c", _POS)] + [Literal(1, _POS)] * _DEEP)
+    where = _deep_plus(_DEEP, lambda: next(leaves))
+    bound = bind(_deep_stmt(select=select, where=where), SCHEMAS)
+    leftmost = bound.where
+    while isinstance(leftmost, BinaryOp):
+        leftmost = leftmost.left
+    assert isinstance(leftmost, BoundColumnRef) and leftmost.name == "line_no"
+    assert _chain_depth(bound.where) == 2 * _DEEP - 2
+
+
+def test_deep_group_by_having_order_by_bind():
+    """The grouped-select check (`_split_for_grouped_check`), the GROUP
+    BY aggregate check (`_contains_aggregate`) and shape matching
+    (`_expr_shape_equal`) over trees past 1000 levels. Shape matching
+    is tried at every node against every key, quadratic in the height,
+    so this uses 1500 levels rather than 5000."""
+    deep = 1500
+    key = _deep_plus(deep, lambda: ColumnRef(None, "line_no", _POS))
+    select = (
+        SelectItem(expr=_deep_plus(deep, lambda: ColumnRef(None, "line_no", _POS)), alias=None, position=_POS),
+        SelectItem(expr=FunctionCall("count", (Star(None, _POS),), _POS), alias=None, position=_POS),
+    )
+    having = BinaryOp(
+        op=Operator.GT,
+        left=_deep_plus(deep, lambda: FunctionCall("count", (Star(None, _POS),), _POS)),
+        right=Literal(0, _POS),
+        position=_POS,
+    )
+    stmt = _deep_stmt(select=select, group_by=(key,), having=having, order_by=(key,))
+    bound = bind(stmt, SCHEMAS)
+    assert _chain_depth(bound.group_by[0]) == deep - 1
+    assert _chain_depth(bound.order_by[0].expr) == deep - 1
+
+
+def test_deep_bare_column_outside_the_group_key_is_still_found():
+    """`_split_for_grouped_check` must still find the first bad bare
+    column at the bottom of a deep tree."""
+    key = ColumnRef(None, "path", _POS)
+    expr = ColumnRef(None, "line_no", _POS)
+    for _ in range(_DEEP):
+        expr = BinaryOp(op=Operator.ADD, left=expr, right=ColumnRef(None, "path", _POS), position=_POS)
+    select = (SelectItem(expr=expr, alias=None, position=_POS),)
+    with pytest.raises(BindError, match="column line_no must appear in the GROUP BY clause"):
+        bind(_deep_stmt(select=select, group_by=(key,)), SCHEMAS)
+
+
+def test_deep_aggregate_in_where_is_still_rejected():
+    call = FunctionCall("count", (Star(None, _POS),), _POS)
+    where = BinaryOp(op=Operator.GT, left=_deep_plus(_DEEP, lambda: Literal(1, _POS)), right=call, position=_POS)
+    where = _deep_plus(1, lambda: where)
+    with pytest.raises(BindError, match="misuse of aggregate"):
+        bind(_deep_stmt(where=where), SCHEMAS)
+
+
+def test_deep_unknown_column_is_reported_left_to_right():
+    """Errors keep their left-to-right order: the first unknown name in
+    a deep chain is the one reported."""
+    names = iter(["nope_first"] + ["nope_later"] * _DEEP)
+    expr = _deep_plus(_DEEP, lambda: ColumnRef(None, next(names), _POS))
+    with pytest.raises(BindError, match="no such column: nope_first"):
+        bind(_deep_stmt(where=expr), SCHEMAS)
+
+
+def test_ordinal_value_of_a_deep_unary_chain():
+    expr = Literal(1, _POS)
+    for _ in range(_DEEP + 1):
+        expr = UnaryOp(op=UnaryOperator.NEG, operand=expr, position=_POS)
+    assert _ordinal_value(expr) == -1
+    expr = UnaryOp(op=UnaryOperator.POS, operand=expr, position=_POS)
+    assert _ordinal_value(expr) == -1
+    assert _ordinal_value(UnaryOp(op=UnaryOperator.NEG, operand=expr, position=_POS)) == 1
+
+
+def test_ordinal_value_of_a_deep_unary_chain_over_a_binary_is_none():
+    expr = BinaryOp(op=Operator.ADD, left=Literal(1, _POS), right=Literal(1, _POS), position=_POS)
+    for _ in range(_DEEP):
+        expr = UnaryOp(op=UnaryOperator.NEG, operand=expr, position=_POS)
+    assert _ordinal_value(expr) is None
+
+
+def test_order_by_and_limit_with_999_unary_minus_bind():
+    """The review's two shapes, through the real parser: `ORDER BY` with
+    999 minus signs is ordinal -1, out of range (a `BindError`); with
+    998 it is ordinal 1. `LIMIT` with 998 is `LIMIT 1`."""
+    with pytest.raises(BindError, match="ORDER BY term out of range"):
+        _bind(f"SELECT path FROM blame ORDER BY {'- ' * 999}1")
+    bound = _bind(f"SELECT path FROM blame ORDER BY {'- ' * 998}1")
+    assert isinstance(bound.order_by[0].expr, BoundColumnRef)
+    assert _bind(f"SELECT path FROM blame LIMIT {'- ' * 998}1").limit == 1
+
+
+def test_999_operator_not_and_unary_chains_bind():
+    from historian.sql.ast import Not
+
+    bound = _bind(f"SELECT {'NOT ' * 999}line_no FROM blame")
+    node = bound.select_list[0].expr
+    for _ in range(999):
+        assert isinstance(node, Not)
+        node = node.operand
+    assert isinstance(node, BoundColumnRef)
+    bound = _bind(f"SELECT {'- ' * 999}line_no FROM blame")
+    node = bound.select_list[0].expr
+    for _ in range(999):
+        assert isinstance(node, UnaryOp)
+        node = node.operand
+    assert isinstance(node, BoundColumnRef)

@@ -594,7 +594,11 @@ walk instead of consuming all history.
 
 Four kinds, all of them the user's fault and none of them tracebacks:
 
-- **Parse errors** name the position and what was expected.
+- **Parse errors** name the position and what was expected. An
+  expression tree taller than SQLite's `SQLITE_MAX_EXPR_DEPTH` (1000),
+  its height counted by SQLite's own per-node rules, is a parse error
+  with SQLite's own message, `Expression tree is too large (maximum
+  depth 1000)`.
 - **Binding errors** name the unknown column or table, and list what
   is available.
 - **Unsupported grammar** says the feature is not supported and points
@@ -913,7 +917,7 @@ error: window functions are not supported
 
 Exit codes: `0` success, `1` bad query, `2` bad usage, `3` the
 repository could not be read, `4` an internal error - a bug in
-historian, not a mistake in the query.
+historian, not a mistake in the query, such as a stack overflow.
 
 ### REPL
 

@@ -2757,3 +2757,97 @@ and `sqlite3AtoF` both skip (`'\v12' % 5` is `2` in `sqlite3`). The
 new scan uses the same constant as `_scan_number` so the value and
 the class cannot disagree about where a number starts; widening it is
 a change to every TEXT conversion, not to `%`.
+
+2026-09-28 - Expression trees are capped at SQLite's own height, 1000,
+and every walk below the parser is an explicit-stack loop
+
+Issue #107, from the M3 review. A query nested deeper than Python
+could walk raised `RecursionError`, and `RecursionError` is a
+`RuntimeError`, so `cli.py`'s repository clause reported it as "could
+not read repository", exit 3. The parser reads left-deep chains
+(`1 + 1 + ...`, `a AND b AND ...`) with a loop and had no limit on
+them at all; the binder, planner and evaluator then recursed once per
+level. Measured on `main` at fa20120, default recursion limit 1000:
+the evaluator used two frames per level for `+`/`||`/`LIKE` (fails at
+497 terms), three for `=`/`<`/`IS`/`IN` (332), the binder's
+`_bind_expr` and the planner's `_split_expr` one (989 to 992), and
+`_ordinal_value` one (994).
+
+The limit is SQLite's `SQLITE_MAX_EXPR_DEPTH`, exactly: 1000, with
+SQLite's own message, "Expression tree is too large (maximum depth
+1000)", as a `ParseError` (exit 1). Not lower: SQLite answers a
+601-term `+` chain, and §1 makes that the right answer, so a limit
+sized to what Python could walk would turn a crash into a permanent
+mismatch. Not unlimited: SQLite rejects anything taller, and an
+engine that accepts what SQLite rejects is the same divergence the
+other way. `sql/parser.py`'s `_expr_height` measures each finished
+clause expression with an explicit stack, by SQLite's per-node rules
+read off the oracle node kind by node kind (`IN (c)` with one
+constant `c` is `= +c`, one extra level; `IN ()` is a leaf; `BETWEEN`'s
+bounds add nothing; `NOT LIKE`/`NOT IN`/`NOT BETWEEN` add a `NOT`;
+`t.c` is two levels; `x AND 0` collapses to a leaf; `LIMIT`/`OFFSET`
+sit under one extra node). A test asserts the oracle's
+`getlimit(SQLITE_LIMIT_EXPR_DEPTH)` equals the parser's constant, so
+drift (#117) fails loudly. The check runs before binding, so a too-
+deep query exits 1 even with `-C` on a directory that does not exist.
+
+Of the issue's two ways to make the walks safe up to that height,
+this takes (a), explicit stacks, not (b), raising the recursion
+limit in `cli.py`. `evaluate()` and its `_finish_*` helpers, the
+binder's `_bind_expr`, `_contains_aggregate`, `_expr_shape_equal`,
+`_split_for_grouped_check` and `_ordinal_value`, and the planner's
+`_split_expr` and `_expr_shape_equal` are each a loop over a plain
+list, in the style of the optimizer's `split_conjuncts` (#121),
+visiting operands left to right so error order, `AND`/`OR`
+short-circuits and aggregate slot order are what the recursive
+versions gave. Reasons for (a):
+
+- A bound tree is not bounded by the parse-time height. A select-list
+  alias referenced from `WHERE` is spliced in as its whole bound
+  tree, so a query SQLite accepts can bind to a tree about 2000
+  levels tall. A recursion limit derived from "1000 levels times
+  three frames" would have been wrong on the first such query.
+- (b) is what #8 (2026-09-01) already rejected - "`sys.
+  setrecursionlimit` is not a fix: it relocates the cliff" - and the
+  objection holds here: the cliff would move with every new frame per
+  level anyone adds, and the process-wide setting also changes what
+  every other caller of the library gets. With explicit stacks,
+  nothing the query does grows Python's stack, so the outcome cannot
+  depend on how deep the caller already was. `tests/test_cli.py` runs
+  one accepted and one rejected boundary query from 0 and from 200
+  extra frames and asserts identical output; the unit tests build
+  5000-level trees and walk them from 700 frames deep.
+- It is the shape a Rust port needs anyway.
+
+The parser's own recursion limits (#8's 1000-long `(`/`NOT`/unary
+runs, #100's resume bookkeeping, the 50-level nesting cap) are
+unchanged. Where they overlap with the height - 1000 `NOT`s or unary
+operators around a literal is height 1001 - the height check now
+rejects the tree, so three #8 parser tests that pinned exactly that
+(1000 `NOT`s, 1000 unary minus, a 5000-term `AND` chain) now pin the
+tallest tree SQLite accepts instead; a run longer than 1000 is still
+rejected by the run limit first, while it is being read. Historian
+stays more permissive than SQLite for unary, `NOT` and paren runs:
+SQLite's LALR stack gives "parser stack overflow" from 90 operators
+after `LIMIT` and 95 in the select list, and #8 chose on purpose not
+to copy that build-specific quirk, so those chains (up to height
+1000) evaluate here and are tested as plain tests, not differential
+ones.
+
+A `RecursionError` that still reaches `cli.main` now has its own
+clause, ordered before `(OSError, RuntimeError)`, and goes to #49's
+fixed internal-error message, exit 4. With the height capped and no
+walk recursing per level, reaching it means historian's own invariant
+broke: spec §5's "a bug in historian, not a mistake in the query".
+Exit 1 would blame the user for historian's bug; exit 3 was simply
+false. Narrowing the repository clause to a dedicated git-failure
+type would remove the class of problem, but nothing else in `src/`
+raises a `RuntimeError` subclass today, so it was noted in the issue,
+not done.
+
+Left for later: nested `BETWEEN` and multi-element `IN` evaluate their
+left operand once per bound or element, so chains of them are
+exponential in time (#137); they are within the height limit and
+correct, only slow, and the depth tests leave them out. `CASE` (#126)
+must add its node to `_height_children`/`_node_height` and to each
+module's `_operands`/`_with_operands`.

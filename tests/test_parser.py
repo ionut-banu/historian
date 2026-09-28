@@ -1147,7 +1147,11 @@ def test_absurdly_deep_staggered_batch_chain_raises_parse_error_not_recursion_er
 
 
 def test_not_chain_up_to_max_depth_parses():
-    expr = _select_expr(_not_chain(_MAX_NESTING_DEPTH))
+    # Issue #107: `_MAX_NESTING_DEPTH` NOTs around a literal is a tree
+    # of height 1001, which SQLite's own `SQLITE_MAX_EXPR_DEPTH` (1000)
+    # rejects, so the tallest NOT chain that parses is one shorter. The
+    # loop that reads the run is unchanged; see the height tests below.
+    expr = _select_expr(_not_chain(_MAX_NESTING_DEPTH - 1))
     assert isinstance(expr, Not)
 
 
@@ -1163,7 +1167,10 @@ def test_absurdly_long_not_chain_raises_parse_error_not_recursion_error():
 
 
 def test_unary_chain_up_to_max_depth_parses():
-    expr = _select_expr(_unary_chain(_MAX_NESTING_DEPTH))
+    # Issue #107: one shorter than `_MAX_NESTING_DEPTH`, for the same
+    # reason as the NOT chain above - 1000 operators and a literal is a
+    # tree of height 1001.
+    expr = _select_expr(_unary_chain(_MAX_NESTING_DEPTH - 1))
     assert isinstance(expr, UnaryOp)
 
 
@@ -1227,10 +1234,235 @@ def test_long_and_chain_still_parses_unaffected_by_depth_limit():
     """AND/OR/comparison chaining is loop-based, not recursive, so it
     was never at risk of RecursionError - unaffected by this fix. QA
     already checked a 500-clause chain by hand; this pins it as a
-    regression test."""
-    sql = "SELECT " + " AND ".join(["a"] * 5000) + " FROM blame"
+    regression test.
+
+    Issue #107: a left-deep chain of n terms is a tree of height n, so
+    the longest chain SQLite accepts has 1000 terms; this used to pin
+    5000, which SQLite rejects. The 5000-term chain now raises the
+    height error (`test_expression_height_*` below)."""
+    sql = "SELECT " + " AND ".join(["a"] * 1000) + " FROM blame"
     expr = _select_expr(sql)
     assert isinstance(expr, And)
+
+
+# --- Expression tree height: SQLite's SQLITE_MAX_EXPR_DEPTH (issue #107) ---
+#
+# SQLite rejects, at prepare time, any expression tree taller than
+# `SQLITE_MAX_EXPR_DEPTH` (1000) with "Expression tree is too large
+# (maximum depth 1000)". A leaf is height 1 and a node is 1 plus its
+# tallest child, but the per-node accounting is SQLite's own, not
+# uniform: `x IN (c)` with one constant `c` is rewritten to `x = +c` (one
+# extra level), `x IN ()` becomes a bare TRUE/FALSE leaf, `BETWEEN`'s
+# bounds cost nothing, `NOT IN`/`NOT LIKE`/`NOT BETWEEN` add a NOT node,
+# `t.c` is a two-level DOT node, and `LIMIT`/`OFFSET` sit under one extra
+# LIMIT node. Every boundary below is read from the oracle in the test
+# itself (both sizes), not assumed, and then required of historian.
+
+_DEPTH_MESSAGE = "Expression tree is too large (maximum depth 1000)"
+
+
+def _oracle_depth_accepts(sql: str) -> bool:
+    """Whether the oracle (Python's `sqlite3`) accepts *sql* as far as
+    the expression-height limit goes: `False` only for SQLite's own
+    height error. Any other outcome - rows, or a different error such
+    as `ESCAPE expression must be a single character` - means the tree
+    was within the limit."""
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE blame (path TEXT, line_no INTEGER)")
+        conn.execute("INSERT INTO blame VALUES ('a', 1)")
+        try:
+            conn.execute(sql).fetchall()
+        except sqlite3.OperationalError as exc:
+            if str(exc) == _DEPTH_MESSAGE:
+                return False
+        return True
+    finally:
+        conn.close()
+
+
+def _chain(n: int, term: str = "1", op: str = "+") -> str:
+    return f" {op} ".join([term] * n)
+
+
+def _in_chain(n: int, value: str, negated: bool = False) -> str:
+    keyword = "NOT IN" if negated else "IN"
+    return "1" + f" {keyword} ({value})" * n
+
+
+#: (id, query builder taking n, the last n SQLite accepts).
+_HEIGHT_BOUNDARIES = [
+    ("select-plus", lambda n: f"SELECT {_chain(n)} FROM blame", 1000),
+    ("select-concat", lambda n: f"SELECT {_chain(n, 'path', '||')} FROM blame", 1000),
+    ("select-eq", lambda n: f"SELECT {_chain(n, '1', '=')} FROM blame", 1000),
+    ("select-lt", lambda n: f"SELECT {_chain(n, '1', '<')} FROM blame", 1000),
+    ("select-and", lambda n: f"SELECT {_chain(n, '1', 'AND')} FROM blame", 1000),
+    ("select-or", lambda n: f"SELECT {_chain(n, '1', 'OR')} FROM blame", 1000),
+    ("select-like", lambda n: f"SELECT {_chain(n, 'path', 'LIKE')} FROM blame", 1000),
+    ("select-is", lambda n: f"SELECT {_chain(n, '1', 'IS')} FROM blame", 1000),
+    ("select-is-not", lambda n: f"SELECT {_chain(n, '1', 'IS NOT')} FROM blame", 1000),
+    ("where-and", lambda n: f"SELECT 1 FROM blame WHERE {_chain(n, 'path = ' + chr(39) + 'x' + chr(39), 'AND')}", 999),
+    ("where-or", lambda n: f"SELECT 1 FROM blame WHERE {_chain(n, 'path = ' + chr(39) + 'x' + chr(39), 'OR')}", 999),
+    ("where-plus-eq", lambda n: f"SELECT 1 FROM blame WHERE {_chain(n)} = 0", 999),
+    ("group-by", lambda n: f"SELECT count(*) FROM blame GROUP BY {_chain(n, 'line_no')}", 1000),
+    ("order-by", lambda n: f"SELECT path FROM blame ORDER BY {_chain(n, 'line_no')}", 1000),
+    ("order-by-alias", lambda n: f"SELECT {_chain(n, 'line_no')} AS c FROM blame ORDER BY c", 1000),
+    ("distinct", lambda n: f"SELECT DISTINCT {_chain(n, 'line_no')} FROM blame", 1000),
+    ("having", lambda n: f"SELECT count(*) FROM blame GROUP BY line_no HAVING {_chain(n, 'line_no')} > 0", 999),
+    ("abs-argument", lambda n: f"SELECT abs({_chain(n)}) FROM blame", 999),
+    ("max-argument", lambda n: f"SELECT max({_chain(n, 'line_no')}) FROM blame", 999),
+    ("count-distinct-argument", lambda n: f"SELECT count(DISTINCT {_chain(n)}) FROM blame", 999),
+    ("count-star-terms", lambda n: f"SELECT {_chain(n, 'count(*)')} FROM blame", 1000),
+    ("is-not-null-chain", lambda n: f"SELECT 1{' IS NOT NULL' * n} FROM blame", 999),
+    ("in-constant-chain", lambda n: f"SELECT {_in_chain(n, '1')} FROM blame", 998),
+    ("in-null-chain", lambda n: f"SELECT {_in_chain(n, 'NULL')} FROM blame", 998),
+    ("in-negative-chain", lambda n: f"SELECT {_in_chain(n, '-1')} FROM blame", 997),
+    ("in-two-values-chain", lambda n: f"SELECT {_in_chain(n, '1, 2')} FROM blame", 999),
+    ("in-column-chain", lambda n: f"SELECT {_in_chain(n, 'line_no')} FROM blame", 999),
+    ("in-qualified-column-chain", lambda n: f"SELECT {_in_chain(n, 'blame.line_no')} FROM blame", 998),
+    ("in-count-star-chain", lambda n: f"SELECT {_in_chain(n, 'count(*)')} FROM blame", 999),
+    ("in-like-chain", lambda n: f"SELECT {_in_chain(n, chr(39) + 'a' + chr(39) + ' LIKE ' + chr(39) + 'a' + chr(39))} FROM blame", 998),
+    ("in-in-chain", lambda n: f"SELECT {_in_chain(n, '1 IN (2)')} FROM blame", 996),
+    ("in-not-in-chain", lambda n: f"SELECT {_in_chain(n, '1 NOT IN (1)')} FROM blame", 995),
+    ("in-not-between-chain", lambda n: f"SELECT {_in_chain(n, '1 NOT BETWEEN 0 AND 1')} FROM blame", 996),
+    ("in-in-column-chain", lambda n: f"SELECT {_in_chain(n, '1 IN (line_no)')} FROM blame", 998),
+    ("not-in-constant-chain", lambda n: f"SELECT {_in_chain(n, '1', negated=True)} FROM blame", 499),
+    ("not-in-two-values-chain", lambda n: f"SELECT {_in_chain(n, '1, 2', negated=True)} FROM blame", 499),
+    ("chain-is-null", lambda n: f"SELECT ({_chain(n)}) IS NULL FROM blame", 999),
+    ("chain-in-one", lambda n: f"SELECT ({_chain(n)}) IN (1) FROM blame", 999),
+    ("chain-in-two", lambda n: f"SELECT ({_chain(n)}) IN (1, 2) FROM blame", 999),
+    ("chain-between", lambda n: f"SELECT ({_chain(n)}) BETWEEN 0 AND 1 FROM blame", 999),
+    ("chain-not-between", lambda n: f"SELECT ({_chain(n)}) NOT BETWEEN 0 AND 1 FROM blame", 998),
+    ("chain-like", lambda n: f"SELECT ({_chain(n)}) LIKE 'a' FROM blame", 999),
+    ("chain-not-like", lambda n: f"SELECT ({_chain(n)}) NOT LIKE 'a' FROM blame", 998),
+    ("like-escape-chain", lambda n: f"SELECT 'a' LIKE 'a' ESCAPE ({_chain(n, chr(39) + '!' + chr(39), '||')}) FROM blame", 999),
+    ("one-in-constant-chain", lambda n: f"SELECT 1 IN ({_chain(n)}) FROM blame", 998),
+    ("one-in-column-chain", lambda n: f"SELECT 1 IN ({_chain(n, 'line_no')}) FROM blame", 999),
+    ("one-in-chain-and-one", lambda n: f"SELECT 1 IN ({_chain(n)}, 1) FROM blame", 999),
+    ("between-high-bound", lambda n: f"SELECT 0 BETWEEN 0 AND ({_chain(n)}) FROM blame", 1000),
+    ("between-low-bound", lambda n: f"SELECT 0 BETWEEN ({_chain(n)}) AND 1 FROM blame", 1000),
+    ("product-terms", lambda n: f"SELECT {_chain(n, '1 * 1')} FROM blame", 999),
+    ("negative-terms", lambda n: f"SELECT {_chain(n, '-1')} FROM blame", 999),
+    ("qualified-column-terms", lambda n: f"SELECT {_chain(n, 'blame.line_no')} FROM blame", 999),
+    # `sqlite3ExprAnd` replaces `x AND <always false>` (either side) by
+    # a bare `0` leaf; OR, a REAL 0.0 and a TRUE `NOT IN ()` do not.
+    ("and-zero", lambda n: f"SELECT ({_chain(n)}) AND 0 FROM blame", 1000),
+    ("zero-and", lambda n: f"SELECT 0 AND ({_chain(n)}) FROM blame", 1000),
+    ("and-empty-in", lambda n: f"SELECT ({_chain(n)}) AND (1 IN ()) FROM blame", 1000),
+    ("and-false-and", lambda n: f"SELECT ({_chain(n)}) AND (0 AND 1) FROM blame", 1000),
+    ("and-empty-not-in", lambda n: f"SELECT ({_chain(n)}) AND (1 NOT IN ()) FROM blame", 999),
+    ("and-real-zero", lambda n: f"SELECT ({_chain(n)}) AND 0.0 FROM blame", 999),
+    ("and-negative-zero", lambda n: f"SELECT ({_chain(n)}) AND -0 FROM blame", 999),
+    ("or-zero", lambda n: f"SELECT ({_chain(n)}) OR 0 FROM blame", 999),
+    ("where-and-chain-then-zero", lambda n: f"SELECT 1 FROM blame WHERE {_chain(n, 'line_no', 'AND')} AND 0", 1000),
+    ("limit", lambda n: f"SELECT 1 FROM blame LIMIT {_chain(n)}", 999),
+    ("offset", lambda n: f"SELECT 1 FROM blame LIMIT 1 OFFSET {_chain(n)}", 999),
+    ("limit-with-offset", lambda n: f"SELECT 1 FROM blame LIMIT {_chain(n)} OFFSET 1", 999),
+]
+
+
+@pytest.mark.parametrize(
+    "build, last_accepted",
+    [pytest.param(build, last, id=name) for name, build, last in _HEIGHT_BOUNDARIES],
+)
+def test_expression_height_boundary_matches_sqlite(build, last_accepted):
+    """The last size SQLite accepts parses; one more raises
+    `ParseError` with SQLite's own message. The oracle is asked about
+    both sizes first, so a changed SQLite fails here rather than
+    leaving the test pinning a stale number."""
+    accepted, rejected = build(last_accepted), build(last_accepted + 1)
+    assert _oracle_depth_accepts(accepted)
+    assert not _oracle_depth_accepts(rejected)
+
+    _parse(accepted)  # must not raise
+    with pytest.raises(ParseError) as excinfo:
+        _parse(rejected)
+    assert str(excinfo.value) == _DEPTH_MESSAGE
+    assert isinstance(excinfo.value.position, Position)
+
+
+def test_expression_height_limit_is_the_oracles_own():
+    """Historian's constant is SQLite's `SQLITE_LIMIT_EXPR_DEPTH`, read
+    from the oracle, so drift in the oracle (#117) fails loudly."""
+    import sqlite3
+
+    from historian.sql import parser as parser_module
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        assert conn.getlimit(sqlite3.SQLITE_LIMIT_EXPR_DEPTH) == parser_module._MAX_EXPR_DEPTH
+    finally:
+        conn.close()
+
+
+def test_empty_in_list_resets_expression_height():
+    """`x IN ()` is a bare TRUE/FALSE leaf in SQLite, whatever `x` is, so
+    a chain of them never grows: 3000 of them are accepted by both."""
+    sql = f"SELECT {_in_chain(3000, '')} FROM blame"
+    assert _oracle_depth_accepts(sql)
+    _parse(sql)  # must not raise
+
+
+def test_expression_height_counts_each_clause_separately():
+    """Heights do not add across select items or clauses: two
+    1000-term chains side by side, and one in WHERE, are all accepted."""
+    chain = _chain(1000, "line_no")
+    sql = f"SELECT {chain}, {chain} FROM blame WHERE {_chain(999)} = 0 ORDER BY {chain}"
+    assert _oracle_depth_accepts(sql)
+    _parse(sql)  # must not raise
+
+
+def test_20000_term_chain_raises_the_height_error_not_recursion_error():
+    """The parser reads a left-deep chain with a loop and accepted
+    20,000 terms before #107; the height check over it must not recurse
+    either."""
+    with pytest.raises(ParseError) as excinfo:
+        _parse(f"SELECT {_chain(20_000)} FROM blame")
+    assert str(excinfo.value) == _DEPTH_MESSAGE
+
+
+@pytest.mark.parametrize("op", ["AND", "OR", "||", "="])
+def test_20000_term_chains_of_other_operators_raise_the_height_error(op):
+    with pytest.raises(ParseError) as excinfo:
+        _parse(f"SELECT 1 FROM blame WHERE {_chain(20_000, 'line_no', op)}")
+    assert str(excinfo.value) == _DEPTH_MESSAGE
+
+
+def test_height_error_points_at_the_start_of_the_expression():
+    sql = f"SELECT path, {_chain(1001)} FROM blame"
+    with pytest.raises(ParseError) as excinfo:
+        _parse(sql)
+    assert excinfo.value.position.offset == sql.index("1 + 1")
+
+
+def test_1000_unary_operators_are_height_1001_and_raise_the_height_error():
+    """The parser's own 1000-operator run limit (#8) still reads 1000
+    operators; the tree they build is one too tall for SQLite's limit.
+    1001 operators still hit #8's run limit first, while parsing."""
+    for chain in (_unary_chain(_MAX_NESTING_DEPTH), _not_chain(_MAX_NESTING_DEPTH)):
+        with pytest.raises(ParseError) as excinfo:
+            _parse(chain)
+        assert str(excinfo.value) == _DEPTH_MESSAGE
+    for chain in (_unary_chain(_MAX_NESTING_DEPTH + 1), _not_chain(_MAX_NESTING_DEPTH + 1)):
+        with pytest.raises(ParseError) as excinfo:
+            _parse(chain)
+        assert "nested too deeply" in str(excinfo.value)
+
+
+def test_order_by_and_limit_with_999_unary_minus():
+    """`ORDER BY - - ... 1` with 999 operators is height 1000 and parses.
+    `LIMIT` sits under SQLite's extra LIMIT node, so the same 999
+    operators there are height 1001 and rejected, and 998 parse."""
+    minus = "- " * 999
+    stmt = _parse(f"SELECT path FROM blame ORDER BY {minus}1")
+    assert isinstance(stmt.order_by[0].expr, UnaryOp)
+    with pytest.raises(ParseError) as excinfo:
+        _parse(f"SELECT path FROM blame LIMIT {minus}1")
+    assert str(excinfo.value) == _DEPTH_MESSAGE
+    stmt = _parse(f"SELECT path FROM blame LIMIT {'- ' * 998}1")
+    assert isinstance(stmt.limit, UnaryOp)
 
 
 # --- Module and node-shape constraints -------------------------------

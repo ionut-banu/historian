@@ -159,9 +159,36 @@ itself on `self._depth` for its own entire duration (open to final
 return, including every resume iteration), not only for its one
 `_parse_expr` call, closing that gap - see `_docs/decisions.md`,
 2026-09-27, for how this was found and what it measures to.
+
+Expression tree height: SQLite's own limit (issue #107)
+--------------------------------------------------------
+
+The two limits above only keep *this module* from recursing too
+deeply; neither bounds the tree it returns. A left-deep chain
+(`1 + 1 + ... + 1`, `a AND b AND ...`) is read with a loop and costs no
+stack at all here, so before #107 the parser happily built trees
+thousands of levels tall, and the binder, planner and evaluator then
+walked them. SQLite rejects any tree taller than `SQLITE_MAX_EXPR_DEPTH`
+(1000) with "Expression tree is too large (maximum depth 1000)", so
+historian now does the same, with the same message and the same
+boundary: `_expr_height` measures each whole clause expression as soon
+as `_parse_expr` finishes it, by SQLite's own per-node rules
+(`_node_height`), and raises `ParseError`. The measurement is an
+explicit-stack loop, never recursion, since it has to survive exactly
+the trees it rejects. `LIMIT`/`OFFSET` get one extra level, SQLite's
+own `TK_LIMIT` node above them. This is SQLite's rule, not a guard
+for Python's stack: the walks downstream are explicit-stack loops too
+and do not rely on it (`_docs/decisions.md`, 2026-09-28).
+
+Where the run limits and the height limit overlap - 1000 `NOT`s or
+unary operators and a literal is height 1001 - the tree is rejected by
+the height check; a run of more than 1000 is still rejected by the run
+limit first, while it is being read.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 from historian.sql.ast import (
     And,
@@ -219,6 +246,20 @@ _MAX_NESTING_DEPTH = 1000
 #: 1000: see the module docstring and `_docs/decisions.md`,
 #: 2026-09-01 for the measured frame costs this is sized against.
 _MAX_RECURSION_DEPTH = 50
+
+#: The tallest expression tree a query may contain: SQLite's own
+#: `SQLITE_MAX_EXPR_DEPTH` (its compile-time default, 1000, and
+#: `sqlite3.connect(...).getlimit(sqlite3.SQLITE_LIMIT_EXPR_DEPTH)` on
+#: the oracle - `tests/test_parser.py` asserts the two agree). Unlike
+#: the two limits above, this one is not about Python's call stack: it
+#: is SQLite's rule, enforced so historian rejects exactly the trees
+#: SQLite rejects (issue #107). See `_expr_height` and the module
+#: docstring.
+_MAX_EXPR_DEPTH = 1000
+
+#: SQLite's own message for a tree taller than `_MAX_EXPR_DEPTH`,
+#: capitalisation included.
+_EXPR_DEPTH_MESSAGE = f"Expression tree is too large (maximum depth {_MAX_EXPR_DEPTH})"
 
 # Tier-1 comparison tokens (`<  <=  >  >=`) and the operator each maps to.
 _RELATIONAL_OPERATORS: dict[TokenType, Operator] = {
@@ -345,6 +386,166 @@ def _int_literal_value(text: str) -> int | float:
     if value > INT64_MAX:
         return float(text)
     return value
+
+
+# --- Expression tree height (issue #107) -----------------------------------
+
+
+def _height_children(node: Expr) -> tuple[Expr, ...]:
+    """*node*'s direct sub-expressions, left to right, for
+    `_expr_height`. Every child is listed, including `BETWEEN`'s bounds
+    (which add nothing to the `BETWEEN` node's own height but are still
+    checked as trees of their own) and `IN (...)`'s left operand when
+    the list is empty (discarded by SQLite, but only after being built
+    and checked)."""
+    if isinstance(node, (Literal, ColumnRef, Star)):
+        return ()
+    if isinstance(node, FunctionCall):
+        return node.args
+    if isinstance(node, (UnaryOp, Not)):
+        return (node.operand,)
+    if isinstance(node, (BinaryOp, And, Or, Is)):
+        return (node.left, node.right)
+    if isinstance(node, Like):
+        if node.escape is None:
+            return (node.left, node.pattern)
+        return (node.left, node.pattern, node.escape)
+    if isinstance(node, In):
+        return (node.left, *node.values)
+    if isinstance(node, Between):
+        return (node.operand, node.low, node.high)
+    raise AssertionError(f"sql/parser.py: unhandled expression node type {type(node).__name__}")
+
+
+@dataclass(frozen=True)
+class _Height:
+    """What `_expr_height` knows about one finished subtree: its
+    height by SQLite's rules, and the two parse-time properties of it
+    that change how SQLite builds the node above it (see
+    `_node_height`)."""
+
+    height: int
+    #: SQLite's `sqlite3ExprIsConstant` as it stands at parse time.
+    constant: bool
+    #: SQLite's `ExprAlwaysFalse`: the node carries `EP_IsFalse`.
+    always_false: bool
+
+
+def _node_height(node: Expr, children: list[_Height]) -> _Height:
+    """The `_Height` of *node*, given one for each of
+    `_height_children(node)`, in order - SQLite's own accounting
+    (`exprSetHeight` in `expr.c` and the grammar actions in `parse.y`),
+    measured against the oracle node kind by node kind (issue #107):
+
+    - A literal is height 1; `t.c` is SQLite's `TK_DOT` over two
+      identifiers, height 2; a bare column is height 1. `*` as a
+      function's sole argument is no argument list at all: `count(*)`
+      is height 1, like `count()`.
+    - A function call is 1 plus its tallest argument. `LIKE` is a
+      function call in SQLite, over `left`, `pattern` and `escape`.
+    - Unary, `NOT`, binary, `IS` and `OR` nodes are 1 plus their
+      tallest operand.
+    - `AND` is too, unless either operand is always false (the integer
+      literal `0`, `x IN ()`, or another such `AND`): SQLite's
+      `sqlite3ExprAnd` then discards both operands and builds a bare
+      `0` leaf, height 1.
+    - `BETWEEN` is 1 plus its operand only: SQLite attaches the bounds
+      after computing the node's height and never recomputes it.
+    - `x IN ()` is a TRUE/FALSE leaf, height 1, whatever `x` was.
+      `x IN (c)` with exactly one *constant* `c` is rewritten to
+      `x = +c`, so `c` costs one extra level. Otherwise `IN` is 1 plus
+      the tallest of `x` and every list value.
+    - `NOT LIKE`, `NOT BETWEEN` and a non-empty `NOT IN` wrap the node
+      in a `NOT`, one more level. (`NOT IN ()` is a leaf, like `IN ()`.)
+
+    "Constant" is SQLite's `sqlite3ExprIsConstant` as it stands at
+    parse time, before any name is resolved: no column reference and
+    no function call (every function, `LIKE` included, is only marked
+    constant later, by name resolution) anywhere in the tree.
+    SQLite also treats the bare identifiers `true`/`false` as constant
+    (and `false` as always false); historian has no boolean literals
+    and resolves those names as columns, so here they are columns like
+    any other."""
+    if isinstance(node, Literal):
+        # Only an INTEGER token can build an `int` literal; SQLite marks
+        # one whose value is 0 `EP_IsFalse` (`sqlite3ExprAlloc`). A REAL
+        # `0.0` is a float here and not always false there either.
+        is_zero = isinstance(node.value, int) and node.value == 0
+        return _Height(1, True, is_zero)
+    if isinstance(node, ColumnRef):
+        return _Height(2 if node.table is not None else 1, False, False)
+    if isinstance(node, Star):
+        return _Height(0, False, False)
+    if isinstance(node, FunctionCall):
+        return _Height(1 + max((child.height for child in children), default=0), False, False)
+    if isinstance(node, (UnaryOp, Not)):
+        (operand,) = children
+        return _Height(1 + operand.height, operand.constant, False)
+    if isinstance(node, And):
+        left, right = children
+        if left.always_false or right.always_false:
+            return _Height(1, True, True)
+        return _Height(1 + max(left.height, right.height), left.constant and right.constant, False)
+    if isinstance(node, (BinaryOp, Or, Is)):
+        left, right = children
+        return _Height(1 + max(left.height, right.height), left.constant and right.constant, False)
+    if isinstance(node, Like):
+        height = 1 + max(child.height for child in children)
+        return _Height(height + 1 if node.negated else height, False, False)
+    if isinstance(node, In):
+        left = children[0]
+        values = children[1:]
+        if not values:
+            # A TRUE (`NOT IN ()`) or FALSE (`IN ()`) leaf.
+            return _Height(1, True, not node.negated)
+        constant = left.constant and all(value.constant for value in values)
+        if len(values) == 1 and values[0].constant:
+            list_height = 1 + values[0].height
+        else:
+            list_height = max(value.height for value in values)
+        height = 1 + max(left.height, list_height)
+        return _Height(height + 1 if node.negated else height, constant, False)
+    if isinstance(node, Between):
+        constant = all(child.constant for child in children)
+        height = 1 + children[0].height
+        return _Height(height + 1 if node.negated else height, constant, False)
+    raise AssertionError(f"sql/parser.py: unhandled expression node type {type(node).__name__}")
+
+
+def _expr_height(root: Expr) -> int:
+    """The height of *root*'s tree by SQLite's rules (`_node_height`),
+    raising `ParseError` with SQLite's own message at the first node
+    (in post-order) taller than `_MAX_EXPR_DEPTH`. SQLite checks every
+    node as it builds it, not only the root, which matters wherever a
+    node's height is not simply 1 plus its tallest child: a `BETWEEN`
+    bound or the left operand of `IN ()` can be too tall on its own
+    even though the node above it is not.
+
+    Not recursive: an explicit stack of `(node, children_done)` pairs
+    and a second stack of finished `_Height` results, in
+    the same style as `plan/optimizer.py`'s `split_conjuncts`. The
+    parser reads a left-deep chain with a loop, so a query can hand
+    this a tree tens of thousands of nodes tall; a recursive walk
+    would raise `RecursionError` on exactly the input this check exists
+    to reject."""
+    pending: list[tuple[Expr, bool]] = [(root, False)]
+    results: list[_Height] = []
+    while pending:
+        node, children_done = pending.pop()
+        children = _height_children(node)
+        if children and not children_done:
+            pending.append((node, True))
+            for child in reversed(children):
+                pending.append((child, False))
+            continue
+        first = len(results) - len(children)
+        child_results = results[first:]
+        del results[first:]
+        result = _node_height(node, child_results)
+        if result.height > _MAX_EXPR_DEPTH:
+            raise ParseError(_EXPR_DEPTH_MESSAGE, node.position)
+        results.append(result)
+    return results[0].height
 
 
 class _Parser:
@@ -522,6 +723,15 @@ class _Parser:
                 )
             if self._match(TokenType.OFFSET):
                 offset = self._parse_expr()
+            # SQLite holds LIMIT and OFFSET under one TK_LIMIT node of
+            # its own, one level above the taller of the two (issue
+            # #107): `LIMIT <height-1000 expression>` is rejected even
+            # though the expression alone is within the limit.
+            limit_height = _expr_height(limit)
+            if offset is not None:
+                limit_height = max(limit_height, _expr_height(offset))
+            if 1 + limit_height > _MAX_EXPR_DEPTH:
+                raise ParseError(_EXPR_DEPTH_MESSAGE, limit.position)
         return SelectStatement(
             select_list=select_list,
             from_table=from_table,
@@ -623,9 +833,18 @@ class _Parser:
                 start.position,
             )
         try:
-            return self._parse_or()
+            expr = self._parse_or()
         finally:
             self._depth -= 1
+        if self._depth == 0:
+            # A whole clause expression (a select item, WHERE, a GROUP
+            # BY or ORDER BY key, HAVING, LIMIT, OFFSET) is complete:
+            # check its height once, over the finished tree, before
+            # anything downstream walks it (issue #107). Nested calls -
+            # parentheses, IN lists, function arguments - are part of
+            # the enclosing clause's tree and are checked with it.
+            _expr_height(expr)
+        return expr
 
     def _consume_available_rparens(self, at_most: int) -> int:
         """Consume up to *at_most* `)` tokens, stopping at the first

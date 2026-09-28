@@ -2698,7 +2698,7 @@ results, which is a different overflow. The `float()` call stays inside
 REAL operand, truncated and clamped to int64 per #75. That matches
 `sqlite3` for a finite one - `'9223372036854775808' % 3` is `1.0` (was
 the INTEGER `2`, `2**63 % 3` unclamped), `5 % '9223372036854775808'`
-is `5.0` (was `5`), `'-9223372036854775809' % 7` is `-1.0` (was `-3`).
+is `5.0` (was `5`), `'-9223372036854775809' % 7` is `-1.0` (was `-2`).
 For a run too large for a double, `%` used to return a wrong exact
 remainder (`'999...9' % 3` gave `0`; `sqlite3` gives `1.0`) and now
 reaches `_int64_truncated` with `inf` and raises `OverflowError` from

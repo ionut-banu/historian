@@ -1240,6 +1240,99 @@ def test_aggregate_sum_of_line_no_times_1_1_diverges_from_naive(awkward_repo):
     _assert_differential(awkward_repo, "SELECT sum(line_no * 1.1) FROM blame")
 
 
+# --- Aggregate sum/avg squash an internally-produced NaN to NULL -------
+# (issue #104)
+#
+# `+inf` and `-inf` cannot be written as a bare numeric literal today
+# (issue #6, scientific-notation literals, is still v2 backlog) - each
+# case below reaches `+inf`/`-inf` by putting a quoted `TEXT` literal
+# such as `'1e400'` through arithmetic (`('1e400'+0)`), which both
+# engines coerce/overflow to `inf` via their own text-to-double
+# conversion. `awkward_repo`'s 12 `blame` rows (`line_no` 1,1,1,2,3,4,
+# 5,6,1,2,3,1 across five paths) give `('1e400'+0) * (line_no % 2 * 2
+# - 1)` an alternating sign per row, so summing it folds `+inf` and
+# `-inf` together inside the KBN running total and must squash to
+# `NULL` - except for the three single-line-file groups (one row each),
+# where there is no cancellation and the group total is a genuine
+# `+inf` that must NOT be squashed.
+
+
+def test_aggregate_sum_of_alternating_infinities_is_null_not_nan(awkward_repo):
+    """`sum(('1e400'+0) * (line_no % 2 * 2 - 1))` over all 12 rows folds
+    `+inf` and `-inf` together inside the KBN accumulator, producing an
+    internal `nan` that must squash to `NULL` - confirmed via oracle -
+    rather than leaking a Python `nan` out of `finish()` as it did
+    before this fix."""
+    _assert_differential(
+        awkward_repo, "SELECT sum(('1e400'+0) * (line_no % 2 * 2 - 1)) FROM blame"
+    )
+
+
+def test_aggregate_avg_of_alternating_infinities_is_null_not_nan(awkward_repo):
+    """Same query as above with `avg` - also `NULL`, confirmed via
+    oracle."""
+    _assert_differential(
+        awkward_repo, "SELECT avg(('1e400'+0) * (line_no % 2 * 2 - 1)) FROM blame"
+    )
+
+
+def test_aggregate_grouped_sum_of_alternating_infinities_mixes_null_and_inf(awkward_repo):
+    """Grouped by `path`: three single-line-file groups (`'a "quoted"
+    name.txt'`, `'binary.bin'`, `'phoenix.txt'`) have no cancellation
+    and their group total is a genuine `+inf`, which must not be
+    squashed; the two multi-line groups (`café.py`, `no_newline.txt`)
+    have alternating-sign rows whose running KBN total goes `nan`
+    internally and must come out `NULL`. Confirmed via oracle - exactly
+    this five-row mix, in `path` order."""
+    query = (
+        "SELECT path, sum(('1e400'+0) * (line_no % 2 * 2 - 1)) "
+        "FROM blame GROUP BY path ORDER BY path"
+    )
+    _assert_differential(awkward_repo, query)
+
+
+def test_aggregate_grouped_avg_of_alternating_infinities_mixes_null_and_inf(awkward_repo):
+    """Same grouping as above with `avg` - identical `NULL`/`inf`
+    pattern per group, confirmed via oracle."""
+    query = (
+        "SELECT path, avg(('1e400'+0) * (line_no % 2 * 2 - 1)) "
+        "FROM blame GROUP BY path ORDER BY path"
+    )
+    _assert_differential(awkward_repo, query)
+
+
+def test_aggregate_sum_overflows_to_a_genuine_infinity_not_null(awkward_repo):
+    """`sum(('1e308'+0) * 10)` over 12 rows: `1e308 * 10` overflows a
+    double's finite range to `+inf` the same way SQLite's own
+    arithmetic does - no cancellation, so this must stay `inf`, not be
+    squashed to `NULL`. Confirmed via oracle; also a regression pin for
+    the mutation gap this issue names: deleting the `_kbn_is_overflow`
+    guard would flip this to a wrong finite value or an exception,
+    which the NaN-cancellation cases above would not catch."""
+    _assert_differential(awkward_repo, "SELECT sum(('1e308'+0) * 10) FROM blame")
+
+
+def test_aggregate_avg_overflows_to_a_genuine_infinity_not_null(awkward_repo):
+    """Same query as above with `avg` - also `inf`, confirmed via
+    oracle."""
+    _assert_differential(awkward_repo, "SELECT avg(('1e308'+0) * 10) FROM blame")
+
+
+def test_aggregate_sum_avg_count_distinct_of_alternating_infinities(awkward_repo):
+    """`DISTINCT` dedups on the raw evaluated value before arithmetic
+    coercion (issue #88), so exactly two raw values (`+inf` and `-inf`)
+    reach the accumulator; `count(DISTINCT ...)` counts both (`2`), and
+    folding them together in `sum`/`avg(DISTINCT ...)` must squash to
+    `NULL` exactly like the non-DISTINCT case. Confirmed via oracle:
+    `(None, None, 2)`."""
+    query = (
+        "SELECT sum(DISTINCT ('1e400'+0) * (line_no % 2 * 2 - 1)), "
+        "avg(DISTINCT ('1e400'+0) * (line_no % 2 * 2 - 1)), "
+        "count(DISTINCT ('1e400'+0) * (line_no % 2 * 2 - 1)) FROM blame"
+    )
+    _assert_differential(awkward_repo, query)
+
+
 # --- Aggregate (issue #60): BindError cases, asserted directly ---------
 #
 # Unlike the section above, these never reach SQLite at all - historian

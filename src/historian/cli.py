@@ -105,6 +105,21 @@ of internal error this backstop exists for, and a `BrokenPipeError`
 from a closed pipe can only ever be raised from the write itself - so
 both new clauses need the write to be reachable from inside the same
 `try` that already guards lex/parse/bind/plan/materialize.
+
+Issue #107: a stack overflow is an internal error too
+-------------------------------------------------------
+
+`RecursionError` is a `RuntimeError`, so the repository clause used to
+catch it: a query nested deeper than the binder, planner or evaluator
+could walk was reported as "could not read repository", exit 3. Both
+causes are gone - the parser rejects any expression taller than
+SQLite's own limit (1000) as a `ParseError`, exit 1, and the walks
+below it are explicit-stack loops that do not grow Python's stack with
+the tree - so a `RecursionError` reaching `main` now means one of those
+guarantees broke. One more clause, `except RecursionError`, ordered
+before `except (OSError, RuntimeError)` for the same reason
+`BrokenPipeError` is, sends it to the internal-error message and exit
+4, never exit 3 and never exit 1 (it is not the user's mistake).
 """
 
 from __future__ import annotations
@@ -125,6 +140,15 @@ from historian.sql.parser import ParseError, parse
 from historian.values import Value
 
 __all__ = ["main"]
+
+#: The fixed diagnostic for an internal error (#49): never `str(exc)`,
+#: the exception's class name, or a traceback. Shared by the
+#: `RecursionError` clause (#107) and the `Exception` backstop.
+_INTERNAL_ERROR_MESSAGE = (
+    "error: historian hit an internal error and could not finish this "
+    "query - this is a bug in historian, not a mistake in your SQL. "
+    "Please report it, with the query that triggered it."
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -217,11 +241,19 @@ def main(argv: Sequence[str] | None = None) -> int:
        piped to `head`) while the result was being written. Not the
        user's fault and not historian's bug either - exit 0, nothing
        further written anywhere.
-    3. `(OSError, RuntimeError)`: the repository itself could not be
+    3. `RecursionError` (#107): Python's stack overflowed somewhere in
+       the pipeline. That is historian's bug, not the user's - the
+       parser rejects every expression taller than SQLite's own limit,
+       and nothing below it recurses per level of the tree - so exit 4
+       with the internal-error message. Ordered before the next clause
+       deliberately: `RecursionError` is a `RuntimeError`, and without
+       its own clause first it would be misreported as an unreadable
+       repository, exit 3.
+    4. `(OSError, RuntimeError)`: the repository itself could not be
        read. Exit 3. Ordered after `BrokenPipeError` deliberately -
        `BrokenPipeError` is an `OSError` subclass, and without its own
        clause first it would be misreported as this case instead.
-    4. `Exception` (never `BaseException` - see below): anything else,
+    5. `Exception` (never `BaseException` - see below): anything else,
        which by elimination is a bug in historian rather than in the
        user's query. Exit 4, with a fixed message that never repeats
        `str(exc)`, the exception's class name, or a traceback (see
@@ -246,16 +278,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     except BrokenPipeError:
         return 0
+    except RecursionError:
+        # Before `(OSError, RuntimeError)` on purpose: `RecursionError` is
+        # a `RuntimeError`, so without its own clause first a stack
+        # overflow would be reported as "could not read repository"
+        # (issue #107). The parser rejects every expression taller than
+        # SQLite's own limit and every walk below it is an explicit-stack
+        # loop, so reaching this means historian's own invariant broke:
+        # an internal error, exit 4, the same message as below.
+        print(_INTERNAL_ERROR_MESSAGE, file=sys.stderr)
+        return 4
     except (OSError, RuntimeError):
         print(f"error: could not read repository: {repo}", file=sys.stderr)
         return 3
     except Exception:
-        print(
-            "error: historian hit an internal error and could not finish this "
-            "query - this is a bug in historian, not a mistake in your SQL. "
-            "Please report it, with the query that triggered it.",
-            file=sys.stderr,
-        )
+        print(_INTERNAL_ERROR_MESSAGE, file=sys.stderr)
         return 4
 
     return 0

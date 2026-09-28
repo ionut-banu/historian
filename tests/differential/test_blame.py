@@ -907,7 +907,7 @@ def test_text_at_and_past_the_int64_boundary_regression_pins(tiny_repo, query):
         "SELECT '9223372036854775808' % 3 FROM blame",
         # (5.0,) REAL - was the INTEGER 5
         "SELECT 5 % '9223372036854775808' FROM blame",
-        # (-1.0,) REAL - int64 min % 7 is -1; was the INTEGER -3
+        # (-1.0,) REAL - int64 min % 7 is -1; was the INTEGER -2
         "SELECT '-9223372036854775809' % 7 FROM blame",
         # (1,) INTEGER - in range, unchanged
         "SELECT '9223372036854775807' % 3 FROM blame",

@@ -277,9 +277,10 @@ def test_where_and(tiny_repo):
 def test_where_three_term_and(tiny_repo):
     """Issue #121: a `WHERE` with three top-level `AND` terms is split
     into three conjunctive terms by `plan/optimizer.py`, each offered
-    to `blame` (which accepts none today), and the tree reassembled
-    with the `Filter` holding all three - results must still match
-    SQLite exactly."""
+    to `blame`, and the tree reassembled with the `Filter` holding all
+    three - results must still match SQLite exactly. Since #122 `blame`
+    accepts the `path` term and blames only `src/utils.py`; the other
+    two are left to the `Filter`."""
     _assert_differential(
         tiny_repo,
         "SELECT path, line_no FROM blame "

@@ -133,7 +133,7 @@ class Operator(Protocol):
 
 #: A pushdown capability label a scan declares in `capabilities()`
 #: (spec §2: `capabilities() -> set[PushdownKind]`). Each table names
-#: its own kinds - `blame`'s will be about `path` (#122) - so this is
+#: its own kinds - `blame`'s are about `path` (#122) - so this is
 #: a plain string rather than one shared enum every table would have
 #: to extend. The optimizer never interprets a kind; it only asks
 #: whether the set is empty (see `plan/optimizer.py`).

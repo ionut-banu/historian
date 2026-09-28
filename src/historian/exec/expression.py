@@ -741,7 +741,7 @@ def _eval_unary(expr: UnaryOp, row: Row, schema: Schema) -> Value:
     numeric = arithmetic_operand(operand)
     if isinstance(numeric, int):
         return _int64_bounded(-numeric)
-    return _squash_nan(-numeric)
+    return squash_nan(-numeric)
 
 
 # --- BinaryOp: arithmetic, concatenation, comparison --------------------
@@ -1027,11 +1027,16 @@ def _int64_bounded(exact: int) -> int | float:
     return float(exact)
 
 
-def _squash_nan(result: float) -> float | None:
+def squash_nan(result: float) -> float | None:
     """NaN can only ever be a computed *result* here, never a stored
     value (`values.py` rejects one outright) - catches `Inf-Inf`,
     `Inf*0`, `Inf/Inf`, not only `0.0/0.0`
-    (`_docs/decisions.md`, 2026-08-31)."""
+    (`_docs/decisions.md`, 2026-08-31). Exported (issue #104) so
+    `exec/operators.py`'s `_Accumulator.finish()` can squash a NaN
+    produced *inside* a running `sum`/`avg` total the same way, rather
+    than reimplementing this check a second time (issue #53's
+    precedent, already followed once for `try_numeric_affinity`/
+    `arithmetic_operand` in #88)."""
     if math.isnan(result):
         return None
     return result
@@ -1133,7 +1138,7 @@ def _arithmetic(op: Operator, left: Value, right: Value) -> Value:
             return None
         if isinstance(left_num, int) and isinstance(right_num, int):
             return _int64_bounded(_truncating_int_div(left_num, right_num))
-        return _squash_nan(left_num / right_num)
+        return squash_nan(left_num / right_num)
     if op is Operator.MOD:
         is_real = isinstance(left_num, float) or isinstance(right_num, float)
         left_int = _int64_truncated(left_num)
@@ -1160,4 +1165,4 @@ def _arithmetic(op: Operator, left: Value, right: Value) -> Value:
         result = left_num * right_num
     else:
         raise AssertionError(f"exec/expression.py: not an arithmetic operator: {op}")
-    return _squash_nan(result)
+    return squash_nan(result)

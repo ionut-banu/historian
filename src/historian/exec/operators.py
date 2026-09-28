@@ -94,6 +94,7 @@ from historian.exec.expression import (
     coerce_to_bool3,
     coerce_to_value,
     evaluate,
+    squash_nan,
     try_numeric_affinity,
 )
 from historian.schema import Column, ColumnType, Row, Schema
@@ -717,8 +718,17 @@ class _Accumulator:
                 # or Inf (_kbn_is_overflow - SQLite's sqlite3IsOverflow),
                 # in which case fall back to rSum alone.
                 if _kbn_is_overflow(self._sum_r_err):
-                    return self._sum_r_sum
-                return self._sum_r_sum + self._sum_r_err
+                    total = self._sum_r_sum
+                else:
+                    total = self._sum_r_sum + self._sum_r_err
+                # issue #104: rSum itself can be NaN (e.g. +inf folded
+                # with -inf mid-accumulation) even when the _kbn_is_
+                # overflow(rErr) guard above does not fire - SQLite's
+                # own sqlite3_result_double(ctx, NaN) always stores
+                # NULL, and finish() has no equivalent "storing a
+                # value" step to catch it, so squash explicitly.
+                # Infinity is untouched - only a real NaN squashes.
+                return squash_nan(total)
             return self._sum_int
         if call.kind == "avg":
             # avgFinalize: same approx/iSum read as sum, no ovrfl check
@@ -733,7 +743,10 @@ class _Accumulator:
                     total += self._sum_r_err
             else:
                 total = float(self._sum_int)
-            return total / self._non_null_count
+            # issue #104: same NaN-in-rSum gap as sum's branch above -
+            # dividing a NaN total by a non-zero count is still NaN,
+            # and must squash to NULL rather than leak out of finish().
+            return squash_nan(total / self._non_null_count)
         if call.kind in ("min", "max"):
             return self._extreme  # None (NULL) if no non-NULL value was ever seen
         raise AssertionError(f"exec/operators.py: unhandled aggregate kind {call.kind!r}")

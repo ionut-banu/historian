@@ -31,6 +31,7 @@ section for what *is* covered differentially and why.
 from __future__ import annotations
 
 import itertools
+import math
 from collections.abc import Iterator, Sequence
 
 import pytest
@@ -1552,6 +1553,49 @@ def test_kbn_refactor_preserves_88_overflow_rule_overflow_then_real_does_not_rai
     (row,) = tuple(Aggregate(_agg_child(rows), [_call("sum", _col("line_no"))]).rows())
 
     assert type(row[0]) is float
+
+
+# --- Issue #104: sum()/avg() squash an internally-produced NaN to NULL -
+#
+# `+inf` folded with `-inf` inside the KBN running total (`_kbn_step`)
+# produces a `nan` in `_sum_r_sum` itself, not only in `_sum_r_err` -
+# the existing `_kbn_is_overflow(self._sum_r_err)` guard in `finish()`
+# does not catch this, because it falls back to `self._sum_r_sum`,
+# which is *also* nan by then. `sqlite3_result_double(ctx, NaN)` always
+# stores `NULL`, so historian's `finish()` must too. Driven directly
+# through `_Accumulator` via `Aggregate` over synthetic rows - no git
+# fixture - per this issue's own acceptance criteria.
+
+
+def test_sum_avg_squash_inf_minus_inf_cancellation_to_null():
+    """`+inf` then `-inf`: the running KBN total goes `nan` internally
+    (confirmed by tracing `_kbn_step` in the issue's own root-cause
+    analysis). `finish()` must return `None`, matching SQLite's
+    `sqlite3_result_double(ctx, NaN)` -> `NULL` rule, for both `sum`
+    and `avg`."""
+    values = [float("inf"), float("-inf")]
+
+    sum_row = _sum_rows(values)
+    assert sum_row[0] is None
+
+    avg_row = _avg_rows(values)
+    assert avg_row[0] is None
+
+
+def test_sum_avg_do_not_squash_a_genuine_infinite_result():
+    """Two `+inf` values, no cancellation: the running total stays a
+    genuine `+inf`, never `nan`, and must come out as `float('inf')`
+    unchanged - proving the fix distinguishes a real NaN from a real
+    infinite result rather than squashing both."""
+    values = [float("inf"), float("inf")]
+
+    sum_row = _sum_rows(values)
+    assert sum_row[0] == float("inf")
+    assert not math.isnan(sum_row[0])
+
+    avg_row = _avg_rows(values)
+    assert avg_row[0] == float("inf")
+    assert not math.isnan(avg_row[0])
 
 
 # --- Aggregate (issue #69): the grouped path --------------------------------

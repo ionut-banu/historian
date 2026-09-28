@@ -167,11 +167,18 @@ Every table's scan declares which predicates it can use to reduce work:
 
 ```
 capabilities() -> set[PushdownKind]
+accepts(term: Predicate) -> bool
 scan(pushed: list[Predicate]) -> Iterator[Row]
 ```
 
-The planner walks the conjunctive terms of the `WHERE` clause, offers
-each to the scan, and passes along the ones it accepts.
+The optimizer walks the conjunctive terms of the `WHERE` clause,
+offers each to the scan with `accepts()`, and passes along the ones
+it accepts, in the order they were offered. A scan whose
+`capabilities()` is empty is offered nothing. A `Predicate` is the
+bound AST subexpression of one term, its column references resolved
+against the scan's own schema; a `PushdownKind` is a label each table
+names for itself. `accepts()` answers from the term's shape alone,
+with no I/O.
 
 **Pushdown may only reduce the input to a superset of the matching
 rows, and the `Filter` operator is never removed in v1.**
@@ -509,9 +516,11 @@ The optimizer's one job in v1.
 1. Split the `WHERE` predicate on `AND` into conjunctive terms. `OR`
    is not split - a disjunction is one term, and pushes down only if a
    scan accepts the whole thing.
-2. Offer each term to the scan beneath it. The scan returns the terms
-   it can use.
-3. Pass the accepted terms to the scan as scan arguments.
+2. Offer each term to the scan beneath it, left to right, one
+   `accepts(term)` call per term. Only the `WHERE` filter directly
+   above the scan is negotiated - never `HAVING`.
+3. Pass the accepted terms to the scan as scan arguments, recorded on
+   the `Scan` operator so the plan shows them.
 4. Leave the `Filter` in place, unchanged, with every term still in it.
 
 Step 4 is deliberate and is the subject of a decision entry. A scan

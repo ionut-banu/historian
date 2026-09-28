@@ -2411,3 +2411,43 @@ overwhelmingly produce shapes closer to the first regime; #100's own
 "comparable to today's pure-nesting ceiling" phrasing already
 anticipated that the worst adversarial mixed shape would not, and
 should not, reach exactly 1000.
+
+2026-09-28 - Pushdown negotiation is one accepts(term) call per term,
+and a term is the bound AST subexpression
+
+Issue #121. The spec fixed `capabilities()` and `scan(pushed)` but
+not how a single term is offered, nor what a `Predicate` is.
+
+The per-term call is `accepts(term: Predicate) -> bool` on the scan
+source. The alternative, one `negotiate(terms) -> accepted` call,
+lets a scan reorder, duplicate, or return a term it was never
+offered; with a boolean per term the optimizer builds the accepted
+list itself, so "an ordered subset of what was offered" holds by
+construction rather than by each table's care. `capabilities()`
+becomes the gate: an empty set means `accepts()` is never called,
+which is also why every pre-#121 test fake still works unchanged.
+
+A `Predicate` is the bound AST node for the term, not a second
+representation. A pushdown-specific type (column, operator, literal)
+would need a translation pass that either loses shapes a future
+table can use or grows into a copy of the AST. The bound node
+already has what #122 needs - `BoundColumnRef.offset` into the scan's
+own schema, since only the `WHERE` filter directly above the `Scan`
+is negotiated - and a table matches it with the same explicit
+`isinstance` checks the evaluator uses. `PushdownKind` is a plain
+string each table names for itself; the optimizer never interprets
+it.
+
+The optimizer is `optimize(tree) -> tree` in `plan/optimizer.py`, a
+separate step `cli.py` calls between `plan()` and execution, so
+`--no-pushdown` (#43) is "do not call it" and `--explain` (#42)
+reads the outcome from `Scan.pushed()`. It rewrites in place - the
+one write is `Scan.set_pushed(accepted)` - rather than rebuilding
+the tree, because rebuilding every ancestor would mean every
+operator exposing its constructor arguments for no decision. It
+reaches the `Scan` through `exec/operators.py`'s `child_of()`, an
+explicit `isinstance` chain, not through other modules' private
+attributes. The `Filter` is read, never replaced: the predicate
+object left in it is the one `plan()` put there. Term splitting uses
+an explicit stack, not recursion, so a long left-deep `AND` chain is
+not bounded by Python's recursion limit.

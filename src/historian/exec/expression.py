@@ -1118,12 +1118,78 @@ def _int64_truncated(value: int | float) -> int:
     second `float` conversion."""
     if isinstance(value, int):
         return value
+    # Infinity first (issue #106): `math.trunc(inf)` raises
+    # `OverflowError`, while SQLite's `doubleToInt64` clamps it like
+    # any other out-of-range magnitude - `('1e400'+0) % 3` is `1.0`.
+    # NaN never reaches here: `squash_nan` has already made it NULL.
+    if value == math.inf:
+        return INT64_MAX
+    if value == -math.inf:
+        return INT64_MIN
     truncated = math.trunc(value)
     if truncated < INT64_MIN:
         return INT64_MIN
     if truncated > INT64_MAX:
         return INT64_MAX
     return truncated
+
+
+def _modulo_text_operand(text: str) -> tuple[int, bool]:
+    """A TEXT operand of `%` (issue #106): its integer value, and
+    whether it counts as REAL for the result's storage class.
+
+    The two come from different scans, because SQLite's own
+    `OP_Remainder` takes them from different places. The class is
+    `numericType`'s, the general text-to-number conversion
+    `arithmetic_operand` already mirrors - so `'1e3'` and `'12.0'` are
+    REAL, `'7abc'` and `'5e'` INTEGER. The value is
+    `sqlite3VdbeIntValue`'s, which for TEXT is `sqlite3Atoi64`: skip
+    whitespace, an optional sign, then digits up to the first
+    non-digit, clamped to int64. A `.` or an exponent is never part of
+    it, so `'1e3'` reads `1`, `'1.5e2'` reads `1`, `'1e400'` reads `1`
+    (never `inf`), and no digits at all reads `0`. Confirmed with
+    tests/oracle.py (module sqlite3 3.45.1): `'1e3' % 7` is `1.0`,
+    `'99999999999999999999e0' % 7` is `0.0` (int64 max % 7).
+
+    `_scan_number` is not touched: `+ - * /` and `sum`/`avg` still
+    need its exponent-accepting grammar for their values."""
+    is_real = isinstance(_coerce_arithmetic_text(text), float)
+    n = len(text)
+    i = 0
+    while i < n and text[i] in _NUMERIC_WHITESPACE:
+        i += 1
+    negative = False
+    if i < n and (text[i] == "+" or text[i] == "-"):
+        negative = text[i] == "-"
+        i += 1
+    digits_start = i
+    while i < n and is_ascii_digit(text[i]):
+        i += 1
+    if i == digits_start:
+        return 0, is_real
+    sign = "-" if negative else ""
+    exact = _int64_digit_run(sign + text[digits_start:i])
+    if exact is not None:
+        return exact, is_real
+    return (INT64_MIN if negative else INT64_MAX), is_real
+
+
+def _modulo_operand(value: Value) -> tuple[int, bool]:
+    """A non-NULL `%` operand as the `int` the remainder is computed
+    from, plus whether it counts as REAL for the result's class: an
+    INTEGER passes through, a REAL is truncated and clamped
+    (`_int64_truncated`), TEXT goes through `_modulo_text_operand`.
+    The `bool` guard is `arithmetic_operand`'s own (issue #63)."""
+    if isinstance(value, bool):
+        raise TypeError(
+            "bool is not a SQL Value; a Bool3 predicate result has leaked "
+            f"into an arithmetic operand position (got {value!r})"
+        )
+    if isinstance(value, str):
+        return _modulo_text_operand(value)
+    if isinstance(value, float):
+        return _int64_truncated(value), True
+    return value, False
 
 
 def _mod_result(remainder: int, is_real: bool) -> int | float:
@@ -1169,11 +1235,11 @@ def _arithmetic(op: Operator, left: Value, right: Value) -> Value:
     afterward the way the `Inf - Inf` family can (`_docs/spec.md`
     §3's own NaN note; `_docs/decisions.md`, 2026-08-31).
 
-    `%` (issue #75) is its own branch, not a variant of `DIV`'s: its
-    storage-class rule looks at the *original* (post-text-coercion)
-    operands - REAL if either was REAL - which must be captured before
-    `_int64_truncated` narrows a REAL operand to the `int` the C-style
-    remainder is computed from. Reuses `_truncating_int_div` exactly as
+    `%` (issue #75) is its own branch, not a variant of `DIV`'s, and
+    runs before `arithmetic_operand` is called: `_modulo_operand` reads
+    each operand's `int` and its REAL-or-not class separately - for
+    TEXT the two come from different scans (issue #106), so `'1e3' % 7`
+    is REAL `1.0` - and the result is REAL if either operand was. Reuses `_truncating_int_div` exactly as
     `DIV` does (`remainder = left - _truncating_int_div(left, right) *
     right`), so no separate sign-fixup logic exists for `%` - a wrong
     quotient sign in `_truncating_int_div` would break both operators
@@ -1183,6 +1249,13 @@ def _arithmetic(op: Operator, left: Value, right: Value) -> Value:
     """
     if left is None or right is None:
         return None
+    if op is Operator.MOD:
+        left_int, left_is_real = _modulo_operand(left)
+        right_int, right_is_real = _modulo_operand(right)
+        if right_int == 0:
+            return None
+        remainder = left_int - _truncating_int_div(left_int, right_int) * right_int
+        return _mod_result(remainder, left_is_real or right_is_real)
     left_num = arithmetic_operand(left)
     right_num = arithmetic_operand(right)
     if op is Operator.DIV:
@@ -1191,14 +1264,6 @@ def _arithmetic(op: Operator, left: Value, right: Value) -> Value:
         if isinstance(left_num, int) and isinstance(right_num, int):
             return _int64_bounded(_truncating_int_div(left_num, right_num))
         return squash_nan(left_num / right_num)
-    if op is Operator.MOD:
-        is_real = isinstance(left_num, float) or isinstance(right_num, float)
-        left_int = _int64_truncated(left_num)
-        right_int = _int64_truncated(right_num)
-        if right_int == 0:
-            return None
-        remainder = left_int - _truncating_int_div(left_int, right_int) * right_int
-        return _mod_result(remainder, is_real)
     if isinstance(left_num, int) and isinstance(right_num, int):
         if op is Operator.ADD:
             exact = left_num + right_num

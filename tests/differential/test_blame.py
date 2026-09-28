@@ -921,6 +921,151 @@ def test_modulo_text_operand_past_int64_is_a_real_operand(tiny_repo, query):
     _assert_differential(tiny_repo, query)
 
 
+# --- Modulo (%): digit-stop TEXT scan and infinite operands (#106) -----
+#
+# SQLite's `OP_Remainder` takes each operand's integer value from
+# `sqlite3VdbeIntValue`, which for TEXT is `sqlite3Atoi64`: whitespace,
+# sign, digits, stop at the first non-digit (never `.` or an
+# exponent), clamped to int64. The REAL-vs-INTEGER class of the result
+# still comes from the general conversion (`numericType`), so `'1e3' %
+# 7` is REAL `1.0`, not `6.0`. A REAL operand - infinite included - is
+# truncated and clamped (`doubleToInt64`), so `inf` is int64 max.
+#
+# Every query here is literal-only (no column reference, except the
+# two `line_no` aggregate/WHERE pins), so each value reaches both
+# engines as query text, parsed independently by each - `1e400` is
+# reached through `'1e400'+0` since exponent literals are #6. Each case
+# also pins the oracle's own answer (tests/oracle.py, module sqlite3
+# 3.45.1), REALs by `float.hex()`, so an oracle version drift (#117)
+# shows up as a failure here rather than silently moving the target.
+
+
+def _hex_or_value(value):
+    return value.hex() if isinstance(value, float) else value
+
+
+def _assert_differential_pinned(repo, query: str, expected) -> None:
+    """`_assert_differential`, plus SQLite's own single-row answer
+    pinned: type and value, a REAL compared by `float.hex()`."""
+    conn = load_unfiltered(BlameScan, repo, BLAME_SCHEMA, "blame")
+    try:
+        sqlite_rows = conn.execute(query).fetchall()
+    finally:
+        conn.close()
+    assert len(sqlite_rows) == 1
+    (sqlite_value,) = sqlite_rows[0]
+    assert type(sqlite_value) is type(expected)
+    assert _hex_or_value(sqlite_value) == _hex_or_value(expected)
+    _, historian_rows = run_historian(query, repo)
+    assert_rows_match(sqlite_rows, historian_rows)
+
+
+_NINES_320 = "9" * 320
+
+
+@pytest.mark.parametrize(
+    "query,expected",
+    [
+        # Newly fixed: historian used the full-number parse.
+        ("SELECT '1e3' % 7 FROM blame LIMIT 1", 1.0),  # was 6.0
+        ("SELECT 7 % '1e3' FROM blame LIMIT 1", 0.0),  # was 7.0
+        ("SELECT 3.0 % '1e2' FROM blame LIMIT 1", 0.0),  # was 3.0
+        ("SELECT '1e30' % 7 FROM blame LIMIT 1", 1.0),  # was 0.0
+        ("SELECT '1.5e2' % 7 FROM blame LIMIT 1", 1.0),  # was 3.0
+        ("SELECT 7 % '1.5e2' FROM blame LIMIT 1", 0.0),  # was 7.0
+        ("SELECT '-1e2' % 7 FROM blame LIMIT 1", -1.0),  # was -2.0
+        ("SELECT '2E1' % 7 FROM blame LIMIT 1", 2.0),  # was 6.0
+        ("SELECT '1e2abc' % 7 FROM blame LIMIT 1", 1.0),  # was 2.0
+        # Regression pin: both scans read 0 before the `.`.
+        ("SELECT '.5' % 7 FROM blame LIMIT 1", 0.0),
+    ],
+)
+def test_modulo_text_operand_with_an_exponent_stops_at_the_first_non_digit(
+    tiny_repo, query, expected
+):
+    _assert_differential_pinned(tiny_repo, query, expected)
+
+
+@pytest.mark.parametrize(
+    "query,expected",
+    [
+        # Newly fixed: each raised OverflowError from math.trunc (exit 4).
+        ("SELECT ('1e400'+0) % 3 FROM blame LIMIT 1", 1.0),
+        ("SELECT 5 % ('1e400'+0) FROM blame LIMIT 1", 5.0),
+        ("SELECT 5 % (-('1e400'+0)) FROM blame LIMIT 1", 5.0),
+        ("SELECT '1e400' % 3 FROM blame LIMIT 1", 1.0),
+        ("SELECT ('1e400'+0) % ('1e400'+0) FROM blame LIMIT 1", 0.0),
+        pytest.param(
+            f"SELECT '{_NINES_320}' % 3 FROM blame LIMIT 1", 1.0, id="320-nines"
+        ),
+        # Regression pins: squash_nan turns 0.0/0.0 into NULL first.
+        ("SELECT (0.0/0.0) % 3 FROM blame LIMIT 1", None),
+        ("SELECT 3 % (0.0/0.0) FROM blame LIMIT 1", None),
+    ],
+)
+def test_modulo_infinite_operand_clamps_to_int64(tiny_repo, query, expected):
+    _assert_differential_pinned(tiny_repo, query, expected)
+
+
+@pytest.mark.parametrize(
+    "query,expected",
+    [
+        # Divisor zero, INTEGER and REAL and TEXT.
+        ("SELECT 7 % 0 FROM blame LIMIT 1", None),
+        ("SELECT 7 % 0.0 FROM blame LIMIT 1", None),
+        ("SELECT 7.5 % 0 FROM blame LIMIT 1", None),
+        ("SELECT 7 % 0.5 FROM blame LIMIT 1", None),
+        ("SELECT 3 % '0e5' FROM blame LIMIT 1", None),
+        ("SELECT 3 % '0.0e5' FROM blame LIMIT 1", None),
+        ("SELECT '5e0' % 0 FROM blame LIMIT 1", None),
+        # Negative operands.
+        ("SELECT -7 % 2 FROM blame LIMIT 1", -1),
+        ("SELECT 7 % -2 FROM blame LIMIT 1", 1),
+        ("SELECT -7 % -2 FROM blame LIMIT 1", -1),
+        # REAL operands with fractions.
+        ("SELECT 7.5 % 2 FROM blame LIMIT 1", 1.0),
+        ("SELECT -7.5 % 2 FROM blame LIMIT 1", -1.0),
+        # Finite int64 clamp boundaries.
+        ("SELECT 9223372036854775807.0 % 3 FROM blame LIMIT 1", 1.0),
+        ("SELECT 9223372036854775808.0 % 3 FROM blame LIMIT 1", 1.0),
+        ("SELECT -99999999999999999999.0 % 7 FROM blame LIMIT 1", -1.0),
+        ("SELECT -9223372036854775808 % -1 FROM blame LIMIT 1", 0),
+        # #105's digit runs past int64 (the infinite one is above).
+        ("SELECT '9223372036854775808' % 3 FROM blame LIMIT 1", 1.0),
+        ("SELECT 5 % '9223372036854775808' FROM blame LIMIT 1", 5.0),
+        ("SELECT '-9223372036854775809' % 7 FROM blame LIMIT 1", -1.0),
+        ("SELECT '9223372036854775807' % 3 FROM blame LIMIT 1", 1),
+        # NULL operands.
+        ("SELECT NULL % 2 FROM blame LIMIT 1", None),
+        ("SELECT 2 % NULL FROM blame LIMIT 1", None),
+        ("SELECT NULL % NULL FROM blame LIMIT 1", None),
+    ],
+)
+def test_modulo_regression_pins_around_the_106_fix(tiny_repo, query, expected):
+    """Already agreed before #106; pinned because the fix rewires how
+    `%` reads its operands."""
+    _assert_differential_pinned(tiny_repo, query, expected)
+
+
+@pytest.mark.parametrize(
+    "query,expected",
+    [
+        # Regression pins over the bound `line_no` column (1, 1, 2).
+        ("SELECT sum(line_no % 2) FROM blame", 2),
+        ("SELECT count(*) FROM blame WHERE line_no % 2 = 1", 2),
+        # Newly fixed: was 6.0 (2.0 three times).
+        ("SELECT sum('1e2' % 7) FROM blame", 3.0),
+        # Newly fixed: was 0 (2.0 never equals 1).
+        ("SELECT count(*) FROM blame WHERE '1e2' % 7 = 1", 3),
+        # Newly fixed: raised OverflowError inside Aggregate / Filter.
+        ("SELECT sum(('1e400'+0) % 3) FROM blame", 3.0),
+        ("SELECT count(*) FROM blame WHERE (('1e400'+0) % 3) = 1", 3),
+    ],
+)
+def test_modulo_106_fix_threads_through_aggregate_and_filter(tiny_repo, query, expected):
+    _assert_differential_pinned(tiny_repo, query, expected)
+
+
 # --- Float-to-text: precision and shape must survive a `%.15g` change --
 #
 # `blame` has no REAL column and the case set had no float literal

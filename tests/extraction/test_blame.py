@@ -340,18 +340,20 @@ def test_phoenix_attributed_to_the_recreation_commit_not_the_original(awkward_re
     assert rows[0][_COMMIT_HASH_IDX] == AWKWARD_HEAD
 
 
-# --- The pushdown-interface stub (M4's real work is #13/#14) -------------
+# --- The pushdown interface (the work-done tests are in tests/pushdown/) --
 
 
-def test_capabilities_is_empty(tiny_repo):
-    assert BlameScan(tiny_repo).capabilities() == set()
+def test_capabilities_are_the_three_path_kinds(tiny_repo):
+    """#122 gave `blame` its `path` pushdown; before it this set was
+    empty."""
+    assert BlameScan(tiny_repo).capabilities() == {blame.PATH_EQ, blame.PATH_IN, blame.PATH_LIKE_PREFIX}
 
 
-def test_scan_ignores_pushed_entirely(tiny_repo):
-    """No pushdown is attempted: calling `scan()` with a non-empty or
-    nonsensical `pushed` argument produces the identical full row set
-    as calling it with none - a predicate that cannot push down must
-    still produce correct results (spec §4)."""
+def test_scan_ignores_pushed_entries_that_are_not_path_terms(tiny_repo):
+    """Nothing that is not an accepted `path` term narrows the scan:
+    calling `scan()` with nonsensical `pushed` entries produces the
+    identical full row set as calling it with none - a predicate that
+    cannot push down must still produce correct results (spec §4)."""
     baseline = sorted(BlameScan(tiny_repo).scan())
     with_garbage = sorted(BlameScan(tiny_repo).scan(pushed=[object(), "not a predicate", 42]))
     assert with_garbage == baseline

@@ -34,7 +34,8 @@ from historian.tables.blame import BLAME_SCHEMA, BlameScan
 from differential.conftest import assert_rows_match, load_unfiltered
 from fixtures.build import CASEFOLD_PATHS
 
-TINY_PATHS = ["src/utils.py", "feature/thing.py"]
+# `git ls-tree` order (bytewise), which is `feature/` before `src/`.
+TINY_PATHS = ["feature/thing.py", "src/utils.py"]
 
 
 def _run(query: str, repo: Path):

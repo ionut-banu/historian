@@ -65,18 +65,70 @@ header. Checking for the tab first, and only ever stripping that one
 leading character (never a general `.strip()`), is what tells them
 apart. `tests/extraction/test_blame.py` has its own, independently
 written parser that proves this the same way, on the same fixture.
+
+`path` pushdown (issue #122)
+----------------------------
+
+`BlameScan.accepts()` takes exactly three shapes of term on the `path`
+column (schema offset 0, matched by `BoundColumnRef.offset`, never by
+name), and `scan()` uses them to blame fewer files:
+
+- ``path = 'lit'`` or ``'lit' = path`` - a text literal only;
+- ``path IN ('lit', ...)`` - every element a text literal, ``IN ()``
+  included; never ``NOT IN``;
+- ``path LIKE 'prefix%'`` - no ``NOT``, no ``ESCAPE``, a text-literal
+  pattern whose only wildcard is one trailing ``%``.
+
+Anything else is rejected and left to the `Filter` above the scan,
+which is never removed. In particular a non-text literal (``path =
+5``) is rejected rather than converted: TEXT affinity would turn it
+into ``'5'``, and that conversion belongs to `exec/expression.py`,
+not to a second copy here.
+
+The candidate set is always cut down from `git ls-tree`'s own output,
+never built from the literals, so `git blame` is never run on a path
+that is not tracked at `HEAD`. A `LIKE` prefix is matched with
+`historian.ascii.ascii_fold` on both sides - the same ASCII-only fold
+the evaluator's `LIKE` uses - because SQLite's `LIKE` folds ASCII case
+(``'src/a.py' LIKE 'SRC/%'`` is true) and leaves every other letter
+alone (``'straße' LIKE 'STRASSE'`` is false). A case-sensitive prefix
+check would drop matching rows; `str.lower()` would add non-matching
+ones and, worse, disagree with the evaluator about what matches.
+
+Several pushed terms narrow one after another, so the result is their
+intersection - still a superset of the rows the whole `WHERE` keeps.
+An `IN` list blames in the list's own order (deduplicated); `=` and
+`LIKE` keep `ls-tree` order.
+
+Every `scan()` call records what it did on the instance -
+`blamed_paths`, `git_invocations`, `tracked_path_count` - reset at the
+start of the call, so a test (and later `--stats`, #42) can assert
+the work was actually avoided rather than only that the rows are
+right (spec §4, "The pushdown layer").
 """
 
 from __future__ import annotations
 
 import subprocess
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ..ascii import ascii_fold
 from ..schema import Column, ColumnType, Row, Schema
+from ..sql.ast import BinaryOp, Expr, In, Like, Literal, Operator
+from ..sql.binder import BoundColumnRef
 
-__all__ = ["BLAME_SCHEMA", "BlameScan", "blame_paths", "list_paths"]
+__all__ = [
+    "BLAME_SCHEMA",
+    "BlameScan",
+    "PATH_EQ",
+    "PATH_IN",
+    "PATH_LIKE_PREFIX",
+    "blame_paths",
+    "list_paths",
+]
 
 #: `blame`'s seven columns (spec §2), in column order. Imported by #9
 #: (the table catalog) and #12 (the `Scan` operator) rather than either
@@ -92,6 +144,17 @@ BLAME_SCHEMA = Schema(
         Column("authored_at", ColumnType.TEXT),
     )
 )
+
+#: `path`'s offset in `BLAME_SCHEMA` - how a pushed term's
+#: `BoundColumnRef` is recognised as naming it.
+_PATH_OFFSET = 0
+
+#: The pushdown kinds `BlameScan.capabilities()` declares (#122): one
+#: per accepted `path` shape. Labels only; the optimizer never reads
+#: them.
+PATH_EQ = "path_eq"
+PATH_IN = "path_in"
+PATH_LIKE_PREFIX = "path_like_prefix"
 
 
 def _decode(data: bytes) -> str:
@@ -226,6 +289,98 @@ def blame_paths(repo: Path, paths: Sequence[str]) -> Iterator[Row]:
         yield from _blame_file(repo, path)
 
 
+# --- `path` pushdown (#122) -----------------------------------------------
+
+
+@dataclass(frozen=True)
+class _PathSelection:
+    """Which paths one accepted term can select. Exactly one field is
+    set: `literals` for `=`/`IN` (deduplicated, in the term's own
+    order), `prefix` for `LIKE 'prefix%'`."""
+
+    literals: tuple[str, ...] | None
+    prefix: str | None
+
+
+def _is_path_column(expr: Expr) -> bool:
+    return isinstance(expr, BoundColumnRef) and expr.offset == _PATH_OFFSET
+
+
+def _is_text_literal(expr: Expr) -> bool:
+    """A `Literal` whose value is a `str` - never `NULL`, never a
+    number (whose TEXT-affinity conversion is the evaluator's job)."""
+    return isinstance(expr, Literal) and isinstance(expr.value, str)
+
+
+def _like_prefix(pattern: str) -> str | None:
+    """The prefix of a `LIKE` pattern of the form ``'prefix%'`` - one
+    trailing `%`, no other `%` or `_` - or `None` for any other
+    pattern."""
+    if len(pattern) == 0 or pattern[-1] != "%":
+        return None
+    prefix = pattern[:-1]
+    if "%" in prefix or "_" in prefix:
+        return None
+    return prefix
+
+
+def _path_selection(term: Expr) -> _PathSelection | None:
+    """The paths *term* can select, or `None` if it is not one of the
+    three accepted shapes. Shape alone, no I/O: this is both
+    `BlameScan.accepts()`'s answer and what `scan()` narrows by, so
+    the two can never disagree."""
+    if isinstance(term, BinaryOp):
+        if term.op != Operator.EQ:
+            return None
+        if _is_path_column(term.left) and _is_text_literal(term.right):
+            return _PathSelection(literals=(term.right.value,), prefix=None)
+        if _is_text_literal(term.left) and _is_path_column(term.right):
+            return _PathSelection(literals=(term.left.value,), prefix=None)
+        return None
+    if isinstance(term, In):
+        if term.negated or not _is_path_column(term.left):
+            return None
+        literals: list[str] = []
+        for value in term.values:
+            if not _is_text_literal(value):
+                return None
+            if value.value not in literals:
+                literals.append(value.value)
+        return _PathSelection(literals=tuple(literals), prefix=None)
+    if isinstance(term, Like):
+        if term.negated or term.escape is not None:
+            return None
+        if not _is_path_column(term.left) or not _is_text_literal(term.pattern):
+            return None
+        prefix = _like_prefix(term.pattern.value)
+        if prefix is None:
+            return None
+        return _PathSelection(literals=None, prefix=prefix)
+    return None
+
+
+def _narrow(candidates: list[str], selection: _PathSelection) -> list[str]:
+    """The entries of *candidates* that *selection* can select.
+
+    Always a sub-list of *candidates* - never a path taken from the
+    query's own literals - so a path `ls-tree` did not report is never
+    blamed. For literals the order is the literals' own; for a prefix,
+    *candidates*' order."""
+    narrowed: list[str] = []
+    if selection.literals is not None:
+        for literal in selection.literals:
+            for path in candidates:
+                if path == literal:
+                    narrowed.append(path)
+        return narrowed
+    assert selection.prefix is not None
+    folded_prefix = ascii_fold(selection.prefix)
+    for path in candidates:
+        if ascii_fold(path).startswith(folded_prefix):
+            narrowed.append(path)
+    return narrowed
+
+
 class BlameScan:
     """The `blame` table's scan operator (spec §2, phase 1; §3's scan
     interface).
@@ -242,36 +397,53 @@ class BlameScan:
 
     def __init__(self, repo: Path):
         self._repo = Path(repo)
+        # The work record (spec §4, "The pushdown layer"), reset by
+        # every `scan()` call. Plain attributes, read by tests and by
+        # `--stats` (#42): the paths `git blame` was run on, in order;
+        # every `git` process started, `ls-tree` included; and how many
+        # paths `ls-tree` reported at `HEAD`.
+        self.blamed_paths: list[str] = []
+        self.git_invocations = 0
+        self.tracked_path_count = 0
 
     def capabilities(self) -> set[str]:
-        """Which pushdown kinds this scan can use.
+        """Which pushdown kinds this scan can use: `path` equality,
+        `path IN`, and `path LIKE 'prefix%'` (spec §2's `blame`
+        table). Every other column is unknown until a file has been
+        blamed, so it cannot reduce work."""
+        return {PATH_EQ, PATH_IN, PATH_LIKE_PREFIX}
 
-        Always empty. `blame`'s `path` pushdown (spec §2's table) is
-        #122; until then this scan does not know how to use a
-        predicate to do less work, so `plan/optimizer.py` (#121) never
-        offers it a term. An empty set here is not a placeholder; it is
-        simply true today.
+    def accepts(self, term: Expr) -> bool:
+        """Whether this scan uses *term* (one conjunctive `WHERE`
+        term, bound against `BLAME_SCHEMA`) to blame fewer files.
+        True only for the three shapes listed in the module
+        docstring; decided from the term's shape alone."""
+        return _path_selection(term) is not None
+
+    def scan(self, pushed: Sequence[Expr] = ()) -> Iterator[Row]:
+        """Yield the `blame` rows at `HEAD` for every path the
+        *pushed* terms can select - every tracked path when nothing is
+        pushed - streamed file by file.
+
+        The rows are a superset of those the pushed terms keep: a
+        path is dropped only when no row of it could satisfy some
+        pushed term. A term `accepts()` would reject narrows nothing.
+        Resets the work record now, at the call, not at the first row.
         """
-        return set()
+        self.blamed_paths = []
+        self.git_invocations = 0
+        self.tracked_path_count = 0
+        return self._scan_rows(tuple(pushed))
 
-    def accepts(self, term: object) -> bool:
-        """Whether this scan would use *term* (one conjunctive `WHERE`
-        term) to do less work - the per-term half of the scan
-        capability contract (#121). Always `False`, matching
-        `capabilities()`; the optimizer does not even ask while that
-        set is empty. #122 gives it real answers for `path` terms."""
-        return False
-
-    def scan(self, pushed: Sequence[object] = ()) -> Iterator[Row]:
-        """Yield every `blame` row at `HEAD`, streamed file by file.
-
-        `pushed` is accepted per §2's ``scan(pushed)`` call convention
-        and is provably ignored: `capabilities()` returns an empty set,
-        so the optimizer (#121) never has anything accepted to pass
-        here, and this method does not inspect `pushed`'s contents at
-        all - every path `list_paths` reports is always blamed,
-        whatever `pushed` is. Rows are streamed (a generator), never
-        materialized as a list, matching spec §1's "no materialized
-        copy" and §2's phase-1 implementation note.
-        """
-        yield from blame_paths(self._repo, list_paths(self._repo))
+    def _scan_rows(self, pushed: tuple[Expr, ...]) -> Iterator[Row]:
+        self.git_invocations += 1
+        candidates = list_paths(self._repo)
+        self.tracked_path_count = len(candidates)
+        for term in pushed:
+            selection = _path_selection(term)
+            if selection is not None:
+                candidates = _narrow(candidates, selection)
+        for path in candidates:
+            self.blamed_paths.append(path)
+            self.git_invocations += 1
+            yield from _blame_file(self._repo, path)

@@ -2293,3 +2293,118 @@ def test_comparison_of_a_null_predicate_result_stays_null():
     from historian.exec.expression import evaluate
 
     assert evaluate(_bin(Operator.EQ, _NULL, _lit(1)), _ROW, _SCHEMA) is None
+
+
+# --- TEXT past int64 is REAL at conversion time (issue #105) -----------
+#
+# `_scan_number` is the one place TEXT becomes a number, for arithmetic
+# (`arithmetic_operand`), column affinity and `sum`'s classification
+# (`try_numeric_affinity`) alike. A plain digit run - no `.`, no
+# exponent - is an `int` only if it fits int64; otherwise it is the
+# `float` of the digit *text* (never `float()` of a Python `int`, which
+# raises `OverflowError` for a large enough one), `inf` if it overflows
+# a double. Confirmed with `tests/oracle.py` (`sqlite3` 3.45.1):
+# `select '9223372036854775808' + 0` -> 9.223372036854776e+18
+# (`0x1.0000000000000p+63`), `select '999...9' + 0` (320 nines) -> inf.
+
+
+def test_try_numeric_affinity_one_past_int64_max_is_real():
+    from historian.exec.expression import try_numeric_affinity
+
+    result = try_numeric_affinity("9223372036854775808")
+    assert type(result) is float
+    assert result == 9223372036854775808.0
+
+
+def test_try_numeric_affinity_huge_digit_run_is_inf_not_a_crash():
+    from historian.exec.expression import try_numeric_affinity
+
+    result = try_numeric_affinity("9" * 320)
+    assert type(result) is float
+    assert result == float("inf")
+
+
+def test_arithmetic_operand_one_past_int64_max_is_real():
+    from historian.exec.expression import arithmetic_operand
+
+    result = arithmetic_operand("9223372036854775808")
+    assert type(result) is float
+    assert result == 9223372036854775808.0
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("9223372036854775807", 9223372036854775807),
+        ("-9223372036854775808", -9223372036854775808),
+        ("+9223372036854775807", 9223372036854775807),
+        ("0009223372036854775807", 9223372036854775807),
+        ("0" * 5000 + "9223372036854775807", 9223372036854775807),
+        ("0" * 5000, 0),
+        ("-0", 0),
+    ],
+    ids=["max", "min", "plus_max", "zeros_max", "zeros_5000_max", "zeros_5000", "minus_zero"],
+)
+def test_arithmetic_operand_digit_run_inside_int64_stays_int(text, expected):
+    """The boundary itself stays INTEGER, however it is spelled -
+    including behind more leading zeros than Python's 4300-digit
+    `int()` limit allows in one call."""
+    from historian.exec.expression import arithmetic_operand
+
+    result = arithmetic_operand(text)
+    assert type(result) is int
+    assert result == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("-9223372036854775809", -9223372036854775808.0),
+        ("+9223372036854775808", 9223372036854775808.0),
+        ("0009223372036854775808", 9223372036854775808.0),
+        ("0" * 5000 + "9223372036854775808", 9223372036854775808.0),
+        ("9" * 5000, float("inf")),
+        ("-" + "9" * 5000, float("-inf")),
+        ("18446744073709551616abc", 18446744073709551616.0),
+    ],
+    ids=["min_minus_one", "plus_max_plus_one", "zeros", "zeros_5000", "nines_5000", "neg_nines_5000", "prefix"],
+)
+def test_arithmetic_operand_digit_run_outside_int64_is_real(text, expected):
+    """`'9'*5000` is past Python's 4300-digit `int()` limit, which
+    raised `ValueError` before #105; `sqlite3` gives `inf`."""
+    from historian.exec.expression import arithmetic_operand
+
+    result = arithmetic_operand(text)
+    assert type(result) is float
+    assert result == expected
+
+
+def test_text_past_int64_minus_one_is_real_not_an_exact_int():
+    """sqlite3 (`tests/oracle.py`): `select '9223372036854775808' - 1,
+    typeof(...)` -> 9.223372036854776e+18|real. The exact subtraction
+    would land back inside int64 (`9223372036854775807`), which is what
+    historian returned before #105."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.SUB, _lit("9223372036854775808"), _lit(1)), _ROW, _SCHEMA)
+    assert type(result) is float
+    assert result == 9223372036854775808.0
+
+
+def test_unary_minus_of_text_past_int64_is_real():
+    """sqlite3: `select -'9223372036854775808'` -> -9.223372036854776e+18,
+    REAL - not the INTEGER int64 min it happens to equal."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_unary(UnaryOperator.NEG, _lit("9223372036854775808")), _ROW, _SCHEMA)
+    assert type(result) is float
+    assert result == -9223372036854775808.0
+
+
+def test_huge_digit_run_text_plus_zero_is_inf():
+    """sqlite3: `select '999...9' + 0` (320 nines) -> inf. Raised
+    `OverflowError` before #105."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.ADD, _lit("9" * 320), _lit(0)), _ROW, _SCHEMA)
+    assert result == float("inf")

@@ -815,6 +815,112 @@ def test_modulo_in_order_by_position(tiny_repo):
     )
 
 
+# --- TEXT past int64 is REAL at conversion time (issue #105) -----------
+#
+# A TEXT operand whose (whitespace-trimmed) leading number is a plain
+# digit run - no `.`, no exponent - is INTEGER only if it fits int64;
+# otherwise `sqlite3` converts it to REAL *before* the operator runs.
+# Before #105 historian kept the exact unbounded Python `int` and only
+# bounded the result, so `'9223372036854775808' - 1` came back as the
+# INTEGER `9223372036854775807`, and a digit run too large for a double
+# crashed with `OverflowError`. Every expected value in the docstrings
+# was confirmed with `tests/oracle.py` (module `sqlite3` 3.45.1), the
+# literal reaching both engines as text in the query string.
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        # (9.223372036854776e+18,) REAL - was the INTEGER 9223372036854775807
+        "SELECT '9223372036854775808' - 1 FROM blame",
+        # (-9.223372036854776e+18,) REAL - was the INTEGER int64 min
+        "SELECT -'9223372036854775808' FROM blame",
+        # (inf,) REAL - was an uncaught OverflowError
+        "SELECT '" + "9" * 320 + "' + 0 FROM blame",
+    ],
+    ids=["minus_one", "unary_minus", "nines_320_plus_zero"],
+)
+def test_text_past_int64_converts_to_real_before_the_operator(tiny_repo, query):
+    _assert_differential(tiny_repo, query)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        # (inf,) - over Python's 4300-digit int() limit, which raised
+        # ValueError before #105
+        "SELECT '" + "9" * 5000 + "' + 0 FROM blame",
+        # (-inf,)
+        "SELECT '-" + "9" * 5000 + "' + 0 FROM blame",
+        # (9223372036854775807,) INTEGER - 5000 leading zeros
+        "SELECT '" + "0" * 5000 + "9223372036854775807' + 0 FROM blame",
+        # (9.223372036854776e+18,) REAL - 5000 leading zeros
+        "SELECT '" + "0" * 5000 + "9223372036854775808' + 0 FROM blame",
+    ],
+    ids=["nines_5000", "negative_nines_5000", "zeros_5000_int64_max", "zeros_5000_past_int64_max"],
+)
+def test_text_digit_runs_longer_than_pythons_int_limit(tiny_repo, query):
+    _assert_differential(tiny_repo, query)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        # (9223372036854775806,) INTEGER
+        "SELECT '9223372036854775807' - 1 FROM blame",
+        # (-9223372036854775808,) INTEGER
+        "SELECT '-9223372036854775808' + 0 FROM blame",
+        # (-9.223372036854776e+18,) REAL
+        "SELECT '-9223372036854775809' + 0 FROM blame",
+        # (9223372036854775807,) INTEGER
+        "SELECT '+9223372036854775807' + 0 FROM blame",
+        # (9.223372036854776e+18,) REAL
+        "SELECT '+9223372036854775808' + 0 FROM blame",
+        # (9223372036854775807,) INTEGER
+        "SELECT '0009223372036854775807' + 0 FROM blame",
+        # (9.223372036854776e+18,) REAL
+        "SELECT '0009223372036854775808' + 0 FROM blame",
+        # (9.223372036854776e+18,) REAL
+        "SELECT '   9223372036854775808   ' + 0 FROM blame",
+        # (9.223372036854776e+18,) REAL
+        "SELECT '9223372036854775808' * 1 FROM blame",
+        # (9.223372036854776e+18,) REAL
+        "SELECT '9223372036854775808' / 1 FROM blame",
+        # (9.223372036854776e+18,) REAL
+        "SELECT -'-9223372036854775809' FROM blame",
+        # (-9223372036854775807,) INTEGER
+        "SELECT -'9223372036854775807' FROM blame",
+    ],
+)
+def test_text_at_and_past_the_int64_boundary_regression_pins(tiny_repo, query):
+    """Already agreed before #105; pinned because the fix touches the
+    shared scanner every one of these goes through."""
+    _assert_differential(tiny_repo, query)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        # (1.0,) REAL - the TEXT is REAL 2**63, clamped to int64 max
+        # (9223372036854775807 % 3 == 1) before the remainder. Before
+        # #105 historian gave the INTEGER 2 (2**63 % 3, unclamped).
+        "SELECT '9223372036854775808' % 3 FROM blame",
+        # (5.0,) REAL - was the INTEGER 5
+        "SELECT 5 % '9223372036854775808' FROM blame",
+        # (-1.0,) REAL - int64 min % 7 is -1; was the INTEGER -3
+        "SELECT '-9223372036854775809' % 7 FROM blame",
+        # (1,) INTEGER - in range, unchanged
+        "SELECT '9223372036854775807' % 3 FROM blame",
+    ],
+)
+def test_modulo_text_operand_past_int64_is_a_real_operand(tiny_repo, query):
+    """`%` reaches TEXT through the same `arithmetic_operand` as `+ - *
+    /`, so #105 changes it too: a digit run past int64 is now a REAL
+    operand, truncated and clamped like any other REAL (issue #75).
+    `%`'s own TEXT grammar (exponents, an infinite operand) is #106."""
+    _assert_differential(tiny_repo, query)
+
+
 # --- Float-to-text: precision and shape must survive a `%.15g` change --
 #
 # `blame` has no REAL column and the case set had no float literal
@@ -1331,6 +1437,66 @@ def test_aggregate_sum_avg_count_distinct_of_alternating_infinities(awkward_repo
         "count(DISTINCT ('1e400'+0) * (line_no % 2 * 2 - 1)) FROM blame"
     )
     _assert_differential(awkward_repo, query)
+
+
+# --- Aggregate sum/avg over TEXT past int64 (issue #105) ---------------
+#
+# `tiny_repo`'s `blame` has 3 rows, so a bare literal argument is summed
+# or averaged 3 times - the same pattern `sum('3abc')` above uses. A
+# TEXT literal whose whole string is integer-shaped but outside int64
+# range is REAL at conversion time in `sqlite3`, so it is never fed to
+# `sum`'s exact-int64 path. Every expected value was confirmed with
+# `tests/oracle.py` (module `sqlite3` 3.45.1), the literal reaching
+# both engines as text in the query string.
+
+_NINES_320 = "9" * 320
+
+
+def test_aggregate_sum_of_text_one_past_int64_max_is_real(tiny_repo):
+    """`sum('9223372036854775808')` -> `2.7670116110564327e+19`
+    (`0x1.8000000000000p+64`), REAL. Before #105 historian classified
+    the TEXT as a clean integer and raised `EvalError: integer
+    overflow`."""
+    _assert_differential(tiny_repo, "SELECT sum('9223372036854775808') FROM blame")
+
+
+def test_aggregate_sum_of_a_huge_digit_run_text_is_inf(tiny_repo):
+    """`sum('999...9')` (320 nines) -> `inf`. Before #105 this raised
+    a bare Python `OverflowError` (`float()` on a huge `int`)."""
+    _assert_differential(tiny_repo, f"SELECT sum('{_NINES_320}') FROM blame")
+
+
+def test_aggregate_avg_of_a_huge_digit_run_text_is_inf(tiny_repo):
+    """`avg('999...9')` (320 nines) -> `inf`; same pre-#105 crash."""
+    _assert_differential(tiny_repo, f"SELECT avg('{_NINES_320}') FROM blame")
+
+
+def test_aggregate_sum_of_text_int64_max_still_raises_integer_overflow(tiny_repo):
+    """`sum('9223372036854775807')` over 3 rows is a genuine int64
+    overflow: `sqlite3` raises `OperationalError: integer overflow`,
+    historian raises `EvalError`. Must keep raising after #105 - this
+    is the case that tells a clean in-range TEXT integer from an
+    out-of-range one."""
+    import sqlite3
+
+    query = "SELECT sum('9223372036854775807') FROM blame"
+    conn = load_unfiltered(BlameScan, tiny_repo, BLAME_SCHEMA, "blame")
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="integer overflow"):
+            conn.execute(query).fetchall()
+    finally:
+        conn.close()
+    with pytest.raises(EvalError, match="integer overflow"):
+        run_historian(query, tiny_repo)
+
+
+def test_aggregate_min_max_of_text_past_int64_stay_text(tiny_repo):
+    """`min`/`max` never convert TEXT to a number (issue #88), so
+    `('9223372036854775808', '9223372036854775808')`, both TEXT."""
+    _assert_differential(
+        tiny_repo,
+        "SELECT min('9223372036854775808'), max('9223372036854775808') FROM blame",
+    )
 
 
 # --- Aggregate (issue #60): BindError cases, asserted directly ---------

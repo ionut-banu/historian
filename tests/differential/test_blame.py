@@ -2606,6 +2606,24 @@ def test_aggregate_distinct_combined_with_select_distinct(awkward_repo):
     )
 
 
+def test_distinct_order_by_aggregate_matching_select_list_aggregate_case_insensitive(
+    awkward_repo,
+):
+    """Issue #103 round 2 (QA FAIL, comment #5869548584): function names
+    are ASCII-case-insensitive in SQLite - `COUNT(*)` in the select list
+    and `count(*)` in `ORDER BY` name the same aggregate, so the sort
+    key *is* fully determined by the output row and this must stay
+    legal, unlike the unselected-aggregate cases below. Before this fix,
+    `_expr_shape_equal`'s `FunctionCall` branch compared raw, un-folded
+    names, so `strict_function_calls=True` wrongly raised `BindError`
+    here even though the aggregate is selected."""
+    _assert_differential(
+        awkward_repo,
+        "SELECT DISTINCT author_name, COUNT(*) FROM blame GROUP BY author_name, path "
+        "ORDER BY count(*) DESC",
+    )
+
+
 # --- DISTINCT (issue #78): BindError cases, asserted directly ------------
 #
 # `sql/binder.py`'s own DISTINCT/ORDER BY narrowing (`_docs/

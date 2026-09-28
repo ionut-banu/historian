@@ -1696,6 +1696,23 @@ def test_distinct_order_by_aggregate_alias_expression_built_purely_from_select_l
     assert isinstance(bound.order_by[0].expr, BinaryOp)
 
 
+def test_distinct_order_by_aggregate_matching_select_list_aggregate_case_insensitive_is_legal():
+    """Issue #103 round 2 (QA FAIL on comment #5869548584): function
+    names are ASCII-case-insensitive in SQLite - `COUNT(*)` in the
+    select list and `count(*)` in `ORDER BY` name the same aggregate,
+    and the sort key *is* fully determined by the output row. Confirmed
+    against the oracle (`tests/oracle.py`, sqlite3 3.45.1) that this
+    exact query is accepted and returns 2 rows, no error. Before this
+    fix, `_expr_shape_equal`'s `FunctionCall` branch compared raw,
+    un-folded names, so `strict_function_calls=True` wrongly rejected
+    it with `BindError`."""
+    bound = _bind(
+        "SELECT DISTINCT author_name, COUNT(*) FROM blame GROUP BY author_name, path "
+        "ORDER BY count(*) DESC"
+    )
+    assert isinstance(bound.order_by[0].expr, FunctionCall)
+
+
 def test_distinct_without_order_by_and_grouped_binds_normally():
     bound = _bind("SELECT DISTINCT author_name, count(*) FROM blame GROUP BY author_name")
     assert bound.distinct is True

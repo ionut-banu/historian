@@ -73,6 +73,7 @@ from pathlib import Path
 
 from collections.abc import Sequence
 
+from historian.ascii import ascii_fold
 from historian.exec.operators import (
     Aggregate,
     AggregateCall,
@@ -179,8 +180,12 @@ def _expr_shape_equal(a: Expr, b: Expr) -> bool:
     if isinstance(a, Star):
         return a.table == b.table
     if isinstance(a, FunctionCall):
+        # Case-fold the name the same way `sql/binder.py`'s own copy
+        # now does (issue #103 round 2) - function names are ASCII-
+        # case-insensitive in SQLite, and a `GROUP BY`/select-list pair
+        # spelled `COUNT`/`count` must still match by shape here too.
         return (
-            a.name == b.name
+            ascii_fold(a.name) == ascii_fold(b.name)
             and len(a.args) == len(b.args)
             and all(_expr_shape_equal(x, y) for x, y in zip(a.args, b.args))
         )

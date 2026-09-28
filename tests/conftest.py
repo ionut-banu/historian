@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from fixtures.build import get_awkward_repo, get_tiny_repo
+from fixtures.build import get_awkward_repo, get_casefold_repo, get_tiny_repo
 
 
 @pytest.fixture(scope="session")
@@ -27,3 +27,10 @@ def tiny_repo() -> Path:
 @pytest.fixture(scope="session")
 def awkward_repo() -> Path:
     return get_awkward_repo()
+
+
+@pytest.fixture(scope="session")
+def casefold_repo() -> Path:
+    """Paths differing only by ASCII or non-ASCII letter case, plus one
+    spelled `5` - built for `blame`'s `path` pushdown tests (#122)."""
+    return get_casefold_repo()

@@ -287,6 +287,40 @@ def test_where_three_term_and(tiny_repo):
     )
 
 
+# --- `path` pushdown (issue #122) --------------------------------------
+#
+# `blame` now accepts `path = 'lit'`, `path IN ('lit', ...)` and `path
+# LIKE 'prefix%'` and blames fewer files for them. The SQLite side is
+# still loaded from an unfiltered scan, so a pushdown that dropped a
+# matching row shows up here as a mismatch. How much work was avoided
+# is `tests/pushdown/test_blame_pushdown.py`'s concern, not this file's.
+
+
+def test_where_pushed_path_eq_and_unpushed_line_no(tiny_repo):
+    _assert_differential(
+        tiny_repo,
+        "SELECT path, line_no FROM blame WHERE path = 'src/utils.py' AND line_no >= 1",
+    )
+
+
+def test_where_pushed_like_prefix_folds_ascii_case(casefold_repo):
+    _assert_differential(casefold_repo, "SELECT path, line FROM blame WHERE path LIKE 'SRC/%'")
+
+
+def test_where_pushed_like_prefix_leaves_non_ascii_case_alone(casefold_repo):
+    _assert_differential(casefold_repo, "SELECT path, line FROM blame WHERE path LIKE 'straße/%'")
+
+
+def test_where_pushed_in_is_case_sensitive(casefold_repo):
+    _assert_differential(
+        casefold_repo, "SELECT path, line FROM blame WHERE path IN ('src/a.py', 'src/b.py', 'STRASSE/a.py')"
+    )
+
+
+def test_where_path_eq_integer_literal_uses_text_affinity(casefold_repo):
+    _assert_differential(casefold_repo, "SELECT path, line FROM blame WHERE path = 5")
+
+
 def test_where_or(tiny_repo):
     _assert_differential(
         tiny_repo, "SELECT path FROM blame WHERE line_no = 1 OR path = 'feature/thing.py'"

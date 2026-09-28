@@ -555,6 +555,111 @@ def _verify_awkward(repo: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# casefold
+#
+# Not one of spec.md §4's named fixtures: a small supporting repository
+# for `blame`'s `path LIKE 'prefix%'` pushdown (issue #122), which needs
+# paths that differ only by letter case - ASCII case, which SQLite's
+# `LIKE` folds, and non-ASCII case (`ß`), which it does not - plus one
+# path spelled `5`, for `path = 5`'s TEXT-affinity case end to end.
+# Neither `tiny` nor `awkward` has any of these, and adding them there
+# would change every existing `blame` differential case's row set.
+#
+# One commit, one author. The paths are written straight into the
+# index from blobs (`git hash-object -w --stdin`, then `git
+# update-index --add --cacheinfo`), never into the working tree:
+# `src/`, `SRC/` and `Src/` are one directory on a case-insensitive
+# file system (macOS's default), so writing them to disk would build a
+# different - and machine-dependent - repository. Everything historian
+# reads (`git ls-tree HEAD`, `git blame HEAD -- <path>`) reads the
+# commit, never the working tree, so an empty working tree is fine.
+# ---------------------------------------------------------------------------
+
+_CASEFOLD_AUTHOR = ("Cas Fold", "cas@example.com")
+
+#: Every path at `HEAD`, in the order `git ls-tree -rz HEAD` lists
+#: them (bytewise path order) - asserted by `_verify_casefold`, so a
+#: pushdown test can state the expected blame order directly.
+CASEFOLD_PATHS = (
+    "5",
+    "SRC/b.py",
+    "STRASSE/a.py",
+    "STRAßE/a.py",
+    "Src/C.py",
+    "other/a.py",
+    "src/a.py",
+    "straße/a.py",
+)
+
+# Filled in once, from this builder's own first deterministic build,
+# and then pinned - see the note on TINY_HEAD above.
+CASEFOLD_HEAD = "f81aaed61d91a09268f6bc17e33a4b3264529d24"
+
+
+def _hash_blob(repo: Path, content: bytes) -> str:
+    """Write *content* to repo's object store as a blob, returning its
+    hash - without the content ever touching the working tree."""
+    result = subprocess.run(
+        ["git", "hash-object", "-w", "--stdin"],
+        cwd=repo,
+        env=_isolated_env({}),
+        input=content,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git hash-object (in {repo}) failed:\n{result.stderr.decode(errors='replace')}")
+    return result.stdout.decode().strip()
+
+
+def build_casefold(dest: Path) -> Path:
+    """Build the `casefold` fixture at dest, verify it, and return dest.
+
+    Raises FixtureError if the built repository does not match what
+    this function was told to build, including a determinism
+    regression against the pinned CASEFOLD_HEAD.
+    """
+    if dest.exists():
+        shutil.rmtree(dest)
+    _init_repo(dest, branch="main")
+    clock = _Clock()
+
+    for path in CASEFOLD_PATHS:
+        blob = _hash_blob(dest, f"content of {path}\n".encode())
+        _run_git(dest, ["update-index", "--add", "--cacheinfo", f"100644,{blob},{path}"])
+    _commit(dest, "Add paths differing only by case", author=_CASEFOLD_AUTHOR, timestamp=clock.tick())
+
+    _verify_casefold(dest)
+
+    head = _run_git(dest, ["rev-parse", "HEAD"]).strip()
+    if head != CASEFOLD_HEAD:
+        raise FixtureError(
+            f"casefold: HEAD is {head}, pinned CASEFOLD_HEAD is {CASEFOLD_HEAD} - "
+            "this is a determinism regression, not a content change, "
+            "unless build_casefold was deliberately edited (update the "
+            "pinned constant in the same commit if so)"
+        )
+    return dest
+
+
+def _verify_casefold(repo: Path) -> None:
+    """Assert that repo matches what build_casefold is supposed to
+    build, through git itself, per the same reasoning as _verify_tiny."""
+    count = int(_run_git(repo, ["rev-list", "--count", "HEAD"]).strip())
+    if count != 1:
+        raise FixtureError(f"casefold: expected exactly 1 commit, found {count}")
+
+    raw = _run_git_bytes(repo, ["ls-tree", "-rz", "HEAD", "--name-only"])
+    listed = tuple(chunk.decode("utf-8") for chunk in raw.split(b"\0") if chunk)
+    if listed != CASEFOLD_PATHS:
+        raise FixtureError(f"casefold: HEAD lists {listed}, expected exactly {CASEFOLD_PATHS} in that order")
+
+    for path in CASEFOLD_PATHS:
+        content = _run_git_bytes(repo, ["cat-file", "-p", f"HEAD:{path}"])
+        if content != f"content of {path}\n".encode():
+            raise FixtureError(f"casefold: {path}'s blob at HEAD is {content!r}")
+
+
+# ---------------------------------------------------------------------------
 # Caching
 #
 # tiny and awkward are rebuilt exactly once per change to this file,
@@ -605,12 +710,23 @@ def get_awkward_repo(cache_dir: Path = CACHE_DIR) -> Path:
     return _cached(cache_dir, "awkward", build_awkward)
 
 
+def get_casefold_repo(cache_dir: Path = CACHE_DIR) -> Path:
+    """Return the path to a built `casefold` repository (issue #122),
+    building (or rebuilding, if build.py has changed since the cached
+    one) it first if necessary."""
+    return _cached(cache_dir, "casefold", build_casefold)
+
+
 if __name__ == "__main__":
     # Manual invocation for debugging: `uv run python -m tests.fixtures.build`
     # (or `python tests/fixtures/build.py` from the repo root) builds
     # both fixtures into the cache directory and prints where they
     # landed, so they can be inspected or cd-ed into by hand.
-    for repo_name, getter in (("tiny", get_tiny_repo), ("awkward", get_awkward_repo)):
+    for repo_name, getter in (
+        ("tiny", get_tiny_repo),
+        ("awkward", get_awkward_repo),
+        ("casefold", get_casefold_repo),
+    ):
         path = getter()
         head = _run_git(path, ["rev-parse", "HEAD"]).strip()
         print(f"{repo_name}: {path} (HEAD {head})")

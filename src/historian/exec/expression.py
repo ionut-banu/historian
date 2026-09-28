@@ -925,6 +925,17 @@ def _scan_number(text: str, start: int) -> tuple[int | float, int] | None:
     optional sign, digits - backed off entirely, not just the invalid
     tail, if not followed by at least one digit: `'5e'`/`'5e+'` both
     fall back to the mantissa alone).
+
+    A plain digit run - no `.`, no exponent - is an `int` only if it
+    fits int64; otherwise it is REAL, right here at conversion time,
+    before any operator sees it (issue #105, SQLite's own rule:
+    `'9223372036854775808' - 1` is `9.22337203685478e+18`, not the
+    exact `9223372036854775807`). That REAL is `float()` of the digit
+    *text*, never of a Python `int`: `float(text)` overflows a huge
+    numeral to `inf` as SQLite does, while `float(int(text))` raises
+    `OverflowError`, and `int(text)` itself raises `ValueError` past
+    Python's 4300-digit limit - so `_int64_digit_run` decides the
+    range from the digit text alone and never builds a big `int`.
     """
     n = len(text)
     i = start
@@ -963,8 +974,49 @@ def _scan_number(text: str, start: int) -> tuple[int | float, int] | None:
     # Constructing a new Value from source text, per this module's own
     # float()-call test - not a lossy comparison cast, the thing the
     # 2026-08-27 decision actually forbids. See that test's docstring.
-    value: int | float = float(number_text) if is_float else int(number_text)
+    value: int | float
+    if is_float:
+        value = float(number_text)
+    else:
+        exact = _int64_digit_run(number_text)
+        if exact is None:
+            value = float(number_text)
+        else:
+            value = exact
     return value, end
+
+
+#: The number of digits in `INT64_MIN`'s magnitude, the longest int64.
+#: A digit run with more significant digits than this cannot fit.
+_INT64_MAX_DIGITS = 19
+
+
+def _int64_digit_run(number_text: str) -> int | None:
+    """`number_text` - an optional sign then ASCII digits only, as
+    `_scan_number` scanned it - as an `int` if it fits SQLite's int64
+    range, else `None` (the caller converts the text to REAL instead).
+
+    Leading zeros are dropped before converting, and a run with more
+    than `_INT64_MAX_DIGITS` significant digits is rejected without
+    converting at all, so `int()` only ever sees at most 19 digits -
+    never a string past Python's 4300-digit `int()` limit, and never a
+    value large enough to matter."""
+    negative = False
+    digits = number_text
+    if digits[0] == "+" or digits[0] == "-":
+        negative = digits[0] == "-"
+        digits = digits[1:]
+    first_significant = 0
+    while first_significant < len(digits) and digits[first_significant] == "0":
+        first_significant += 1
+    significant = digits[first_significant:]
+    if len(significant) > _INT64_MAX_DIGITS:
+        return None
+    magnitude = int(significant) if significant else 0
+    value = -magnitude if negative else magnitude
+    if value < INT64_MIN or value > INT64_MAX:
+        return None
+    return value
 
 
 def _coerce_arithmetic_text(text: str) -> int | float:

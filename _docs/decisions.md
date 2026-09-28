@@ -2538,3 +2538,70 @@ the binder has treated it as `BindError` since #60/#69. §3 gets a
 fourth bullet, in this same commit, naming it explicitly - not a
 change in behaviour, a description catching up to code that already
 existed.
+
+2026-09-28 - #78's SELECT DISTINCT/ORDER BY narrowing now catches an
+unselected aggregate too, closing the gap the M3 milestone review
+found
+
+Issue #103. `SELECT DISTINCT author_name FROM blame GROUP BY
+author_name, path ORDER BY count(*) DESC` bound and ran without error,
+printing rows in whatever order `Sort` happened to produce for the
+unselected `count(*)` key - confirmed live against the oracle
+(`awkward_repo`'s unfiltered blame rows through `sqlite3` 3.45.1) that
+this is the identical "sort key not determined by the deduplicated
+output row" shape the 2026-09-25 entry above already decided to
+reject for a bare column, just with an aggregate call in the key
+position instead of a column reference. That entry's own reasoning
+applies unchanged - `sqlite3` accepts the query and answers from its
+own unspecified internals (here, `Sam Lee` then `Zoë Müller`; swap the
+oracle's own two rules for what a deterministic engine might do and
+each predicts a different, and different again, order - see that
+entry for the discriminating arithmetic in full) - so this was always
+meant to be a `BindError` under #78's own rule. It was not: the root
+cause was in the code, not the decision.
+
+`_split_for_grouped_check` had one `FunctionCall` branch shared by
+three callers - the two GROUP BY/HAVING-keyed narrowings (#60/#69,
+2026-09-19/2026-09-24 entries), where an aggregate call is *never*
+required to shape-match a given key (that is what makes a bare column
+under it exempt at all), and the DISTINCT/ORDER BY narrowing above,
+matched against the *select list* instead, where an aggregate call is
+exactly as much a "key touch" as a bare column and must itself
+shape-match a select-list item the same way. The branch returned
+"contains an aggregate, no bad column" unconditionally for any
+`FunctionCall`, which was correct for the first two callers and wrong
+for the third - it made every unselected aggregate call in a DISTINCT
+query's `ORDER BY` invisible to the walk, rather than caught by it.
+
+Fixed with a keyword-only `strict_function_calls` flag on
+`_split_for_grouped_check`, `False` by default (the two GROUP BY/HAVING
+callers, unchanged) and `True` only at the DISTINCT/ORDER BY call site
+in `bind()`. When set, a `FunctionCall` that does not shape-match one
+of the given keys comes back as the walk's "bad" node, exactly as a
+bare column already does - so the return type widens from
+`BoundColumnRef | None` to `Expr | None`, and the DISTINCT call site
+branches on `isinstance(bad, FunctionCall)` to phrase the `BindError`
+around an aggregate rather than a column name. No other caller's
+behaviour changes: the flag defaults to today's rule everywhere else,
+and the existing GROUP BY/HAVING test suite (`tests/test_binder.py`,
+`tests/differential/test_blame.py`) still passes unmodified. This is a
+bug fix to code that did not yet implement #78's own already-made
+decision, not a new design decision.
+
+Confirmed against the oracle for every acceptance shape: the
+unselected-aggregate case above and its always-false-`WHERE` and
+`count(*) + 0`-nested variants all raise `BindError` now, data-
+independently, before any row is read; every already-legal shape
+(the aggregate matched by exact select-list shape, by alias, by
+ordinal, and - newly tested - by an expression built purely from the
+selected aggregate's own alias, `ORDER BY c + 1`) stays legal,
+unchanged.
+
+`_docs/spec.md` §3's "Errors" section's "Aggregate misuse" bullet
+gained this shape in the same commit as the fix, mirroring #102's own
+"fix the code, catch the spec up in the same commit" discipline: an
+`ORDER BY` key under `SELECT DISTINCT` - bare column or aggregate call
+alike - that is not itself a select-list item or built purely from one
+is now named alongside the bullet's other four shapes, with its own
+sentence explaining why it is the one of the five `sqlite3` does not
+itself reject at prepare time.

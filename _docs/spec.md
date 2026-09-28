@@ -556,7 +556,7 @@ walk instead of consuming all history.
 
 ### Errors
 
-Three kinds, all of them the user's fault and none of them tracebacks:
+Four kinds, all of them the user's fault and none of them tracebacks:
 
 - **Parse errors** name the position and what was expected.
 - **Binding errors** name the unknown column or table, and list what

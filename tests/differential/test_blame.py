@@ -22,6 +22,7 @@ for each, per #59's Spec section): `ORDER BY`, `GROUP BY`, `HAVING`,
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Iterator, Sequence
 
 import pytest
@@ -231,6 +232,140 @@ def test_tie_free_proof_with_equal_totals_but_reordered_rows_still_fails():
             ordered=True,
             tie_free_proof=(3, 3),
         )
+
+
+# --- Harness unit tests: exact cell comparison (issue #110) -------------
+#
+# Spec §4, "Compare": two cells match only if they have the same Python
+# type and, for REAL, the same `float.hex()` - so `0.0` and `-0.0` are
+# different cells, as are two doubles one ULP apart. A NaN on either
+# side is a failure of its own. No repository is involved in any of
+# these: they are properties of `assert_rows_match` alone.
+
+_ZERO_SIGN_MODES = [
+    pytest.param({}, id="multiset"),
+    pytest.param({"ordered": True, "key_positions": (0,)}, id="key-positions"),
+    pytest.param({"ordered": True, "tie_free_proof": (1, 1)}, id="tie-free-proof"),
+]
+
+
+@pytest.mark.parametrize("mode", _ZERO_SIGN_MODES)
+@pytest.mark.parametrize(
+    "sqlite_rows,historian_rows",
+    [
+        pytest.param([(0.0,)], [(-0.0,)], id="pos-vs-neg"),
+        pytest.param([(-0.0,)], [(0.0,)], id="neg-vs-pos"),
+    ],
+)
+def test_exact_comparison_rejects_zero_of_the_other_sign(mode, sqlite_rows, historian_rows):
+    with pytest.raises(AssertionError):
+        assert_rows_match(sqlite_rows, historian_rows, **mode)
+
+
+@pytest.mark.parametrize("mode", _ZERO_SIGN_MODES[:2])
+def test_exact_comparison_rejects_zero_of_the_other_sign_beside_other_columns(mode):
+    """The key column ties under `order_key`, so in `key_positions`
+    mode the zero lands in one group and the exact rule has to catch it
+    inside the group's multiset compare."""
+    with pytest.raises(AssertionError):
+        assert_rows_match([(1, 0.0)], [(1, -0.0)], **mode)
+
+
+def test_same_signed_zero_multiset_in_different_order_passes():
+    assert_rows_match([(0.0,), (-0.0,)], [(-0.0,), (0.0,)])
+
+
+def test_same_signed_zero_multiset_in_different_order_passes_inside_a_tied_group():
+    """`0.0` and `-0.0` tie under `ORDER BY`, so they form one group
+    whose rows are compared as an exact multiset."""
+    assert_rows_match(
+        [(0.0, "a"), (-0.0, "b")],
+        [(-0.0, "b"), (0.0, "a")],
+        ordered=True,
+        key_positions=(0,),
+    )
+
+
+def test_signed_zero_multisets_with_different_counts_fail():
+    with pytest.raises(AssertionError):
+        assert_rows_match([(0.0,), (-0.0,)], [(0.0,), (0.0,)])
+
+
+@pytest.mark.parametrize(
+    "sqlite_rows,historian_rows",
+    [
+        pytest.param([(1.0,)], [(1,)], id="real-vs-int"),
+        pytest.param([(1,)], [(1.0,)], id="int-vs-real"),
+        pytest.param([(0.3,)], [(0.1 + 0.2,)], id="one-ulp-apart"),
+        pytest.param([(math.inf,)], [(-math.inf,)], id="inf-vs-neg-inf"),
+        pytest.param([(None,)], [(0,)], id="null-vs-zero"),
+        pytest.param([(0,)], [(None,)], id="zero-vs-null"),
+    ],
+)
+def test_exact_comparison_rejects(sqlite_rows, historian_rows):
+    with pytest.raises(AssertionError):
+        assert_rows_match(sqlite_rows, historian_rows)
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        pytest.param([(1.0,)], id="real"),
+        pytest.param([(None,)], id="null"),
+        pytest.param([(math.inf,), (-math.inf,)], id="infinities"),
+    ],
+)
+def test_exact_comparison_accepts_identical_cells(rows):
+    assert_rows_match(rows, list(rows))
+
+
+_NAN_MESSAGE = (
+    "NaN cannot appear in a SQLite result; a NaN in historian's output is an "
+    "engine bug, a NaN in SQLite's is impossible"
+)
+
+
+@pytest.mark.parametrize("mode", _ZERO_SIGN_MODES)
+@pytest.mark.parametrize(
+    "sqlite_rows,historian_rows",
+    [
+        pytest.param([(math.nan,)], [(math.nan,)], id="both"),
+        pytest.param([(1.0,)], [(math.nan,)], id="historian"),
+        pytest.param([(math.nan,)], [(1.0,)], id="sqlite"),
+    ],
+)
+def test_nan_on_either_side_is_its_own_failure(mode, sqlite_rows, historian_rows):
+    with pytest.raises(AssertionError) as excinfo:
+        assert_rows_match(sqlite_rows, historian_rows, **mode)
+    assert _NAN_MESSAGE in str(excinfo.value)
+
+
+@pytest.mark.parametrize("position", [0, 1, 2, 3])
+def test_nan_fails_wherever_its_row_would_sort(position):
+    """The NaN check runs before any sort, so it neither raises
+    `TypeError` nor depends on where a NaN would land among `None`,
+    numbers and TEXT."""
+    historian_rows = [(None,), (-0.0,), (2,), ("x",)]
+    sqlite_rows = list(historian_rows)
+    historian_rows[position] = (math.nan,)
+    with pytest.raises(AssertionError) as excinfo:
+        assert_rows_match(sqlite_rows, historian_rows)
+    assert _NAN_MESSAGE in str(excinfo.value)
+
+
+def test_mixed_column_sorts_and_compares_regardless_of_input_order():
+    rows = [(None,), (3,), (0.0,), ("b",), (-0.0,), (0,), (1.5,), ("a",), (None,), (-0.0,), (0,)]
+    for shift in range(len(rows)):
+        rotated = rows[shift:] + rows[:shift]
+        assert_rows_match(rows, list(reversed(rotated)))
+
+
+def test_real_mismatch_message_shows_float_hex_of_both_cells():
+    with pytest.raises(AssertionError) as excinfo:
+        assert_rows_match([(0.3,)], [(0.1 + 0.2,)])
+    message = str(excinfo.value)
+    assert (0.3).hex() in message
+    assert (0.1 + 0.2).hex() in message
 
 
 # --- tiny_repo: WHERE, expressions, and the #47 affinity asymmetry ----

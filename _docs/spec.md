@@ -730,6 +730,22 @@ cleverness that changes the answer is caught.
 Comparison follows §3: sorted multisets unless the query has an
 `ORDER BY`, exact order when it does.
 
+Two cells match if and only if they have exactly the same Python type
+and then, for `REAL`, the same `float.hex()` - bit-identical, so `0.0`
+and `-0.0` differ, `inf` and `-inf` differ, and one ULP is a
+difference - or, for any other type, are `==`. Never a tolerance, and
+never `==` or `repr` for `REAL`. A NaN on either side is a failure of
+its own, checked before anything is sorted or compared: SQLite has no
+NaN, so one can only be an engine bug.
+
+The multiset sort key for a cell is a pair: `order_key` first, so the
+`NULL`, numeric, `TEXT` order is SQLite's, then an exact tie-break
+(type name, then the value, a `REAL` by `float.hex()`), so two equal
+multisets always sort to the same sequence even where `order_key`
+ties `0`, `0.0` and `-0.0`. Under `ORDER BY`, rows are still grouped
+into ties by `order_key` alone - `0.0` and `-0.0` genuinely tie there
+- and the rows within a tied group are compared as an exact multiset.
+
 This layer tests the SQL engine, not the extraction — both sides read
 the same extracted rows, so a wrong `authored_at` is wrong in both.
 That is what the extraction layer is for.

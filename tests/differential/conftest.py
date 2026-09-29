@@ -49,8 +49,10 @@ each, both with `pushed=()` - proving the separation holds *by
 construction of two independent code paths*, not by coincidence of
 one shared call.
 
-Comparison follows §3: sorted multisets unless the query has an
-`ORDER BY`, exact order when it does. `assert_rows_match` grows two
+Comparison follows §4: sorted multisets unless the query has an
+`ORDER BY`, exact order when it does, and cells compared exactly -
+same Python type, REAL by `float.hex()`, NaN a failure of its own
+(issue #110; `_cells_match`). `assert_rows_match` grows two
 keyword-only parameters for the `ORDER BY` case (issue #61):
 `ordered` and `key_positions` - see its own docstring for the tie-
 tolerant design and why it exists.
@@ -64,6 +66,7 @@ would be wrong on both sides and invisible here. That is what
 from __future__ import annotations
 
 import itertools
+import math
 import sqlite3
 from collections.abc import Sequence
 from pathlib import Path
@@ -81,6 +84,7 @@ from historian.sql.parser import parse
 from historian.values import order_key
 
 __all__ = [
+    "NAN_MESSAGE",
     "assert_rows_match",
     "create_table_sql",
     "load_unfiltered",
@@ -202,9 +206,12 @@ def run_historian(
 # --- Step 5: compare -------------------------------------------------------
 
 
-def _cell_sort_key(value):
-    """A sort key for one cell, tolerant of a `bool` that should never
-    have reached a `Value` position in the first place.
+def _cell_order_key(value):
+    """`values.order_key` for one cell, tolerant of a `bool` that should
+    never have reached a `Value` position in the first place. This is
+    SQLite's own `ORDER BY` order, under which `0`, `0.0` and `-0.0` tie
+    - it decides where a cell sorts and which `ORDER BY` group it joins,
+    never whether two cells are equal.
 
     `values.order_key` raises `TypeError` on a `bool` ("bool is not a
     SQL Value") by design (`values.py`'s own docstring) - a `Bool3`
@@ -221,18 +228,94 @@ def _cell_sort_key(value):
     `values.py` accepts anywhere else: `int(True) == 1`, an entirely
     legitimate `Value`, so `order_key` is only ever handed a `bool` by
     proxy, for sorting purposes, never directly. The comparison in
-    `assert_rows_match` below still sees the original, unconverted
-    `True` and still reports it as a type mismatch against `1` - this
-    function only decides where a row lands in sorted order, never
-    whether two cells are equal.
+    `_cells_match` below still sees the original, unconverted `True`
+    and still reports it as a type mismatch against `1`.
     """
     if isinstance(value, bool):
         return order_key(int(value))
     return order_key(value)
 
 
+def _exact_tiebreak(value) -> tuple[str, object]:
+    """A second sort component that tells apart exactly the cells
+    `_cells_match` tells apart (issue #110): the Python type's name,
+    then the value itself - a REAL by `float.hex()`, so `0.0` and
+    `-0.0` get different keys. `None` maps to a constant. When the type
+    names differ the tuple comparison stops there, so the payloads it
+    compares are always of one type."""
+    if value is None:
+        return ("NoneType", 0)
+    if isinstance(value, float):
+        return ("float", value.hex())
+    return (type(value).__name__, value)
+
+
+def _cell_sort_key(value) -> tuple:
+    """The multiset sort key for one cell: SQLite's order first
+    (`_cell_order_key`), exact identity second (`_exact_tiebreak`). The
+    second component is only reached when `order_key` ties, so the
+    NULL/numeric/TEXT order is unchanged, and two equal multisets always
+    sort to the same sequence - without it, a stable sort would keep
+    each engine's own order among `0`, `0.0` and `-0.0`, and an exact
+    comparison could line up a `0.0` against a `-0.0` from two equal
+    multisets and report a false mismatch."""
+    return (_cell_order_key(value), _exact_tiebreak(value))
+
+
 def _row_sort_key(row: Row) -> tuple:
     return tuple(_cell_sort_key(value) for value in row)
+
+
+def _cells_match(sqlite_cell, historian_cell) -> bool:
+    """Spec §4's cell-equality rule (issue #110): the same Python type,
+    and then a REAL by `float.hex()` - bit-identical for every non-NaN
+    double, so `0.0` is not `-0.0`, `inf` is not `-inf`, and one ULP is
+    a difference - and anything else by `==`. NaN never gets here:
+    `assert_rows_match` rejects it before sorting or comparing.
+
+    Never bare `==` across types: `True == 1` and `1 == 1.0` in Python,
+    so a comparator using it would report `[(True,)]` (historian's
+    actual output for `SELECT 1 = 1 FROM blame`, #48) as matching
+    SQLite's `[(1,)]` - see `_docs/decisions.md` for why this is a
+    decision, not an implementation detail. And never `==` for REAL:
+    `0.0 == -0.0` in Python, which hid a live unary-minus mismatch
+    (#110)."""
+    if type(sqlite_cell) is not type(historian_cell):
+        return False
+    if isinstance(sqlite_cell, float):
+        return sqlite_cell.hex() == historian_cell.hex()
+    return sqlite_cell == historian_cell
+
+
+def _describe_cell(value) -> str:
+    """`repr` and type name, plus `float.hex()` for a REAL - `repr`
+    alone prints `0.0` and `-0.0` as different but would print two
+    doubles a ULP apart the same way at some precisions, and hex is the
+    form the rest of this project records REALs in."""
+    if isinstance(value, float):
+        return f"{value!r} (float, {value.hex()})"
+    return f"{value!r} ({type(value).__name__})"
+
+
+#: The failure message for a NaN cell (issue #110). SQLite has no NaN
+#: value - it stores a NaN result as NULL - so one can only ever come
+#: from historian.
+NAN_MESSAGE = (
+    "NaN cannot appear in a SQLite result; a NaN in historian's output is an "
+    "engine bug, a NaN in SQLite's is impossible"
+)
+
+
+def _assert_no_nan(rows: Sequence[Row], side: str) -> None:
+    """Fails on the first NaN cell in *rows*, naming *side* and its
+    position. Run before any sort or comparison, so the check does not
+    depend on the engine's own `squash_nan`, and a NaN (which is
+    unordered against everything) can neither raise nor mis-order the
+    sort."""
+    for index, row in enumerate(rows):
+        for col, value in enumerate(row):
+            if isinstance(value, float) and math.isnan(value):
+                raise AssertionError(f"{side} row {index} column {col} is NaN: {NAN_MESSAGE}")
 
 
 def _assert_row_sequences_match(
@@ -243,14 +326,7 @@ def _assert_row_sequences_match(
     below build on. `context` is prepended to every failure message
     (e.g. `"tied group (('x',),): "`) so a mismatch inside one tied
     group of an `ordered=True` comparison is still easy to place.
-
-    Never bare `==`: `True == 1` in Python, so a comparator using it
-    would report `[(True,)]` (historian's actual output for `SELECT
-    1 = 1 FROM blame`) as matching `[(1,)]` (SQLite's actual answer)
-    and be structurally blind to #48 - see `_docs/decisions.md` for
-    why this is a decision, not an implementation detail. Requires
-    both the same Python type and the same value, for exactly that
-    reason.
+    Each cell pair goes through `_cells_match`.
     """
     assert len(sqlite_rows) == len(historian_rows), (
         f"{context}row count mismatch: sqlite produced {len(sqlite_rows)}, "
@@ -264,11 +340,10 @@ def _assert_row_sequences_match(
             f"sqlite={sqlite_row!r} historian={historian_row!r}"
         )
         for col, (sqlite_cell, historian_cell) in enumerate(zip(sqlite_row, historian_row)):
-            matches = type(sqlite_cell) is type(historian_cell) and sqlite_cell == historian_cell
-            assert matches, (
+            assert _cells_match(sqlite_cell, historian_cell), (
                 f"{context}row {index} column {col} disagrees: "
-                f"sqlite={sqlite_cell!r} ({type(sqlite_cell).__name__}) "
-                f"historian={historian_cell!r} ({type(historian_cell).__name__})"
+                f"sqlite={_describe_cell(sqlite_cell)} "
+                f"historian={_describe_cell(historian_cell)}"
             )
 
 
@@ -278,7 +353,8 @@ def _assert_multiset_match(
     """Sorts both lists with `_row_sort_key` (never Python's bare
     `sorted()`, which raises `TypeError` comparing `None` to anything
     or comparing across storage classes - `values.order_key` already
-    implements SQLite's total order and handles both), then compares
+    implements SQLite's total order and handles both, and the exact
+    tie-break makes equal multisets sort identically), then compares
     corresponding rows via `_assert_row_sequences_match`."""
     sorted_sqlite = sorted(sqlite_rows, key=_row_sort_key)
     sorted_historian = sorted(historian_rows, key=_row_sort_key)
@@ -364,6 +440,10 @@ def assert_rows_match(
       never trusts an exact-order comparison it has no way to know is
       sound.
 
+    In every mode, cells are compared by `_cells_match` (spec §4: same
+    Python type, REAL by `float.hex()`), and a NaN cell on either side
+    fails before anything is sorted or compared (issue #110).
+
     The harness never parses or runs the test's own SQL anywhere in
     this function, including the `tie_free_proof` path: it only ever
     receives two integers the caller computed elsewhere.
@@ -377,6 +457,9 @@ def assert_rows_match(
             "real SQL query over the same FROM/WHERE - see this function's "
             "own docstring."
         )
+
+    _assert_no_nan(sqlite_rows, "sqlite")
+    _assert_no_nan(historian_rows, "historian")
 
     assert len(sqlite_rows) == len(historian_rows), (
         f"row count mismatch: sqlite produced {len(sqlite_rows)}, "
@@ -401,9 +484,12 @@ def assert_rows_match(
         _assert_row_sequences_match(sqlite_rows, historian_rows)
         return
 
-    sqlite_keys = [tuple(_cell_sort_key(row[pos]) for pos in key_positions) for row in sqlite_rows]
+    # Grouping is on SQLite's `ORDER BY` order alone: `0.0` and `-0.0`
+    # genuinely tie there on both engines, so they share a group, and
+    # the exact rule applies within it (issue #110).
+    sqlite_keys = [tuple(_cell_order_key(row[pos]) for pos in key_positions) for row in sqlite_rows]
     historian_keys = [
-        tuple(_cell_sort_key(row[pos]) for pos in key_positions) for row in historian_rows
+        tuple(_cell_order_key(row[pos]) for pos in key_positions) for row in historian_rows
     ]
     sqlite_groups = _grouped_by_consecutive_key(sqlite_rows, sqlite_keys)
     historian_groups = _grouped_by_consecutive_key(historian_rows, historian_keys)

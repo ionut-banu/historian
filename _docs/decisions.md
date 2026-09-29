@@ -2851,3 +2851,46 @@ exponential in time (#137); they are within the height limit and
 correct, only slow, and the depth tests leave them out. `CASE` (#126)
 must add its node to `_height_children`/`_node_height` and to each
 module's `_operands`/`_with_operands`.
+
+2026-09-29 - The differential harness compares REALs by `float.hex()`,
+and unary minus is `0 - x` except over a REAL literal
+
+Issue #110, from the M3 review. The harness matched cells with
+`type(a) is type(b) and a == b`, and `0.0 == -0.0` in Python, so a
+zero of the wrong sign passed. It hid a live mismatch: `SELECT
+-(line_no * 0.0) FROM blame` is `0x0.0p+0` on every row in SQLite and
+was `-0x0.0p+0` in historian, because `_finish_negate` flipped the
+sign of every REAL. SQLite codes unary minus over anything but a
+literal as `0 - x`, which is `+0.0` for either zero, and folds a REAL
+literal directly under `-` into a negative literal.
+
+Measured with `tests/oracle.py` (module `sqlite3` 3.45.1), by
+`float.hex()`: `-(line_no * 0.0)`, `-(0.0 * 1)`, `-(0.0 / 1)`, `-(0.0
+% 5)`, `-(1 - 1.0)`, `-(-0.0 + 0)`, `-(+0.0)`, `-'0.0'`, `-'0.0abc'`,
+`-'1e-400'`, `-'-0.0'`, `-(-0.0)` and `-(-(-0.0))` are all `0x0.0p+0`;
+`-(0.0)`, `-((0.0))` and `-0.0` are `-0x0.0p+0`; `-'0'` and `-(0)` are
+the INTEGER `0`; `-('1e400'+0)` is `-inf` and `-(-('1e400'+0))` is
+`inf`. The first eleven of those were `-0x0.0p+0` in historian.
+
+Harness: two cells match only with the same Python type and, for
+REAL, the same `float.hex()`; no tolerance. A NaN on either side is a
+failure of its own, checked before any sort, so the harness does not
+rely on `squash_nan` and a NaN cannot mis-order the sort. Because
+`order_key` ties `0`, `0.0` and `-0.0` and the sort is stable, the
+multiset sort key gained an exact tie-break (type name, then the
+value, a REAL by hex), or two equal multisets could line up a `0.0`
+against a `-0.0`. `ORDER BY` grouping stays on `order_key`, since the
+two zeros really do tie there on both engines; within a group the
+compare is exact.
+
+Engine: `_finish_negate` computes `0.0 - x` for a REAL, and `_start`
+returns `-value` directly for a `UnaryOp(NEG, Literal(<float>))`, a
+structural check beside the int64-minimum one (which still runs
+first). Parentheses never reach the AST, so `-((0.0))` is that shape;
+unary `+` does, so `-(+0.0)` is not. `0 - x` equals `-x` exactly for
+every non-zero double, so nothing else moves.
+
+The two changes land together. The exact comparator alone turned none
+of the 453 existing differential tests red, and the new zero-sign
+cases need the engine fix, so landing the harness first would have
+meant either leaving them out or marking them xfail.

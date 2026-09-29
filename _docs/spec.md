@@ -487,6 +487,25 @@ be a stored value. A computed NaN reaching `order_key` would violate the
 total order, which is a risk for the expression evaluator rather than
 for this module.
 
+SQLite does keep the sign of a zero, and unary minus decides it. `-x`
+over a computed or TEXT-derived `REAL` is `0 - x`, not a sign flip:
+the same for every non-zero value and for the infinities (`inf` and
+`-inf` swap), but `+0.0` for both `0.0` and `-0.0`. The one exception
+is a `REAL` literal directly under `-`, through any parentheses (which
+are not a node), which SQLite folds to a negative literal. Unary `+`
+is a node, so it breaks the fold. `INTEGER` negation is unaffected.
+
+```
+-(0.0)  -((0.0))  -0.0    -0.0   REAL literal under -: folded
+-(line_no * 0.0)          0.0    computed: 0 - x
+-(+0.0)                   0.0    + is its own node
+-(-0.0)                   0.0    outer - over a computed -0.0
+-'0.0'  -'-0.0'           0.0    TEXT scans to REAL: 0 - x
+-'0'                      0      INTEGER
+```
+
+See `_docs/decisions.md`, 2026-09-29, issue #110.
+
 Aggregate edge cases, which differential tests will find immediately:
 
 | case | result |

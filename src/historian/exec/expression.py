@@ -385,6 +385,13 @@ def _start(
             # `_finish_negate`'s docstring.
             results.append(INT64_MIN)
             return
+        if isinstance(node.operand, Literal) and isinstance(node.operand.value, float):
+            # A REAL literal directly under `-` (parentheses are not a
+            # node): SQLite folds it to a negative literal, a true sign
+            # flip, so `-(0.0)` is `-0.0` - unlike `_finish_negate`'s
+            # `0 - x` for everything else (issue #110).
+            results.append(-node.operand.value)
+            return
         work.append((_Step.FINISH_NEGATE, node))
         work.append((_Step.EVAL, node.operand))
         return
@@ -884,6 +891,15 @@ def _finish_negate(operand_result: Value | Bool3) -> Value:
     leading-prefix text coercion arithmetic uses (`-'5'` is `-5`,
     `-'abc'` is `0`) and the same int64-overflow-to-REAL rule.
 
+    A REAL is negated as SQLite does it, `0 - x` rather than a sign
+    flip (issue #110): the two agree for every non-zero value and for
+    the infinities, and differ only for a zero, where `0 - x` gives
+    `+0.0` for both `0.0` and `-0.0` - so `-(0.0 * 1)` and `-'0.0'`
+    are `+0.0`. The one exception is a REAL literal directly under `-`,
+    which SQLite folds to a negative literal (`-(0.0)` is `-0.0`);
+    `_start` handles that structurally, so it never gets here. Unary
+    `+` is its own node, so `-(+0.0)` is not that shape and is `+0.0`.
+
     `+` is a true no-op in SQLite - confirmed directly against
     `sqlite3` 3.51.0, and contradicting this issue's own body, which
     claims unary `+` "goes through the identical leading-prefix
@@ -917,7 +933,9 @@ def _finish_negate(operand_result: Value | Bool3) -> Value:
     numeric = arithmetic_operand(operand)
     if isinstance(numeric, int):
         return _int64_bounded(-numeric)
-    return squash_nan(-numeric)
+    # `0 - x`, not `-x`: they differ only for a zero, where SQLite's
+    # subtraction gives `+0.0` for both `0.0` and `-0.0` (issue #110).
+    return squash_nan(0.0 - numeric)
 
 
 # --- BinaryOp: arithmetic, concatenation, comparison --------------------

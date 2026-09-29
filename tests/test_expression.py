@@ -818,6 +818,79 @@ def test_negated_int64_min_literal_arithmetic_stays_exact():
     assert isinstance(result, int)
 
 
+# --- Unary minus and the sign of zero (issue #110) ----------------------
+#
+# SQLite negates a computed value as `0 - x`, not by flipping the sign
+# bit, so `-(0.0 * 1)` is `+0.0`; only a REAL literal directly under
+# `-` (parentheses are not a node) is folded to a negative literal, so
+# `-(0.0)` is `-0.0`. Checked with `tests/oracle.py` (sqlite3 module
+# 3.45.1), `SELECT <expr> FROM blame` over one row with `line_no = 3`,
+# REALs by `float.hex()`. Here `n` (5) stands in for `line_no`; any
+# non-negative integer times 0.0 is `+0.0`.
+
+
+def _neg(operand):
+    return _unary(UnaryOperator.NEG, operand)
+
+
+@pytest.mark.parametrize(
+    "expr,expected_hex",
+    [
+        pytest.param(_neg(_bin(Operator.MUL, _col("n"), _lit(0.0))), "0x0.0p+0", id="-(n * 0.0)"),
+        pytest.param(_neg(_bin(Operator.MUL, _col("r"), _lit(0.0))), "0x0.0p+0", id="-(r * 0.0)"),
+        pytest.param(_neg(_bin(Operator.MUL, _lit(0.0), _lit(1))), "0x0.0p+0", id="-(0.0 * 1)"),
+        pytest.param(_neg(_bin(Operator.DIV, _lit(0.0), _lit(1))), "0x0.0p+0", id="-(0.0 / 1)"),
+        pytest.param(_neg(_bin(Operator.MOD, _lit(0.0), _lit(5))), "0x0.0p+0", id="-(0.0 % 5)"),
+        pytest.param(_neg(_bin(Operator.SUB, _lit(1), _lit(1.0))), "0x0.0p+0", id="-(1 - 1.0)"),
+        pytest.param(
+            _neg(_bin(Operator.ADD, _neg(_lit(0.0)), _lit(0))), "0x0.0p+0", id="-(-0.0 + 0)"
+        ),
+        pytest.param(_neg(_unary(UnaryOperator.POS, _lit(0.0))), "0x0.0p+0", id="-(+0.0)"),
+        pytest.param(_neg(_lit("0.0")), "0x0.0p+0", id="-'0.0'"),
+        pytest.param(_neg(_lit("0.0abc")), "0x0.0p+0", id="-'0.0abc'"),
+        pytest.param(_neg(_lit("1e-400")), "0x0.0p+0", id="-'1e-400'"),
+        pytest.param(_neg(_lit("-0.0")), "0x0.0p+0", id="-'-0.0'"),
+        pytest.param(_neg(_lit(0.0)), "-0x0.0p+0", id="-(0.0) literal"),
+        pytest.param(_neg(_neg(_lit(0.0))), "0x0.0p+0", id="-(-0.0)"),
+        pytest.param(_neg(_neg(_neg(_lit(0.0)))), "0x0.0p+0", id="-(-(-0.0))"),
+        pytest.param(
+            _neg(_bin(Operator.MUL, _lit(1.5), _lit(1))), "-0x1.8000000000000p+0", id="-(1.5 * 1)"
+        ),
+        pytest.param(_neg(_lit(1.5)), "-0x1.8000000000000p+0", id="-1.5 literal"),
+        pytest.param(_neg(_lit("1e400")), "-inf", id="-'1e400'"),
+        pytest.param(_neg(_bin(Operator.ADD, _lit("1e400"), _lit(0))), "-inf", id="-('1e400'+0)"),
+        pytest.param(
+            _neg(_neg(_bin(Operator.ADD, _lit("1e400"), _lit(0)))), "inf", id="-(-('1e400'+0))"
+        ),
+    ],
+)
+def test_unary_minus_zero_sign_matches_sqlite(expr, expected_hex):
+    from historian.exec.expression import evaluate
+
+    result = evaluate(expr, _ROW, _SCHEMA)
+    assert type(result) is float
+    assert result.hex() == expected_hex
+
+
+def test_unary_minus_over_a_text_integer_zero_stays_integer():
+    """`-'0'` and `-(0)` are INTEGER `0` (oracle: `int 0`)."""
+    from historian.exec.expression import evaluate
+
+    for expr in (_neg(_lit("0")), _neg(_lit(0))):
+        result = evaluate(expr, _ROW, _SCHEMA)
+        assert type(result) is int
+        assert result == 0
+
+
+def test_unary_minus_over_a_computed_nan_is_still_null():
+    """A NaN operand (never a stored value, but one the evaluator must
+    not let out) negates to NULL, as before."""
+    from historian.exec.expression import evaluate
+
+    nan_row: Row = (5, "5", math.nan)
+    assert evaluate(_neg(_bin(Operator.MUL, _col("r"), _lit(1))), nan_row, _SCHEMA) is None
+
+
 # --- Unary plus: SQLite's real behaviour is a no-op, not a coercion -----
 #
 # This issue's own body claims "unary -/+ on a text operand goes

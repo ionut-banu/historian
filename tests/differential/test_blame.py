@@ -4208,3 +4208,150 @@ def test_deep_where_chain_pushes_the_path_term_and_keeps_the_filter(tiny_repo, p
     assert_rows_match(reference_rows, rows)
     _assert_differential(tiny_repo, query)
     _assert_differential(tiny_repo, unpushable)
+
+
+# --- Unary minus and the sign of zero (issue #110) ----------------------
+#
+# SQLite negates a computed value as `0 - x`, so `-(line_no * 0.0)` is
+# `+0.0`, and folds only a REAL literal directly under `-` (through any
+# parentheses, which are not a node) to a negative literal, so `-(0.0)`
+# is `-0.0`. Historian used to flip the sign bit for every REAL, and the
+# harness's old `==` comparison could not see the difference. Every
+# REAL below was checked with `tests/oracle.py` (sqlite3 module 3.45.1)
+# by `float.hex()`; the pinned cases fail loudly if the oracle drifts
+# (#117).
+#
+# On `awkward`, `line_no` runs 1,1,1,1,1,2,2,3,3,4,5,6, so `(line_no-3)
+# * 0.0` is seven `-0.0` and five `+0.0` - the mixed-sign column the
+# harness's exact multiset tie-break has to line up.
+
+
+def _assert_differential_pinned_rows(repo, query: str, expected_rows) -> None:
+    """`_assert_differential`, plus SQLite's own full answer pinned in
+    order, each cell by type and a REAL by `float.hex()`."""
+    conn = load_unfiltered(BlameScan, repo, BLAME_SCHEMA, "blame")
+    try:
+        sqlite_rows = conn.execute(query).fetchall()
+    finally:
+        conn.close()
+    assert [tuple(type(cell) for cell in row) for row in sqlite_rows] == [
+        tuple(type(cell) for cell in row) for row in expected_rows
+    ]
+    assert [tuple(_hex_or_value(cell) for cell in row) for row in sqlite_rows] == [
+        tuple(_hex_or_value(cell) for cell in row) for row in expected_rows
+    ]
+    _, historian_rows = run_historian(query, repo)
+    assert_rows_match(sqlite_rows, historian_rows)
+
+
+def test_negated_computed_zero_is_positive_zero_on_every_row(awkward_repo):
+    """The reviewer's case: every one of `awkward`'s 12 rows is
+    `0x0.0p+0` in SQLite; historian gave `-0x0.0p+0`."""
+    _assert_differential_pinned_rows(
+        awkward_repo, "SELECT -(line_no * 0.0) FROM blame", [(0.0,)] * 12
+    )
+
+
+@pytest.mark.parametrize(
+    "expr,expected",
+    [
+        # Computed or text-derived REAL: `0 - x`, so `+0.0`.
+        ("-(0.0 * 1)", 0.0),
+        ("-(0.0 / 1)", 0.0),
+        ("-(0.0 % 5)", 0.0),
+        ("-(1 - 1.0)", 0.0),
+        ("-(-0.0 + 0)", 0.0),
+        ("-(+0.0)", 0.0),  # unary plus is its own node: no literal fold
+        ("-'0.0'", 0.0),
+        ("-'0.0abc'", 0.0),
+        ("-'1e-400'", 0.0),
+        ("-'-0.0'", 0.0),
+        ("-(-0.0)", 0.0),
+        ("-(-(-0.0))", 0.0),
+        # A REAL literal directly under `-`: folded, so `-0.0`.
+        ("-(0.0)", -0.0),
+        ("-((0.0))", -0.0),
+        ("-0.0", -0.0),
+        # Non-zero and infinite values: `0 - x` is exactly `-x`.
+        ("-(1.5 * 1)", -1.5),
+        ("-('1e400' + 0)", -math.inf),
+        ("-(-('1e400' + 0))", math.inf),
+        # TEXT that scans to INTEGER stays INTEGER.
+        ("-'0'", 0),
+        ("-(0)", 0),
+    ],
+)
+def test_unary_minus_zero_sign(tiny_repo, expr, expected):
+    _assert_differential_pinned(tiny_repo, f"SELECT {expr} FROM blame LIMIT 1", expected)
+
+
+@pytest.mark.parametrize(
+    "expr",
+    ["-(line_no * 0.0)", "-(0.0)", "-'0.0'", "-(+0.0)", "-0.0"],
+)
+def test_unary_minus_zero_sign_on_every_row(awkward_repo, expr):
+    _assert_differential(awkward_repo, f"SELECT line_no, {expr} FROM blame")
+
+
+def test_mixed_sign_zero_column(awkward_repo):
+    _assert_differential_pinned_rows(
+        awkward_repo,
+        "SELECT (line_no-3)*0.0 FROM blame ORDER BY line_no, path",
+        [(-0.0,)] * 7 + [(0.0,)] * 5,
+    )
+    _assert_differential(awkward_repo, "SELECT (line_no-3)*0.0 FROM blame")
+
+
+def test_mixed_sign_zero_column_order_by(awkward_repo):
+    """`0.0` and `-0.0` tie under `ORDER BY`, so all 12 rows form one
+    group, compared as an exact multiset."""
+    query = "SELECT (line_no-3)*0.0 FROM blame ORDER BY (line_no-3)*0.0"
+    conn = load_unfiltered(BlameScan, awkward_repo, BLAME_SCHEMA, "blame")
+    try:
+        sqlite_rows = conn.execute(query).fetchall()
+    finally:
+        conn.close()
+    _, historian_rows = run_historian(query, awkward_repo)
+    assert len(sqlite_rows) == 12
+    assert_rows_match(sqlite_rows, historian_rows, ordered=True, key_positions=(0,))
+
+
+@pytest.mark.parametrize(
+    "query,expected_rows",
+    [
+        # DISTINCT keeps the first of the equal zeros it meets; both
+        # engines scan line 1 (a `-0.0`) first.
+        ("SELECT DISTINCT (line_no-3)*0.0 FROM blame", [(-0.0,)]),
+        ("SELECT min((line_no-3)*0.0), max((line_no-3)*0.0) FROM blame", [(-0.0, -0.0)]),
+        ("SELECT count(DISTINCT (line_no-3)*0.0) FROM blame", [(1,)]),
+        ("SELECT sum((line_no-3)*0.0) FROM blame", [(0.0,)]),
+        ("SELECT -(line_no * 0.0) FROM blame WHERE line_no < 0", []),
+        ("SELECT sum(-(line_no * 0.0)) FROM blame WHERE line_no < 0", [(None,)]),
+    ],
+)
+def test_mixed_sign_zero_aggregates_and_distinct(awkward_repo, query, expected_rows):
+    _assert_differential_pinned_rows(awkward_repo, query, expected_rows)
+
+
+def test_mixed_sign_zero_where_equals_zero(awkward_repo):
+    """`-0.0 = 0` is true, so every row passes; the selected zeros keep
+    their own signs."""
+    _assert_differential(
+        awkward_repo, "SELECT line_no, (line_no-3)*0.0 FROM blame WHERE (line_no-3)*0.0 = 0"
+    )
+
+
+@pytest.mark.parametrize(
+    "where",
+    ["line_no = 2", "path = 'src/utils.py'"],
+)
+def test_negated_computed_zero_under_a_pushable_predicate(tiny_repo, where):
+    """The negated zero is in the SELECT list and never itself pushed;
+    the rows still match the unfiltered SQLite load."""
+    query = f"SELECT -(line_no * 0.0) FROM blame WHERE {where}"
+    conn = load_unfiltered(BlameScan, tiny_repo, BLAME_SCHEMA, "blame")
+    try:
+        assert conn.execute(query).fetchall()
+    finally:
+        conn.close()
+    _assert_differential(tiny_repo, query)

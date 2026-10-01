@@ -12,6 +12,10 @@ Commands
 - `uv run python tests/oracle.py "<setup SQL>" "<query SQL>"` - ask
   the oracle (Python's bundled `sqlite3` module) an ad hoc question;
   setup is optional - see `_docs/process.md`, "The oracle"
+- `HISTORIAN_SWEEP_OPERATORS=3 uv run pytest
+  tests/differential/test_evaluation_order.py` - the full 3-operator
+  evaluation-order sweep (about 3.5 minutes); run it at milestone
+  boundaries and when #117 lands
 
 Layout
 

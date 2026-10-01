@@ -2991,7 +2991,7 @@ SQLite's own answer depends on the position. The docstring now says
 so.
 
 Testing cost. The `k <= 3` sweep through historian's whole pipeline
-is about five minutes, which is too long for every run. The suite runs
+is about 3.5 minutes, which is too long for every run. The suite runs
 `k <= 2` by default (2,312 formulas in five placements, 11,560
 queries, plus 2,736 `IN`/`BETWEEN` queries), grouped by formula
 skeleton into 249 tests. `HISTORIAN_SWEEP_OPERATORS=3` runs the full

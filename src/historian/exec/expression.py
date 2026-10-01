@@ -45,10 +45,9 @@ expected (`WHERE line_no`, SQLite's C-style truthiness, at the
 `WHERE`/`HAVING` root or nested under `AND`/`OR`/`NOT`) is each a
 real, grammar-reachable shape - real SQLite accepts both, since
 booleans have no storage class of their own (`_docs/decisions.md`,
-2026-08-27: "`typeof(true)` is `integer`"). `evaluate()` itself still
-does not carry a notion of "the position this whole call's result is
-about to be used in" - it stays structural throughout, deciding
-`Value` vs `Bool3` from each node's own shape alone. Issue #38 adds
+2026-08-27: "`typeof(true)` is `integer`"). The *shape* of the result -
+`Value` vs `Bool3` - is still decided from each node's own shape
+alone, never from where the whole expression sits. Issue #38 adds
 `coerce_to_value` (`Bool3 -> Value`, `True`/`False`/`None` becoming
 SQLite's own `1`/`0`/`NULL` spelling) and `coerce_to_bool3` (`Value ->
 Bool3`, via the same leading-prefix numeric coercion arithmetic uses,
@@ -83,6 +82,31 @@ each do the same at their own call site. Still no `position` parameter:
 each of these already knows, structurally, that the operand it is about
 to hand to `values.eq`/`_coerce_to_text`/`arithmetic_operand` must be a
 `Value`, from its own node shape alone.
+
+Where evaluation stops does depend on calling context (issue #111)
+-------------------------------------------------------------------
+
+Up to #111 this docstring said `evaluate()` "does not carry a notion
+of the position this whole call's result is about to be used in".
+That holds for the result's shape (above) and no longer for which
+operands are evaluated. SQLite evaluates every operand of `AND`, `OR`,
+`NOT` and `BETWEEN` when the result is used as a value, but at the
+root of `WHERE`/`HAVING` - and through `AND`/`OR`/`NOT` below it -
+stops as soon as whether the condition is `TRUE` is decided. Measured
+with an exhaustive sweep against the oracle (`_docs/decisions.md`,
+2026-10-01): a select-list `(line_no = 5 AND <raises>)` raises, a
+`WHERE line_no = 5 AND <raises>` does not, and `WHERE line_no = NULL
+AND <raises>` does not either, while `WHERE NOT (line_no = NULL AND
+<raises>)` does, because under the `NOT` a `NULL` could still lead to
+a kept row. `IN` stops at its first matching element everywhere.
+
+So the context does reach the evaluator, as two entry points rather
+than a mode flag on one: `evaluate()` for a value (`Project`, `Sort`,
+`GROUP BY` keys, aggregate arguments) and `evaluate_condition()` for
+`Filter`. Inside, each work-stack entry carries a `_Context` - `VALUE`,
+or condition context with `NULL` counting as `FALSE` or as `TRUE` -
+which only `AND`/`OR`/`NOT` pass on to their operands (`NOT` flipping
+it); every other node evaluates its operands as values. See `_run`.
 
 Column affinity
 ----------------
@@ -177,6 +201,7 @@ __all__ = [
     "coerce_to_bool3",
     "coerce_to_value",
     "evaluate",
+    "evaluate_condition",
     "try_numeric_affinity",
 ]
 
@@ -218,7 +243,8 @@ class EvalError(Exception):
 class _Step(Enum):
     """What `evaluate()` does with one entry of its work stack - see
     `evaluate()`. `EVAL` starts a node; every other step finishes one
-    whose operands have already been evaluated onto the value stack."""
+    whose operands have already been evaluated onto the value stack,
+    or decides whether the next operand is needed at all."""
 
     EVAL = auto()
     FINISH_BINARY = auto()
@@ -230,48 +256,120 @@ class _Step(Enum):
     FINISH_OR = auto()
     FINISH_NOT = auto()
     FINISH_LIKE = auto()
-    FINISH_IN = auto()
+    IN_AFTER_ELEMENT = auto()
     FINISH_BETWEEN = auto()
+    BETWEEN_AFTER_LOW = auto()
+    FINISH_BETWEEN_HIGH = auto()
+
+
+class _Context(Enum):
+    """Where a node's result is used, which decides whether `AND`, `OR`
+    and `BETWEEN` may stop before their last operand (issue #111;
+    `_docs/spec.md` §3 "Expression evaluation").
+
+    `VALUE`: the result is a value - a select-list item, a sort or
+    group key, an aggregate argument, or an operand of anything but
+    `AND`/`OR`/`NOT`. Every operand is evaluated.
+
+    `NULL_IS_FALSE` / `NULL_IS_TRUE`: condition context - the root of
+    `WHERE`/`HAVING`, and the operands of `AND`/`OR`/`NOT` in condition
+    context. Only whether the clause's outcome is reached matters, and
+    a `NULL` counts towards it as `FALSE` at the root (only `TRUE` keeps
+    a row) and under an even number of `NOT`s, as `TRUE` under an odd
+    number. `NOT` flips it; `AND`/`OR` pass it to both operands."""
+
+    VALUE = auto()
+    NULL_IS_FALSE = auto()
+    NULL_IS_TRUE = auto()
+
+
+def _negated_context(context: _Context) -> _Context:
+    """The context of `NOT`'s operand, given the `NOT`'s own."""
+    if context is _Context.NULL_IS_FALSE:
+        return _Context.NULL_IS_TRUE
+    if context is _Context.NULL_IS_TRUE:
+        return _Context.NULL_IS_FALSE
+    return _Context.VALUE
+
+
+#: One entry of `evaluate()`'s work stack: the step, the node it is for,
+#: the context that node is evaluated in, and - for `IN_AFTER_ELEMENT`
+#: only - which list element has just been evaluated (0 otherwise).
+_Work = tuple[_Step, Expr, _Context, int]
 
 
 def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
-    """Evaluate *expr* against *row*, described by *schema*.
+    """Evaluate *expr* against *row*, described by *schema*, as a value:
+    every operand is evaluated, except that `IN` stops at the first
+    element equal to its left side (issue #111). This is what every
+    caller except `Filter` wants - see `evaluate_condition`.
 
     Returns a `historian.values.Value` for a value-shaped node, a
     `historian.values.Bool3` for a predicate-shaped one - see the
-    module docstring for exactly which shapes are which and why that
-    split is structural rather than context-driven.
+    module docstring for exactly which shapes are which. The context
+    decides only which operands are evaluated, never the result's
+    shape.
+    """
+    return _run(expr, row, schema, _Context.VALUE)
+
+
+def evaluate_condition(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
+    """Evaluate *expr* as the whole `WHERE` or `HAVING` condition
+    (`Filter`): like `evaluate()`, but `AND`, `OR`, `NOT` and `BETWEEN`
+    at the top of the tree stop as soon as whether the condition is
+    `TRUE` is decided, exactly where SQLite does (issue #111). The
+    result can then differ from `evaluate()`'s only between `FALSE` and
+    `NULL` - an `AND` stopped by a `NULL` left side is `NULL` even when
+    its right side would have made it `FALSE` - and never in whether it
+    is `TRUE`, which is all `Filter` asks of it.
+    """
+    return _run(expr, row, schema, _Context.NULL_IS_FALSE)
+
+
+def _run(expr: Expr, row: Row, schema: Schema, context: _Context) -> Value | Bool3:
+    """The evaluation loop behind `evaluate()`/`evaluate_condition()`.
 
     Not recursive (issue #107): one loop over an explicit work stack of
-    `(step, node)` pairs and a value stack of finished results, so the
-    Python stack does not grow with the tree. A recursive walk crashed
-    with `RecursionError` from about 330 levels (three frames per level
-    for a comparison), well inside what SQLite itself evaluates, and a
-    bound tree can be taller still than any parsed one (a select-list
-    alias spliced into `WHERE`). `_Step.EVAL` on a node pushes a finish
-    step for it and then its operands, in reverse, so they are
-    evaluated left to right - the same order, operand for operand, as
-    the recursive version this replaces, which keeps which error is
-    raised first, and every short-circuit, unchanged:
+    `(step, node, context, index)` entries and a value stack of finished
+    results, so the Python stack does not grow with the tree. A
+    recursive walk crashed with `RecursionError` from about 330 levels
+    (three frames per level for a comparison), well inside what SQLite
+    itself evaluates, and a bound tree can be taller still than any
+    parsed one (a select-list alias spliced into `WHERE`). `_Step.EVAL`
+    on a node pushes a finish step for it and then its operands, in
+    reverse, so they are evaluated left to right, which keeps which
+    error is raised first the same as a recursive walk would.
 
-    - `AND`/`OR` evaluate the left operand, then decide
-      (`AND_AFTER_LEFT`/`OR_AFTER_LEFT`) whether the right one is
-      needed at all (issue #51).
-    - `IN` evaluates the left operand once per list element, paired
-      with that element, and not at all for `IN ()`; `BETWEEN`
-      evaluates its operand twice, once per bound (#137 tracks both).
+    Where evaluation stops early (issue #111, measured against SQLite;
+    `_docs/decisions.md`, 2026-10-01):
+
+    - `AND`/`OR` in condition context evaluate the left operand, then
+      decide (`AND_AFTER_LEFT`/`OR_AFTER_LEFT`) whether the right one is
+      needed: not after a `FALSE` left side of `AND` or a `TRUE` one of
+      `OR`, nor after a `NULL` left side of `AND` where `NULL` counts
+      as `FALSE` or of `OR` where it counts as `TRUE` (`_Context`). In
+      value context both operands are always evaluated.
+    - `BETWEEN` in condition context is `x >= low AND x <= high`
+      (`NOT BETWEEN` is `NOT` over that): `BETWEEN_AFTER_LOW` stops
+      after the first comparison by the same rule. In value context it
+      evaluates the operand, the low bound, the operand again and the
+      high bound (#137 tracks the second operand evaluation).
+    - `IN` evaluates the left operand and the first element, compares
+      them, and stops on a match (`IN_AFTER_ELEMENT`), in both
+      contexts; otherwise the next element, the left operand again
+      (#137), and so on. `IN ()` evaluates nothing.
     - `LIKE` evaluates `left`, `pattern`, then `escape`, before any
       check on the escape.
 
     Each finish step is a plain function below (`_finish_binary`,
     `_finish_like`, ...) over already-evaluated operands.
     """
-    work: list[tuple[_Step, Expr]] = [(_Step.EVAL, expr)]
+    work: list[_Work] = [(_Step.EVAL, expr, context, 0)]
     results: list[Value | Bool3] = []
     while work:
-        step, node = work.pop()
+        step, node, context, index = work.pop()
         if step is _Step.EVAL:
-            _start(node, row, work, results)
+            _start(node, context, row, work, results)
         elif step is _Step.FINISH_BINARY:
             right = results.pop()
             left = results.pop()
@@ -283,38 +381,36 @@ def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
             left = results.pop()
             results.append(_finish_is(node, left, right, schema))
         elif step is _Step.AND_AFTER_LEFT:
+            # Condition context only (`_start`). `and3(FALSE, x)` is
+            # FALSE for every x; a NULL left side makes the AND NULL or
+            # FALSE, and where NULL counts as FALSE that is decided too.
+            # The NULL is kept as the result: it counts the same way in
+            # the parent, which shares this context (issue #111).
             left_bool3 = coerce_to_bool3(results.pop())
-            if left_bool3 is False:
-                # Short-circuit (issue #51): SQLite evaluates AND left to
-                # right and stops once the left operand is FALSE, never
-                # touching the right - see the module docstring's "Short-
-                # circuit AND/OR" section. Exact under three-valued logic:
-                # and3(FALSE, x) is FALSE for every x, NULL included, so
-                # this changes nothing about the *result*, only whether the
-                # right operand is evaluated at all. A NULL left operand is
-                # not "decided" and still falls through.
-                results.append(False)
-            else:
-                results.append(left_bool3)
-                work.append((_Step.FINISH_AND, node))
-                work.append((_Step.EVAL, node.right))
+            results.append(left_bool3)
+            if left_bool3 is not False and not (
+                left_bool3 is None and context is _Context.NULL_IS_FALSE
+            ):
+                work.append((_Step.FINISH_AND, node, context, 0))
+                work.append((_Step.EVAL, node.right, context, 0))
         elif step is _Step.FINISH_AND:
             right_bool3 = coerce_to_bool3(results.pop())
-            left_bool3 = results.pop()
+            left_bool3 = coerce_to_bool3(results.pop())
             results.append(values.and3(left_bool3, right_bool3))
         elif step is _Step.OR_AFTER_LEFT:
+            # Mirror of AND_AFTER_LEFT: `or3(TRUE, x)` is TRUE for every
+            # x, and a NULL left side decides it where NULL counts as
+            # TRUE (under an odd number of NOTs).
             left_bool3 = coerce_to_bool3(results.pop())
-            if left_bool3 is True:
-                # Short-circuit (issue #51): or3(TRUE, x) is TRUE for every
-                # x, NULL included - same reasoning as AND above, mirrored.
-                results.append(True)
-            else:
-                results.append(left_bool3)
-                work.append((_Step.FINISH_OR, node))
-                work.append((_Step.EVAL, node.right))
+            results.append(left_bool3)
+            if left_bool3 is not True and not (
+                left_bool3 is None and context is _Context.NULL_IS_TRUE
+            ):
+                work.append((_Step.FINISH_OR, node, context, 0))
+                work.append((_Step.EVAL, node.right, context, 0))
         elif step is _Step.FINISH_OR:
             right_bool3 = coerce_to_bool3(results.pop())
-            left_bool3 = results.pop()
+            left_bool3 = coerce_to_bool3(results.pop())
             results.append(values.or3(left_bool3, right_bool3))
         elif step is _Step.FINISH_NOT:
             results.append(values.not3(coerce_to_bool3(results.pop())))
@@ -323,17 +419,47 @@ def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
             pattern = results.pop()
             left = results.pop()
             results.append(_finish_like(node, left, pattern, escape))
-        elif step is _Step.FINISH_IN:
-            count = 2 * len(node.values)
-            pairs = results[len(results) - count :]
-            del results[len(results) - count :]
-            results.append(_finish_in(node, pairs, schema))
+        elif step is _Step.IN_AFTER_ELEMENT:
+            element = results.pop()
+            left = results.pop()
+            so_far = results.pop()
+            matched = _in_element_matches(node, left, node.values[index], element, schema)
+            so_far = values.or3(so_far, matched)
+            if matched is not True and index + 1 < len(node.values):
+                results.append(so_far)
+                work.append((_Step.IN_AFTER_ELEMENT, node, _Context.VALUE, index + 1))
+                work.append((_Step.EVAL, node.values[index + 1], _Context.VALUE, 0))
+                work.append((_Step.EVAL, node.left, _Context.VALUE, 0))
+            else:
+                results.append(values.not3(so_far) if node.negated else so_far)
         elif step is _Step.FINISH_BETWEEN:
             high = results.pop()
             operand_for_high = results.pop()
             low = results.pop()
             operand_for_low = results.pop()
-            results.append(_finish_between(node, operand_for_low, low, operand_for_high, high, schema))
+            results.append(
+                _finish_between(node, operand_for_low, low, operand_for_high, high, schema)
+            )
+        elif step is _Step.BETWEEN_AFTER_LOW:
+            # Condition context only. *context* is that of the inner
+            # `x >= low AND x <= high`, already flipped for NOT BETWEEN
+            # (`_start`), so the stopping rule is AND_AFTER_LEFT's.
+            low = results.pop()
+            operand = results.pop()
+            above_low = _between_low(node, operand, low, schema)
+            if above_low is False or (above_low is None and context is _Context.NULL_IS_FALSE):
+                results.append(values.not3(above_low) if node.negated else above_low)
+            else:
+                results.append(above_low)
+                work.append((_Step.FINISH_BETWEEN_HIGH, node, context, 0))
+                work.append((_Step.EVAL, node.high, _Context.VALUE, 0))
+                work.append((_Step.EVAL, node.operand, _Context.VALUE, 0))
+        elif step is _Step.FINISH_BETWEEN_HIGH:
+            high = results.pop()
+            operand = results.pop()
+            above_low = results.pop()
+            result = values.and3(above_low, _between_high(node, operand, high, schema))
+            results.append(values.not3(result) if node.negated else result)
         else:
             raise AssertionError(f"exec/expression.py: unhandled evaluation step {step}")
     (result,) = results
@@ -341,12 +467,19 @@ def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
 
 
 def _start(
-    node: Expr, row: Row, work: list[tuple[_Step, Expr]], results: list[Value | Bool3]
+    node: Expr,
+    context: _Context,
+    row: Row,
+    work: list[_Work],
+    results: list[Value | Bool3],
 ) -> None:
     """`evaluate()`'s `_Step.EVAL`: a leaf's value goes straight onto
     *results*; any other node pushes its finish step onto *work*, then
     its operands in reverse, so they come off the stack - and are
-    evaluated - left to right."""
+    evaluated - left to right. Only `AND`/`OR`/`NOT` pass a condition
+    *context* on to their operands; every other node's operands are
+    evaluated as values."""
+    value = _Context.VALUE
     if isinstance(node, Literal):
         results.append(node.value)
         return
@@ -367,14 +500,16 @@ def _start(
             node.position,
         )
     if isinstance(node, BinaryOp):
-        work.append((_Step.FINISH_BINARY, node))
-        work.append((_Step.EVAL, node.right))
-        work.append((_Step.EVAL, node.left))
+        work.append((_Step.FINISH_BINARY, node, value, 0))
+        work.append((_Step.EVAL, node.right, value, 0))
+        work.append((_Step.EVAL, node.left, value, 0))
         return
     if isinstance(node, UnaryOp):
         if node.op is UnaryOperator.POS:
-            # `+x` is `x`, untouched - see `_finish_negate`'s docstring.
-            work.append((_Step.EVAL, node.operand))
+            # `+x` is `x`, untouched - see `_finish_negate`'s docstring -
+            # but its operand is a value even in a condition: SQLite
+            # evaluates both sides of `WHERE +(a AND b)` (issue #111).
+            work.append((_Step.EVAL, node.operand, value, 0))
             return
         if (
             isinstance(node.operand, Literal)
@@ -392,50 +527,68 @@ def _start(
             # `0 - x` for everything else (issue #110).
             results.append(-node.operand.value)
             return
-        work.append((_Step.FINISH_NEGATE, node))
-        work.append((_Step.EVAL, node.operand))
+        work.append((_Step.FINISH_NEGATE, node, value, 0))
+        work.append((_Step.EVAL, node.operand, value, 0))
         return
     if isinstance(node, Is):
-        work.append((_Step.FINISH_IS, node))
-        work.append((_Step.EVAL, node.right))
-        work.append((_Step.EVAL, node.left))
+        work.append((_Step.FINISH_IS, node, value, 0))
+        work.append((_Step.EVAL, node.right, value, 0))
+        work.append((_Step.EVAL, node.left, value, 0))
         return
     if isinstance(node, And):
-        work.append((_Step.AND_AFTER_LEFT, node))
-        work.append((_Step.EVAL, node.left))
+        if context is value:
+            work.append((_Step.FINISH_AND, node, value, 0))
+            work.append((_Step.EVAL, node.right, value, 0))
+        else:
+            work.append((_Step.AND_AFTER_LEFT, node, context, 0))
+        work.append((_Step.EVAL, node.left, context, 0))
         return
     if isinstance(node, Or):
-        work.append((_Step.OR_AFTER_LEFT, node))
-        work.append((_Step.EVAL, node.left))
+        if context is value:
+            work.append((_Step.FINISH_OR, node, value, 0))
+            work.append((_Step.EVAL, node.right, value, 0))
+        else:
+            work.append((_Step.OR_AFTER_LEFT, node, context, 0))
+        work.append((_Step.EVAL, node.left, context, 0))
         return
     if isinstance(node, Not):
-        work.append((_Step.FINISH_NOT, node))
-        work.append((_Step.EVAL, node.operand))
+        work.append((_Step.FINISH_NOT, node, context, 0))
+        work.append((_Step.EVAL, node.operand, _negated_context(context), 0))
         return
     if isinstance(node, Like):
-        work.append((_Step.FINISH_LIKE, node))
+        work.append((_Step.FINISH_LIKE, node, value, 0))
         if node.escape is not None:
-            work.append((_Step.EVAL, node.escape))
-        work.append((_Step.EVAL, node.pattern))
-        work.append((_Step.EVAL, node.left))
+            work.append((_Step.EVAL, node.escape, value, 0))
+        work.append((_Step.EVAL, node.pattern, value, 0))
+        work.append((_Step.EVAL, node.left, value, 0))
         return
     if isinstance(node, In):
         if not node.values:
-            # `IN ()` folds over zero elements: FALSE, and the left
-            # operand is never evaluated - see `_finish_in`.
+            # `IN ()` is FALSE, and the left operand is never evaluated.
             results.append(values.not3(False) if node.negated else False)
             return
-        work.append((_Step.FINISH_IN, node))
-        for element in reversed(node.values):
-            work.append((_Step.EVAL, element))
-            work.append((_Step.EVAL, node.left))
+        # The result so far - FALSE, matched by nothing yet - then the
+        # left operand and the first element; IN_AFTER_ELEMENT compares
+        # them and goes on to the next element only if they differ.
+        results.append(False)
+        work.append((_Step.IN_AFTER_ELEMENT, node, value, 0))
+        work.append((_Step.EVAL, node.values[0], value, 0))
+        work.append((_Step.EVAL, node.left, value, 0))
         return
     if isinstance(node, Between):
-        work.append((_Step.FINISH_BETWEEN, node))
-        work.append((_Step.EVAL, node.high))
-        work.append((_Step.EVAL, node.operand))
-        work.append((_Step.EVAL, node.low))
-        work.append((_Step.EVAL, node.operand))
+        if context is value:
+            work.append((_Step.FINISH_BETWEEN, node, value, 0))
+            work.append((_Step.EVAL, node.high, value, 0))
+            work.append((_Step.EVAL, node.operand, value, 0))
+            work.append((_Step.EVAL, node.low, value, 0))
+            work.append((_Step.EVAL, node.operand, value, 0))
+            return
+        # `x NOT BETWEEN ...` is `NOT (x BETWEEN ...)` in SQLite, so the
+        # inner AND sits under one more NOT than the node itself.
+        inner = _negated_context(context) if node.negated else context
+        work.append((_Step.BETWEEN_AFTER_LOW, node, inner, 0))
+        work.append((_Step.EVAL, node.low, value, 0))
+        work.append((_Step.EVAL, node.operand, value, 0))
         return
     raise AssertionError(f"exec/expression.py: unhandled expression node type {type(node).__name__}")
 
@@ -445,10 +598,12 @@ def _start(
 # Two small, pure functions of evaluate()'s own return value - deliberately
 # not a `position` parameter threaded through evaluate()'s recursive
 # dispatch. See the module docstring's "Value or Bool3, decided by node
-# shape, not calling context" section for why: `evaluate()` never needs to
-# know what position its *own* result is about to be used in - each of its
-# branches already knows, structurally, what position its *children's*
-# results are in, purely from which node it is currently dispatching on.
+# shape, not calling context" section for why: converting a result never
+# needs to know what position it is about to be used in - each branch
+# already knows, structurally, what its *children's* results must be,
+# purely from which node it is currently dispatching on. (Which children
+# are evaluated at all does depend on the calling context since #111 -
+# `_Context` - but that never changes what a result is converted to.)
 #
 # `coerce_to_value` originally (#38) had exactly one caller, from outside
 # evaluate()'s own recursion: `Project` (`exec/operators.py`), on a
@@ -566,8 +721,8 @@ def _finish_between(
     high: Value | Bool3,
     schema: Schema,
 ) -> Bool3:
-    """`x BETWEEN low AND high` is `values.and3(values.ge(x, low),
-    values.le(x, high))`, per this issue's own criteria - not bespoke
+    """`x BETWEEN low AND high` in value context is
+    `values.and3(values.ge(x, low), values.le(x, high))` - not bespoke
     logic. Confirmed against `sqlite3`: `20 BETWEEN 30 AND NULL` is
     `FALSE`, not `NULL` - the first comparison alone already makes it
     `FALSE`, and `and3(FALSE, NULL)` is `FALSE`. Affinity is applied
@@ -576,69 +731,73 @@ def _finish_between(
 
     `evaluate()` has already evaluated, in this order, the operand, the
     low bound, the operand again and the high bound (#137 tracks the
-    second evaluation of the operand).
+    second evaluation of the operand). In condition context `_run`
+    calls `_between_low`/`_between_high` itself, one at a time, so it
+    can stop after the first (issue #111).
     """
-    operand_low_left, operand_low_right = _affinity_pair(
-        expr.operand, operand_for_low, expr.low, low, schema
-    )
-    operand_high_left, operand_high_right = _affinity_pair(
-        expr.operand, operand_for_high, expr.high, high, schema
-    )
     result = values.and3(
-        values.ge(operand_low_left, operand_low_right),
-        values.le(operand_high_left, operand_high_right),
+        _between_low(expr, operand_for_low, low, schema),
+        _between_high(expr, operand_for_high, high, schema),
     )
     return values.not3(result) if expr.negated else result
 
 
-def _finish_in(expr: In, pairs: list[Value | Bool3], schema: Schema) -> Bool3:
-    """`x IN (v1, ..., vn)` is `values.or3` folded over each
-    `values.eq(x, vi)`, per this issue's own criteria - not bespoke
-    NULL-handling logic. Confirmed against `sqlite3`: `5 IN (5,
-    NULL)` is `TRUE` (`or3` short-circuits on the first match before
-    the `NULL` element matters), `6 IN (5, NULL)` is `NULL` (no
-    element matches, but a `NULL` element means "maybe", not "no").
-    `IN ()` folds over zero elements, leaving the `False` starting
-    accumulator untouched - matching `sql/ast.py`'s own docstring that
-    `IN ()` is always `FALSE`.
+def _between_low(expr: Between, operand: Value | Bool3, low: Value | Bool3, schema: Schema) -> Bool3:
+    """`x >= low`, with each side's own affinity - `BETWEEN`'s first
+    comparison, before any `NOT`."""
+    left, right = _affinity_pair(expr.operand, operand, expr.low, low, schema)
+    return values.ge(left, right)
 
-    Affinity (issue #47, correcting this docstring's own former claim
-    that it worked "exactly as for `=`" - it does not): a list element
-    contributes no affinity of its own, ever - not "usually," not
-    "unless the element happens to itself be a bare column." Confirmed
-    against `sqlite3` (`t(n INTEGER, s TEXT, r REAL)`, row `(5, '5',
-    5.0)`): `'5' IN (n)` -> `0`, `'5' IN (r)` -> `0`, `5 IN (s)` -> `0`
-    - each is `1` if the element's own affinity were (wrongly)
-    consulted the way `=`'s right operand's is. Only `x`'s own
-    affinity - the same structural question `_affinity_of` already
-    asks for every other operator - is ever applied, and it is applied
-    once per element independently: `x IN ('5', 'abc')` still converts
-    `'5'` and `'abc'` against `x`'s affinity individually, per the
-    already-correct `test_in_applies_affinity_to_each_element_independently`.
-    `_affinity_pair`'s `right_has_affinity=False` is the
-    single change this makes: `x`'s own affinity still applies to each
-    element, the element's affinity never does.
 
-    This is genuinely different from `_finish_between`, not a case that
+def _between_high(expr: Between, operand: Value | Bool3, high: Value | Bool3, schema: Schema) -> Bool3:
+    """`x <= high`, with each side's own affinity - `BETWEEN`'s second
+    comparison, before any `NOT`."""
+    left, right = _affinity_pair(expr.operand, operand, expr.high, high, schema)
+    return values.le(left, right)
+
+
+def _in_element_matches(
+    expr: In, left: Value | Bool3, element_expr: Expr, element: Value | Bool3, schema: Schema
+) -> Bool3:
+    """`values.eq(x, vi)` for one already-evaluated list element of `x
+    IN (v1, ..., vn)`. `evaluate()` folds these with `values.or3` in
+    list order, starting from `FALSE`, and stops at the first `TRUE`
+    (issue #111: SQLite does, in every context) - so the result is the
+    `or3` fold over the elements it reached, which is the fold over all
+    of them, since `or3(TRUE, x)` is `TRUE`. Confirmed against
+    `sqlite3`: `5 IN (5, NULL)` is `TRUE`, `6 IN (5, NULL)` is `NULL`
+    (no element matches, but a `NULL` element means "maybe", not "no"),
+    and a `NULL` element or left side never stops it. `IN ()` never
+    gets here: `evaluate()` answers it as `FALSE` without evaluating the
+    left operand at all, matching `sql/ast.py`'s own docstring. `NOT
+    IN` is `values.not3` of the fold, applied by `evaluate()`.
+
+    Affinity (issue #47): a list element contributes no affinity of its
+    own, ever - not "usually," not "unless the element happens to itself
+    be a bare column." Confirmed against `sqlite3` (`t(n INTEGER, s
+    TEXT, r REAL)`, row `(5, '5', 5.0)`): `'5' IN (n)` -> `0`, `'5' IN
+    (r)` -> `0`, `5 IN (s)` -> `0` - each is `1` if the element's own
+    affinity were (wrongly) consulted the way `=`'s right operand's is.
+    Only `x`'s own affinity - the same structural question
+    `_affinity_of` already asks for every other operator - is ever
+    applied, and it is applied once per element independently: `x IN
+    ('5', 'abc')` still converts `'5'` and `'abc'` against `x`'s
+    affinity individually. `_affinity_pair`'s `right_has_affinity=False`
+    is the single change this makes.
+
+    This is genuinely different from `BETWEEN`, not a case that
     "tidying" the two onto one path would preserve: a `BETWEEN` bound
     is an independent RHS operand, symmetric with `=`, and keeps its
     own affinity. Confirmed against `sqlite3` for the identical
     operand shape, same row (`n = 1`): `'1' BETWEEN n AND n` -> `1`,
-    `'1' IN (n)` -> `0`. `_finish_between` is intentionally left calling
-    `_affinity_pair` with its default `right_has_affinity=True`.
-
-    *pairs* is what `evaluate()` produced for a non-empty list: the left
-    operand and then the element, once per element, in list order -
-    `[x, v1, x, v2, ...]`. `IN ()` never reaches here: `evaluate()`
-    answers it without evaluating the left operand at all.
+    `'1' IN (n)` -> `0`. `_between_low`/`_between_high` are
+    intentionally left calling `_affinity_pair` with its default
+    `right_has_affinity=True`.
     """
-    result: Bool3 = False
-    for index, element in enumerate(expr.values):
-        left, right = _affinity_pair(
-            expr.left, pairs[2 * index], element, pairs[2 * index + 1], schema, right_has_affinity=False
-        )
-        result = values.or3(result, values.eq(left, right))
-    return values.not3(result) if expr.negated else result
+    left_value, right_value = _affinity_pair(
+        expr.left, left, element_expr, element, schema, right_has_affinity=False
+    )
+    return values.eq(left_value, right_value)
 
 
 # --- LIKE: unconditional text coercion, no affinity, ASCII-only fold ----
@@ -990,19 +1149,20 @@ def _affinity_pair(
     nodes that produced them, which is all affinity looks at (see
     `_affinity_of`). Shared by every predicate that goes through "the
     identical affinity algorithm" as `=` - which is every caller except
-    `_finish_in`.
+    `_in_element_matches`.
 
     `right_has_affinity` (issue #47) is the explicit, structural
-    escape hatch `_finish_in` uses: SQLite's own rule is that the
+    escape hatch `_in_element_matches` uses: SQLite's own rule is that the
     right-hand side of `IN`/`NOT IN` *with a list* has no affinity at
     all, regardless of what kind of expression a given element is -
     unlike `=`/`IS`/`BETWEEN`, where each operand independently asks
-    `_affinity_of` the normal way. `_finish_in` passes
+    `_affinity_of` the normal way. `_in_element_matches` passes
     `right_has_affinity=False` for every element; every other caller
     takes the default and is unaffected. A plain keyword parameter,
     not a dynamic-dispatch trick (`AGENTS.md`), and it does not touch
-    `_finish_between`, which must keep applying each bound's own
-    affinity independently - see `_finish_in`'s docstring for the
+    `_between_low`/`_between_high`, which must keep applying each
+    bound's own affinity independently - see `_in_element_matches`'s
+    docstring for the
     evidence that the two operators, though structurally identical
     here, are not supposed to behave alike."""
     left = coerce_to_value(left_result)

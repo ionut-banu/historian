@@ -573,6 +573,32 @@ Aggregate calls are not evaluated here. The planner splits each
 `Aggregate` operator, and the surrounding scalar expression, computed
 here over the aggregate's output row.
 
+Evaluation order follows SQLite, which is observable only when an
+operand raises (today, a `LIKE ... ESCAPE` whose escape is not one
+character). Operands are evaluated left to right, and where the
+evaluation stops depends on where the expression is used:
+
+- **Value context** - a select-list item, an `ORDER BY` or `GROUP BY`
+  key, an aggregate argument, and any operand of anything but
+  `AND`/`OR`/`NOT` (a comparison, arithmetic, unary `+`/`-`, `||`,
+  `IS`, `LIKE`, `IN`, `BETWEEN`): every operand of `AND`, `OR`, `NOT`
+  and `BETWEEN` is evaluated.
+- **Condition context** - the root of `WHERE` and of `HAVING`, and the
+  operands of `AND`/`OR`/`NOT` in condition context: evaluation stops
+  once whether the condition is `TRUE` is decided. `AND` stops after a
+  `FALSE` left side and `OR` after a `TRUE` one. A `NULL` left side
+  counts as `FALSE` at the root and under an even number of `NOT`s, so
+  it stops `AND` there, and as `TRUE` under an odd number, where it
+  stops `OR`. `x BETWEEN low AND high` is `x >= low AND x <= high` and
+  stops the same way; `x NOT BETWEEN ...` is `NOT (x BETWEEN ...)`.
+- `IN` stops at the first list element equal to its left side, in
+  both contexts. A `NULL` element or left side does not stop it, and
+  `IN ()` evaluates nothing.
+
+The evaluator has one entry point per context: `evaluate()` for a
+value, `evaluate_condition()` for `Filter`. A future `CASE WHEN` or
+`JOIN ... ON` condition is condition context and uses the second.
+
 ### Pushdown negotiation
 
 The optimizer's one job in v1.

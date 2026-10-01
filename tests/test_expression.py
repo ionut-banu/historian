@@ -1743,86 +1743,360 @@ def test_like_escape_column_operand_null_row_value_is_null():
     assert evaluate(_like(_lit("a!b"), _lit("a!!b"), escape=esc_col), row, schema) is None
 
 
-# --- AND / OR: short-circuit evaluation, left to right (issue #51) ------
+# --- AND / OR: where evaluation stops (issue #51, corrected by #111) ---
 #
-# SQLite evaluates AND/OR left to right and stops early - confirmed live
-# (this issue's own orchestrator correction):
+# #51 made AND/OR stop after a decided left operand everywhere. #111
+# measured SQLite (sqlite3 module 3.45.1, an exhaustive sweep in
+# tests/differential/test_evaluation_order.py) and found the rule
+# depends on where the expression is used:
 #
-#   create table t(p); insert into t values('a'),('b');
 #   select count(*) from t where p = 'zzz' and p like 'a' escape 'ab';
-#       -> 0   (FALSE left operand short-circuits; ESCAPE never runs)
-#   select count(*) from t where p like 'a' escape 'ab' and p = 'zzz';
-#       -> Error: ESCAPE expression must be a single character
-#   select count(*) from t where 1=1 or p like 'a' escape 'ab';
-#       -> 2   (TRUE left operand short-circuits; ESCAPE never runs)
-#   select count(*) from t where p like 'a' escape 'ab' or 1=1;
-#       -> Error
-#   select count(*) from t where 0=1 or p like 'a' escape 'ab';
-#       -> Error (FALSE does not short-circuit OR; right still runs)
+#       -> 0      condition context: FALSE left side, ESCAPE never runs
+#   select (p = 'zzz' and p like 'a' escape 'ab') from t;
+#       -> Error  value context: both operands evaluated
 #
-# Before this issue, evaluate()'s And/Or branches evaluated both
-# operands unconditionally and then called and3/or3 - harmless until
-# ESCAPE became the first expression able to raise at runtime.
+# `evaluate()` is value context, `evaluate_condition()` is the root of
+# WHERE/HAVING. The leaf-counting tests further down pin every row of
+# the rule; these keep #51's own cases, now in the context they hold in.
 
 _POISON_LIKE = _like(_lit("a"), _lit("a"), escape=_lit("ab"))  # invalid escape length
 
 
-def test_and_short_circuits_on_a_false_left_operand_right_never_evaluated():
-    """`FALSE AND <raises>` returns `False` without evaluating the
-    right operand at all."""
-    from historian.exec.expression import evaluate
+def test_and_with_a_false_left_operand_stops_in_condition_context():
+    """`WHERE FALSE AND <raises>` is `False`, the right operand never
+    evaluated."""
+    from historian.exec.expression import evaluate_condition
 
-    assert evaluate(And(_FALSE, _POISON_LIKE, _POS), _ROW, _SCHEMA) is False
+    assert evaluate_condition(And(_FALSE, _POISON_LIKE, _POS), _ROW, _SCHEMA) is False
 
 
-@pytest.mark.parametrize("left", [_TRUE, _NULL])
-def test_and_does_not_short_circuit_on_a_true_or_null_left_operand(left):
-    """A `TRUE` or `NULL` left operand still evaluates (and can still
-    raise from) the right operand - three-valued logic, not a blanket
-    short-circuit that skips the right operand whenever the left one
-    is already decided-looking."""
+@pytest.mark.parametrize("left", [_TRUE, _FALSE, _NULL])
+def test_and_evaluates_both_operands_in_value_context(left):
+    """`SELECT (<left> AND <raises>)` raises whatever the left side is."""
     from historian.exec.expression import EvalError, evaluate
 
     with pytest.raises(EvalError):
         evaluate(And(left, _POISON_LIKE, _POS), _ROW, _SCHEMA)
 
 
-def test_or_short_circuits_on_a_true_left_operand_right_never_evaluated():
-    """`TRUE OR <raises>` returns `True` without evaluating the right
-    operand at all."""
-    from historian.exec.expression import evaluate
+def test_and_with_a_true_left_operand_continues_in_condition_context():
+    from historian.exec.expression import EvalError, evaluate_condition
 
-    assert evaluate(Or(_TRUE, _POISON_LIKE, _POS), _ROW, _SCHEMA) is True
+    with pytest.raises(EvalError):
+        evaluate_condition(And(_TRUE, _POISON_LIKE, _POS), _ROW, _SCHEMA)
 
 
-@pytest.mark.parametrize("left", [_FALSE, _NULL])
-def test_or_does_not_short_circuit_on_a_false_or_null_left_operand(left):
-    """A `FALSE` or `NULL` left operand still evaluates (and can still
-    raise from) the right operand."""
+def test_and_with_a_null_left_operand_stops_at_the_root_of_a_condition():
+    """At the root of WHERE only TRUE keeps a row, and `NULL AND x` is
+    never TRUE: sqlite3, `... where line_no = NULL and <raises>` -> no
+    rows. The result is NULL, which drops the row."""
+    from historian.exec.expression import evaluate_condition
+
+    assert evaluate_condition(And(_NULL, _POISON_LIKE, _POS), _ROW, _SCHEMA) is None
+
+
+def test_or_with_a_true_left_operand_stops_in_condition_context():
+    from historian.exec.expression import evaluate_condition
+
+    assert evaluate_condition(Or(_TRUE, _POISON_LIKE, _POS), _ROW, _SCHEMA) is True
+
+
+@pytest.mark.parametrize("left", [_TRUE, _FALSE, _NULL])
+def test_or_evaluates_both_operands_in_value_context(left):
     from historian.exec.expression import EvalError, evaluate
 
     with pytest.raises(EvalError):
         evaluate(Or(left, _POISON_LIKE, _POS), _ROW, _SCHEMA)
 
 
-def test_and_or_short_circuit_still_match_the_three_valued_truth_table_when_nothing_raises():
-    """The short-circuit change must not alter and3/or3's own
-    already-tested truth table (tests/test_values.py) for the ordinary
-    case where nothing raises - re-run here through evaluate() with a
-    non-poisoned right operand, guarding against an implementation that
-    short-circuits too eagerly (e.g. returning the left operand's own
-    coercion instead of falling through to and3/or3 whenever it isn't
-    poisoned)."""
-    from historian.exec.expression import evaluate
+@pytest.mark.parametrize("left", [_FALSE, _NULL])
+def test_or_with_a_false_or_null_left_operand_continues_at_the_root_of_a_condition(left):
+    from historian.exec.expression import EvalError, evaluate_condition
+
+    with pytest.raises(EvalError):
+        evaluate_condition(Or(left, _POISON_LIKE, _POS), _ROW, _SCHEMA)
+
+
+@pytest.mark.parametrize("entry", ["evaluate", "evaluate_condition"])
+def test_and_or_still_match_the_three_valued_truth_table_when_nothing_raises(entry):
+    """Neither context changes and3/or3's own truth table
+    (tests/test_values.py) where every operand is evaluated - guarding
+    against stopping too eagerly, e.g. on a NULL left side of OR, where
+    the right side still decides the answer."""
+    from historian.exec import expression
+
+    run = getattr(expression, entry)
+    assert run(And(_TRUE, _NULL, _POS), _ROW, _SCHEMA) is None
+    assert run(And(_TRUE, _TRUE, _POS), _ROW, _SCHEMA) is True
+    assert run(Or(_NULL, _TRUE, _POS), _ROW, _SCHEMA) is True
+    assert run(Or(_NULL, _FALSE, _POS), _ROW, _SCHEMA) is None
+    assert run(Or(_NULL, _NULL, _POS), _ROW, _SCHEMA) is None
+    assert run(Or(_FALSE, _FALSE, _POS), _ROW, _SCHEMA) is False
+    assert run(Not(Or(_NULL, _FALSE, _POS), _POS), _ROW, _SCHEMA) is None
+
+
+def test_a_null_left_side_that_stops_a_condition_leaves_null_not_false():
+    """`NULL AND FALSE` is FALSE as a value, but at the root of a
+    condition the AND stops on the NULL and the result is NULL: the
+    two differ only in a way no WHERE can see, since neither is TRUE.
+    Under NOT, where NULL counts as TRUE, the AND does not stop."""
+    from historian.exec.expression import evaluate, evaluate_condition
 
     assert evaluate(And(_NULL, _FALSE, _POS), _ROW, _SCHEMA) is False
-    assert evaluate(And(_NULL, _TRUE, _POS), _ROW, _SCHEMA) is None
-    assert evaluate(And(_NULL, _NULL, _POS), _ROW, _SCHEMA) is None
-    assert evaluate(And(_TRUE, _TRUE, _POS), _ROW, _SCHEMA) is True
-    assert evaluate(Or(_NULL, _TRUE, _POS), _ROW, _SCHEMA) is True
-    assert evaluate(Or(_NULL, _FALSE, _POS), _ROW, _SCHEMA) is None
-    assert evaluate(Or(_NULL, _NULL, _POS), _ROW, _SCHEMA) is None
-    assert evaluate(Or(_FALSE, _FALSE, _POS), _ROW, _SCHEMA) is False
+    assert evaluate_condition(And(_NULL, _FALSE, _POS), _ROW, _SCHEMA) is None
+    assert evaluate_condition(Not(And(_NULL, _FALSE, _POS), _POS), _ROW, _SCHEMA) is True
+
+
+# --- Which leaves are evaluated (issue #111) -----------------------------
+#
+# Only an error makes evaluation order observable in a query, so a
+# change that evaluated one leaf too many where nothing raises would
+# pass every differential test. These count reads instead: each leaf is
+# a bare column, and the row records which offsets were read, in order.
+# Leaf values are 1 (TRUE), 0 (FALSE) and None (NULL). Every expected
+# read list follows from the rule measured against sqlite3 3.45.1 (see
+# tests/differential/test_evaluation_order.py and _docs/decisions.md,
+# 2026-10-01):
+#
+# - value context reads every leaf;
+# - in condition context AND stops after FALSE, OR after TRUE, and a
+#   NULL left side stops AND where NULL counts as FALSE (an even number
+#   of NOTs above, the WHERE root included) and OR where it counts as
+#   TRUE (an odd number);
+# - BETWEEN in condition context is `x >= low AND x <= high`, and NOT
+#   BETWEEN is NOT over that;
+# - IN stops at the first equal element in both contexts; a NULL
+#   element or left side never stops it.
+
+_T, _F, _N = 1, 0, None
+
+
+class _CountingRow(tuple):
+    """A row that records the offset of every column read."""
+
+    def __new__(cls, cells):
+        row = super().__new__(cls, cells)
+        row.reads = []
+        return row
+
+    def __getitem__(self, index):
+        self.reads.append(index)
+        return super().__getitem__(index)
+
+
+def _leaf(offset: int) -> BoundColumnRef:
+    return BoundColumnRef(offset=offset, name=f"c{offset}", position=_POS)
+
+
+_A, _B, _C, _D = _leaf(0), _leaf(1), _leaf(2), _leaf(3)
+
+_COUNTING_SCHEMA = Schema(columns=tuple(Column(f"c{i}", ColumnType.INTEGER) for i in range(4)))
+
+
+def _reads(entry: str, expr, *cells):
+    """`(result, offsets read)` for *expr* over a row of *cells*, run
+    through `evaluate` or `evaluate_condition`."""
+    from historian.exec import expression
+
+    row = _CountingRow(cells)
+    result = getattr(expression, entry)(expr, row, _COUNTING_SCHEMA)
+    return result, row.reads
+
+
+def _and(left, right):
+    return And(left, right, _POS)
+
+
+def _or(left, right):
+    return Or(left, right, _POS)
+
+
+def _not(operand):
+    return Not(operand, _POS)
+
+
+@pytest.mark.parametrize("left", [_T, _F, _N])
+@pytest.mark.parametrize("right", [_T, _F, _N])
+@pytest.mark.parametrize(
+    "build",
+    [_and, _or, lambda l, r: _not(_and(l, r)), lambda l, r: _not(_or(l, r))],
+    ids=["AND", "OR", "NOT AND", "NOT OR"],
+)
+def test_value_context_reads_every_leaf(build, left, right):
+    """`SELECT (a AND b)`, `SELECT NOT (a OR b)`, ...: both leaves are
+    read whatever their values."""
+    _, reads = _reads("evaluate", build(_A, _B), left, right)
+    assert reads == [0, 1]
+
+
+@pytest.mark.parametrize(
+    "build, left, expected_reads",
+    [
+        # At the root, NULL counts as FALSE.
+        (_and, _F, [0]),
+        (_and, _N, [0]),
+        (_and, _T, [0, 1]),
+        (_or, _T, [0]),
+        (_or, _N, [0, 1]),
+        (_or, _F, [0, 1]),
+        # Under one NOT, NULL counts as TRUE.
+        (lambda l, r: _not(_and(l, r)), _F, [0]),
+        (lambda l, r: _not(_and(l, r)), _N, [0, 1]),
+        (lambda l, r: _not(_and(l, r)), _T, [0, 1]),
+        (lambda l, r: _not(_or(l, r)), _T, [0]),
+        (lambda l, r: _not(_or(l, r)), _N, [0]),
+        (lambda l, r: _not(_or(l, r)), _F, [0, 1]),
+        # Under two, back to FALSE.
+        (lambda l, r: _not(_not(_and(l, r))), _N, [0]),
+        (lambda l, r: _not(_not(_or(l, r))), _N, [0, 1]),
+        # The polarity reaches through AND/OR to nested operands.
+        (lambda l, r: _and(_D, _not(_and(l, r))), _N, [3, 0, 1]),
+        (lambda l, r: _or(_not(_or(l, r)), _D), _N, [0, 3]),
+    ],
+)
+def test_condition_context_stops_where_sqlite_does(build, left, expected_reads):
+    _, reads = _reads("evaluate_condition", build(_A, _B), left, _T, _F, _T)
+    assert reads == expected_reads
+
+
+@pytest.mark.parametrize("left", [_T, _F, _N])
+@pytest.mark.parametrize("right", [_T, _F, _N])
+@pytest.mark.parametrize(
+    "build",
+    [_and, _or, lambda l, r: _not(_and(l, r)), lambda l, r: _not(_or(l, r))],
+    ids=["AND", "OR", "NOT AND", "NOT OR"],
+)
+def test_condition_context_keeps_exactly_the_rows_value_context_keeps(build, left, right):
+    """Stopping early never changes which rows a WHERE keeps: the
+    condition result is TRUE exactly when the value result is."""
+    from historian import values
+    from historian.exec.expression import coerce_to_bool3
+
+    condition, _ = _reads("evaluate_condition", build(_A, _B), left, right)
+    value, _ = _reads("evaluate", build(_A, _B), left, right)
+    assert values.is_true(coerce_to_bool3(condition)) == values.is_true(coerce_to_bool3(value))
+
+
+@pytest.mark.parametrize(
+    "wrap",
+    [
+        lambda e: _bin(Operator.EQ, e, _lit(0)),
+        lambda e: _is(e, _lit(None), negated=True),
+        lambda e: _bin(Operator.ADD, e, _lit(0)),
+        lambda e: _bin(Operator.CONCAT, e, _lit("x")),
+        lambda e: _like(e, _lit("0")),
+        lambda e: _between(e, _lit(0), _lit(1)),
+        lambda e: _in(_lit(7), (e,)),
+        lambda e: _in(e, (_lit(7),)),
+        lambda e: _unary(UnaryOperator.POS, e),
+        lambda e: _unary(UnaryOperator.NEG, e),
+    ],
+    ids=["=", "IS NOT", "+", "||", "LIKE", "BETWEEN", "IN element", "IN left", "unary +", "unary -"],
+)
+def test_an_operand_of_any_other_operator_is_value_context_inside_a_condition(wrap):
+    """`WHERE (a AND b) = 0`, `WHERE +(a AND b)`, ...: the AND is an
+    operand, not the condition, so both leaves are read even though the
+    left one is FALSE. (`BETWEEN` reads its operand twice, #137.)"""
+    _, reads = _reads("evaluate_condition", wrap(_and(_A, _B)), _F, _T)
+    assert reads[:2] == [0, 1]
+    assert set(reads) == {0, 1}
+
+
+@pytest.mark.parametrize("entry", ["evaluate", "evaluate_condition"])
+@pytest.mark.parametrize("negated", [False, True])
+@pytest.mark.parametrize(
+    "cells, expected_reads",
+    [
+        # Left side, then each element in turn, the left side read again
+        # per element (#137).
+        ((1, 1, 2, 3), [0, 1]),
+        ((2, 1, 2, 3), [0, 1, 0, 2]),
+        ((3, 1, 2, 3), [0, 1, 0, 2, 0, 3]),
+        ((4, 1, 2, 3), [0, 1, 0, 2, 0, 3]),
+        # A NULL element does not stop it; the match after it does.
+        ((2, None, 2, 3), [0, 1, 0, 2]),
+        # A NULL left side matches nothing and stops nothing.
+        ((None, 1, 2, 3), [0, 1, 0, 2, 0, 3]),
+    ],
+)
+def test_in_stops_at_the_first_match_in_both_contexts(entry, negated, cells, expected_reads):
+    _, reads = _reads(entry, _in(_A, (_B, _C, _D), negated=negated), *cells)
+    assert reads == expected_reads
+
+
+@pytest.mark.parametrize("entry", ["evaluate", "evaluate_condition"])
+def test_in_results_are_unchanged_by_stopping(entry):
+    """sqlite3: `5 IN (5, NULL)` -> 1, `6 IN (5, NULL)` -> NULL, `6 IN
+    (5, 7)` -> 0, `NULL IN (5)` -> NULL, and NOT IN their negations."""
+    expr = _in(_A, (_B, _C))
+    assert _reads(entry, expr, 5, 5, None)[0] is True
+    assert _reads(entry, expr, 6, 5, None)[0] is None
+    assert _reads(entry, expr, 6, 5, 7)[0] is False
+    assert _reads(entry, expr, None, 5, 7)[0] is None
+    negated = _in(_A, (_B, _C), negated=True)
+    assert _reads(entry, negated, 5, 5, None)[0] is False
+    assert _reads(entry, negated, 6, 5, None)[0] is None
+    assert _reads(entry, negated, 6, 5, 7)[0] is True
+
+
+@pytest.mark.parametrize("entry", ["evaluate", "evaluate_condition"])
+def test_empty_in_reads_nothing(entry):
+    assert _reads(entry, _in(_A, ()), 1) == (False, [])
+    assert _reads(entry, _in(_A, (), negated=True), 1) == (True, [])
+
+
+@pytest.mark.parametrize("negated", [False, True])
+@pytest.mark.parametrize("cells", [(5, 10, 20), (5, None, 20), (5, 0, 20), (None, 0, 20)])
+def test_between_reads_every_operand_in_value_context(negated, cells):
+    """The operand, the low bound, the operand again (#137), the high
+    bound."""
+    _, reads = _reads("evaluate", _between(_A, _B, _C, negated=negated), *cells)
+    assert reads == [0, 1, 0, 2]
+
+
+@pytest.mark.parametrize(
+    "negated, outer_not, cells, expected_reads",
+    [
+        # `x >= low` FALSE stops it in every polarity.
+        (False, False, (5, 10, 20), [0, 1]),
+        (True, False, (5, 10, 20), [0, 1]),
+        (False, True, (5, 10, 20), [0, 1]),
+        # NULL stops it where NULL counts as FALSE: plain BETWEEN at the
+        # root, or NOT BETWEEN under one NOT.
+        (False, False, (5, None, 20), [0, 1]),
+        (True, True, (5, None, 20), [0, 1]),
+        (False, False, (None, 0, 20), [0, 1]),
+        # ... and not where it counts as TRUE.
+        (True, False, (5, None, 20), [0, 1, 0, 2]),
+        (False, True, (5, None, 20), [0, 1, 0, 2]),
+        # TRUE never stops it.
+        (False, False, (5, 0, 20), [0, 1, 0, 2]),
+        (True, False, (5, 0, 20), [0, 1, 0, 2]),
+    ],
+)
+def test_between_stops_like_and_in_condition_context(negated, outer_not, cells, expected_reads):
+    expr = _between(_A, _B, _C, negated=negated)
+    if outer_not:
+        expr = _not(expr)
+    _, reads = _reads("evaluate_condition", expr, *cells)
+    assert reads == expected_reads
+
+
+@pytest.mark.parametrize("negated", [False, True])
+@pytest.mark.parametrize("outer_not", [False, True])
+@pytest.mark.parametrize("operand", [5, None])
+@pytest.mark.parametrize("low", [0, 5, 10, None])
+@pytest.mark.parametrize("high", [0, 5, 10, None])
+def test_between_keeps_exactly_the_rows_value_context_keeps(negated, outer_not, operand, low, high):
+    from historian import values
+    from historian.exec.expression import coerce_to_bool3
+
+    expr = _between(_A, _B, _C, negated=negated)
+    if outer_not:
+        expr = _not(expr)
+    condition, _ = _reads("evaluate_condition", expr, operand, low, high)
+    value, _ = _reads("evaluate", expr, operand, low, high)
+    assert values.is_true(coerce_to_bool3(condition)) == values.is_true(coerce_to_bool3(value))
 
 
 # --- IN: per-element affinity, or3-folded, values.not3 for NOT IN -------
@@ -2669,27 +2943,57 @@ def test_deep_comparison_chain_with_affinity():
     assert coerce_to_value(evaluate(expr, _ROW, _SCHEMA)) == 1
 
 
-def test_deep_and_chain_short_circuits_on_the_leftmost_false():
-    """A FALSE leftmost leaf decides every AND above it without touching
-    a right operand - each right operand here is a FunctionCall, which
-    raises EvalError if it is ever evaluated."""
-    from historian.exec.expression import evaluate
+@pytest.mark.parametrize("leftmost, expected", [(0, False), (None, None)], ids=["false", "null"])
+def test_deep_and_chain_stops_on_the_leftmost_false_or_null_in_condition_context(leftmost, expected):
+    """A FALSE or NULL leftmost leaf decides every AND above it at the
+    root of a condition without touching a right operand - each right
+    operand here is a FunctionCall, which raises EvalError if it is
+    ever evaluated (#111)."""
+    from historian.exec.expression import evaluate_condition
 
     call = FunctionCall(name="f", args=(), position=_POS)
-    expr = _lit(0)
+    expr = _lit(leftmost)
     for _ in range(_DEEP):
         expr = And(left=expr, right=call, position=_POS)
-    assert evaluate(expr, _ROW, _SCHEMA) is False
+    assert _at_depth(700, lambda: evaluate_condition(expr, _ROW, _SCHEMA)) is expected
 
 
-def test_deep_or_chain_short_circuits_on_the_leftmost_true():
-    from historian.exec.expression import evaluate
+def test_deep_or_chain_stops_on_the_leftmost_true_in_condition_context():
+    from historian.exec.expression import evaluate_condition
 
     call = FunctionCall(name="f", args=(), position=_POS)
     expr = _lit(1)
     for _ in range(_DEEP):
         expr = Or(left=expr, right=call, position=_POS)
-    assert evaluate(expr, _ROW, _SCHEMA) is True
+    assert _at_depth(700, lambda: evaluate_condition(expr, _ROW, _SCHEMA)) is True
+
+
+def test_deep_not_and_chain_in_condition_context():
+    """`NOT (NOT (... (NULL AND f) ...))` with an odd number of NOTs
+    around every AND: NULL counts as TRUE there, so the AND does not
+    stop and the FunctionCall raises; with an even number it stops."""
+    from historian.exec.expression import EvalError, evaluate_condition
+
+    call = FunctionCall(name="f", args=(), position=_POS)
+    even = _lit(None)
+    for _ in range(_DEEP // 2):
+        even = Not(Not(And(left=even, right=call, position=_POS), _POS), _POS)
+    assert evaluate_condition(even, _ROW, _SCHEMA) is None
+    with pytest.raises(EvalError):
+        evaluate_condition(Not(And(left=_lit(None), right=call, position=_POS), _POS), _ROW, _SCHEMA)
+
+
+def test_deep_and_chain_evaluates_every_operand_in_value_context():
+    """The same chain as above in value context: the first right
+    operand is evaluated, and raises."""
+    from historian.exec.expression import EvalError, evaluate
+
+    call = FunctionCall(name="f", args=(), position=_POS)
+    expr = _lit(0)
+    for _ in range(_DEEP):
+        expr = And(left=expr, right=call, position=_POS)
+    with pytest.raises(EvalError):
+        _at_depth(700, lambda: evaluate(expr, _ROW, _SCHEMA))
 
 
 def test_deep_and_chain_evaluates_every_right_operand_when_not_decided():
@@ -2734,8 +3038,13 @@ def test_deep_not_and_unary_chains():
     assert evaluate(minus_chain, _ROW, _SCHEMA) == -5
 
 
-def test_deep_is_like_in_between_chains():
-    from historian.exec.expression import evaluate
+@pytest.mark.parametrize("entry", ["evaluate", "evaluate_condition"])
+def test_deep_is_like_in_between_chains(entry):
+    """Both entry points: IN and BETWEEN step through their operands
+    differently in condition context (#111), still without recursing."""
+    from historian.exec import expression
+
+    evaluate = getattr(expression, entry)
 
     is_chain = _col("n")
     like_chain = _col("s")

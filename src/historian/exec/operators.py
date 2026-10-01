@@ -67,7 +67,7 @@ them, and both are handled here, by calling one of
   any bare predicate in select-list position) stores SQLite's own
   storage-class answer (`sqlite3`: `select 1 = 1, typeof(1 = 1)` ->
   `1|integer`) rather than a Python `True`/`False`/`None`.
-- `Filter` calls `coerce_to_bool3` on `evaluate()`'s result before
+- `Filter` calls `coerce_to_bool3` on `evaluate_condition()`'s result before
   handing it to `values.is_true`, so a `Value`-shaped predicate
   (`WHERE line_no`, a bare column with no comparison) gets SQLite's
   C-style truthiness (`sqlite3`: `select x from t where x` keeps
@@ -94,6 +94,7 @@ from historian.exec.expression import (
     coerce_to_bool3,
     coerce_to_value,
     evaluate,
+    evaluate_condition,
     squash_nan,
     try_numeric_affinity,
 )
@@ -227,7 +228,13 @@ class Filter:
     """`WHERE` / `HAVING` (spec §3): yields exactly the rows of `child`
     for which `predicate` evaluates to `TRUE`.
 
-    `evaluate(predicate, row, child.schema)` returns a `Value` for a
+    The predicate goes through `evaluate_condition`, not `evaluate`
+    (issue #111): this is the one condition context in the engine, the
+    root of `WHERE`/`HAVING`, where `AND`/`OR`/`NOT`/`BETWEEN` stop as
+    soon as whether the row is kept is decided, as SQLite's do. Every
+    other operator here evaluates values and calls `evaluate`.
+
+    `evaluate_condition(predicate, row, child.schema)` returns a `Value` for a
     value-shaped predicate (`WHERE line_no`, a bare column with no
     comparison) or a `Bool3` - `True`, `False`, or `None`, meaning SQL
     `TRUE`, `FALSE`, or `NULL` - for a predicate-shaped one.
@@ -265,7 +272,8 @@ class Filter:
     def rows(self) -> Iterator[Row]:
         child_schema = self._child.schema
         for row in self._child.rows():
-            if values.is_true(coerce_to_bool3(evaluate(self._predicate, row, child_schema))):
+            result = evaluate_condition(self._predicate, row, child_schema)
+            if values.is_true(coerce_to_bool3(result)):
                 yield row
 
 

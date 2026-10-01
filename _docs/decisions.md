@@ -2894,3 +2894,114 @@ The two changes land together. The exact comparator alone turned none
 of the 453 existing differential tests red, and the new zero-sign
 cases need the engine fix, so landing the harness first would have
 meant either leaving them out or marking them xfail.
+
+2026-10-01 - Evaluation stops early only in condition context; in
+value context every operand is evaluated
+
+Issue #111, from the M3 review. The #51 entry (2026-09-25) says
+"SQLite evaluates `AND`/`OR` left to right and stops once the result
+is decided". As a general statement that is wrong, and this entry
+corrects it; the #51 entry stays as written. It held for the shapes
+#51 tested, which were all at the root of `WHERE`, and the evaluator
+applied it everywhere: `AND` stopped on a `FALSE` left side and `OR`
+on a `TRUE` one in every clause, `IN` and `BETWEEN` never stopped, and
+nothing depended on `NULL` or `NOT`. Only an error makes the order
+visible, and today only an invalid `LIKE ... ESCAPE` raises, so
+`SELECT (line_no = 5 AND <raises>) FROM blame` returned rows where
+SQLite raises, and `WHERE line_no = NULL AND <raises>` raised where
+SQLite returns no rows.
+
+The rule, measured against the oracle (Python's `sqlite3` module,
+SQLite 3.45.1 - not 3.50.4, see #117; re-run on version drift):
+
+- Value context (a select-list item, under `DISTINCT` too, an `ORDER
+  BY` key by expression, alias or ordinal, a `GROUP BY` key, an
+  aggregate argument, any operand of a comparison, arithmetic, unary
+  `+`/`-`, `||`, `IS`, `LIKE`, `IN` or `BETWEEN`): every operand of
+  `AND`, `OR`, `NOT` and `BETWEEN` is evaluated.
+- Condition context (the root of `WHERE` and `HAVING`, and operands of
+  `AND`/`OR`/`NOT` in condition context): `AND` stops after a `FALSE`
+  left side, `OR` after a `TRUE` one, and a `NULL` left side stops
+  `AND` where `NULL` counts as `FALSE` - the root, and under an even
+  number of `NOT`s - and `OR` where it counts as `TRUE`, under an odd
+  number. `AND`/`OR` pass that polarity to both operands and `NOT`
+  flips it, which is the issue's "`NOT` flips what the clause is
+  waiting for", generalised to any depth. `BETWEEN` is `x >= low AND
+  x <= high` and `NOT BETWEEN` is `NOT` over that.
+- `IN` stops at the first element equal to the left side, in both
+  contexts; a `NULL` element or left side never stops it.
+
+These are SQLite's code generator's jump rules: `sqlite3ExprIfTrue`/
+`IfFalse` with a jump-if-NULL flag, where `AND` under `IfTrue` codes
+its left side with `IfFalse` and the flag inverted, and `NOT` swaps
+`IfTrue` for `IfFalse`. That was the model the sweep was checked
+against; the oracle, not the model, is what the tests compare with.
+
+The sweep. A reference model of the rule was run against SQLite
+over `tiny`'s `blame` rows for every formula built from `AND`/`OR`/
+`NOT` with up to three binary operators, `NOT` optional on every
+operator node (and on every leaf for up to one operator), leaves
+`TRUE`/`FALSE`/`NULL`/`ERR`, each in `WHERE`, `HAVING` (over `max()`
+leaves, so nothing moves to `WHERE`, #141), the select list, `ORDER
+BY` and `GROUP BY`: 421,160 queries, 0 disagreements. With a fifth,
+per-row mixed leaf (`line_no < 2`), up to two operators: 22,050
+queries, 0. `IN`/`NOT IN` with one to three elements from the leaf
+set or the left side itself, and `BETWEEN`/`NOT BETWEEN` with each of
+the three from the leaf set, in `WHERE`, under `NOT` in `WHERE` and in
+the select list: 8,490 queries, 0. The issue's rule and the oracle
+agree; nothing in the issue needed correcting.
+
+One finding about the issue's suggested leaves. With `line_no = 1`,
+`line_no = 5` and `line_no = NULL` as leaves, 36 of 22,050 queries
+differ from the model, all in `WHERE` with the leaf as a top-level
+conjunct: SQLite propagates `column = constant` into the other
+conjuncts and folds what becomes constant, so `WHERE NOT (line_no = 5
+AND <raises>) AND line_no = 5` raises (the `5 = 5` folds away) and
+`WHERE (<raises> AND line_no = NULL) AND line_no = 1` does not. That
+is the constant-folding difference #51 already accepted, not
+evaluation order, so the sweep's leaves are `line_no >= 1`, `line_no
+> 5` and `line_no < NULL`, which SQLite does not propagate.
+
+Design. The context reaches the evaluator as two entry points rather
+than a flag: `evaluate()` is value context and keeps every existing
+caller (`Project`, `Sort`, `GROUP BY` keys, aggregate arguments);
+`evaluate_condition()` is condition context and has one caller,
+`Filter`. Inside, both run the #107 work-stack loop, now with a
+`_Context` on every entry - `VALUE`, `NULL_IS_FALSE` or `NULL_IS_TRUE`
+- which only `AND`/`OR`/`NOT` pass on to their operands; every other
+node evaluates its operands as values. `AND_AFTER_LEFT`/
+`OR_AFTER_LEFT` exist only in condition context; in value context
+`AND`/`OR` push both operands and `FINISH_AND`/`FINISH_OR`. `IN`
+became incremental, one `IN_AFTER_ELEMENT` step per element carrying
+its index, so it can stop; `BETWEEN` in condition context stops after
+`BETWEEN_AFTER_LOW`. A stopped `AND` keeps its `NULL` left side as its
+result, so `evaluate_condition()` can return `NULL` where the full
+value is `FALSE`. That is safe because the parent shares the
+polarity, so the `NULL` counts the same way the `FALSE` would; the
+unit tests check that the two entry points keep exactly the same
+rows. Still no recursion: the depth tests run through both entry
+points.
+
+The module docstring's claim that `evaluate()` "does not carry a
+notion of the position this whole call's result is about to be used
+in" no longer holds. It still holds for the result's shape, `Value`
+vs `Bool3`, which is decided by the node alone, and for the #38/#63
+coercions. It does not hold for which operands are evaluated, because
+SQLite's own answer depends on the position. The docstring now says
+so.
+
+Testing cost. The `k <= 3` sweep through historian's whole pipeline
+is about five minutes, which is too long for every run. The suite runs
+`k <= 2` by default (2,312 formulas in five placements, 11,560
+queries, plus 2,736 `IN`/`BETWEEN` queries), grouped by formula
+skeleton into 249 tests. `HISTORIAN_SWEEP_OPERATORS=3` runs the full
+`k <= 3` set: 1,785 tests, 421,160 queries, all agreeing with the
+oracle (3.45.1), in 3.5 minutes. Both serve `tiny`'s rows from memory after one real
+scan, to avoid running `git blame` per query; nothing is pushed for
+any sweep query.
+
+Not changed: `HAVING` terms without an aggregate, which SQLite moves
+to `WHERE` (#141); constant folding (#51); evaluating the `IN` left
+side and the `BETWEEN` operand once (#137). `CASE WHEN` and `JOIN ...
+ON`, once they exist, are condition context and use
+`evaluate_condition()`.

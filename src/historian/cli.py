@@ -11,10 +11,16 @@ a required positional `QUERY`, `-C`/`--repo PATH` (default: the
 current working directory), and `table`-format output. Out of scope,
 each already filed: `-f`/`--file` (#40), the other `--format` values
 and the pretty position-aware error box (#41, M6 item 18),
-`--no-pushdown` (#43), the REPL (#44, M6 item 19). None of those flags
+the REPL (#44, M6 item 19). None of those flags
 is registered with `argparse` below, so passing any of them hits
 `argparse`'s own "unrecognized arguments" handling and exits 2 - not
 silently accepted, not silently ignored.
+
+`--no-pushdown` (#43) is in scope: `main` skips `optimize()`, so the
+`Scan` keeps the empty `pushed` that `plan()` built it with and calls
+`source.scan(pushed=())` - the same "nothing pushed" call the
+differential harness makes. Nothing in `plan/` or `optimize()` knows
+the flag exists, and the `Filter` is unchanged.
 
 `--explain` and `--stats` (#42, M4 item 15) are in scope. `--explain`
 prints the optimized operator tree to stdout (`plan/explain.py`) and
@@ -191,6 +197,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print the work done, after the results (to stderr)",
     )
+    parser.add_argument(
+        "--no-pushdown",
+        action="store_true",
+        help="disable pushdown: the scan does all of its work",
+    )
     return parser
 
 
@@ -322,7 +333,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         tokens = tokenize(args.query)
         stmt = parse(tokens)
         bound = bind(stmt, catalog=SCHEMAS)
-        tree = optimize(plan(bound, repo, tables=SCAN_FACTORIES))
+        tree = plan(bound, repo, tables=SCAN_FACTORIES)
+        if not args.no_pushdown:
+            tree = optimize(tree)
         if args.explain:
             sys.stdout.write(format_plan(tree))
             return 0

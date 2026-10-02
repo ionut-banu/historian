@@ -61,6 +61,10 @@ src/utils.py  2
 The last line is the only part of any output that varies between two
 identical runs.
 
+`--no-pushdown` runs the query with nothing pushed into the scan, so
+it blames every path and returns the same rows. Combine it with
+`--stats` to see what pushdown saves.
+
 ## How correctness is defined
 
 By SQLite, not by opinion.

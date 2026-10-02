@@ -3114,3 +3114,23 @@ expression tree, a non-aggregate function call in `LIMIT`/`OFFSET`
 messages that say `WHERE` for an `ORDER BY` - all #144. historian's
 wording for the aggregate-misuse and `HAVING` errors stays its own
 (#102).
+
+2026-10-02 - `--explain` runs `ls-tree` but never `blame`; the plan goes
+to stdout, `--stats` to stderr; `Project` is printed
+
+Three small calls #42 made where spec §5 was silent or inconsistent.
+(1) §5 says `--explain` does not run the query, yet its example shows
+`12 of 4013 paths`, which needs the list of tracked paths. `--explain`
+makes exactly one `git` call, `ls-tree`, through the scan source's own
+`estimate(pushed)`, which reuses the narrowing `scan()` uses; it never
+runs `git blame`, so the work record afterwards is one invocation and
+no blamed path. (2) §5 sends results to stdout and everything else to
+stderr. The plan is what `--explain` was asked for, so it goes to
+stdout and can be piped; `--stats` goes to stderr after the results,
+so stdout is byte-identical with and without it. `--explain --stats`
+prints the plan only, and `--stats` prints nothing after any error.
+(3) The planner always builds a `Project`, and the spec's example
+omitted it; the printer shows every operator and the example was
+edited to match. A call written twice (`count(*)` in the select list
+and in `ORDER BY`) occupies two `Aggregate` slots but is listed once on
+the `Aggregate` line, because the line says what is computed.

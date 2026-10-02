@@ -56,6 +56,7 @@ def test_pipeline_modules_together_do_not_import_subprocess():
         "historian.sql.binder",
         "historian.plan.planner",
         "historian.plan.optimizer",
+        "historian.plan.explain",
         "historian.exec.expression",
         "historian.exec.operators",
         "historian.values",

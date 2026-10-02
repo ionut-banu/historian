@@ -950,14 +950,27 @@ Results go to stdout, everything else to stderr, so piping works.
 
 ### `--explain`
 
-Prints the operator tree with what the optimizer decided:
+Prints the operator tree with what the optimizer decided, root first,
+one operator per line, children indented two spaces. Every operator is
+printed, `Project` included. For
+`SELECT author_name, count(*) FROM blame WHERE path LIKE 'src/auth/%'
+GROUP BY author_name ORDER BY 2 DESC`:
 
 ```
-Sort (count(*) DESC)
-  Aggregate (group=[author_name], aggs=[count(*)])
-    Filter (path LIKE 'src/auth/%')
-      BlameScan (pushed: path LIKE 'src/auth/%' -> 12 of 4013 paths)
+Project (author_name, count(*))
+  Sort (count(*) DESC)
+    Aggregate (group=[author_name], aggs=[count(*)])
+      Filter (path LIKE 'src/auth/%')
+        BlameScan (pushed: path LIKE 'src/auth/%' -> 12 of 4013 paths)
 ```
+
+The scan line is `<Name> (pushed: <terms> -> <n> of <total> paths)`:
+the pushed terms joined by `, ` (or `none`), the paths tracked at
+`HEAD`, and how many of them the scan would blame for those terms.
+Knowing that takes one `git ls-tree` and never a `git blame`. The plan
+goes to stdout, since it is what was asked for. `--explain` with
+`--stats` prints the plan only: nothing ran, so there is no work to
+report.
 
 It is a debugging tool, a test surface, and the clearest single
 demonstration of what the project does. The `Filter` still appearing
@@ -976,7 +989,11 @@ what §1 declares.
 ```
 
 The same counters the pushdown tests assert on, printed. Whatever
-proves pushdown works in a test should be visible to a user.
+proves pushdown works in a test should be visible to a user. They go
+to stderr after the results, so stdout is identical with and without
+`--stats`, and only after a query that succeeded. The counts are what
+the scan actually did: `LIMIT 0` never reads the scan and prints
+`0 paths blamed, 0 skipped`.
 
 ### Errors
 

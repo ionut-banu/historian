@@ -669,6 +669,28 @@ Four kinds, all of them the user's fault and none of them tracebacks:
   and never left for `exec/expression.py` to discover at runtime from
   an actual row.
 
+When a statement has more than one binding error, historian reports
+the one SQLite reports. SQLite's order, measured on 3.45.1
+(`_docs/decisions.md`, 2026-10-02): the `FROM` table and the
+qualifier of any `x.*` select-list item; `LIMIT`, then `OFFSET`, for
+what SQLite rejects there (a column reference, reported at once, or
+an aggregate call, reported only once neither clause has a column
+reference outside one); the select list, left to right; `HAVING` on a
+non-aggregate query; `HAVING`; `WHERE`; `ORDER BY`; `GROUP BY`; then
+an aggregate call in the `WHERE` of an aggregate query or in the
+`ORDER BY` of a non-aggregate one (an aggregate query has `GROUP BY`
+or an aggregate call in its select list; in a non-aggregate query an
+aggregate call in `WHERE` is reported at `WHERE`'s turn). Within an
+`ORDER BY` or `GROUP BY` clause, every name error comes before an
+out-of-range ordinal, and in `GROUP BY` an ordinal before an
+aggregate key. Within one call, an unknown function comes before a
+wrong argument count, and that before aggregate misuse. historian's
+own rejections of queries SQLite accepts - the bare column that is
+neither a `GROUP BY` key nor inside an aggregate, the `SELECT
+DISTINCT ... ORDER BY` key, a `LIMIT`/`OFFSET` that is not a literal
+integer - come after every error SQLite raises, so they never hide
+one.
+
 Do not invent runtime type errors. SQLite is permissive - comparing a
 string to an integer is a valid comparison with a defined answer, not
 a failure. Every error historian raises that SQLite does not is a

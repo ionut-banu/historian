@@ -4657,3 +4657,89 @@ def test_numeric_or_of_path_and_line_no_cannot_push_down(numeric_repo):
     _assert_numeric_case(
         numeric_repo, "SELECT count(*) FROM blame WHERE path = 'mid.txt' OR line_no > 99", [(33,)]
     )
+
+
+# --- Grouping keys over mixed INTEGER/REAL values (issue #113) ----------
+#
+# `GROUP BY`, `SELECT DISTINCT` and `count/sum/avg(DISTINCT x)` key on
+# `values.group_key`. `blame` has no column mixing storage classes and
+# historian has no `CASE` or `CAST`, so these expressions use integer
+# overflow to make the *same number* come out as an INTEGER on some
+# rows and a REAL on others (SQLite turns an overflowing `int * int`
+# into a REAL, and so does historian):
+#
+# - `_MIXED_INT_FIRST` is `2**62` on every row: an INTEGER on line 1,
+#   a REAL (`2**63` overflowed, minus `2**62`) on every later line.
+# - `_MIXED_REAL_FIRST` is `1` on every row: a REAL on lines 1-5, an
+#   INTEGER only on line 6 - so the first value seen is a REAL.
+# - `_INT64_MAX_SPLIT` is `2**63 - 1` (INTEGER) on line 1 and
+#   `float(2**63 - 1)` - which is `2**63.0`, not equal - on later lines.
+# - `_SHIFTED` merges line 1's INTEGER `1` with line 2's REAL `1.0`,
+#   and leaves every later line its own REAL group.
+#
+# Each expected answer is SQLite's own, pinned by type and `float.hex()`
+# (`_assert_differential_pinned_rows`); multi-group rows are in SQLite's
+# output order, and historian's are compared as a multiset.
+# Text-vs-number in *one* column cannot be built without `CASE`/`CAST`;
+# `line_no || ''` beside `line_no` covers numeric-looking TEXT as its
+# own key column, and `tests/test_operators.py` covers `[1, '1']` in
+# one column.
+
+_MIXED_INT_FIRST = "line_no * 4611686018427387904 - (line_no - 1) * 4611686018427387904"
+_MIXED_REAL_FIRST = "(7 - line_no) * 4611686018427387904 / 4611686018427387904 - (6 - line_no)"
+_INT64_MAX_SPLIT = "line_no * 9223372036854775807 / line_no"
+_SHIFTED = "line_no * 4611686018427387904 / 4611686018427387904 - (line_no > 1)"
+
+
+@pytest.mark.parametrize(
+    "query,expected_rows",
+    [
+        (f"SELECT DISTINCT {_MIXED_INT_FIRST} FROM blame", [(4611686018427387904,)]),
+        (f"SELECT {_MIXED_INT_FIRST} AS k, count(*) FROM blame GROUP BY k", [(4611686018427387904, 12)]),
+        (f"SELECT DISTINCT {_MIXED_REAL_FIRST} FROM blame", [(1.0,)]),
+        (f"SELECT {_MIXED_REAL_FIRST} AS k, count(*) FROM blame GROUP BY k", [(1.0, 12)]),
+        (
+            f"SELECT count(DISTINCT {_MIXED_REAL_FIRST}), sum(DISTINCT {_MIXED_REAL_FIRST}), "
+            f"avg(DISTINCT {_MIXED_REAL_FIRST}) FROM blame",
+            [(1, 1.0, 1.0)],
+        ),
+        (
+            f"SELECT DISTINCT {_INT64_MAX_SPLIT} FROM blame",
+            [(9223372036854775807,), (9.223372036854776e18,)],
+        ),
+        (
+            f"SELECT {_INT64_MAX_SPLIT} AS k, count(*) FROM blame GROUP BY k",
+            [(9223372036854775807, 5), (9.223372036854776e18, 7)],
+        ),
+        (
+            f"SELECT count(DISTINCT {_MIXED_INT_FIRST}), count(DISTINCT {_INT64_MAX_SPLIT}), "
+            f"sum(DISTINCT {_MIXED_INT_FIRST}), sum(DISTINCT {_INT64_MAX_SPLIT}), "
+            f"avg(DISTINCT {_INT64_MAX_SPLIT}) FROM blame",
+            [(1, 2, 4611686018427387904, 1.8446744073709552e19, 9.223372036854776e18)],
+        ),
+        (
+            f"SELECT {_SHIFTED} AS k, count(*) FROM blame GROUP BY k",
+            [(1, 7), (2.0, 2), (3.0, 1), (4.0, 1), (5.0, 1)],
+        ),
+        (f"SELECT count(DISTINCT {_SHIFTED}), sum(DISTINCT {_SHIFTED}) FROM blame", [(5, 15.0)]),
+        (
+            "SELECT line_no || '' AS t, line_no, count(*) FROM blame GROUP BY t, line_no",
+            [("1", 1, 5), ("2", 2, 2), ("3", 3, 2), ("4", 4, 1), ("5", 5, 1), ("6", 6, 1)],
+        ),
+        (
+            "SELECT count(DISTINCT line_no || ''), count(DISTINCT line_no), "
+            "count(DISTINCT line_no * 1.0) FROM blame",
+            [(6, 6, 6)],
+        ),
+    ],
+)
+def test_group_key_over_mixed_integer_and_real(awkward_repo, query, expected_rows):
+    _assert_differential_pinned_rows(awkward_repo, query, expected_rows)
+
+
+def test_group_key_mixed_int_first_on_tiny(tiny_repo):
+    _assert_differential_pinned_rows(
+        tiny_repo,
+        f"SELECT {_MIXED_INT_FIRST} AS k, count(*) FROM blame GROUP BY k",
+        [(4611686018427387904, 3)],
+    )

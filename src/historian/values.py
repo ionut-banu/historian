@@ -116,16 +116,25 @@ NULLs land first within the NULL-valued group of the ascending key
 Grouping is not comparison either
 ---------------------------------
 
-``GROUP BY`` and ``DISTINCT`` must key rows by the raw ``Value``, using
-Python's own ``==`` and ``hash()`` - a plain ``dict`` keyed on the value
-is correct. Do **not** key them with :func:`eq`. ``eq(None, None)`` is
-``None``, which is falsy, so using it would put every NULL row in its own
-group; ``None == None`` is ``True``, which is what SQLite does (a column
-of NULL, NULL, 1, 1, 2 gives three groups, and ``SELECT DISTINCT``
-returns one NULL row, not two). Python's ``1 == 1.0`` with
-``hash(1) == hash(1.0)`` likewise matches SQLite grouping an INTEGER 1
-and a REAL 1.0 together. No function is needed for this, which is why
-none is provided.
+``GROUP BY``, ``SELECT DISTINCT`` and ``count/sum/avg(DISTINCT x)`` key
+rows with :func:`group_key`. Do **not** key them with :func:`eq`.
+``eq(None, None)`` is ``None``, which is falsy, so using it would put
+every NULL row in its own group; SQLite puts all NULLs in one group (a
+column of NULL, NULL, 1, 1, 2 gives three groups, and ``SELECT
+DISTINCT`` returns one NULL row, not two).
+
+Nor do they key on :func:`order_key` or on the raw ``Value``. Both
+would give the right groups today, but only through Python's own
+``1 == 1.0`` and ``hash(1) == hash(1.0)``: an ``int`` hashed and
+compared against a ``float``. That is exactly the kind of implicit
+Python behaviour AGENTS.md says must be redesigned rather than
+translated, because a Rust port has no ``i64 == f64`` that is both
+exact and hash-consistent. :func:`group_key` spells SQL's grouping
+equality out instead, so that no ``int`` is ever compared or hashed
+against a ``float``: every integer-valued numeric keys as an integer
+and every other float keys as a float under a different tag. This
+reverses an earlier note here that said no function was needed; see
+``_docs/decisions.md``, 2026-10-02.
 
 Not in this module
 ------------------
@@ -154,6 +163,7 @@ __all__ = [
     "and3",
     "eq",
     "ge",
+    "group_key",
     "gt",
     "is_",
     "is_not",
@@ -196,6 +206,20 @@ INT64_MAX = 9223372036854775807
 _RANK_NULL = 0
 _RANK_NUMERIC = 1
 _RANK_TEXT = 2
+
+# group_key's tags: one per variant of the Rust enum
+# `Null | Int(i64) | Real(f64) | Text`. Unrelated to the ranks above;
+# grouping has no order, only equality.
+_GROUP_NULL = 0
+_GROUP_INT = 1
+_GROUP_REAL = 2
+_GROUP_TEXT = 3
+
+# The int64 range as floats, for group_key's float branch, so the range
+# check compares a float with a float. Both are exact doubles: -2**63
+# and 2**63. A float f is inside int64 iff INT64_MIN_F <= f < TWO_POW_63_F.
+_INT64_MIN_F = -9223372036854775808.0
+_TWO_POW_63_F = 9223372036854775808.0
 
 
 def _rank(value: Value) -> int:
@@ -410,3 +434,55 @@ def order_key(value: Value) -> tuple[int, int | float | str]:
         # payload slot the same type family as the numeric case.
         return (_RANK_NULL, 0)
     return (rank, value)
+
+
+# --- Grouping ------------------------------------------------------------
+
+
+def group_key(value: Value) -> tuple[int, int | float | str]:
+    """The equality key for ``GROUP BY``, ``SELECT DISTINCT`` and
+    ``count/sum/avg(DISTINCT x)``: two values are in the same group iff
+    their keys are equal. Usable as a ``dict``/``set`` key.
+
+    Returns ``(tag, payload)``, one tag per variant of a Rust
+    ``Null | Int(i64) | Real(f64) | Text`` enum. The rules, each checked
+    against SQLite with bound values:
+
+    - NULL: every NULL is in one group, ``(_GROUP_NULL, 0)``, never
+      merging with ``0``, ``0.0`` or ``''``.
+    - INTEGER: ``(_GROUP_INT, value)``.
+    - REAL that is finite, integral and inside int64
+      (``-2**63 <= f < 2**63``): ``(_GROUP_INT, int(f))``, so ``1.0``
+      groups with ``1``, ``-0.0`` and ``0.0`` with ``0``, and
+      ``float(-2**63)`` with ``-2**63``. ``int()`` of such a float is
+      exact, so ``float(2**53)`` groups with ``2**53`` but not with
+      ``2**53 + 1``.
+    - Any other REAL (fractional, infinite, or outside int64 - which
+      no INTEGER can equal): ``(_GROUP_REAL, value)``. ``float(2**63 -
+      1)`` is ``2**63.0``, so it stays apart from ``2**63 - 1``.
+    - TEXT: ``(_GROUP_TEXT, value)``, case-sensitive; ``'1'`` never
+      groups with ``1``.
+
+    No ``int`` is ever compared or hashed against a ``float``: an
+    ``int`` payload only ever meets another ``int`` payload, and a
+    ``float`` payload another ``float``. NaN raises ``ValueError`` and
+    ``bool`` ``TypeError``, exactly as for :func:`order_key` (both
+    through :func:`_rank`).
+
+    Which group member is *shown* is not this function's concern: the
+    caller keeps the first value it saw for each key, as SQLite does.
+    """
+    rank = _rank(value)
+    if rank == _RANK_NULL:
+        return (_GROUP_NULL, 0)
+    if rank == _RANK_TEXT:
+        return (_GROUP_TEXT, value)
+    if isinstance(value, int):
+        return (_GROUP_INT, value)
+    if (
+        math.isfinite(value)
+        and value.is_integer()
+        and _INT64_MIN_F <= value < _TWO_POW_63_F
+    ):
+        return (_GROUP_INT, int(value))
+    return (_GROUP_REAL, value)

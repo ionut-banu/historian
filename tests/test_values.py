@@ -6,14 +6,19 @@ the project rule that SQLite is the definition of correct. The query
 used is quoted above each group.
 """
 
+import math
+
 import pytest
 
 from historian.values import (
+    INT64_MAX,
+    INT64_MIN,
     Bool3,
     Value,
     and3,
     eq,
     ge,
+    group_key,
     gt,
     is_,
     is_not,
@@ -538,30 +543,127 @@ def test_order_key_does_not_compare_int_against_str():
     assert order_key(None)[0] < order_key(1)[0]
 
 
-# --- Grouping / DISTINCT equality ----------------------------------------
-
+# --- Grouping / DISTINCT equality: group_key (issue #113) -----------------
+#
+# Every expected value below was checked against the oracle (Python's
+# bundled sqlite3, 3.45.1 here) with the numbers *bound as parameters*,
+# never typed as float literals, e.g.:
+#
+#   uv run python tests/oracle.py "" \
+#     "SELECT x, count(*) FROM (SELECT ? AS x UNION ALL SELECT ?) GROUP BY x" \
+#     9007199254740993 9007199254740992.0
+#   -> two groups, one row each
+#
 # sqlite3 :memory: "create table t(x); insert into t
 #   values(null),(null),(1),(1),(2); select quote(x), count(*) from t
 #   group by x;" -> NULL|2, 1|2, 2|1
 # select distinct x  -> NULL, 1, 2 (one NULL row, not two)
 
+TWO_POW_53 = 2**53
+TWO_POW_63 = 2**63
 
-def test_group_by_raw_value_produces_three_groups():
-    column = [None, None, 1, 1, 2]
-    groups: dict[Value, int] = {}
+
+def _group(column: list[Value]) -> dict[object, list[Value]]:
+    """Group *column* the way `Aggregate`/`Distinct` do: by `group_key`,
+    first-seen order, every member kept."""
+    groups: dict[object, list[Value]] = {}
     for value in column:
-        groups[value] = groups.get(value, 0) + 1
-    assert len(groups) == 3
-    assert groups[None] == 2
-    assert groups[1] == 2
-    assert groups[2] == 1
+        groups.setdefault(group_key(value), []).append(value)
+    return groups
+
+
+def test_group_key_int_and_equal_float_are_one_group():
+    assert group_key(1) == group_key(1.0)
+
+
+def test_group_key_all_three_zeros_are_one_group():
+    assert group_key(0) == group_key(0.0)
+    assert group_key(0.0) == group_key(-0.0)
+    assert group_key(0) == group_key(-0.0)
+
+
+def test_group_key_int64_min_and_its_float_are_one_group():
+    assert group_key(-(2**63)) == group_key(float(-(2**63)))
+
+
+def test_group_key_compares_exactly_not_through_float_rounding():
+    """`float(2**53 + 1)` rounds to `2**53.0`; SQLite still keeps the
+    INTEGER `2**53 + 1` and the REAL `2**53.0` apart."""
+    assert group_key(TWO_POW_53 + 1) != group_key(float(TWO_POW_53))
+    assert group_key(TWO_POW_53) == group_key(float(TWO_POW_53))
+
+
+def test_group_key_int64_max_and_its_rounded_float_are_two_groups():
+    """`float(2**63 - 1)` is `2**63.0`, which is outside int64 and not
+    equal to `2**63 - 1`."""
+    assert float(TWO_POW_63 - 1) == float(TWO_POW_63)
+    assert group_key(TWO_POW_63 - 1) != group_key(float(TWO_POW_63 - 1))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [float(TWO_POW_63), float(2**64), -float(2**64), 1e300, -1e300, math.inf, -math.inf, 1.5],
+)
+def test_group_key_never_holds_an_integer_outside_int64(value):
+    """The Rust-port contract: a key is `Null | Int(i64) | Real(f64) |
+    Text`, so no integer anywhere in it may leave the int64 range - a
+    float outside it keys as a float, not as a Python bigint."""
+    key = group_key(value)
+    parts = key if isinstance(key, tuple) else (key,)
+    for part in parts:
+        if isinstance(part, int):
+            assert INT64_MIN <= part <= INT64_MAX
+
+
+def test_group_key_large_floats_still_group_with_themselves():
+    assert group_key(float(TWO_POW_63)) == group_key(float(TWO_POW_63))
+    assert group_key(float(TWO_POW_63)) != group_key(float(2**64))
+    assert group_key(1e300) == group_key(1e300)
+
+
+def test_group_key_text_never_merges_with_a_number():
+    assert group_key("1") != group_key(1)
+    assert group_key("1") != group_key(1.0)
+    assert group_key("a") == group_key("a")
+    assert group_key("a") != group_key("A")
+
+
+def test_group_key_nulls_are_one_group_and_never_merge_with_zero_or_empty():
+    assert group_key(None) == group_key(None)
+    assert group_key(None) != group_key(0)
+    assert group_key(None) != group_key(0.0)
+    assert group_key(None) != group_key("")
+
+
+def test_group_key_infinities():
+    assert group_key(math.inf) != group_key(-math.inf)
+    assert group_key(math.inf) == group_key(math.inf)
+    assert group_key(1.5) != group_key(1)
+    assert group_key(1.5) != group_key(2)
+    assert group_key(1.5) == group_key(1.5)
+
+
+@pytest.mark.parametrize("nan", [NAN, NEGATIVE_NAN])
+def test_group_key_rejects_nan_like_order_key(nan):
+    with pytest.raises(ValueError, match="NaN is not a SQL Value"):
+        order_key(nan)
+    with pytest.raises(ValueError, match="NaN is not a SQL Value"):
+        group_key(nan)
+
+
+def test_group_key_rejects_bool_like_order_key():
+    with pytest.raises(TypeError, match="bool is not a SQL Value"):
+        group_key(True)
+
+
+def test_group_by_key_produces_three_groups_over_nulls():
+    groups = _group([None, None, 1, 1, 2])
+    assert list(groups.values()) == [[None, None], [1, 1], [2]]
 
 
 def test_distinct_over_nulls_yields_exactly_one_null():
-    column = [None, None, 1, 1, 2]
-    distinct = list(dict.fromkeys(column))
+    distinct = [members[0] for members in _group([None, None, 1, 1, 2]).values()]
     assert distinct == [None, 1, 2]
-    assert distinct.count(None) == 1
 
 
 def test_grouping_by_the_eq_function_would_be_wrong():
@@ -570,16 +672,21 @@ def test_grouping_by_the_eq_function_would_be_wrong():
     Asserted so the trap is recorded, not just described."""
     assert eq(None, None) is None
     assert not is_true(eq(None, None))
-    assert (None == None) is True  # noqa: E711
+    assert group_key(None) == group_key(None)
 
 
 def test_grouping_treats_int_and_equal_float_as_one_group():
     """sqlite3 "insert into t values(1),(1.0),('1'); select quote(x),
     count(*) from t group by x;" -> 1|2, '1'|1."""
-    column = [1, 1.0, "1"]
-    groups: dict[Value, int] = {}
-    for value in column:
-        groups[value] = groups.get(value, 0) + 1
-    assert len(groups) == 2
-    assert groups[1] == 2
-    assert groups["1"] == 1
+    groups = _group([1, 1.0, "1"])
+    assert [len(members) for members in groups.values()] == [2, 1]
+    assert [members[0] for members in groups.values()] == [1, "1"]
+
+
+def test_grouping_keeps_the_first_seen_representative():
+    """Oracle, bound: `-0.0, 0, 0.0` -> one group shown as `-0.0`;
+    `1.0, 1` -> one group shown as `1.0`."""
+    (zeros,) = _group([-0.0, 0, 0.0]).values()
+    assert math.copysign(1.0, zeros[0]) == -1.0
+    (ones,) = _group([1.0, 1]).values()
+    assert type(ones[0]) is float

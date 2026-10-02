@@ -532,13 +532,15 @@ class _Accumulator:
     its node-type dispatch. This is meant to port to Rust later, where
     an enum match is the direct idiom for exactly this shape.
 
-    `self._distinct_seen` (issue #84) is a `set` of `values.order_key`
-    results, `None` when `call.distinct` is `False` - mirroring
+    `self._distinct_seen` (issue #84) is a `set` of `values.group_key`
+    results (issue #113: SQL grouping equality spelled out explicitly -
+    `1` and `1.0` share a key, `'1'` does not - rather than leaning on
+    Python's `1 == 1.0`), `None` when `call.distinct` is `False` - mirroring
     `self._extreme`'s own "`None` until seen" style, except this one
     stays `None` for the whole call's life rather than being populated
     lazily. Consulted only in the `count(<expr>)`, `sum`, and `avg`
     branches of `step()` below: before counting/summing/accumulating a
-    non-NULL value, its `order_key` is checked against the set -
+    non-NULL value, its `group_key` is checked against the set -
     always on the *raw* value `evaluate()`/`coerce_to_value()` produced,
     never on a coerced-for-arithmetic version of it (issue #88: `'3'`
     and `3` carry different storage-class ranks and must not merge just
@@ -629,13 +631,13 @@ class _Accumulator:
         self._distinct_seen: set | None = set() if call.distinct else None
 
     def _distinct_duplicate(self, value: values.Value) -> bool:
-        """`True` when *value*'s `order_key` has already been recorded
+        """`True` when *value*'s `group_key` has already been recorded
         for this call - and records it when it has not. Only ever
         called from the `count(<expr>)`, `sum`, and `avg` branches of
         `step()`, and only when `self._call.distinct` (`self.
         _distinct_seen` is `None` otherwise, so this is never reached
         for a non-DISTINCT call - see the class docstring)."""
-        key = values.order_key(value)
+        key = values.group_key(value)
         if key in self._distinct_seen:
             return True
         self._distinct_seen.add(key)
@@ -847,11 +849,13 @@ class Aggregate:
     table, the one place the two paths genuinely diverge.
 
     Two key tuples are the same group under SQL equality, not Python
-    `==` - `values.order_key(value)` is used as the per-column
-    dictionary key component, which already normalizes storage-class-
-    insensitive numeric equality (`1`/`1.0` share a key; `'1'` does
-    not, since it carries a different storage-class rank) - see
-    `values.py`'s own docstring. Groups are emitted in
+    `==` - `values.group_key(value)` (issue #113) is the per-column
+    dictionary key component. It spells SQL's grouping equality out
+    explicitly: NULLs share a key, `1`/`1.0`/`-0.0`-style integer-
+    valued numerics share a key, `2**53 + 1` and `float(2**53)` do not
+    (exact, no float rounding), and `'1'` never shares a key with a
+    number - see `values.group_key`'s own docstring. The first-seen
+    key values are what a group shows (`1.0, 1` shows `1.0`). Groups are emitted in
     **first-row-encountered order**: a plain `dict` preserves
     insertion order, and no key is ever re-inserted once seen, so this
     falls out of the implementation rather than needing a separate
@@ -910,7 +914,7 @@ class Aggregate:
             return
 
         # Grouped path (#69): one accumulator set per distinct key,
-        # keyed by `values.order_key` per column so grouping uses SQL
+        # keyed by `values.group_key` per column so grouping uses SQL
         # equality rather than Python's - see the class docstring.
         # `groups` maps that key to `(key_values, accumulators)`; a
         # plain dict's insertion order is what gives first-row-
@@ -920,7 +924,7 @@ class Aggregate:
             key_values = tuple(
                 coerce_to_value(evaluate(expr, row, child_schema)) for expr in self._group_by
             )
-            key = tuple(values.order_key(value) for value in key_values)
+            key = tuple(values.group_key(value) for value in key_values)
             entry = groups.get(key)
             if entry is None:
                 entry = (key_values, [_Accumulator(call) for call in self._calls])
@@ -1189,14 +1193,13 @@ class Distinct:
     first time its dedup key is seen, and never again.
 
     Two key tuples are the same dedup group under SQL equality, not
-    Python `==` - `tuple(values.order_key(value) for value in row)` is
-    exactly the per-column key `Aggregate`'s own grouped path
-    (`exec/operators.py`'s `Aggregate.rows()`) already builds to group
-    by SQL equality rather than Python's: `NULL`s are equal to each
-    other and form one group, `1` and `1.0` merge into one group (the
-    first-encountered representative is what gets yielded), and `'1'`
-    (`TEXT`) stays its own group, never merging with numeric `1`
-    (`values.order_key`'s own storage-class ranking keeps them apart).
+    Python `==` - `tuple(values.group_key(value) for value in row)`
+    (issue #113) is exactly the per-column key `Aggregate`'s own
+    grouped path (`Aggregate.rows()`) builds: `NULL`s are equal to
+    each other and form one group, `1` and `1.0` merge into one group
+    (the first-encountered representative is what gets yielded), and
+    `'1'` (`TEXT`) stays its own group, never merging with numeric `1`
+    (`values.group_key` tags TEXT apart from every number).
 
     Streams: pulls one row at a time from `child` and yields it
     immediately the first time its key is new, holding only the
@@ -1208,12 +1211,11 @@ class Distinct:
     reorders deterministically via its own stable, per-key contract;
     `Project` is a 1-in-1-out, order-preserving generator).
 
-    Which row a group of duplicates keeps is moot and needs no design
-    of its own, let alone a test that could observe it: `Distinct`
-    groups by the *entire* output row, so two rows sharing a dedup key
-    are, by construction, identical in every column - there is no
-    other row's value that could leak through regardless of which one
-    happens to be first.
+    Which row a group of duplicates keeps is observable: two rows that
+    share a dedup key are SQL-equal in every column but not necessarily
+    the same storage class (`1` and `1.0`), so the first one seen is
+    the one yielded, matching SQLite (`SELECT DISTINCT` over bound
+    `1.0, 1` returns `1.0`; over `-0.0, 0, 0.0` returns `-0.0`).
     """
 
     def __init__(self, child: Operator) -> None:
@@ -1227,7 +1229,7 @@ class Distinct:
     def rows(self) -> Iterator[Row]:
         seen: set[tuple[object, ...]] = set()
         for row in self._child.rows():
-            key = tuple(values.order_key(value) for value in row)
+            key = tuple(values.group_key(value) for value in row)
             if key in seen:
                 continue
             seen.add(key)

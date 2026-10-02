@@ -356,7 +356,12 @@ src/historian/
   sql/lexer.py     text -> tokens
   sql/ast.py       AST node definitions
   sql/parser.py    tokens -> AST
-  sql/binder.py    name resolution, unknown column/table errors
+  sql/binder.py    bind(): the resolution order, one function per step
+  sql/bound.py     BindError and the bound statement types
+  sql/bind_expr.py name resolution and single-expression binding
+  sql/bind_clauses.py  per-clause binding: ordinals, LIMIT/OFFSET,
+                   GROUP BY, ORDER BY, the select list
+  sql/grouped.py   the grouped and DISTINCT narrowing checks
   sql/walk.py      shared expression walks: children, rebuild, shape
                    equality, aggregate detection; BoundColumnRef
   plan/nodes.py    operator tree definitions

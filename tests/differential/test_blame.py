@@ -1988,7 +1988,7 @@ def test_select_list_alias_not_visible_to_other_select_items_stays_bind_error(ti
 def test_group_by_nested_aggregate_via_alias_still_raises_bind_error(tiny_repo):
     """`SELECT count(*) AS c FROM blame GROUP BY count(c)` stays a
     `BindError` - `GROUP BY`'s own pre-existing re-check
-    (`_contains_aggregate` after binding a `GROUP BY` item) already
+    (`sql/walk.py`'s `contains_aggregate` after binding a `GROUP BY` item) already
     rejects any aggregate in a `GROUP BY` key, nested-via-alias or not
     - out of scope for this issue, listed here only as a regression
     guard against this fix accidentally changing that outcome."""
@@ -2194,7 +2194,7 @@ def test_bare_column_group_key_keeps_its_source_affinity_in_having(awkward_repo)
 
 # --- LIKE ... ESCAPE joins the shape-equal/split walks (issue #101) ----
 #
-# `escape` was missing from `sql/binder.py`'s `_expr_shape_equal`,
+# `escape` was missing from `sql/walk.py`'s `expr_shape_equal` (then in `sql/binder.py`),
 # `plan/planner.py`'s own copy of it, and `plan/planner.py`'s
 # `_split_expr` - three of the six hand-written expression walks that
 # #51 should have given an `escape` branch alongside `left`/`pattern`.
@@ -3241,7 +3241,7 @@ def test_distinct_order_by_aggregate_matching_select_list_aggregate_case_insensi
     and `count(*)` in `ORDER BY` name the same aggregate, so the sort
     key *is* fully determined by the output row and this must stay
     legal, unlike the unselected-aggregate cases below. Before this fix,
-    `_expr_shape_equal`'s `FunctionCall` branch compared raw, un-folded
+    `sql/walk.py`'s `expr_shape_equal` `FunctionCall` branch compared raw, un-folded
     names, so `strict_function_calls=True` wrongly raised `BindError`
     here even though the aggregate is selected."""
     _assert_differential(

@@ -1972,7 +1972,7 @@ def test_distinct_order_by_aggregate_matching_select_list_aggregate_case_insensi
     and the sort key *is* fully determined by the output row. Confirmed
     against the oracle (`tests/oracle.py`, sqlite3 3.45.1) that this
     exact query is accepted and returns 2 rows, no error. Before this
-    fix, `_expr_shape_equal`'s `FunctionCall` branch compared raw,
+    fix, `sql/walk.py`'s `expr_shape_equal` `FunctionCall` branch compared raw,
     un-folded names, so `strict_function_calls=True` wrongly rejected
     it with `BindError`."""
     bound = _bind(
@@ -1985,7 +1985,7 @@ def test_distinct_order_by_aggregate_matching_select_list_aggregate_case_insensi
 # --- Aggregate DISTINCT flag joins shape equality (issue #131) -----------
 #
 # `count(path)` and `count(DISTINCT path)` are different aggregates, but
-# `_same_node_fields` used to compare a `FunctionCall` by folded name
+# `sql/walk.py`'s `_same_node_fields` used to compare a `FunctionCall` by folded name
 # only, so the strict DISTINCT/ORDER BY match accepted one for the
 # other. SQLite itself accepts the rejected queries below (checked with
 # `tests/oracle.py`); the `BindError` is #78's deliberate narrowing:
@@ -2178,12 +2178,12 @@ def test_like_escape_arbitrary_expression_containing_a_column_still_binds():
     assert like.escape.left.name == "author_name"
 
 
-# --- LIKE ... ESCAPE: escape joins `_expr_shape_equal`'s Like branch --------
+# --- LIKE ... ESCAPE: escape joins `sql/walk.py`'s `expr_shape_equal` Like branch --------
 # --- (issue #101) ------------------------------------------------------
 #
 # #51 threaded `escape` through binding (above) and #51/#108's own
-# `_contains_aggregate`/`_split_for_grouped_check` walks already compare
-# it. `_expr_shape_equal`'s `Like` branch was the one left comparing
+# `sql/walk.py`'s `contains_aggregate`/`_split_for_grouped_check` walks already compare
+# it. `sql/walk.py`'s `expr_shape_equal` `Like` branch was the one left comparing
 # only `negated`/`left`/`pattern` - so a `LIKE ... ESCAPE` select-list
 # or HAVING expression that differs from a GROUP BY key only in its
 # escape operand silently shape-matched that key. Once `escape` joins
@@ -2194,7 +2194,7 @@ def test_like_escape_arbitrary_expression_containing_a_column_still_binds():
 # which historian deliberately does not reproduce (see the module
 # docstring's determinism note): confirmed live, simulating the fix
 # in-process against the real binder, that both raise this exact
-# `BindError` once only `_expr_shape_equal`'s `Like` branch is patched.
+# `BindError` once only `sql/walk.py`'s `expr_shape_equal` `Like` branch is patched.
 
 
 def test_like_escape_select_list_differing_only_in_escape_from_group_key_is_a_bind_error():
@@ -2307,8 +2307,8 @@ def test_deep_alias_spliced_into_where_binds():
 
 def test_deep_group_by_having_order_by_bind():
     """The grouped-select check (`_split_for_grouped_check`), the GROUP
-    BY aggregate check (`_contains_aggregate`) and shape matching
-    (`_expr_shape_equal`) over trees past 1000 levels. Shape matching
+    BY aggregate check (`sql/walk.py`'s `contains_aggregate`) and shape matching
+    (`sql/walk.py`'s `expr_shape_equal`) over trees past 1000 levels. Shape matching
     is tried at every node against every key, quadratic in the height,
     so this uses 1500 levels rather than 5000."""
     deep = 1500
@@ -2414,7 +2414,7 @@ def test_999_operator_not_and_unary_chains_bind():
 
 
 def test_group_by_key_with_aggregate_only_in_like_escape_is_a_bind_error():
-    """A1, `_contains_aggregate`: the only aggregate call in the GROUP
+    """A1, `sql/walk.py`'s `contains_aggregate`: the only aggregate call in the GROUP
     BY key sits in `Like.escape`. A walk that does not visit `escape`
     sees no aggregate and accepts the key."""
     with pytest.raises(

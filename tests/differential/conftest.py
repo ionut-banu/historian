@@ -77,7 +77,7 @@ from historian.exec.operators import ScanSource
 from historian.plan.planner import ScanFactory
 from historian.plan.optimizer import optimize
 from historian.plan.planner import plan
-from historian.schema import Row, Schema
+from historian.schema import ColumnType, Row, Schema
 from historian.sql.binder import bind
 from historian.sql.lexer import tokenize
 from historian.sql.parser import parse
@@ -87,7 +87,9 @@ __all__ = [
     "NAN_MESSAGE",
     "assert_rows_match",
     "create_table_sql",
+    "load_table_sql",
     "load_unfiltered",
+    "raw_table_name",
     "run_historian",
     "scan_all_rows",
 ]
@@ -131,9 +133,77 @@ def create_table_sql(table_name: str, schema: Schema) -> str:
     columns. Each `Column.type.value` is already the exact SQLite
     keyword (`"TEXT"`, `"INTEGER"`, `"REAL"` - `schema.py`'s own
     docstring), so this is a direct translation with no lookup table
-    of its own."""
+    of its own.
+
+    This is the plain declaration: a `REAL` column here stores a bound
+    `-0.0` as `0.0` and an `int` as a float, so `load_unfiltered` does
+    not use it for a schema with a `REAL` column - see
+    `load_table_sql`."""
     columns_sql = ", ".join(f'"{column.name}" {column.type.value}' for column in schema.columns)
     return f'CREATE TABLE "{table_name}" ({columns_sql})'
+
+
+def raw_table_name(table_name: str) -> str:
+    """The name of the typeless table a schema with a `REAL` column is
+    loaded into (`load_table_sql`); the view carrying *table_name*
+    reads from it."""
+    return f"{table_name}__raw"
+
+
+def load_table_sql(table_name: str, schema: Schema) -> tuple[list[str], str]:
+    """The statements that create *table_name* for loading, and the
+    name of the table the rows are inserted into (issue #140).
+
+    A schema with no `REAL` column gets exactly `create_table_sql`'s
+    plain `CREATE TABLE`, inserted into directly.
+
+    A schema with a `REAL` column cannot be mirrored by a plain `REAL`
+    column: SQLite stores a bound `-0.0` there as `0.0` (and an `int`
+    `5` as `5.0`), so a scan that emitted `-0.0` would look like a
+    mismatch that is only an artifact of loading. A column with no
+    declared type keeps the bits but drops `REAL` affinity (`x = '5'`
+    then differs from a `REAL` column). So the rows go into a typeless
+    raw table (`raw_table_name`), and *table_name* is a view over it
+    that selects `CAST(col AS REAL)` for each `REAL` column and passes
+    every `TEXT` and `INTEGER` column through unchanged. The `CAST`
+    keeps the sign of `-0.0` and gives the view column `REAL` affinity
+    (`PRAGMA table_info` reports it `REAL`); an `int` or text the scan
+    put in a `REAL` column comes out as a float, exactly as a stored
+    `REAL` column would hold it, so a scan doing that is reported as a
+    mismatch rather than normalised. `_docs/decisions.md`, 2026-10-02.
+    """
+    if not any(column.type is ColumnType.REAL for column in schema.columns):
+        return [create_table_sql(table_name, schema)], table_name
+
+    raw = raw_table_name(table_name)
+    raw_columns_sql = ", ".join(
+        f'"{column.name}"' if column.type is ColumnType.REAL else f'"{column.name}" {column.type.value}'
+        for column in schema.columns
+    )
+    view_columns_sql = ", ".join(
+        f'CAST("{column.name}" AS REAL) AS "{column.name}"'
+        if column.type is ColumnType.REAL
+        else f'"{column.name}" AS "{column.name}"'
+        for column in schema.columns
+    )
+    return [
+        f'CREATE TABLE "{raw}" ({raw_columns_sql})',
+        f'CREATE VIEW "{table_name}" AS SELECT {view_columns_sql} FROM "{raw}"',
+    ], raw
+
+
+def _assert_no_nan_loaded(rows: Sequence[Row], schema: Schema) -> None:
+    """Fails on a NaN cell in a scanned row before it is loaded (issue
+    #140): SQLite stores a bound NaN as NULL, so loading it would make
+    historian's NaN look like a match against SQLite's NULL."""
+    for index, row in enumerate(rows):
+        for col, value in enumerate(row):
+            if isinstance(value, float) and math.isnan(value):
+                raise AssertionError(
+                    f"scanned row {index} column {col} "
+                    f"({schema.columns[col].name!r}) is NaN; SQLite would load it as "
+                    f"NULL and hide it: {NAN_MESSAGE}"
+                )
 
 
 def load_unfiltered(
@@ -141,15 +211,21 @@ def load_unfiltered(
 ) -> sqlite3.Connection:
     """Steps 1-2 together: `scan_all_rows` (see its own docstring for
     why this never touches `plan()`), then a fresh in-memory SQLite
-    database with one table, `table_name`, declared via
-    `create_table_sql` and loaded with every row `scan_all_rows`
-    produced."""
+    database with one table, `table_name`, created via
+    `load_table_sql` and loaded with every row `scan_all_rows`
+    produced, bound exactly as scanned. A schema with a `REAL` column
+    makes `table_name` a `CAST` view over a typeless raw table (see
+    `load_table_sql`); any other schema gets the plain `CREATE TABLE`.
+    A NaN cell fails the load (`_assert_no_nan_loaded`)."""
     rows = scan_all_rows(factory, repo)
+    _assert_no_nan_loaded(rows, schema)
     conn = sqlite3.connect(":memory:")
-    conn.execute(create_table_sql(table_name, schema))
+    statements, insert_into = load_table_sql(table_name, schema)
+    for statement in statements:
+        conn.execute(statement)
     if rows:
         placeholders = ", ".join("?" for _ in schema.columns)
-        conn.executemany(f'INSERT INTO "{table_name}" VALUES ({placeholders})', rows)
+        conn.executemany(f'INSERT INTO "{insert_into}" VALUES ({placeholders})', rows)
     conn.commit()
     return conn
 
@@ -158,7 +234,10 @@ def load_unfiltered(
 
 
 def run_historian(
-    query: str, repo: Path, tables: dict[str, ScanFactory] = _DEFAULT_TABLES
+    query: str,
+    repo: Path,
+    tables: dict[str, ScanFactory] = _DEFAULT_TABLES,
+    catalog: dict[str, Schema] = SCHEMAS,
 ) -> tuple[Schema, list[Row]]:
     """Step 4: reproduce `cli.py:main`'s own pipeline exactly -
     `tokenize -> parse -> bind -> plan -> optimize -> tree.rows()` - and never
@@ -174,13 +253,15 @@ def run_historian(
     below can substitute a spy `ScanSource` factory for the
     separation test; every case in this file that runs a real query
     against a real repository uses the default. `bind()`'s own
-    `catalog` argument below is always `historian.catalog.SCHEMAS`,
-    unconditionally - not threaded through `tables` - because every
-    case in this file, spy included, binds against the name "blame"
-    (`_SpySource` in `tests/differential/test_blame.py` is shaped
-    against `BLAME_SCHEMA` for exactly this reason), the same way
-    `cli.py` always calls `bind(stmt, catalog=SCHEMAS)` regardless of
-    which `tables` mapping `plan()` then receives.
+    `catalog` argument defaults to `historian.catalog.SCHEMAS` - not
+    threaded through `tables` - because nearly every case binds against
+    the name "blame" (`_SpySource` in `tests/differential/test_blame.py`
+    is shaped against `BLAME_SCHEMA` for exactly this reason), the same
+    way `cli.py` always calls `bind(stmt, catalog=SCHEMAS)` regardless
+    of which `tables` mapping `plan()` then receives. It is a parameter
+    only for a synthetic table no catalog has (issue #140's `REAL`
+    column, `tests/differential/test_real_columns.py`), which passes a
+    one-table catalog matching its stub `tables`.
 
     Neither this function nor `scan_all_rows`/`load_unfiltered` above
     catches `LexError`, `ParseError`, `BindError` or `EvalError` -
@@ -198,7 +279,7 @@ def run_historian(
     """
     tokens = tokenize(query)
     stmt = parse(tokens)
-    bound = bind(stmt, catalog=SCHEMAS)
+    bound = bind(stmt, catalog=catalog)
     tree = optimize(plan(bound, repo, tables=tables))
     return tree.schema, list(tree.rows())
 

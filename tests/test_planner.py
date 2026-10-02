@@ -26,7 +26,7 @@ from historian.exec.operators import Aggregate, Distinct, Filter, Limit, Project
 from historian.plan import planner
 from historian.plan.planner import plan
 from historian.schema import Column, ColumnType, Row, Schema
-from historian.sql.ast import BinaryOp, FunctionCall, Is, Like, Literal, OrderDirection, Operator as Op, Star
+from historian.sql.ast import And, BinaryOp, FunctionCall, Is, Like, Literal, OrderDirection, Operator as Op, Star
 from historian.sql.binder import BoundColumnRef, BoundOrderByItem, BoundSelectItem, BoundSelectStatement, bind
 from historian.sql.lexer import Position, tokenize
 from historian.sql.parser import parse
@@ -418,6 +418,66 @@ def test_plan_min_max_distinct_threads_the_flag_too():
     tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
 
     assert [call.distinct for call in tree._child._calls] == [True, True]
+
+
+# --- count(x) and count(DISTINCT x) keep separate slots (issue #131) ------
+#
+# `_split_expr` gives every call its own slot and never deduplicates, so
+# no query reaches the planner's `_expr_shape_equal` with two aggregate
+# calls. These pin that end to end, so adding the `distinct` comparison
+# to `_same_node_fields` (and any later consolidation, #112) cannot
+# start sharing a slot between the two.
+
+_TWO_PATHS_THREE_ROWS = [
+    ("a.py", 1, "ana@x.com"),
+    ("a.py", 2, "ana@x.com"),
+    ("b.py", 1, "bo@x.com"),
+]
+
+
+def test_plan_count_and_count_distinct_of_same_column_get_separate_calls():
+    """`SELECT count(path), count(DISTINCT path) FROM widgets`: two
+    `AggregateCall`s, flags False then True, giving `(3, 2)`."""
+    source = _FakeSource(_TWO_PATHS_THREE_ROWS)
+    stmt = _stmt(
+        [
+            _select_item(_func("count", _col("path"))),
+            _select_item(_func("count", _col("path"), distinct=True)),
+        ]
+    )
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert [call.distinct for call in tree._child._calls] == [False, True]
+    assert list(tree.rows()) == [(3, 2)]
+
+
+def test_plan_having_with_count_and_count_distinct_of_same_column_gets_separate_calls():
+    """`SELECT count(path), count(DISTINCT path) FROM widgets HAVING
+    count(DISTINCT path) = 2 AND count(path) = 3`: the HAVING calls
+    get their own slots too, flags as written, and the filter passes
+    only because the two are evaluated separately."""
+    source = _FakeSource(_TWO_PATHS_THREE_ROWS)
+    having = And(
+        left=_bin(Op.EQ, _func("count", _col("path"), distinct=True), _lit(2)),
+        right=_bin(Op.EQ, _func("count", _col("path")), _lit(3)),
+        position=_POS,
+    )
+    stmt = _stmt(
+        [
+            _select_item(_func("count", _col("path"))),
+            _select_item(_func("count", _col("path"), distinct=True)),
+        ],
+        having=having,
+    )
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree._child, Filter)
+    aggregate = tree._child._child
+    assert isinstance(aggregate, Aggregate)
+    assert [call.distinct for call in aggregate._calls] == [False, True, True, False]
+    assert list(tree.rows()) == [(3, 2)]
 
 
 def test_plan_aggregate_query_produces_correct_row_end_to_end():
@@ -1121,6 +1181,25 @@ def test_expr_shape_equal_like_with_identical_escape_operands_is_equal():
     a = Like(left=_col("path"), pattern=_lit("c%"), negated=False, position=_POS, escape=_lit("c"))
     b = Like(left=_col("path"), pattern=_lit("c%"), negated=False, position=_POS, escape=_lit("c"))
     assert planner._expr_shape_equal(a, b) is True
+
+
+def test_expr_shape_equal_count_differing_only_in_distinct_is_not_equal():
+    """Issue #131: the planner's own copy of the binder's `distinct`
+    check. Unreachable from a query - `_split_expr` never compares two
+    aggregate calls - so hand-built nodes, in both argument orders."""
+    plain = _func("count", _col("path"))
+    flagged = _func("count", _col("path"), distinct=True)
+    assert planner._expr_shape_equal(plain, flagged) is False
+    assert planner._expr_shape_equal(flagged, plain) is False
+
+
+def test_expr_shape_equal_count_with_equal_distinct_flags_is_equal():
+    """The reverse: equal flags still compare equal, both set and both
+    clear."""
+    assert planner._expr_shape_equal(
+        _func("count", _col("path"), distinct=True), _func("count", _col("path"), distinct=True)
+    ) is True
+    assert planner._expr_shape_equal(_func("count", _col("path")), _func("count", _col("path"))) is True
 
 
 def test_expr_shape_equal_literals_differing_only_in_int_versus_real_type_are_not_equal():

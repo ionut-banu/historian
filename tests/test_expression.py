@@ -3069,3 +3069,112 @@ def test_deep_is_like_in_between_chains(entry):
     assert evaluate(_between(deep_operand, _lit(0), _lit(_DEEP)), _ROW, _SCHEMA) is True
     assert evaluate(_in(_lit(_DEEP), (deep_operand,)), _ROW, _SCHEMA) is True
     assert evaluate(_like(deep_operand, _lit(str(_DEEP))), _ROW, _SCHEMA) is True
+
+
+# --- Issue #136: numeric-text whitespace is exactly the six characters
+# SQLite skips (space, \t, \n, \v, \f, \r), leading and trailing, and
+# nothing else. Oracle: tests/oracle.py (sqlite3 module 3.45.1), the
+# string as a quoted literal and as a bound parameter, same results:
+#   select '\v12'+0, '\v12'%5, -'\v12', '\x1c12'+0, '\xa012'+0;
+#     -> 12|2|-12|0|0
+#   select 1 where '\v1';  -> 1
+# One test per site that reads `_NUMERIC_WHITESPACE`, so a failure
+# names the site.
+
+_NUMERIC_WS = [" ", "\t", "\n", "\v", "\f", "\r"]
+_NUMERIC_WS_IDS = ["space", "tab", "newline", "vtab", "formfeed", "cr"]
+_NOT_NUMERIC_WS = [
+    "\x1c", "\x1d", "\x1e", "\x1f", "\x85", "\xa0", " ", "　", "﻿",
+]
+_NOT_NUMERIC_WS_IDS = [
+    "x1c", "x1d", "x1e", "x1f", "x85", "xa0", "u2003", "u3000", "ufeff",
+]
+
+
+@pytest.mark.parametrize("ws", _NUMERIC_WS, ids=_NUMERIC_WS_IDS)
+def test_numeric_whitespace_arithmetic_skips_leading(ws):
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.ADD, _lit(ws + "12"), _lit(0)), _ROW, _SCHEMA)
+    assert result == 12
+    assert type(result) is int
+
+
+@pytest.mark.parametrize("ws", _NUMERIC_WS, ids=_NUMERIC_WS_IDS)
+def test_numeric_whitespace_modulo_skips_leading(ws):
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.MOD, _lit(ws + "12"), _lit(5)), _ROW, _SCHEMA)
+    assert result == 2
+    assert type(result) is int
+
+
+@pytest.mark.parametrize("ws", _NUMERIC_WS, ids=_NUMERIC_WS_IDS)
+def test_numeric_whitespace_unary_minus_skips_leading(ws):
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_unary(UnaryOperator.NEG, _lit(ws + "12")), _ROW, _SCHEMA)
+    assert result == -12
+    assert type(result) is int
+
+
+@pytest.mark.parametrize("ws", _NUMERIC_WS, ids=_NUMERIC_WS_IDS)
+def test_numeric_whitespace_text_condition_truthiness_skips_leading(ws):
+    from historian.exec.expression import coerce_to_bool3, evaluate
+
+    assert coerce_to_bool3(evaluate(_lit(ws + "1"), _ROW, _SCHEMA)) is True
+
+
+@pytest.mark.parametrize("ws", _NUMERIC_WS, ids=_NUMERIC_WS_IDS)
+def test_numeric_whitespace_affinity_skips_both_ends(ws):
+    from historian.exec.expression import try_numeric_affinity
+
+    for text in (ws + "12", "12" + ws, ws + "12" + ws):
+        result = try_numeric_affinity(text)
+        assert result == 12
+        assert type(result) is int
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["\v12\v.5", "1\v2", "\v-\v5", "\v", " ", "\v\v", "-\v5"],
+)
+def test_numeric_whitespace_affinity_not_skipped_inside_or_alone(text):
+    """Not skipped between sign and digits or inside a number, and a
+    whitespace-only string is not a number: the text comes back
+    unchanged (`n INTEGER` holding `'\\v'` stays `text` in SQLite)."""
+    from historian.exec.expression import try_numeric_affinity
+
+    assert try_numeric_affinity(text) == text
+
+
+@pytest.mark.parametrize("ws", _NUMERIC_WS, ids=_NUMERIC_WS_IDS)
+def test_numeric_whitespace_only_text_reads_as_zero(ws):
+    from historian.exec.expression import evaluate
+
+    for op in (Operator.ADD, Operator.MOD):
+        rhs = _lit(0) if op is Operator.ADD else _lit(5)
+        result = evaluate(_bin(op, _lit(ws), rhs), _ROW, _SCHEMA)
+        assert result == 0
+        assert type(result) is int
+
+
+@pytest.mark.parametrize("ctl", _NOT_NUMERIC_WS, ids=_NOT_NUMERIC_WS_IDS)
+def test_non_whitespace_controls_are_not_skipped_in_arithmetic(ctl):
+    """`'\\x1c12' + 0` is `0` in SQLite: only the six ASCII characters
+    are skipped, not `str.strip()`/`isspace()`'s wider set."""
+    from historian.exec.expression import evaluate
+
+    result = evaluate(_bin(Operator.ADD, _lit(ctl + "12"), _lit(0)), _ROW, _SCHEMA)
+    assert result == 0
+    assert type(result) is int
+    result = evaluate(_bin(Operator.MOD, _lit(ctl + "12"), _lit(5)), _ROW, _SCHEMA)
+    assert result == 0
+
+
+@pytest.mark.parametrize("ctl", _NOT_NUMERIC_WS, ids=_NOT_NUMERIC_WS_IDS)
+def test_non_whitespace_controls_are_not_skipped_by_affinity(ctl):
+    from historian.exec.expression import try_numeric_affinity
+
+    assert try_numeric_affinity(ctl + "12") == ctl + "12"
+    assert try_numeric_affinity("12" + ctl) == "12" + ctl

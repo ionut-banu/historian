@@ -2365,3 +2365,32 @@ def test_count_sum_avg_distinct_key_on_sql_equality(column, expected):
     ]
     (row,) = tuple(Aggregate(_agg_child(_column_rows(column)), calls).rows())
     assert _same_values(row, expected)
+
+
+# Issue #136: `sum`/`avg` read TEXT through the numeric-text
+# whitespace set, which includes `\v` (0x0B).
+
+
+def test_sum_avg_skip_vertical_tab_around_text_numbers():
+    """`create table t(s text); insert into t values ('\\v12'); select
+    sum(s), typeof(sum(s)) from t;` -> 12|integer, and with `'12\\v'`
+    `avg(s), typeof(avg(s))` -> 12.0|real (tests/oracle.py, sqlite3
+    module 3.45.1). Two rows `'\\v12'`, `'12\\v'`: `sum` 24 integer,
+    `avg` 12.0 real."""
+    leading = [("a.py", "\v12", "e")]
+    trailing = [("a.py", "12\v", "e")]
+    both = [("a.py", "\v12", "e"), ("a.py", "12\v", "e")]
+    (sum_row,) = tuple(Aggregate(_agg_child(leading), [_call("sum", _col("line_no"))]).rows())
+    (avg_row,) = tuple(Aggregate(_agg_child(trailing), [_call("avg", _col("line_no"))]).rows())
+    (both_row,) = tuple(
+        Aggregate(
+            _agg_child(both), [_call("sum", _col("line_no")), _call("avg", _col("line_no"))]
+        ).rows()
+    )
+    assert sum_row == (12,)
+    assert type(sum_row[0]) is int
+    assert avg_row == (12.0,)
+    assert type(avg_row[0]) is float
+    assert both_row == (24, 12.0)
+    assert type(both_row[0]) is int
+    assert type(both_row[1]) is float

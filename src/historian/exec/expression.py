@@ -211,18 +211,24 @@ __all__ = [
 # arithmetic here needs both - subtraction and negation can overflow
 # toward either end.
 
-#: ASCII whitespace this module's own numeric-text scanner skips before
-#: a number, in both the arithmetic (leading-prefix) and affinity
-#: (whole-string) conversions below. Deliberately its own small
-#: constant rather than importing `sql/lexer.py`'s `_WHITESPACE`: that
-#: set encodes which bytes are whitespace *between SQL tokens*
-#: (`\v` is pointedly excluded there, per `_docs/decisions.md`
-#: 2026-09-01, because SQLite's tokenizer rejects it) - a completely
-#: different question from what SQLite's C `atof`-equivalent skips
-#: before a numeric string. Only ordinary space is ever exercised by
-#: this issue's criteria; the rest is a conservative, unverified
-#: default rather than a claim about SQLite's exact behaviour there.
-_NUMERIC_WHITESPACE = " \t\n\r\f"
+#: The ASCII whitespace SQLite skips around the digits of numeric text:
+#: space, `\t`, `\n`, `\v`, `\f`, `\r` (0x20, 0x09, 0x0A, 0x0B, 0x0C,
+#: 0x0D), exactly - leading and trailing for the whole-string (affinity)
+#: conversion, leading only for the arithmetic and `%` scans, and never
+#: between a sign and its digits or inside a number. Confirmed with
+#: `tests/oracle.py` (sqlite3 module 3.45.1), a quoted literal and a
+#: bound parameter alike: every other character is a non-number
+#: character - 0x00-0x08, 0x0E-0x1F (`\x1c`-`\x1f` included), 0x7F,
+#: `\x85`, `\xa0` and the Unicode spaces (`'\x1c12' + 0` and
+#: `'\xa012' + 0` are `0`). `_docs/decisions.md`, issue #136. Read by
+#: `_scan_number`, `%`'s scan and `_strip_numeric_whitespace`. A plain
+#: string, not `str.isspace()` or a bare `str.strip()`: those are
+#: Unicode-aware and differ from SQLite. Deliberately its own constant
+#: rather than `sql/lexer.py`'s `_WHITESPACE`: that set is which bytes
+#: separate SQL tokens (`\v` is pointedly excluded there, per
+#: `_docs/decisions.md` 2026-09-01, because SQLite's tokenizer rejects
+#: it), a different question from which bytes numeric conversion skips.
+_NUMERIC_WHITESPACE = " \t\n\v\f\r"
 
 
 class EvalError(Exception):
@@ -1005,9 +1011,9 @@ def _apply_affinity(
 def _strip_numeric_whitespace(text: str) -> str:
     """`text` with `_NUMERIC_WHITESPACE` characters trimmed from both
     ends - not Python's `str.strip()`, which trims a broader,
-    Unicode-aware set this module has no evidence SQLite's own
-    whole-string numeric-affinity check agrees with (only plain ASCII
-    space is exercised by this issue's own criteria)."""
+    Unicode-aware set. SQLite's whole-string numeric-affinity check
+    trims exactly those six ASCII characters (`\\x1c`, `\\x85` and
+    `\\xa0` are not trimmed; sqlite3 3.45.1, issue #136)."""
     return text.strip(_NUMERIC_WHITESPACE)
 
 

@@ -451,8 +451,13 @@ inputs no hand-written test would think to try.
 TEXT becomes a number in exactly one place, `exec/expression.py`'s
 `_scan_number`, for arithmetic's leading-prefix coercion, column
 affinity's whole-string coercion and `sum`/`avg`'s classification
-alike - the one exception is the integer value `%` reads, below. A
-plain digit run - no `.`, no exponent - is `INTEGER` only if
+alike - the one exception is the integer value `%` reads, below. The
+whitespace skipped before a number (and after it, for column affinity's
+whole-string coercion) is exactly the six ASCII characters space, `\t`,
+`\n`, `\v`, `\f`, `\r` (0x20, 0x09, 0x0A, 0x0B, 0x0C, 0x0D), and never
+between a sign and its digits: `'\v12' + 0` is `12`, `'\x1c12' + 0` and
+`'\xa012' + 0` are `0`. This is not the lexer's SQL-token whitespace,
+which omits `\v`. A plain digit run - no `.`, no exponent - is `INTEGER` only if
 it fits int64; otherwise it is `REAL` at that point, before any
 operator sees it, and a run too large for a double is `inf`:
 

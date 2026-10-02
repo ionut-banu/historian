@@ -27,15 +27,14 @@ then (GROUP BY) an aggregate key. See `_docs/decisions.md`,
 Two parts: the issue's own table, and the sweep - every pair and
 every triple of fragments from distinct clauses of a catalog of 27
 erroring fragments in 7 clauses, each spliced into three base queries
-(grouped, plain and aggregate-by-select-list). Pairs always run; the
-triples (5,242 queries) run only with HISTORIAN_ERROR_SWEEP=full, since
-they add little the pairs and the table do not already pin.
+(grouped, plain and aggregate-by-select-list): 79 single fragments,
+874 pairs and 5,242 triples. Every case only parses and binds, so the
+whole sweep takes about five seconds and runs by default.
 """
 
 from __future__ import annotations
 
 import itertools
-import os
 import re
 import sqlite3
 
@@ -333,9 +332,6 @@ BASES = {
     },
 }
 
-_FULL_SWEEP = os.environ.get("HISTORIAN_ERROR_SWEEP") == "full"
-
-
 def _build(base: str, fragment_names) -> str:
     parts = dict(BASES[base])
     for name in fragment_names:
@@ -373,9 +369,7 @@ def _sweep(size: int) -> list:
 
 _SINGLES = _sweep(1)
 _PAIRS = _sweep(2)
-_TRIPLES = _sweep(3) if _FULL_SWEEP else [
-    pytest.param("", id="set HISTORIAN_ERROR_SWEEP=full", marks=pytest.mark.skip(reason="triples run with HISTORIAN_ERROR_SWEEP=full"))
-]
+_TRIPLES = _sweep(3)
 
 
 def test_sweep_size():
@@ -384,8 +378,7 @@ def test_sweep_size():
     27 in the plain base."""
     assert len(_SINGLES) == 26 + 27 + 26
     assert len(_PAIRS) == 284 + 306 + 284
-    if _FULL_SWEEP:
-        assert len(_TRIPLES) == 1682 + 1878 + 1682
+    assert len(_TRIPLES) == 1682 + 1878 + 1682
 
 
 @pytest.mark.parametrize("query", _SINGLES)

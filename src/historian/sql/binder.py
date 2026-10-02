@@ -48,11 +48,12 @@ to bind successfully and only fail later, generically, in
 `exec/expression.py`). A recognised name still gets its arity checked
 (`count` takes zero or one argument, `*` counts as one; `sum`/`avg`/
 `min`/`max` take exactly one, and never `*`) and, when `ctx.
-reject_aggregates` is set (`bind()` turns this on for `WHERE`, the
-one clause this issue's grammar can put an aggregate call in), is
-rejected outright - `WHERE count(*) > 1` is `BindError`, matching
-`sqlite3`'s own "misuse of aggregate function" rejection, though not
-its wording (§3's Errors section does not require that).
+reject_aggregates` is set (`bind()` turns this on for `WHERE`, and
+for `ORDER BY` in a non-aggregate query), is rejected - `WHERE
+count(*) > 1` is `BindError`, matching `sqlite3`'s own "misuse of
+aggregate function" rejection, though not its wording (§3's Errors
+section does not require that). Rejected does not always mean raised
+at once: see "Resolution order" below for when it is reported.
 
 Two more aggregate-misuse shapes, closed by issue #102, follow the
 same "reject at bind time, unconditionally" rule rather than waiting
@@ -181,19 +182,53 @@ is exactly what `'straße'.upper() == 'STRASSE'` would wrongly do in
 Python. `historian.ascii.ascii_fold` implements SQLite's rule
 directly: only the 26 ASCII letters move, nothing else is consulted.
 
-Resolution and error order
-----------------------------
+Resolution order
+------------------
 
-Confirmed against `sqlite3` by constructing queries with more than one
-thing wrong at once: the `FROM` table is resolved first, before
-anything else (`select authr_name from ghost` reports the missing
-table). Within a clause, the leftmost unresolved name wins (`select
-ghost1, ghost2 from blame` reports `ghost1`). The select list resolves
-before `WHERE` (`select ghost_select from blame where ghost_where = 1`
-reports `ghost_select`). This is *not* `SelectStatement`'s own field
-order (`select_list`, `from_table`, `where`) - `bind()` below checks
-`from_table` first regardless, which a naive walk of the dataclass's
-fields would get backward.
+When a statement has more than one error, `bind()` reports the one
+SQLite reports (issue #115, spec §3 "Errors"). Measured against the
+oracle - Python's `sqlite3` module, SQLite 3.45.1 - by splicing one,
+two and three erroring fragments from different clauses into a base
+query (`tests/differential/test_error_order.py`), the order is:
+
+1. The FROM table, then the qualifier of any `x.*` select-list item
+   (`SELECT ghost_s, ghost.* FROM blame` reports `no such table:
+   ghost`).
+2. LIMIT, then OFFSET - only what SQLite rejects there: a column
+   reference (any, even a real column or an alias: LIMIT sees no
+   columns) or an aggregate call. A column reference outside every
+   aggregate call is reported at once; an error inside an aggregate
+   call only once both clauses have no such column reference, the
+   last one found winning (`_check_limit_offset_names`).
+3. The select list, items left to right.
+4. `HAVING` on a non-aggregate query.
+5. `HAVING`.
+6. `WHERE`. In a non-aggregate query an aggregate call here is
+   reported in place, in left-to-right order with the clause's names.
+7. `ORDER BY`, terms left to right: every name error first, then an
+   out-of-range ordinal.
+8. `GROUP BY`, terms left to right: every name error first, then an
+   out-of-range ordinal, then an aggregate key.
+9. Late: an aggregate call in the `WHERE` of an aggregate query, or in
+   the `ORDER BY` of a non-aggregate one (`_Context.late_misuse`).
+   "Aggregate query" means `GROUP BY` is written or the select list
+   contains an aggregate call.
+10. historian's own rejections of queries SQLite accepts, in this
+    order: the bare column with an aggregate or not a `GROUP BY` key
+    in the select list, in `HAVING`, in `ORDER BY`; the `SELECT
+    DISTINCT ... ORDER BY` key; a `LIMIT`/`OFFSET` that is not a
+    literal integer. They come after every error SQLite raises, so
+    when a query has both, SQLite's wins.
+
+Within one clause expression, operands are visited left to right, so
+the leftmost unresolved name wins (`select ghost1, ghost2 from blame`
+reports `ghost1`); within one call the name is checked first, then
+the arity, then aggregate misuse (`WHERE avg() = 1` reports the
+arity), and a nested aggregate is reported where it is found, in any
+clause. The order of different error kinds inside one expression tree
+is #144. None of this is `SelectStatement`'s own field order
+(`select_list`, `from_table`, `where`, ...), which a naive walk of the
+dataclass's fields would follow instead.
 """
 
 from __future__ import annotations
@@ -426,6 +461,14 @@ class _Context:
     #: for the select list, where an aggregate call is exactly what
     #: this issue exists to allow.
     reject_aggregates: bool = False
+    #: Issue #115: where a rejected aggregate goes. `None` raises it on
+    #: the spot (WHERE of a non-aggregate query). A list collects it
+    #: instead, and binding goes on as if the call were legal: `bind()`
+    #: raises the first collected error only after GROUP BY, because
+    #: that is when SQLite reports an aggregate call in the WHERE of an
+    #: aggregate query, or in the ORDER BY of a non-aggregate one. See
+    #: the module docstring's "Resolution order".
+    late_misuse: list[BindError] | None = None
 
 
 # --- FROM-table resolution -------------------------------------------------
@@ -433,8 +476,8 @@ class _Context:
 
 def _resolve_table(stmt: SelectStatement, catalog: dict[str, Schema]) -> _Context:
     """Resolve `stmt.from_table` against `catalog`, case-insensitively
-    and ASCII-only. Checked first, before any select-list or WHERE
-    name, per the module docstring's resolution-order evidence.
+    and ASCII-only. Checked first, before anything else in the
+    statement - step 1 of the module docstring's "Resolution order".
 
     The error's position is `stmt.position` (the `SELECT` keyword):
     `from_table` is a bare string on the AST with no position of its
@@ -555,11 +598,14 @@ def _resolve_name(ref: ColumnRef, ctx: _Context) -> Expr:
     # row is ever considered, the same way the literal-call case
     # already is.
     if ctx.reject_aggregates and _contains_aggregate(resolved):
-        raise BindError(
-            f"misuse of aggregate: aliased column {ref.name} refers to an aggregate call, "
-            "which is not allowed here",
-            ref.position,
-            (),
+        _reject_aggregate(
+            BindError(
+                f"misuse of aggregate: aliased column {ref.name} refers to an aggregate call, "
+                "which is not allowed here",
+                ref.position,
+                (),
+            ),
+            ctx,
         )
     return resolved
 
@@ -590,46 +636,60 @@ def _validate_function_call(call: FunctionCall, ctx: _Context) -> None:
     section. Raises `BindError`; never returns a value, mirroring
     `_bind_column_ref`'s own "raise or fall through" shape.
 
-    Order matters: an unrecognised name is rejected before
-    `ctx.reject_aggregates` is even consulted, so `WHERE foo(x) > 1`
-    (an unknown function, not a real aggregate) reports "no such
-    function", never "aggregate functions are not allowed in WHERE" -
-    the latter message would be actively misleading about what is
-    actually wrong.
+    Order matters, and is SQLite's (issue #115): an unrecognised name
+    first, then the arity, then `ctx.reject_aggregates` - so `WHERE
+    foo(x) > 1` reports "no such function" and `WHERE avg() = 1`
+    reports "wrong number of arguments to function avg()", never the
+    aggregate misuse. A rejected aggregate goes through
+    `_reject_aggregate`, which raises it or, when `ctx.late_misuse` is
+    a list, collects it for `bind()` to raise later.
     """
     name = ascii_fold(call.name)
     if name not in _AGGREGATE_NAMES:
         raise BindError(
             f"no such function: {call.name}", call.position, tuple(sorted(_AGGREGATE_NAMES))
         )
+    arity_error = _arity_error(call)
+    if arity_error is not None:
+        raise arity_error
     if ctx.reject_aggregates:
-        raise BindError(
-            f"misuse of aggregate function {call.name}(): aggregate calls are not allowed in WHERE",
-            call.position,
-            (),
+        _reject_aggregate(
+            BindError(
+                f"misuse of aggregate function {call.name}(): aggregate calls are not allowed in WHERE",
+                call.position,
+                (),
+            ),
+            ctx,
         )
-    if name == "count":
+
+
+def _arity_error(call: FunctionCall) -> BindError | None:
+    """The arity error for a call to one of `_AGGREGATE_NAMES`, or
+    `None` when the argument count is right. `count` takes zero
+    arguments, `*` or one expression; `sum`/`avg`/`min`/`max` take
+    exactly one expression and never `*` - `sum(*)` is not `sum(<every
+    column>)`, and SQLite reports it as the same arity error (checked
+    against the oracle, 3.45.1)."""
+    message = f"wrong number of arguments to function {call.name}()"
+    if ascii_fold(call.name) == "count":
         # count() and count(*) are both zero-column forms (`*` is one
         # AST node, not zero); count(<expr>) is the one-argument form.
-        # Never more than one - `count(path, line_no)` is exactly
-        # sqlite3's own arity error, differently worded (§3's Errors
-        # section does not require matching text).
         if len(call.args) > 1:
-            raise BindError(
-                f"wrong number of arguments to function {call.name}()", call.position, ()
-            )
-        return
-    # sum/avg/min/max: exactly one argument, and never `*` - `sum(*)`
-    # is not `sum(<every column>)`; SQLite itself rejects it, and this
-    # grammar has no meaning to give it either.
-    if len(call.args) != 1:
-        raise BindError(f"wrong number of arguments to function {call.name}()", call.position, ())
-    if isinstance(call.args[0], Star):
-        raise BindError(
-            f"{call.name}(*) is not valid: {call.name} takes a single expression, not *",
-            call.position,
-            (),
-        )
+            return BindError(message, call.position, ())
+        return None
+    if len(call.args) != 1 or isinstance(call.args[0], Star):
+        return BindError(message, call.position, ())
+    return None
+
+
+def _reject_aggregate(error: BindError, ctx: _Context) -> None:
+    """Raise *error* now, or - when `ctx.late_misuse` is a list -
+    keep the first such error there and return, so binding goes on as
+    if the aggregate were legal (issue #115)."""
+    if ctx.late_misuse is None:
+        raise error
+    if not ctx.late_misuse:
+        ctx.late_misuse.append(error)
 
 
 # --- Walking an expression tree without recursion (issue #107) --------------
@@ -653,8 +713,8 @@ def _validate_function_call(call: FunctionCall, ctx: _Context) -> None:
 def _operands(expr: Expr) -> tuple[Expr, ...]:
     """*expr*'s direct sub-expressions, left to right - the order every
     walk below visits them in, which is what keeps "the leftmost
-    unresolved name wins" (the module docstring's "Resolution and error
-    order") true without recursion. A leaf has none."""
+    unresolved name wins" (the module docstring's "Resolution order")
+    true without recursion. A leaf has none."""
     if isinstance(expr, (Literal, ColumnRef, BoundColumnRef, Star)):
         return ()
     if isinstance(expr, FunctionCall):
@@ -978,7 +1038,12 @@ def _bind_limit_offset(expr: Expr, clause: str) -> int:
     shape sqlite3 itself accepts here (arithmetic, `CASE`, a
     predicate, any scalar or aggregate function call, a TEXT/REAL/
     `NULL` literal, a column reference, a select-list alias, a
-    subquery)."""
+    subquery).
+
+    Called last, after every error SQLite itself raises (issue #115):
+    a column reference or aggregate call here has already been
+    reported by `_check_limit_offset_names`, at LIMIT's own turn, so
+    what reaches this rejection is a shape SQLite accepts."""
     value = _ordinal_value(expr)
     if value is None:
         raise BindError(
@@ -990,63 +1055,154 @@ def _bind_limit_offset(expr: Expr, clause: str) -> int:
     return value
 
 
-def _bind_group_by_item(
-    raw_expr: Expr, ctx: _Context, bound_items: tuple[BoundSelectItem, ...]
-) -> Expr:
-    """Resolve one `GROUP BY` entry: an ordinal (`_ordinal_value`,
-    shared with `ORDER BY`) is a positional reference into
-    `bound_items` (the select list *after* `Star` expansion, matching
-    `sqlite3`'s own "1st GROUP BY term" counting), resolved purely by
-    position and never through `_resolve_name`'s alias-vs-column logic
-    at all (an ordinal is not a name) - confirmed against `sqlite3`
-    during this issue's grooming (orchestrator's correction comment).
-    Anything else binds as an ordinary expression, with select-list
-    alias fallback (`alias_first=False`, per #32/#60's precedent for
-    `GROUP BY`/`HAVING`).
+def _check_limit_offset_names(exprs: tuple[Expr, ...]) -> None:
+    """The errors SQLite raises for `LIMIT` and `OFFSET` (*exprs*, in
+    that order), at their turn in the resolution order: right after the
+    FROM table, before the select list (issue #115). SQLite resolves
+    them against no columns at all and with no select-list alias, so
+    every column reference is "no such column", real column or not.
 
-    Either route can turn out to reference an aggregate call - a bare
-    `count(*)` written directly, an alias of one, or an ordinal
-    pointing at one - and all three are rejected identically here,
-    the uniform rule the orchestrator's correction states explicitly.
+    Measured against the oracle (3.45.1), two strengths of error:
+
+    - A column reference outside every aggregate call is reported at
+      once (`LIMIT ghost_l OFFSET ghost_f` reports `ghost_l`).
+    - An aggregate call is always an error here, but a soft one: the
+      call's arity error or, failing that, its misuse, and then any
+      column reference inside its arguments, each replacing the one
+      before - and a later hard error, or a later soft one, in either
+      clause replaces it again. Only if both clauses are walked
+      without a hard error is the last soft error raised (`LIMIT
+      avg(1) OFFSET ghost_f` reports `ghost_f`; `LIMIT count(*) OFFSET
+      sum(1)` reports `sum`; `LIMIT count(ghost_x)` reports
+      `ghost_x`).
+
+    A call to a function that is not an aggregate is left alone, along
+    with its arguments: SQLite rejects it here too, but the order of
+    that against the rest is #144, so it reaches `_bind_limit_offset`'s
+    literal-only rejection instead. Pre-order, left to right, over an
+    explicit stack of `(node, inside an aggregate call)` (issue #107).
     """
-    ordinal = _ordinal_value(raw_expr)
-    if ordinal is not None:
-        if ordinal < 1 or ordinal > len(bound_items):
-            raise BindError(
-                f"1st GROUP BY term out of range - should be between 1 and {len(bound_items)}",
-                raw_expr.position,
-                (),
-            )
-        target = bound_items[ordinal - 1]
-        if _contains_aggregate(target.expr):
-            raise BindError(
-                "aggregate functions are not allowed in the GROUP BY clause",
-                raw_expr.position,
-                (),
-            )
-        return target.expr
+    soft: BindError | None = None
+    for expr in exprs:
+        pending: list[tuple[Expr, bool]] = [(expr, False)]
+        while pending:
+            node, inside_aggregate = pending.pop()
+            if isinstance(node, ColumnRef):
+                display = f"{node.table}.{node.name}" if node.table is not None else node.name
+                error = BindError(f"no such column: {display}", node.position, ())
+                if not inside_aggregate:
+                    raise error
+                soft = error
+                continue
+            if isinstance(node, FunctionCall):
+                if ascii_fold(node.name) not in _AGGREGATE_NAMES:
+                    continue
+                arity_error = _arity_error(node)
+                if arity_error is not None:
+                    soft = arity_error
+                else:
+                    soft = BindError(f"misuse of aggregate function {node.name}()", node.position, ())
+                inside_aggregate = True
+            for operand in reversed(_operands(node)):
+                pending.append((operand, inside_aggregate))
+    if soft is not None:
+        raise soft
 
+
+# --- Ordinals out of range, shared by GROUP BY and ORDER BY ------------------
+
+
+def _ordinal_suffix(number: int) -> str:
+    """`1st`, `2nd`, `3rd`, `4th`, ..., `11th`, `12th`, `13th`, `21st`
+    - the spelling SQLite's "Nth ... term out of range" uses (checked
+    against the oracle for the 2nd, 3rd, 11th and 21st term)."""
+    if 11 <= number % 100 <= 13:
+        return f"{number}th"
+    last = number % 10
+    if last == 1:
+        return f"{number}st"
+    if last == 2:
+        return f"{number}nd"
+    if last == 3:
+        return f"{number}rd"
+    return f"{number}th"
+
+
+def _check_ordinal(raw_expr: Expr, index: int, clause: str, item_count: int) -> int:
+    """The ordinal value of *raw_expr*, the *index*-th (zero-based)
+    term of *clause* (`"GROUP BY"`/`"ORDER BY"`), checked against the
+    select list's length after `Star` expansion; `BindError` naming
+    the term, as SQLite does, when it is out of range."""
+    ordinal = _ordinal_value(raw_expr)
+    assert ordinal is not None
+    if ordinal < 1 or ordinal > item_count:
+        raise BindError(
+            f"{_ordinal_suffix(index + 1)} {clause} term out of range - should be between 1 and {item_count}",
+            raw_expr.position,
+            (),
+        )
+    return ordinal
+
+
+# --- GROUP BY (issue #69) ----------------------------------------------------
+
+
+def _bind_group_by(
+    group_by: tuple[Expr, ...], ctx: _Context, bound_items: tuple[BoundSelectItem, ...]
+) -> tuple[Expr, ...]:
+    """Resolve the `GROUP BY` terms, in three passes over them - the
+    order SQLite reports a clause's errors in (issue #115, measured):
+
+    1. Every term that is not an ordinal binds as an ordinary
+       expression, left to right, with select-list alias fallback
+       (`alias_first=False`, per #32/#60's precedent for `GROUP BY`/
+       `HAVING`). Name errors (no such column or function, arity, a
+       nested aggregate) raise here, so `GROUP BY 99, ghost` reports
+       `ghost`.
+    2. Every ordinal (`_ordinal_value`, shared with `ORDER BY`) is
+       checked against `bound_items` (the select list *after* `Star`
+       expansion, matching `sqlite3`'s own "1st GROUP BY term"
+       counting) and resolved to that item's own bound expression -
+       purely by position, never through `_resolve_name`, since an
+       ordinal is not a name.
+    3. A term that is, or reaches, an aggregate call - written
+       directly, an alias of one, or an ordinal pointing at one - is
+       rejected identically, the uniform rule the orchestrator's
+       correction on #69 states: `GROUP BY count(*), 99` reports the
+       ordinal.
+
+    The keys come back in clause order, exactly as the one-pass
+    version built them.
+    """
     group_ctx = dataclasses.replace(
         ctx,
         select_items=bound_items,
         alias_fallback=True,
         alias_first=False,
         reject_aggregates=False,
+        late_misuse=None,
     )
-    bound_expr = _bind_expr(raw_expr, group_ctx)
-    if _contains_aggregate(bound_expr):
-        raise BindError(
-            "aggregate functions are not allowed in the GROUP BY clause",
-            raw_expr.position,
-            (),
-        )
-    return bound_expr
-
-
-def _bind_group_by(
-    group_by: tuple[Expr, ...], ctx: _Context, bound_items: tuple[BoundSelectItem, ...]
-) -> tuple[Expr, ...]:
-    return tuple(_bind_group_by_item(item, ctx, bound_items) for item in group_by)
+    keys: list[Expr | None] = []
+    for raw_expr in group_by:
+        if _ordinal_value(raw_expr) is None:
+            keys.append(_bind_expr(raw_expr, group_ctx))
+        else:
+            keys.append(None)
+    for index, raw_expr in enumerate(group_by):
+        if keys[index] is None:
+            ordinal = _check_ordinal(raw_expr, index, "GROUP BY", len(bound_items))
+            keys[index] = bound_items[ordinal - 1].expr
+    bound_keys: list[Expr] = []
+    for raw_expr, key in zip(group_by, keys):
+        assert key is not None
+        if _contains_aggregate(key):
+            raise BindError(
+                "aggregate functions are not allowed in the GROUP BY clause",
+                raw_expr.position,
+                (),
+            )
+        bound_keys.append(key)
+    return tuple(bound_keys)
 
 
 # --- ORDER BY (issue #61) ----------------------------------------------------
@@ -1073,31 +1229,36 @@ def _bind_group_by(
 # reused rather than reimplemented.
 
 
-def _bind_order_by_item(
-    item: OrderByItem, ctx: _Context, bound_items: tuple[BoundSelectItem, ...]
-) -> BoundOrderByItem:
-    """Resolve one `ORDER BY` entry. An ordinal (`_ordinal_value`) is a
-    positional reference into `bound_items`, 1-based, out-of-range
-    (0, negative, or past the end) raising the same "1st ORDER BY term
-    out of range" shape `_bind_group_by_item` uses for `GROUP BY` -
-    unlike that method, an ordinal resolving to an aggregate call is
-    never rejected (see the section comment above). Anything else
-    binds as an ordinary expression through `ctx` - the caller supplies
-    `alias_first=True` and whichever `reject_aggregates` the query's
-    aggregate status calls for; this function does not decide either.
+def _bind_order_by(
+    order_by: tuple[OrderByItem, ...], ctx: _Context, bound_items: tuple[BoundSelectItem, ...]
+) -> tuple[BoundOrderByItem, ...]:
+    """Resolve the `ORDER BY` terms in two passes, the order SQLite
+    reports a clause's errors in (issue #115): first every term that is
+    not an ordinal binds as an ordinary expression through `ctx`, left
+    to right - the caller supplies `alias_first=True`, and whichever
+    `reject_aggregates`/`late_misuse` the query's aggregate status
+    calls for; this function decides neither - so `ORDER BY 99, ghost`
+    reports `ghost`; then every ordinal (`_ordinal_value`) is checked,
+    1-based, against `bound_items`, out-of-range (0, negative, or past
+    the end) raising the same "Nth ... term out of range" shape
+    `GROUP BY` uses, and resolves to the referenced item's own bound
+    expression. Unlike `GROUP BY`, an ordinal resolving to an aggregate
+    call is never rejected (see the section comment above).
     """
-    ordinal = _ordinal_value(item.expr)
-    if ordinal is not None:
-        if ordinal < 1 or ordinal > len(bound_items):
-            raise BindError(
-                f"1st ORDER BY term out of range - should be between 1 and {len(bound_items)}",
-                item.expr.position,
-                (),
-            )
-        bound_expr = bound_items[ordinal - 1].expr
-    else:
-        bound_expr = _bind_expr(item.expr, ctx)
-    return BoundOrderByItem(expr=bound_expr, direction=item.direction, position=item.position)
+    exprs: list[Expr | None] = []
+    for item in order_by:
+        if _ordinal_value(item.expr) is None:
+            exprs.append(_bind_expr(item.expr, ctx))
+        else:
+            exprs.append(None)
+    bound: list[BoundOrderByItem] = []
+    for index, item in enumerate(order_by):
+        expr = exprs[index]
+        if expr is None:
+            ordinal = _check_ordinal(item.expr, index, "ORDER BY", len(bound_items))
+            expr = bound_items[ordinal - 1].expr
+        bound.append(BoundOrderByItem(expr=expr, direction=item.direction, position=item.position))
+    return tuple(bound)
 
 
 # --- The grouped narrowing (issue #60, extended by #69) ---------------------
@@ -1120,7 +1281,7 @@ def _bind_order_by_item(
 # select_exprs)`, passing the bound select-list expressions in place
 # of `group_by`'s keys. An ordinal ORDER BY key needs no extra check:
 # it already resolves to the referenced select-list item's own bound
-# expression (`_bind_order_by_item`, above), which trivially
+# expression (`_bind_order_by`, above), which trivially
 # shape-matches itself as the first `group_keys` entry checked. A
 # select-list alias reference is the same story: `_resolve_name`
 # (`ctx.alias_first=True` for ORDER BY) already splices in that item's
@@ -1285,10 +1446,14 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema]) -> BoundSelectStatem
     """Resolve every table and column reference in `stmt` against
     `catalog`, and expand `SELECT *` / `table.*`.
 
-    Raises `BindError` - never returns `None`/`False` - on the first
-    name that does not resolve, in the order documented in the module
-    docstring: the FROM table, then the select list left to right,
-    then WHERE. `catalog` is required, not defaulted: this module
+    Raises `BindError` - never returns `None`/`False` - for the first
+    error in the order the module docstring's "Resolution order"
+    section states, which is SQLite's (issue #115): the FROM table and
+    any unknown `x.*` qualifier, LIMIT then OFFSET, the select list,
+    HAVING on a non-aggregate query, HAVING, WHERE, ORDER BY, GROUP BY,
+    the late aggregate misuse, and last historian's own rejections of
+    queries SQLite accepts. The body below is that order, one step
+    after another. `catalog` is required, not defaulted: this module
     never imports `historian.tables.blame` or `historian.catalog`
     itself (issue #35 - AGENTS.md's "no git and no subprocess
     imports" for everything above the scan operators), so it has no
@@ -1296,51 +1461,38 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema]) -> BoundSelectStatem
     real `blame` table pass `historian.catalog.SCHEMAS` explicitly -
     `cli.py` is the one production call site that does.
     """
+    # 1. The FROM table, then the qualifier of any `x.*` select-list
+    # item - SQLite expands stars before resolving any name, so
+    # `SELECT ghost_s, ghost.* FROM blame` reports `ghost`.
     ctx = _resolve_table(stmt, catalog)
+    for item in stmt.select_list:
+        if isinstance(item.expr, Star) and item.alias is None:
+            _bind_star(item.expr, ctx)
+
+    # 2. LIMIT, then OFFSET: only what SQLite rejects there (a column
+    # reference, an aggregate call). The literal-only rule (#77) is
+    # historian's own and waits for step 10.
+    limit_offset = tuple(expr for expr in (stmt.limit, stmt.offset) if expr is not None)
+    _check_limit_offset_names(limit_offset)
+
+    # 3. The select list, left to right. Items bind against the plain
+    # `ctx`, with no alias fallback, so aliases stay invisible to each
+    # other (#32 finding 3).
     bound_items: list[BoundSelectItem] = []
     for item in stmt.select_list:
         bound_items.extend(_bind_select_item(item, ctx))
-    # Issue #69: GROUP BY resolves next - ordinal or named, alias
-    # fallback on, column-first - before the grouped narrowing check
-    # below, which needs the resolved keys to know what is covered.
-    bound_group_by = _bind_group_by(stmt.group_by, ctx, tuple(bound_items))
-    # Issue #60's bare-column-mixed-with-aggregate narrowing, extended
-    # by #69 to cover GROUP BY keys - after the whole select list and
-    # GROUP BY are bound and before WHERE - the select list resolves
-    # before WHERE per the module docstring's resolution-order
-    # section, and this check is squarely part of resolving it.
-    _check_grouped_select_list(bound_items, bound_group_by)
-    # WHERE binds with the select-list alias fallback on (issue #32),
-    # column-first (`alias_first=False`), and aggregate calls rejected
-    # outright (issue #60) - a fresh `_Context` rather than mutating
-    # `ctx`, since `_Context` is frozen and select-list items must keep
-    # binding against the plain `ctx` above, with no fallback, so
-    # aliases stay invisible to each other (finding 3).
-    where_ctx = dataclasses.replace(
-        ctx,
-        select_items=tuple(bound_items),
-        alias_fallback=True,
-        alias_first=False,
-        reject_aggregates=True,
-    )
-    bound_where = _bind_expr(stmt.where, where_ctx) if stmt.where is not None else None
-    # HAVING (issue #69): the one clause where an aggregate call *is*
-    # legal, referenced directly or by select-list alias - the exact
-    # opposite of GROUP BY and WHERE. Binds like WHERE otherwise
-    # (alias fallback on, column-first), just with
-    # `reject_aggregates=False` so a real, correctly-arity aggregate
-    # call binds normally; splitting it out into an `Aggregate` slot
-    # is `plan/planner.py`'s job, reusing the same split it already
-    # applies to `select_list` (spec §3's "Expression evaluation").
-    having_ctx = dataclasses.replace(
-        ctx,
-        select_items=tuple(bound_items),
-        alias_fallback=True,
-        alias_first=False,
-        reject_aggregates=False,
-    )
-    bound_having = _bind_expr(stmt.having, having_ctx) if stmt.having is not None else None
-    if bound_having is not None and not bound_group_by:
+    items = tuple(bound_items)
+
+    # Whether the query aggregates at all - GROUP BY written, or an
+    # aggregate call anywhere in the select list. An aggregate call in
+    # HAVING or ORDER BY does not count (confirmed against sqlite3:
+    # `select path from t having count(*) > 1` is still "HAVING clause
+    # on a non-aggregate query"). Decides steps 4, 6 and 7.
+    select_has_aggregate = any(_contains_aggregate(item.expr) for item in items)
+    is_aggregate_query = bool(stmt.group_by) or select_has_aggregate
+
+    # 4. HAVING on a non-aggregate query, before HAVING's own names.
+    if stmt.having is not None and not is_aggregate_query:
         # A `HAVING` clause only makes sense against an aggregate
         # query - confirmed live against `sqlite3 3.51.0`:
         # `select path from t having path = 'x'` (no GROUP BY, no
@@ -1355,14 +1507,73 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema]) -> BoundSelectStatem
         # `select path from t having count(*) > 1` still raises the
         # identical "HAVING clause on a non-aggregate query" error -
         # only the select list (or GROUP BY) decides that question.
-        select_has_aggregate = any(_contains_aggregate(item.expr) for item in bound_items)
-        if not select_has_aggregate:
-            raise BindError(
-                "HAVING requires an aggregate query - add GROUP BY or an "
-                "aggregate function to the select list",
-                stmt.having.position,
-                (),
-            )
+        raise BindError(
+            "HAVING requires an aggregate query - add GROUP BY or an "
+            "aggregate function to the select list",
+            stmt.having.position,
+            (),
+        )
+
+    # The late aggregate misuse (step 9) is collected here while WHERE
+    # and ORDER BY bind, and raised only after GROUP BY.
+    late_misuse: list[BindError] = []
+
+    # 5. HAVING (issue #69): the one clause where an aggregate call
+    # *is* legal, referenced directly or by select-list alias. Alias
+    # fallback on, column-first. Splitting an aggregate call out into
+    # an `Aggregate` slot is `plan/planner.py`'s job (spec §3's
+    # "Expression evaluation").
+    having_ctx = dataclasses.replace(
+        ctx,
+        select_items=items,
+        alias_fallback=True,
+        alias_first=False,
+        reject_aggregates=False,
+    )
+    bound_having = _bind_expr(stmt.having, having_ctx) if stmt.having is not None else None
+
+    # 6. WHERE: alias fallback on (#32), column-first, aggregate calls
+    # rejected (#60) - on the spot in a non-aggregate query, but late
+    # (step 9) in an aggregate one, which is when SQLite reports them.
+    where_ctx = dataclasses.replace(
+        ctx,
+        select_items=items,
+        alias_fallback=True,
+        alias_first=False,
+        reject_aggregates=True,
+        late_misuse=late_misuse if is_aggregate_query else None,
+    )
+    bound_where = _bind_expr(stmt.where, where_ctx) if stmt.where is not None else None
+
+    # 7. ORDER BY (#61): alias-first. A bare aggregate call is legal
+    # only in an aggregate query; in any other it is rejected late
+    # (step 9). See the "ORDER BY" section comment above
+    # `_bind_order_by`.
+    order_ctx = dataclasses.replace(
+        ctx,
+        select_items=items,
+        alias_fallback=True,
+        alias_first=True,
+        reject_aggregates=not is_aggregate_query,
+        late_misuse=late_misuse,
+    )
+    bound_order_by = _bind_order_by(stmt.order_by, order_ctx, items)
+
+    # 8. GROUP BY (#69): last of the clauses, ordinal or named, alias
+    # fallback on, column-first.
+    bound_group_by = _bind_group_by(stmt.group_by, ctx, items)
+
+    # 9. The late aggregate misuse: an aggregate call in the WHERE of
+    # an aggregate query, or in the ORDER BY of a non-aggregate one.
+    if late_misuse:
+        raise late_misuse[0]
+
+    # 10. historian's own rejections of queries SQLite accepts, after
+    # every error SQLite raises (#115), in the order they had before.
+    #
+    # The select list: #60's bare-column-mixed-with-aggregate
+    # narrowing, extended by #69 to GROUP BY keys.
+    _check_grouped_select_list(bound_items, bound_group_by)
     if bound_having is not None:
         # Orchestrator correction: a bare column reference in HAVING
         # that is neither a GROUP BY key (matched by shape, exactly
@@ -1389,26 +1600,6 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema]) -> BoundSelectStatem
                 bad_column.position,
                 (),
             )
-    # ORDER BY (issue #61): whether the query aggregates at all - GROUP
-    # BY present, or an aggregate call anywhere in the select list -
-    # decides both whether a bare aggregate call in ORDER BY is legal
-    # (reject_aggregates, mirroring WHERE's outright rejection when
-    # `False`) and whether the grouped narrowing below applies. See the
-    # "ORDER BY" section comment above `_bind_order_by_item` for the
-    # sqlite3 evidence.
-    is_aggregate_query = bool(bound_group_by) or any(
-        _contains_aggregate(item.expr) for item in bound_items
-    )
-    order_ctx = dataclasses.replace(
-        ctx,
-        select_items=tuple(bound_items),
-        alias_fallback=True,
-        alias_first=True,
-        reject_aggregates=not is_aggregate_query,
-    )
-    bound_order_by = tuple(
-        _bind_order_by_item(item, order_ctx, tuple(bound_items)) for item in stmt.order_by
-    )
     if is_aggregate_query:
         # The same "grouped but not a key" narrowing HAVING already
         # gets (2026-09-24's decisions.md entry), extended here: once
@@ -1468,18 +1659,15 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema]) -> BoundSelectStatem
                     bad.position,
                     (),
                 )
-    # LIMIT / OFFSET (issue #77): each is bound independently of
-    # everything above - no interaction with GROUP BY/aggregation, no
-    # select-list alias fallback (sqlite3 itself gives LIMIT/OFFSET
-    # zero visible columns and no alias fallback either, confirmed
-    # live during this issue's grooming) - see `_bind_limit_offset`.
-    # `stmt.offset` is never set while `stmt.limit` is `None` (the
-    # parser's own guarantee, `sql/ast.py`'s docstring), so
-    # `bound_offset` is correspondingly `None` in that case too.
+    # LIMIT / OFFSET (issue #77): a literal integer, resolved to a
+    # plain Python `int` - see `_bind_limit_offset`. `stmt.offset` is
+    # never set while `stmt.limit` is `None` (the parser's own
+    # guarantee, `sql/ast.py`'s docstring), so `bound_offset` is
+    # correspondingly `None` in that case too.
     bound_limit = _bind_limit_offset(stmt.limit, "LIMIT") if stmt.limit is not None else None
     bound_offset = _bind_limit_offset(stmt.offset, "OFFSET") if stmt.offset is not None else None
     return BoundSelectStatement(
-        select_list=tuple(bound_items),
+        select_list=items,
         from_table=ctx.table_name,
         where=bound_where,
         group_by=bound_group_by,

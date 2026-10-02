@@ -2267,3 +2267,101 @@ def test_avg_of_integers_rounds_the_sum_to_float_before_dividing():
 
     assert type(value) is float
     assert value.hex() == "-0x1.daf26ae3ccde3p+60"
+
+
+# --- group_key at the three grouping sites (issue #113) ---------------------
+#
+# `Aggregate` with `GROUP BY`, `Distinct`, and `count/sum/avg(DISTINCT x)`
+# all key on `values.group_key`. Every expected value below came from the
+# oracle (Python's bundled sqlite3, 3.45.1 here) with the numbers bound as
+# parameters, never as float literals - e.g. for the `[1.0, 1]` row:
+#
+#   uv run python tests/oracle.py "" \
+#     "SELECT x, count(*) FROM (SELECT ? AS x UNION ALL SELECT ?) GROUP BY x" 1.0 1
+#   -> 1.0|2
+#   ... "SELECT DISTINCT x FROM (SELECT ? AS x UNION ALL SELECT ?)" 1.0 1
+#   -> 1.0
+#   ... "SELECT count(DISTINCT x), sum(DISTINCT x), avg(DISTINCT x) FROM (...)" 1.0 1
+#   -> 1|1.0|1.0
+#
+# Text is reached with `CAST(? AS TEXT)` and NULL with a `NULL` literal.
+# SQLite's own group output order is unspecified without `ORDER BY`;
+# historian's is first-row-encountered (`Aggregate`'s docstring), which
+# is what the group lists below are written in. Each expected
+# representative is checked with `type()`/`copysign`, since `1 == 1.0`
+# and `0.0 == -0.0` in Python would let a wrong representative pass.
+
+_P53 = 2**53
+_P63 = 2**63
+
+#: (case id, input column, expected GROUP BY (key, count) rows in first-
+#: seen order, expected DISTINCT rows, expected (count, sum, avg) DISTINCT)
+_GROUP_KEY_CASES = [
+    ("int_then_real", [1, 1.0], [(1, 2)], [1], (1, 1, 1.0)),
+    ("real_then_int", [1.0, 1], [(1.0, 2)], [1.0], (1, 1.0, 1.0)),
+    ("three_zeros", [-0.0, 0, 0.0], [(-0.0, 3)], [-0.0], (1, 0.0, 0.0)),
+    (
+        "two_pow_53_plus_one",
+        [_P53 + 1, float(_P53)],
+        [(_P53 + 1, 1), (float(_P53), 1)],
+        [_P53 + 1, float(_P53)],
+        (2, 1.8014398509481984e16, 9007199254740992.0),
+    ),
+    (
+        "int64_max_vs_its_float",
+        [_P63 - 1, float(_P63 - 1)],
+        [(_P63 - 1, 1), (float(_P63), 1)],
+        [_P63 - 1, float(_P63)],
+        (2, 1.8446744073709552e19, 9.223372036854776e18),
+    ),
+    ("int_vs_text", [1, "1"], [(1, 1), ("1", 1)], [1, "1"], (2, 2, 1.0)),
+    ("nulls_and_zero", [None, None, 0], [(None, 2), (0, 1)], [None, 0], (1, 0, 0.0)),
+]
+
+
+def _same_values(actual, expected) -> bool:
+    """Equal *and* the same storage class and zero sign, element-wise."""
+    if len(actual) != len(expected):
+        return False
+    for got, want in zip(actual, expected):
+        if type(got) is not type(want) or got != want:
+            return False
+        if isinstance(got, float) and math.copysign(1.0, got) != math.copysign(1.0, want):
+            return False
+    return True
+
+
+def _column_rows(column) -> list[Row]:
+    return [("a.py", value, "e") for value in column]
+
+
+@pytest.mark.parametrize(
+    "column, expected", [(c[1], c[2]) for c in _GROUP_KEY_CASES], ids=[c[0] for c in _GROUP_KEY_CASES]
+)
+def test_group_by_keys_on_sql_equality(column, expected):
+    result = Aggregate(_agg_child(_column_rows(column)), [_call("count")], group_by=[_col("line_no")])
+    rows = tuple(result.rows())
+    assert [row[1] for row in rows] == [count for _key, count in expected]
+    assert _same_values([row[0] for row in rows], [key for key, _count in expected])
+
+
+@pytest.mark.parametrize(
+    "column, expected", [(c[1], c[3]) for c in _GROUP_KEY_CASES], ids=[c[0] for c in _GROUP_KEY_CASES]
+)
+def test_distinct_keys_on_sql_equality(column, expected):
+    rows = tuple(Distinct(_child(_column_rows(column))).rows())
+    assert _same_values([row[1] for row in rows], expected)
+    assert all(row[0] == "a.py" and row[2] == "e" for row in rows)
+
+
+@pytest.mark.parametrize(
+    "column, expected", [(c[1], c[4]) for c in _GROUP_KEY_CASES], ids=[c[0] for c in _GROUP_KEY_CASES]
+)
+def test_count_sum_avg_distinct_key_on_sql_equality(column, expected):
+    calls = [
+        _call("count", _col("line_no"), distinct=True),
+        _call("sum", _col("line_no"), distinct=True),
+        _call("avg", _col("line_no"), distinct=True),
+    ]
+    (row,) = tuple(Aggregate(_agg_child(_column_rows(column)), calls).rows())
+    assert _same_values(row, expected)

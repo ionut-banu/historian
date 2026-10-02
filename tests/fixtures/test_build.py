@@ -15,6 +15,7 @@ tests exercise it through build_tiny/build_awkward.
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -619,3 +620,82 @@ def test_verify_casefold_raises_when_a_path_is_missing(tmp_path):
 
 def test_casefold_repo_session_fixture_resolves_to_the_pinned_build(casefold_repo):
     assert build._run_git(casefold_repo, ["rev-parse", "HEAD"]).strip() == build.CASEFOLD_HEAD
+
+
+# ---------------------------------------------------------------------------
+# large (#27)
+#
+# The builder is tested at a small size so these stay fast; only the
+# last test builds the real fixture, and only under --build-large.
+# ---------------------------------------------------------------------------
+
+_SMALL_LARGE = {"commits": 12, "paths": 40, "auth_paths": 5}
+
+
+def _head_tree_hash(repo: Path) -> str:
+    return build._run_git(repo, ["rev-parse", "HEAD"]).strip()
+
+
+def test_large_builds_the_requested_shape(tmp_path):
+    repo = build.build_large(tmp_path / "r", **_SMALL_LARGE)
+    assert build._run_git(repo, ["rev-list", "--count", "HEAD"]).strip() == "12"
+    paths = [p for p in build._run_git(repo, ["ls-tree", "-r", "--name-only", "-z", "HEAD"]).split("\0") if p]
+    assert len(paths) == 40
+    assert len([p for p in paths if p.startswith("src/auth/")]) == 5
+
+
+def test_large_is_deterministic_for_a_seed(tmp_path):
+    a = build.build_large(tmp_path / "a", seed=7, **_SMALL_LARGE)
+    b = build.build_large(tmp_path / "b", seed=7, **_SMALL_LARGE)
+    assert _head_tree_hash(a) == _head_tree_hash(b)
+
+
+def test_large_differs_between_seeds(tmp_path):
+    a = build.build_large(tmp_path / "a", seed=1, **_SMALL_LARGE)
+    b = build.build_large(tmp_path / "b", seed=2, **_SMALL_LARGE)
+    assert _head_tree_hash(a) != _head_tree_hash(b)
+
+
+def test_large_is_deterministic_under_hostile_ambient_config(monkeypatch, tmp_path):
+    clean = build.build_large(tmp_path / "clean", **_SMALL_LARGE)
+    hostile = tmp_path / "hostile.gitconfig"
+    hostile.write_text("[core]\n\tautocrlf = true\n[commit]\n\tgpgsign = true\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(hostile))
+    again = build.build_large(tmp_path / "again", **_SMALL_LARGE)
+    assert _head_tree_hash(clean) == _head_tree_hash(again)
+
+
+def test_large_blame_works_on_a_generated_path(tmp_path):
+    repo = build.build_large(tmp_path / "r", **_SMALL_LARGE)
+    out = build._run_git(repo, ["blame", "--line-porcelain", "src/auth/module_00.py"])
+    assert build._hex40_commit_hashes(out)
+
+
+def test_verify_large_raises_when_the_commit_count_is_wrong(tmp_path):
+    repo = build.build_large(tmp_path / "r", **_SMALL_LARGE)
+    with pytest.raises(build.FixtureError, match="commits"):
+        build._verify_large(repo, commits=13, paths=40, auth_paths=5)
+
+
+def test_verify_large_raises_when_the_auth_prefix_count_is_wrong(tmp_path):
+    repo = build.build_large(tmp_path / "r", **_SMALL_LARGE)
+    with pytest.raises(build.FixtureError, match="src/auth/"):
+        build._verify_large(repo, commits=12, paths=40, auth_paths=6)
+
+
+def test_running_build_as_a_script_rejects_an_unknown_fixture_name():
+    result = subprocess.run(
+        [sys.executable, build.__file__, "bogus"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "unknown fixture" in result.stderr
+
+
+def test_the_full_large_fixture_has_the_documented_shape(large_repo):
+    count = int(build._run_git(large_repo, ["rev-list", "--count", "HEAD"]).strip())
+    assert count == build.LARGE_COMMITS
+    paths = [p for p in build._run_git(large_repo, ["ls-tree", "-r", "--name-only", "-z", "HEAD"]).split("\0") if p]
+    assert len(paths) == build.LARGE_PATHS == 4013
+    assert len([p for p in paths if p.startswith("src/auth/")]) == build.LARGE_AUTH_PATHS == 12

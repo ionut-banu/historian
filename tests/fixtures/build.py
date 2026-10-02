@@ -6,9 +6,10 @@ for what was found beyond the spec's original six GIT_* environment
 variables and why the fix is "inherit nothing" rather than "override
 the settings we know about."
 
-Only `tiny` and `awkward` are built here. `large` is tracked as its own
-issue (#27) and is deliberately not implemented in this module - see
-that issue for the isolation recipe restated for whoever picks it up.
+`tiny`, `awkward` and `casefold` are correctness fixtures, built and
+cached on demand. `large` (#27) is a benchmark fixture: it is never
+built by `uv run pytest`, only on request - see the `large` section
+below.
 
 This module uses `subprocess` and touches git directly. Per AGENTS.md,
 that rule applies to src/historian/ (the parser, planner and executor);
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import random
 import shutil
 import subprocess
 from pathlib import Path
@@ -660,6 +662,146 @@ def _verify_casefold(repo: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# large
+#
+# "generated, hundreds of commits. Benchmarks only, never correctness" -
+# spec.md §4. It exists so M4's pushdown demo has a repository with
+# thousands of paths to skip: `path LIKE 'src/auth/%'` matches 12 of
+# 4,013 paths here.
+#
+# Differences from the three fixtures above, each deliberate (#27):
+#
+# - It is never built by `uv run pytest`. Hundreds of commits on every
+#   suite run is a recurring cost for a fixture that gates no
+#   correctness test. Build it with `uv run python -m tests.fixtures.build
+#   large`, or run the suite with `--build-large` (tests/conftest.py).
+# - It is generated from a seeded PRNG, so a given seed always gives the
+#   same repository, and cached once built like the others.
+# - Its HEAD is not pinned. It will be retuned as benchmarking needs
+#   change, and nothing asserts on its contents beyond the shape
+#   `_verify_large` checks. Do not write a correctness test against it.
+#
+# The history is streamed through `git fast-import`: 300 commits over
+# 4,013 files would otherwise mean thousands of `git add` and `git
+# commit` invocations. fast-import takes the same explicit author,
+# committer and timestamps `_commit` does, under the same isolated
+# environment, so the result does not depend on ambient configuration.
+# ---------------------------------------------------------------------------
+
+LARGE_SEED = 2024
+LARGE_COMMITS = 300
+LARGE_PATHS = 4013
+#: Paths under `src/auth/`, the prefix the pushdown demo queries.
+LARGE_AUTH_PATHS = 12
+
+_LARGE_AUTHORS = (
+    ("Ana Petrova", "ana@example.com"),
+    ("Bo Lindqvist", "bo@example.com"),
+    ("Cy Okafor", "cy@example.com"),
+    ("Dee Haddad", "dee@example.com"),
+    ("Eli Tanaka", "eli@example.com"),
+    ("Fay Novak", "fay@example.com"),
+    ("Gus Moreau", "gus@example.com"),
+    ("Hana Weiss", "hana@example.com"),
+)
+
+
+def _large_paths(count: int, auth_paths: int) -> list[str]:
+    """`count` distinct paths, the first `auth_paths` under `src/auth/`
+    and the rest spread over a few directories, in a fixed order."""
+    paths = [f"src/auth/module_{i:02d}.py" for i in range(auth_paths)]
+    for i in range(count - auth_paths):
+        top = ("src", "docs", "tests", "tools")[i % 4]
+        paths.append(f"{top}/pkg_{(i // 4) % 50:02d}/file_{i:05d}.py")
+    return paths
+
+
+def _fast_import_data(content: bytes) -> bytes:
+    return b"data %d\n" % len(content) + content + b"\n"
+
+
+def build_large(
+    dest: Path,
+    *,
+    seed: int = LARGE_SEED,
+    commits: int = LARGE_COMMITS,
+    paths: int = LARGE_PATHS,
+    auth_paths: int = LARGE_AUTH_PATHS,
+) -> Path:
+    """Build the `large` fixture at dest, verify it, and return dest.
+
+    The first commit adds every path; each later commit edits one to
+    five existing paths, chosen and authored by a PRNG seeded with
+    `seed`. The parameters exist so the builder's own tests can build a
+    small one quickly; the defaults are the fixture.
+    """
+    if auth_paths > paths:
+        raise FixtureError(f"large: auth_paths ({auth_paths}) exceeds paths ({paths})")
+    if dest.exists():
+        shutil.rmtree(dest)
+    _init_repo(dest, branch="main")
+    rng = random.Random(seed)
+    clock = _Clock()
+
+    all_paths = _large_paths(paths, auth_paths)
+    lines: dict[str, list[str]] = {p: [f"# {p}", "def f():", "    return 0"] for p in all_paths}
+
+    stream = bytearray()
+    for n in range(commits):
+        name, email = _LARGE_AUTHORS[rng.randrange(len(_LARGE_AUTHORS))] if n else _LARGE_AUTHORS[0]
+        when = clock.tick()
+        message = f"Commit {n}".encode()
+        stream += b"commit refs/heads/main\n"
+        stream += f"author {name} <{email}> {when}\n".encode()
+        stream += f"committer {name} <{email}> {when}\n".encode()
+        stream += _fast_import_data(message)
+        if n == 0:
+            touched = all_paths
+        else:
+            touched = sorted({all_paths[rng.randrange(len(all_paths))] for _ in range(1 + rng.randrange(5))})
+            for path in touched:
+                lines[path].append(f"    # edit in commit {n}")
+        for path in touched:
+            stream += f"M 100644 inline {path}\n".encode()
+            stream += _fast_import_data(("\n".join(lines[path]) + "\n").encode())
+        stream += b"\n"
+
+    result = subprocess.run(
+        ["git", "fast-import", "--quiet"],
+        cwd=dest,
+        env=_isolated_env({}),
+        input=bytes(stream),
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git fast-import (in {dest}) failed:\n{result.stderr.decode(errors='replace')}")
+    _run_git(dest, ["reset", "--quiet", "--hard", "HEAD"])
+
+    _verify_large(dest, commits=commits, paths=paths, auth_paths=auth_paths)
+    return dest
+
+
+def _verify_large(repo: Path, *, commits: int, paths: int, auth_paths: int) -> None:
+    """Assert that repo has the shape build_large was asked for, through
+    git itself. Content is deliberately not checked: see the note above."""
+    count = int(_run_git(repo, ["rev-list", "--count", "HEAD"]).strip())
+    if count != commits:
+        raise FixtureError(f"large: expected exactly {commits} commits, found {count}")
+
+    head_paths = [p for p in _run_git(repo, ["ls-tree", "-r", "--name-only", "-z", "HEAD"]).split("\0") if p]
+    if len(head_paths) != paths:
+        raise FixtureError(f"large: expected exactly {paths} paths at HEAD, found {len(head_paths)}")
+    auth = [p for p in head_paths if p.startswith("src/auth/")]
+    if len(auth) != auth_paths:
+        raise FixtureError(f"large: expected {auth_paths} paths under src/auth/, found {len(auth)}")
+
+    if commits > 1:
+        identities = set(_run_git(repo, ["log", "--format=%an <%ae>"]).strip().splitlines())
+        if len(identities) < 2:
+            raise FixtureError(f"large: expected more than one author identity, found {identities}")
+
+
+# ---------------------------------------------------------------------------
 # Caching
 #
 # tiny and awkward are rebuilt exactly once per change to this file,
@@ -710,6 +852,14 @@ def get_awkward_repo(cache_dir: Path = CACHE_DIR) -> Path:
     return _cached(cache_dir, "awkward", build_awkward)
 
 
+def get_large_repo(cache_dir: Path = CACHE_DIR) -> Path:
+    """Return the path to a built `large` repository (issue #27),
+    building (or rebuilding, if build.py has changed since the cached
+    one) it first if necessary. Slow: callers are opt-in, see
+    tests/conftest.py."""
+    return _cached(cache_dir, "large", build_large)
+
+
 def get_casefold_repo(cache_dir: Path = CACHE_DIR) -> Path:
     """Return the path to a built `casefold` repository (issue #122),
     building (or rebuilding, if build.py has changed since the cached
@@ -719,14 +869,22 @@ def get_casefold_repo(cache_dir: Path = CACHE_DIR) -> Path:
 
 if __name__ == "__main__":
     # Manual invocation for debugging: `uv run python -m tests.fixtures.build`
-    # (or `python tests/fixtures/build.py` from the repo root) builds
-    # both fixtures into the cache directory and prints where they
-    # landed, so they can be inspected or cd-ed into by hand.
-    for repo_name, getter in (
-        ("tiny", get_tiny_repo),
-        ("awkward", get_awkward_repo),
-        ("casefold", get_casefold_repo),
-    ):
-        path = getter()
+    # builds the correctness fixtures into the cache directory and prints
+    # where they landed. `large` is slow and never built by default; name
+    # it to build it: `uv run python -m tests.fixtures.build large`.
+    import sys
+
+    getters = {
+        "tiny": get_tiny_repo,
+        "awkward": get_awkward_repo,
+        "casefold": get_casefold_repo,
+        "large": get_large_repo,
+    }
+    wanted = sys.argv[1:] or ["tiny", "awkward", "casefold"]
+    unknown = [name for name in wanted if name not in getters]
+    if unknown:
+        sys.exit(f"unknown fixture(s): {unknown}; choose from {sorted(getters)}")
+    for repo_name in wanted:
+        path = getters[repo_name]()
         head = _run_git(path, ["rev-parse", "HEAD"]).strip()
         print(f"{repo_name}: {path} (HEAD {head})")

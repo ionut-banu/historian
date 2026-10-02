@@ -12,6 +12,8 @@ Commands
 - `uv run python tests/oracle.py "<setup SQL>" "<query SQL>"` - ask
   the oracle (Python's bundled `sqlite3` module) an ad hoc question;
   setup is optional - see `_docs/process.md`, "The oracle"
+- `uv run python -m tests.fixtures.build large` - build the opt-in
+  `large` benchmark fixture (`uv run pytest --build-large` too)
 - `HISTORIAN_SWEEP_OPERATORS=3 uv run pytest
   tests/differential/test_evaluation_order.py` - the full 3-operator
   evaluation-order sweep (about 3.5 minutes); run it at milestone

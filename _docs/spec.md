@@ -765,7 +765,10 @@ Four fixtures:
   an empty commit message, and a line of content that looks like git
   porcelain output.
 - **large** — generated, hundreds of commits. Benchmarks only, never
-  correctness.
+  correctness. Built from a seeded PRNG, 300 commits over 4,013
+  paths (12 under `src/auth/`), and never built by a plain `uv run
+  pytest`: ask for it with `--build-large` or `uv run python -m
+  tests.fixtures.build large`. Its `HEAD` is not pinned.
 - **casefold** — one commit of paths differing only by letter case:
   ASCII (`src/`, `SRC/`, `Src/`) and non-ASCII (`straße/`, `STRAßE/`,
   `STRASSE/`), plus a path spelled `5`. Exists for `blame`'s `LIKE`

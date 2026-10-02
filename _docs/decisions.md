@@ -3134,3 +3134,26 @@ omitted it; the printer shows every operator and the example was
 edited to match. A call written twice (`count(*)` in the select list
 and in `ORDER BY`) occupies two `Aggregate` slots but is listed once on
 the `Aggregate` line, because the line says what is computed.
+
+2026-10-02 - A fifth fixture, `numeric`, so a bare `line_no` can tell
+numeric order from text order
+
+Issue #109. `tiny`'s largest `line_no` is 2 and `awkward`'s is 6, so
+every comparison, sort or `max` of a bare `line_no` gave the same
+answer done as a number or as text, and #99 was reachable only
+because `sum(line_no)` reaches two digits. The cheaper-looking fix, a
+12-line file added to `awkward`, was measured in a scratch copy before
+deciding: 18 existing tests fail (12 differential cases hard-coded to
+`awkward`'s 12 rows, `test_awkward_yields_exactly_twelve_rows`, one
+`--explain` test in `tests/test_cli.py`, and four fixture pins). Each
+would be a rewrite of an assertion that was correct, which is where a
+differential case quietly stops meaning what it meant. So, following
+the `casefold` precedent, `tests/fixtures/build.py` gained a separate
+fixture: Ana commits `long.txt` (120 lines), `mid.txt` (12) and
+`short.txt` (3), and Bo rewrites `long.txt` lines 10-99, giving 135
+blame rows. It is pinned by `NUMERIC_HEAD`, and `_verify_numeric`
+asks Python's `sqlite3`, not historian, that `max(line_no)` is 120
+while `max(CAST(line_no AS TEXT))` is `'99'` and that `line_no > 9`
+holds for 114 rows against 10 as text, so an edit that restores
+agreement fails the build. Cost accepted: one more fixture to build,
+pin and cache. Spec §4's fixture list is updated alongside.

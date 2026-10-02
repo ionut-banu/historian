@@ -168,8 +168,8 @@ class ScanSource(Protocol):
     - `capabilities()`: the pushdown kinds this scan can use at all.
       Empty means "never offer me anything" - the optimizer then calls
       neither `accepts()` nor anything else, so a source with no
-      capabilities (`blame` before #122, every test fake that predates
-      #121) need not implement `accepts()` meaningfully.
+      capabilities (a test fake that implements no pushdown) need not
+      implement `accepts()` meaningfully.
     - `accepts(term)`: the per-term negotiation (issue #121). `True`
       means the scan will use *term* to do less work when it is later
       passed in `pushed`. It must be a pure answer about *term*'s

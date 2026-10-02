@@ -611,6 +611,54 @@ def test_plan_having_with_only_a_select_list_aggregate_and_no_group_by():
     assert list(tree.rows()) == [(2,)]
 
 
+def test_plan_hand_built_having_without_any_aggregate_filters_the_scan_rows():
+    """`plan()`'s `elif having is not None` shape (issue #112): a
+    hand-built statement with `HAVING` and no `GROUP BY` or aggregate
+    anywhere - unreachable through `bind()` - is not an aggregate query,
+    so `HAVING` is a plain `Filter` over the scan rows, with no
+    `Aggregate`."""
+    source = _FakeSource([("a.py", 1, "ana@x.com"), ("b.py", 2, "bo@x.com")])
+    having = _bin(Op.EQ, _col("path"), _lit("b.py"))
+    stmt = _stmt([_select_item(_col("line_no"))], where=None, having=having)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Project)
+    assert isinstance(tree._child, Filter)
+    assert isinstance(tree._child._child, Scan)
+    assert list(tree.rows()) == [(2,)]
+
+
+def test_plan_hand_built_aggregate_only_in_having_builds_aggregate():
+    """The planner's aggregate-query decision looks at `HAVING` and
+    `ORDER BY` as well as the select list (issue #112): an aggregate
+    call written only in `HAVING` of a hand-built statement still gets
+    `Aggregate`, below `HAVING`'s `Filter`."""
+    source = _FakeSource([("a.py", 1, "ana@x.com"), ("b.py", 2, "bo@x.com")])
+    having = _bin(Op.GT, _count_star(), _lit(1))
+    stmt = _stmt([_select_item(_lit(7))], where=None, having=having)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Project)
+    assert isinstance(tree._child, Filter)
+    assert isinstance(tree._child._child, Aggregate)
+    assert list(tree.rows()) == [(7,)]
+
+
+def test_plan_hand_built_aggregate_only_in_order_by_builds_aggregate():
+    source = _FakeSource([("a.py", 1, "ana@x.com"), ("b.py", 2, "bo@x.com")])
+    order_by = [BoundOrderByItem(expr=_count_star(), direction=OrderDirection.ASC, position=_POS)]
+    stmt = _stmt([_select_item(_lit(7))], where=None, order_by=order_by)
+
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(source))
+
+    assert isinstance(tree, Project)
+    assert isinstance(tree._child, Sort)
+    assert isinstance(tree._child._child, Aggregate)
+    assert list(tree.rows()) == [(7,)]
+
+
 def test_plan_group_by_query_produces_correct_grouped_rows_end_to_end():
     """`SELECT path, count(*) FROM widgets GROUP BY path` against
     three fake rows, two sharing a path: the whole tree, assembled

@@ -3494,6 +3494,148 @@ def test_where_real_column_wins_over_alias_of_a_different_column(tiny_repo):
     )
 
 
+# --- Alias naming an aggregate, with a real column of the same name (#165) -
+#
+# `count(*) AS path` names an aggregate and `path` is a real `blame`
+# column. Measured on the oracle (3.45.1): WHERE, GROUP BY and HAVING
+# resolve `path` to the column; ORDER BY resolves it to the alias.
+# `tiny_repo`'s `blame` has `feature/thing.py` (1 row) and
+# `src/utils.py` (2 rows). Each test pins SQLite's own answer as well as
+# comparing historian to it, so two engines both returning nothing
+# cannot pass where rows are expected.
+
+
+def _assert_differential_expecting(repo, query: str, expected, *, ordered: bool = False) -> None:
+    conn = load_unfiltered(BlameScan, repo, BLAME_SCHEMA, "blame")
+    try:
+        sqlite_rows = conn.execute(query).fetchall()
+    finally:
+        conn.close()
+    if ordered:
+        assert sqlite_rows == expected
+    else:
+        assert sorted(sqlite_rows) == sorted(expected)
+    _, historian_rows = run_historian(query, repo)
+    if ordered:
+        assert_rows_match(sqlite_rows, historian_rows, ordered=True, key_positions=(0,))
+    else:
+        assert_rows_match(sqlite_rows, historian_rows)
+
+
+def test_where_real_column_wins_over_alias_of_count_star_matching(tiny_repo):
+    """#165, oracle: `SELECT count(*) AS path FROM blame WHERE path =
+    'feature/thing.py'` returns `[(1,)]` - the count of the one
+    matching row, the column having won."""
+    _assert_differential_expecting(
+        tiny_repo,
+        "SELECT count(*) AS path FROM blame WHERE path = 'feature/thing.py'",
+        [(1,)],
+    )
+
+
+def test_where_real_column_wins_over_alias_of_count_star_matching_nothing(tiny_repo):
+    """#165, oracle: `SELECT count(*) AS path FROM blame WHERE path =
+    'nosuch'` returns `[(0,)]` - one row holding 0, not zero rows."""
+    _assert_differential_expecting(
+        tiny_repo, "SELECT count(*) AS path FROM blame WHERE path = 'nosuch'", [(0,)]
+    )
+
+
+def test_where_real_column_wins_over_alias_of_sum(tiny_repo):
+    """#165, oracle: `SELECT sum(line_no) AS path FROM blame WHERE path
+    = 'src/utils.py'` returns `[(3,)]` (line_no 1 + 2)."""
+    _assert_differential_expecting(
+        tiny_repo,
+        "SELECT sum(line_no) AS path FROM blame WHERE path = 'src/utils.py'",
+        [(3,)],
+    )
+
+
+def test_where_real_column_wins_over_alias_spelled_in_another_case(tiny_repo):
+    """#165, oracle: `SELECT count(*) AS PATH FROM blame WHERE path =
+    'src/utils.py'` returns `[(2,)]`."""
+    _assert_differential_expecting(
+        tiny_repo, "SELECT count(*) AS PATH FROM blame WHERE path = 'src/utils.py'", [(2,)]
+    )
+
+
+def test_group_by_real_column_wins_over_alias_of_count_star(tiny_repo):
+    """#165, oracle: `SELECT count(*) AS path FROM blame GROUP BY path`
+    returns the two group counts `1` and `2` - one row per path, no
+    `aggregate functions are not allowed in the GROUP BY clause`."""
+    _assert_differential_expecting(
+        tiny_repo, "SELECT count(*) AS path FROM blame GROUP BY path", [(1,), (2,)]
+    )
+
+
+def test_group_by_qualified_real_column_with_alias_of_count_star(tiny_repo):
+    """#165, oracle: `SELECT count(*) AS path FROM blame GROUP BY
+    blame.path` returns `1` and `2`, as the unqualified form does - a
+    qualified name never reaches the alias."""
+    _assert_differential_expecting(
+        tiny_repo, "SELECT count(*) AS path FROM blame GROUP BY blame.path", [(1,), (2,)]
+    )
+
+
+def test_having_real_column_wins_over_alias_of_count_star_matching(tiny_repo):
+    """#165, oracle: `SELECT count(*) AS path FROM blame GROUP BY path
+    HAVING path = 'feature/thing.py'` returns `[(1,)]` - the one group
+    whose path matches."""
+    _assert_differential_expecting(
+        tiny_repo,
+        "SELECT count(*) AS path FROM blame GROUP BY path HAVING path = 'feature/thing.py'",
+        [(1,)],
+    )
+
+
+def test_having_real_column_wins_over_alias_of_count_star_matching_nothing(tiny_repo):
+    """#165, oracle: the same with `HAVING path = 'nosuch'` returns no
+    rows at all (a grouped query, so zero groups is zero rows)."""
+    _assert_differential_expecting(
+        tiny_repo,
+        "SELECT count(*) AS path FROM blame GROUP BY path HAVING path = 'nosuch'",
+        [],
+    )
+
+
+def test_order_by_alias_of_aggregate_wins_over_real_column(tiny_repo):
+    """#165, oracle: `SELECT -count(*) AS path FROM blame GROUP BY path
+    ORDER BY path` returns `[(-2,), (-1,)]` - sorted by the aggregate,
+    where sorting by the path text would give `[(-1,), (-2,)]`. `-count(*)`
+    because plain `count(*)`'s order (1, 2) equals the path order here."""
+    _assert_differential_expecting(
+        tiny_repo,
+        "SELECT -count(*) AS path FROM blame GROUP BY path ORDER BY path",
+        [(-2,), (-1,)],
+        ordered=True,
+    )
+
+
+def test_order_by_alias_of_aggregate_wins_over_real_column_descending(tiny_repo):
+    """#165, oracle: the same with `ORDER BY path DESC` returns
+    `[(-1,), (-2,)]`."""
+    _assert_differential_expecting(
+        tiny_repo,
+        "SELECT -count(*) AS path FROM blame GROUP BY path ORDER BY path DESC",
+        [(-1,), (-2,)],
+        ordered=True,
+    )
+
+
+def test_alias_of_count_star_named_path_in_where_group_by_having_and_order_by(tiny_repo):
+    """#165, oracle: `SELECT count(*) AS path FROM blame WHERE path =
+    'src/utils.py' GROUP BY path HAVING path = 'src/utils.py' ORDER BY
+    path` returns `[(2,)]` - the column in WHERE, GROUP BY and HAVING,
+    the alias in ORDER BY, all in one query."""
+    _assert_differential_expecting(
+        tiny_repo,
+        "SELECT count(*) AS path FROM blame WHERE path = 'src/utils.py' "
+        "GROUP BY path HAVING path = 'src/utils.py' ORDER BY path",
+        [(2,)],
+        ordered=True,
+    )
+
+
 def test_where_unmatched_name_raises_bind_error(tiny_repo):
     """The regression guard for the "safe direction" #9 pinned: a name
     matching neither a real column nor any select-list alias still

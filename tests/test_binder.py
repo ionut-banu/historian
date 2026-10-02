@@ -677,6 +677,95 @@ def test_where_real_column_wins_over_alias_of_a_different_column():
     assert ref.offset == BLAME_SCHEMA.index_of("path")
 
 
+# --- Alias naming an aggregate, with a real column of the same name (#165) -
+#
+# `count(*) AS path` names an aggregate and `path` is a real `blame`
+# column. Each clause resolves `path` as SQLite does: WHERE, GROUP BY
+# and HAVING take the real column (so the alias's aggregate is never
+# reached, and never rejected); ORDER BY takes the alias; LIMIT and
+# OFFSET see neither. The no-real-column contrast is already pinned by
+# `test_aggregate_alias_used_as_where_operand_raises_bind_error` and
+# `test_group_by_aggregate_via_alias_raises_bind_error`.
+
+
+def _assert_where_operand_is_path_column(sql: str) -> None:
+    bound = _bind(sql)
+    ref = bound.where.left
+    assert isinstance(ref, BoundColumnRef)
+    assert ref.offset == BLAME_SCHEMA.index_of("path")
+
+
+def test_where_real_column_wins_over_alias_of_count_star():
+    """#165, oracle (3.45.1): `select count(*) as path from blame
+    where path = 'feature/thing.py'` returns `1` - one row, the count
+    of rows matching the real column; with `'nosuch'` it returns `0`.
+    No `misuse of aggregate` error, because `path` is the column. The
+    WHERE operand binds to `path`'s own offset."""
+    _assert_where_operand_is_path_column("SELECT count(*) AS path FROM blame WHERE path = 'x'")
+
+
+def test_where_real_column_wins_over_alias_of_sum():
+    """#165, oracle (3.45.1): `select sum(line_no) as path from blame
+    where path = 'src/utils.py'` returns `3` (1 + 2), filtering on the
+    real column. Same resolution as the `count(*)` form."""
+    _assert_where_operand_is_path_column("SELECT sum(line_no) AS path FROM blame WHERE path = 'x'")
+
+
+def test_where_real_column_wins_over_alias_of_different_case():
+    """#165, oracle (3.45.1): `select count(*) as PATH from blame
+    where path = 'src/utils.py'` returns `2` - the alias spelled in a
+    different case still names the real column's row set, not the
+    aggregate. The WHERE operand binds to `path`'s own offset."""
+    _assert_where_operand_is_path_column("SELECT count(*) AS PATH FROM blame WHERE path = 'x'")
+
+
+def test_group_by_real_column_wins_over_alias_of_count_star():
+    """#165, oracle (3.45.1): `select count(*) as path from blame
+    group by path` returns `1` and `2` - one row per path, grouped by
+    the column. Not `aggregate functions are not allowed in the GROUP
+    BY clause`. The one group key is the `path` column ref."""
+    bound = _bind("SELECT count(*) AS path FROM blame GROUP BY path")
+    assert len(bound.group_by) == 1
+    key = bound.group_by[0]
+    assert isinstance(key, BoundColumnRef)
+    assert key.offset == BLAME_SCHEMA.index_of("path")
+
+
+def test_having_real_column_wins_over_alias_of_count_star():
+    """#165, oracle (3.45.1): `select count(*) as path from blame
+    group by path having path = 'feature/thing.py'` returns `1` (one
+    group); with `'nosuch'` it returns no rows. HAVING filters on the
+    column, so its operand is the `path` column ref, not the
+    aggregate."""
+    bound = _bind("SELECT count(*) AS path FROM blame GROUP BY path HAVING path = 'x'")
+    ref = bound.having.left
+    assert isinstance(ref, BoundColumnRef)
+    assert ref.offset == BLAME_SCHEMA.index_of("path")
+
+
+def test_order_by_alias_of_aggregate_wins_over_real_column():
+    """#165, oracle (3.45.1): `select -count(*) as path from blame
+    group by path order by path` returns `-2`, `-1` (sorted by the
+    aggregate; sorting by the path text would give `-1`, `-2`), and
+    `desc` reverses it. ORDER BY is the one clause where the alias
+    wins, with no error. The ORDER BY key is the select item's
+    aggregate expression, not a column ref."""
+    bound = _bind("SELECT -count(*) AS path FROM blame GROUP BY path ORDER BY path")
+    key = bound.order_by[0].expr
+    assert not isinstance(key, BoundColumnRef)
+    assert key == bound.select_list[0].expr
+
+
+def test_limit_and_offset_see_neither_column_nor_alias():
+    """#165, oracle (3.45.1): `select count(*) as path from blame limit
+    path` and `... limit 1 offset path` both fail with `no such column:
+    path` - neither the real column nor the alias is visible there."""
+    with pytest.raises(BindError, match=r"no such column: path"):
+        _bind("SELECT count(*) AS path FROM blame LIMIT path")
+    with pytest.raises(BindError, match=r"no such column: path"):
+        _bind("SELECT count(*) AS path FROM blame LIMIT 1 OFFSET path")
+
+
 def test_where_duplicate_alias_resolves_to_first_occurrence():
     """#32 finding 4: `select b as x, c as x from t where x > 50`
     resolves `x` to the first item, `b` - confirmed against `sqlite3`

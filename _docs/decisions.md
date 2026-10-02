@@ -3172,3 +3172,35 @@ unselected-aggregate `BindError`. The planner copy is defensive, kept
 mirrored for #112 to consolidate: `_split_expr` gives every call its
 own slot and `GROUP BY` keys cannot be aggregates, so no query reaches
 it with two aggregate calls.
+
+2026-10-02 - One shared module for the expression walks
+
+Issue #112. The children table existed three times (`sql/binder.py`,
+`plan/planner.py`, `sql/parser.py`), rebuild twice and shape equality
+twice, and "is this an aggregate query" was decided in three places.
+Adding a field to an expression node took an edit in each copy, and
+nothing failed when one was missed: #101 (`LIKE ... ESCAPE`) and #131
+(`count(DISTINCT x)`) were both a copy left behind. The copies are
+merged into `src/historian/sql/walk.py` - `children`,
+`with_children`, `expr_shape_equal`, `contains_aggregate` and
+`is_aggregate_query` - written as plain `isinstance` chains, and
+`tests/test_walk.py` builds every node type by reflection and fails
+when a field is not handled. This supersedes the 2026-09-28 advice to
+edit each module's `_operands`/`_with_operands` when a node is added.
+
+The module sits in `sql/` because it depends only on the AST and is
+needed by the parser, which must not import the binder or anything
+above it. `BoundColumnRef` moved into it, since the walks must know
+it and cannot import the binder; `sql/binder.py` re-exports it, so
+existing imports name the same class.
+
+The predicate takes the `GROUP BY` keys and the expressions to look
+at. The binder passes the select list alone, SQLite's rule; the
+planner passes the select list, `HAVING` and `ORDER BY`, which gives
+the same answer for every bound statement.
+
+Two unreachable edges were settled by the reflection tests rather
+than left implicit: shape equality now handles `ColumnRef` (by table
+and name; only bound trees are compared in practice) and compares
+`BoundColumnRef.name` as well as its offset. Within one bound
+statement the offset determines the name, so no query changes.

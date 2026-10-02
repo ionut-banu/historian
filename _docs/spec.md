@@ -357,6 +357,8 @@ src/historian/
   sql/ast.py       AST node definitions
   sql/parser.py    tokens -> AST
   sql/binder.py    name resolution, unknown column/table errors
+  sql/walk.py      shared expression walks: children, rebuild, shape
+                   equality, aggregate detection; BoundColumnRef
   plan/nodes.py    operator tree definitions
   plan/planner.py  AST -> operator tree
   plan/optimizer.py  pushdown negotiation

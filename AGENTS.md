@@ -31,6 +31,12 @@ Layout
   Unicode-aware rules. Imports nothing beyond the stdlib, so every
   layer - lexer, binder, expression evaluator - can import it without
   creating a cycle or pulling in git/subprocess.
+- `src/historian/sql/walk.py` - the shared expression-tree walks: a
+  node's children, rebuilding a node around new children, shape
+  equality, `contains_aggregate`, the aggregate-query predicate, and
+  `BoundColumnRef`. Adding a field to an expression node is one edit
+  here, and `tests/test_walk.py` fails until it is made. Imports only
+  the stdlib, `historian.ascii`, `sql/ast.py` and `sql/lexer.py`.
 - `tests/` - pytest tests, one file per module under test
 - `tests/extraction/` - tests checking the git-backed tables against
   `git` itself, e.g. `test_blame.py`

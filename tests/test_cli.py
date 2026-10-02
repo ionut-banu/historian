@@ -322,7 +322,7 @@ def test_no_query_argument_exits_2(capsys):
 
 @pytest.mark.parametrize(
     "flag",
-    ["--no-pushdown", "--format", "-f", "--file"],
+    ["--format", "-f", "--file"],
 )
 def test_deferred_flags_are_unrecognized_and_exit_2(flag, capsys):
     """None of §5's other flags are implemented yet - passing any of
@@ -1055,3 +1055,261 @@ def test_large_demo_stats_show_pushdown_work_avoided(large_repo, capsys):
     ret, _out, err = _stats(large_repo, "SELECT path FROM blame WHERE author_name = 'nobody'", capsys)
     assert ret == 0
     assert re.match(r"\d+ paths? blamed, 0 skipped", err.splitlines()[0])
+
+
+# --- --no-pushdown (#43) ---------------------------------------------------
+
+TINY_ALL = ["feature/thing.py", "src/utils.py"]
+
+
+def _run(repo, query, capsys, *flags):
+    """One in-process run; returns (exit code, stdout, stderr, the
+    scans `main` built)."""
+    built_scans: list[BlameScan] = []
+
+    def factory(r):
+        scan = BlameScan(r)
+        built_scans.append(scan)
+        return scan
+
+    original = cli.SCAN_FACTORIES["blame"]
+    cli.SCAN_FACTORIES["blame"] = factory
+    try:
+        ret = cli.main(["-C", str(repo), *flags, query])
+    finally:
+        cli.SCAN_FACTORIES["blame"] = original
+    captured = capsys.readouterr()
+    return ret, captured.out, captured.err, built_scans
+
+
+def _lines_multiset(out):
+    return sorted(out.splitlines())
+
+
+def _both(repo, query, capsys, *, ordered=False):
+    """Run with and without the flag; assert exit codes, stderr and the
+    rows agree (sorted multiset unless *ordered*, which needs a total
+    ORDER BY and compares exactly). Returns both scans' records."""
+    on = _run(repo, query, capsys)
+    off = _run(repo, query, capsys, "--no-pushdown")
+    assert on[0] == off[0]
+    assert on[2] == off[2]
+    if ordered:
+        assert on[1] == off[1]
+    else:
+        assert _lines_multiset(on[1]) == _lines_multiset(off[1])
+    return on, off
+
+
+def _record(result):
+    scans = result[3]
+    return [(s.blamed_paths, s.git_invocations) for s in scans]
+
+
+def test_no_pushdown_blames_every_path_and_scans_with_nothing_pushed(tiny_repo, capsys, monkeypatch):
+    calls = []
+    original = BlameScan.scan
+
+    def spy(self, pushed=()):
+        calls.append(tuple(pushed))
+        return original(self, pushed=pushed)
+
+    monkeypatch.setattr(BlameScan, "scan", spy)
+    query = "SELECT path FROM blame WHERE path = 'src/utils.py'"
+    ret, _out, _err, scans = _run(tiny_repo, query, capsys, "--no-pushdown")
+    assert ret == 0
+    (scan,) = scans
+    assert scan.blamed_paths == TINY_ALL
+    assert calls == [()]
+
+    calls.clear()
+    _ret, _out, _err, scans = _run(tiny_repo, query, capsys)
+    assert scans[0].blamed_paths == ["src/utils.py"]
+    assert len(calls) == 1 and len(calls[0]) == 1
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        "path = 'src/utils.py'",
+        "path IN ('src/utils.py', 'feature/thing.py')",
+        "path LIKE 'src/%'",
+        "path LIKE 'src/%' AND path = 'src/utils.py'",
+    ],
+)
+def test_no_pushdown_same_rows_on_pushable_shapes(tiny_repo, capsys, where):
+    on, off = _both(tiny_repo, f"SELECT path, line_no, author_name FROM blame WHERE {where}", capsys)
+    assert on[0] == 0
+    assert on[1].count("\n") > 1  # header plus at least one row
+    assert len(_record(on)[0][0]) < len(TINY_ALL) or where.startswith("path IN")
+    assert _record(off)[0][0] == TINY_ALL
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        "path LIKE 'SRC/%'",
+        "path = 'café.py'",
+        "path IN ('café.py', 'café.py', 'untracked.txt')",
+    ],
+)
+def test_no_pushdown_same_rows_on_awkward_repo(awkward_repo, capsys, where):
+    on, off = _both(awkward_repo, f"SELECT path, line_no FROM blame WHERE {where}", capsys)
+    assert on[0] == 0
+    assert len(_record(off)[0][0]) == off[3][0].tracked_path_count
+
+
+@pytest.mark.parametrize("where", ["path LIKE 'SRC/%'", "path LIKE 'src/%'", "path IN ('src/a.py', 'src/a.py', 'nope')"])
+def test_no_pushdown_same_rows_on_casefold_repo(casefold_repo, capsys, where):
+    on, off = _both(casefold_repo, f"SELECT path, line_no FROM blame WHERE {where}", capsys)
+    assert on[0] == 0
+    assert on[1].count("\n") > 1
+    assert len(_record(off)[0][0]) == off[3][0].tracked_path_count
+
+
+def test_no_pushdown_matches_nothing(tiny_repo, capsys):
+    on, off = _both(tiny_repo, "SELECT path FROM blame WHERE path = 'does/not/exist'", capsys)
+    assert on[0] == 0 and on[1] == "path\n"
+    assert _record(on)[0][0] == []
+    assert _record(off)[0][0] == TINY_ALL
+
+    on, off = _both(tiny_repo, "SELECT count(*) FROM blame WHERE path = 'does/not/exist'", capsys)
+    assert on[1].splitlines()[1:] == ["0"]
+    assert off[1].splitlines()[1:] == ["0"]
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        "author_name = 'Ana Petrova'",
+        "line_no > 3",
+        "path = 5",
+        "path = NULL",
+        "path NOT IN ('a')",
+        "path LIKE 'src/%' ESCAPE '\\'",
+        "path LIKE '%x'",
+        "path = 'a' OR path = 'b'",
+        "path = line_no",
+    ],
+)
+def test_no_pushdown_unpushable_predicates_do_identical_work(tiny_repo, capsys, where):
+    on, off = _both(tiny_repo, f"SELECT path, line_no FROM blame WHERE {where}", capsys)
+    assert _record(on) == _record(off)
+    if on[0] == 0:
+        assert _record(on)[0][0] == TINY_ALL
+
+
+def test_no_pushdown_mixed_pushable_and_unpushable(tiny_repo, capsys):
+    on, off = _both(
+        tiny_repo,
+        "SELECT path, line_no FROM blame WHERE path LIKE 'src/%' AND author_name = 'Ana Petrova'",
+        capsys,
+    )
+    assert on[1].count("\n") > 1
+    assert _record(on)[0][0] == ["src/utils.py"]
+    assert _record(off)[0][0] == TINY_ALL
+
+
+@pytest.mark.parametrize(
+    "query,ordered",
+    [
+        ("SELECT path, line_no FROM blame", False),
+        ("SELECT path, count(*) FROM blame GROUP BY path HAVING count(*) > 0", False),
+        ("SELECT path FROM blame LIMIT 0", False),
+        ("SELECT DISTINCT path FROM blame", False),
+        ("SELECT path, count(*) FROM blame GROUP BY path", False),
+        ("SELECT path, line_no FROM blame ORDER BY path, line_no LIMIT 3", True),
+        ("SELECT path, line_no FROM blame ORDER BY path, line_no LIMIT 2 OFFSET 1", True),
+    ],
+)
+def test_no_pushdown_same_rows_on_other_query_shapes(tiny_repo, capsys, query, ordered):
+    on, off = _both(tiny_repo, query, capsys, ordered=ordered)
+    assert on[0] == 0
+
+
+def test_no_pushdown_explain_differs_only_in_the_scan_line(tiny_repo, capsys):
+    query = "SELECT path FROM blame WHERE path = 'src/utils.py'"
+    ret, on_out, on_err, on_scans = _run(tiny_repo, query, capsys, "--explain")
+    ret2, off_out, off_err, off_scans = _run(tiny_repo, query, capsys, "--explain", "--no-pushdown")
+    assert ret == ret2 == 0 and on_err == off_err == ""
+    assert on_out == (
+        "Project (path)\n"
+        "  Filter (path = 'src/utils.py')\n"
+        "    BlameScan (pushed: path = 'src/utils.py' -> 1 of 2 paths)\n"
+    )
+    assert off_out == (
+        "Project (path)\n"
+        "  Filter (path = 'src/utils.py')\n"
+        "    BlameScan (pushed: none -> 2 of 2 paths)\n"
+    )
+    assert off_scans[0].blamed_paths == []
+    assert off_scans[0].git_invocations == 1
+
+
+def test_no_pushdown_stats(tiny_repo, capsys):
+    query = "SELECT path FROM blame WHERE path = 'src/utils.py'"
+    on = _run(tiny_repo, query, capsys, "--stats")
+    off = _run(tiny_repo, query, capsys, "--stats", "--no-pushdown")
+    plain = _run(tiny_repo, query, capsys, "--no-pushdown")
+    assert off[2].splitlines()[0] == "2 paths blamed, 0 skipped"
+    assert on[2].splitlines()[0] == "1 path blamed, 1 skipped"
+    assert on[1] == off[1] == plain[1]
+    assert plain[2] == ""
+
+    limit0 = _run(tiny_repo, "SELECT path FROM blame LIMIT 0", capsys, "--stats", "--no-pushdown")
+    assert limit0[2].splitlines()[0] == "0 paths blamed, 0 skipped"
+
+
+def test_no_pushdown_explain_with_stats_prints_plan_only(tiny_repo, capsys):
+    ret, out, err, _ = _run(tiny_repo, _SPEC_QUERY, capsys, "--explain", "--stats", "--no-pushdown")
+    assert ret == 0
+    assert out.endswith("BlameScan (pushed: none -> 2 of 2 paths)\n")
+    assert err == ""
+
+
+def test_no_pushdown_flag_position_and_repetition(tiny_repo, capsys):
+    query = "SELECT path, line_no FROM blame WHERE path = 'src/utils.py'"
+    repo = str(tiny_repo)
+    argvs = [
+        ["--no-pushdown", "-C", repo, query],
+        ["-C", repo, query, "--no-pushdown"],
+        ["-C", repo, "--no-pushdown", query],
+        ["-C", repo, "--no-pushdown", "--no-pushdown", query],
+    ]
+    outs = []
+    for argv in argvs:
+        assert cli.main(argv + ["--stats"]) == 0
+        captured = capsys.readouterr()
+        assert captured.err.splitlines()[0] == "2 paths blamed, 0 skipped"
+        outs.append(captured.out)
+    assert len(set(outs)) == 1
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--no-pushdown=1", "SELECT path FROM blame"],
+        ["--no-pushdown"],
+        ["--no-pushdown", "--bogus", "SELECT path FROM blame"],
+    ],
+)
+def test_no_pushdown_usage_errors_exit_2(argv, capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(argv)
+    assert excinfo.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == "" and captured.err != ""
+
+
+def test_no_pushdown_error_paths_unchanged(tiny_repo, tmp_path, capsys):
+    ret, out, err, _ = _run(tiny_repo, "SELEC path FROM blame", capsys, "--no-pushdown")
+    assert ret == 1 and out == "" and err.startswith("error:")
+    ret, out, err, _ = _run(tmp_path / "missing", "SELECT path FROM blame", capsys, "--no-pushdown")
+    assert ret == 3 and out == "" and err != ""
+
+
+def test_help_lists_no_pushdown(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--help"])
+    assert excinfo.value.code == 0
+    assert "--no-pushdown" in capsys.readouterr().out

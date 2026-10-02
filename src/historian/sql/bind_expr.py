@@ -277,6 +277,30 @@ def _find_alias_expr(name: str, ctx: _Context) -> Expr | None:
     return None
 
 
+def _reject_aliased_aggregate(ref: ColumnRef, resolved: Expr, ctx: _Context) -> None:
+    # Issue #102: a real column is never an aggregate call, so this
+    # only ever fires for the alias branch - a bare reference to a
+    # select-list alias that turns out to name an aggregate call,
+    # reached in a clause where an aggregate is never legal at all
+    # (`ctx.reject_aggregates`, the same flag `_validate_function_call`
+    # already checks for a *literal* aggregate call written directly
+    # here). `WHERE c > 1` (c aliasing `count(*)`) is exactly this -
+    # `sqlite3`'s own "misuse of aggregate: count()", confirmed against
+    # the oracle - and it must be rejected unconditionally, before any
+    # row is ever considered, the same way the literal-call case
+    # already is.
+    if ctx.reject_aggregates and contains_aggregate(resolved):
+        _reject_aggregate(
+            BindError(
+                f"misuse of aggregate: aliased column {ref.name} refers to an aggregate call, "
+                "which is not allowed here",
+                ref.position,
+                (),
+            ),
+            ctx,
+        )
+
+
 def _resolve_name(ref: ColumnRef, ctx: _Context) -> Expr:
     """Resolve `ref`, falling back to a select-list alias of the same
     name when no real column claims it - see the module docstring's
@@ -310,27 +334,7 @@ def _resolve_name(ref: ColumnRef, ctx: _Context) -> Expr:
     else:
         raise BindError(f"no such column: {ref.name}", ref.position, ctx.schema.names)
 
-    # Issue #102: a real column is never an aggregate call, so this
-    # only ever fires for the alias branch - a bare reference to a
-    # select-list alias that turns out to name an aggregate call,
-    # reached in a clause where an aggregate is never legal at all
-    # (`ctx.reject_aggregates`, the same flag `_validate_function_call`
-    # already checks for a *literal* aggregate call written directly
-    # here). `WHERE c > 1` (c aliasing `count(*)`) is exactly this -
-    # `sqlite3`'s own "misuse of aggregate: count()", confirmed against
-    # the oracle - and it must be rejected unconditionally, before any
-    # row is ever considered, the same way the literal-call case
-    # already is.
-    if ctx.reject_aggregates and contains_aggregate(resolved):
-        _reject_aggregate(
-            BindError(
-                f"misuse of aggregate: aliased column {ref.name} refers to an aggregate call, "
-                "which is not allowed here",
-                ref.position,
-                (),
-            ),
-            ctx,
-        )
+    _reject_aliased_aggregate(ref, resolved, ctx)
     return resolved
 
 
@@ -425,6 +429,67 @@ def _reject_aggregate(error: BindError, ctx: _Context) -> None:
 # style already established by the parser's own precedence methods.
 
 
+def _rebuild_with_bound_operands(node: Expr, results: list[Expr], ctx: _Context) -> Expr:
+    """Take *node*'s bound operands off the end of *results* and
+    rebuild *node* around them; a `FunctionCall` also gets the nested-
+    aggregate check, after all of its arguments are bound."""
+    first = len(results) - len(children(node))
+    bound_operands = results[first:]
+    del results[first:]
+    if isinstance(node, FunctionCall):
+        _check_no_nested_aggregate(node, bound_operands, ctx)
+    return with_children(node, bound_operands)
+
+
+def _bind_leaf(node: Expr, ctx: _Context) -> Expr | None:
+    """Bind *node* on the spot when it has no operands to wait for, or
+    return `None` when it has some. A `Star` and a `BoundColumnRef` here
+    always raise."""
+    if isinstance(node, Literal):
+        return node
+    if isinstance(node, ColumnRef):
+        if ctx.alias_fallback:
+            return _resolve_name(node, ctx)
+        return _bind_column_ref(node, ctx)
+    if isinstance(node, Star):
+        # A whole, alias-less select-list item and count(*)'s sole
+        # unqualified argument are handled by their own callers before
+        # ever reaching here - see `_bind_select_item` and the
+        # `FunctionCall` case in `_start_function_call`. Any other
+        # position is exactly the parser-permissiveness backstop: `* AS
+        # alias`, `*` inside a general expression, and `count(blame.*)`
+        # (a *qualified* star as a function argument) all reach this
+        # branch and are rejected here rather than crashing or
+        # silently mis-expanding.
+        raise BindError(
+            "* is only allowed as a whole select-list item or the sole argument to a function call",
+            node.position,
+            (),
+        )
+    if isinstance(node, BoundColumnRef):
+        raise AssertionError("sql/binder.py: a BoundColumnRef reached _bind_expr; it is already bound")
+    return None
+
+
+def _start_function_call(call: FunctionCall, ctx: _Context) -> Expr | None:
+    """The first visit to a `FunctionCall`: run its checks before any
+    argument is bound, and return the call itself for `count(*)`, or
+    `None` when its arguments still have to be bound."""
+    # Issue #60: name/arity/WHERE-rejection, before anything else -
+    # see _validate_function_call and the module docstring's
+    # "Aggregate calls" section. Every FunctionCall past this point
+    # is a real, correctly-arity aggregate call.
+    _validate_function_call(call, ctx)
+    if len(call.args) == 1 and isinstance(call.args[0], Star) and call.args[0].table is None:
+        # count(*): passed through unexpanded. `*` here means "no
+        # columns", not "all columns" - see `sql/bound.py`'s docstring.
+        # A *qualified* sole argument (count(blame.*)) does not
+        # take this path and falls through to the general Star
+        # rejection in `_bind_leaf`.
+        return call
+    return None
+
+
 def _bind_expr(expr: Expr, ctx: _Context) -> Expr:
     """Bind every `ColumnRef` in `expr`'s tree against `ctx.schema`,
     with select-list alias fallback (issue #32) when `ctx.alias_fallback`
@@ -452,52 +517,16 @@ def _bind_expr(expr: Expr, ctx: _Context) -> Expr:
     while pending:
         node, operands_done = pending.pop()
         if operands_done:
-            first = len(results) - len(children(node))
-            bound_operands = results[first:]
-            del results[first:]
-            if isinstance(node, FunctionCall):
-                _check_no_nested_aggregate(node, bound_operands, ctx)
-            results.append(with_children(node, bound_operands))
+            results.append(_rebuild_with_bound_operands(node, results, ctx))
             continue
-        if isinstance(node, Literal):
-            results.append(node)
+        leaf = _bind_leaf(node, ctx)
+        if leaf is not None:
+            results.append(leaf)
             continue
-        if isinstance(node, ColumnRef):
-            if ctx.alias_fallback:
-                results.append(_resolve_name(node, ctx))
-            else:
-                results.append(_bind_column_ref(node, ctx))
-            continue
-        if isinstance(node, Star):
-            # A whole, alias-less select-list item and count(*)'s sole
-            # unqualified argument are handled by their own callers before
-            # ever reaching here - see `_bind_select_item` and the
-            # `FunctionCall` case below. Any other position is exactly the
-            # parser-permissiveness backstop: `* AS
-            # alias`, `*` inside a general expression, and `count(blame.*)`
-            # (a *qualified* star as a function argument) all reach this
-            # branch and are rejected here rather than crashing or
-            # silently mis-expanding.
-            raise BindError(
-                "* is only allowed as a whole select-list item or the sole argument to a function call",
-                node.position,
-                (),
-            )
-        if isinstance(node, BoundColumnRef):
-            raise AssertionError("sql/binder.py: a BoundColumnRef reached _bind_expr; it is already bound")
         if isinstance(node, FunctionCall):
-            # Issue #60: name/arity/WHERE-rejection, before anything else -
-            # see _validate_function_call and the module docstring's
-            # "Aggregate calls" section. Every FunctionCall past this point
-            # is a real, correctly-arity aggregate call.
-            _validate_function_call(node, ctx)
-            if len(node.args) == 1 and isinstance(node.args[0], Star) and node.args[0].table is None:
-                # count(*): passed through unexpanded. `*` here means "no
-                # columns", not "all columns" - see `sql/bound.py`'s docstring.
-                # A *qualified* sole argument (count(blame.*)) does not
-                # take this path and falls through to the general Star
-                # rejection above.
-                results.append(node)
+            passed_through = _start_function_call(node, ctx)
+            if passed_through is not None:
+                results.append(passed_through)
                 continue
         # #51: a LIKE's escape is an ordinary operand expression, bound
         # the same way left/pattern already are - `children` leaves it

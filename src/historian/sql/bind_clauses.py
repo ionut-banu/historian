@@ -134,6 +134,35 @@ def _bind_limit_offset(expr: Expr, clause: str) -> int:
     return value
 
 
+def _walk_limit_offset_expr(expr: Expr, soft: BindError | None) -> BindError | None:
+    """Walk one `LIMIT`/`OFFSET` expression for `_check_limit_offset_names`:
+    raise at the first hard error, otherwise return the soft error
+    pending after this expression - *soft* as it came in, or the one
+    this expression replaced it with."""
+    pending: list[tuple[Expr, bool]] = [(expr, False)]
+    while pending:
+        node, inside_aggregate = pending.pop()
+        if isinstance(node, ColumnRef):
+            display = f"{node.table}.{node.name}" if node.table is not None else node.name
+            error = BindError(f"no such column: {display}", node.position, ())
+            if not inside_aggregate:
+                raise error
+            soft = error
+            continue
+        if isinstance(node, FunctionCall):
+            if ascii_fold(node.name) not in _AGGREGATE_NAMES:
+                continue
+            arity_error = _arity_error(node)
+            if arity_error is not None:
+                soft = arity_error
+            else:
+                soft = BindError(f"misuse of aggregate function {node.name}()", node.position, ())
+            inside_aggregate = True
+        for operand in reversed(children(node)):
+            pending.append((operand, inside_aggregate))
+    return soft
+
+
 def _check_limit_offset_names(exprs: tuple[Expr, ...]) -> None:
     """The errors SQLite raises for `LIMIT` and `OFFSET` (*exprs*, in
     that order), at their turn in the resolution order: right after the
@@ -163,27 +192,7 @@ def _check_limit_offset_names(exprs: tuple[Expr, ...]) -> None:
     """
     soft: BindError | None = None
     for expr in exprs:
-        pending: list[tuple[Expr, bool]] = [(expr, False)]
-        while pending:
-            node, inside_aggregate = pending.pop()
-            if isinstance(node, ColumnRef):
-                display = f"{node.table}.{node.name}" if node.table is not None else node.name
-                error = BindError(f"no such column: {display}", node.position, ())
-                if not inside_aggregate:
-                    raise error
-                soft = error
-                continue
-            if isinstance(node, FunctionCall):
-                if ascii_fold(node.name) not in _AGGREGATE_NAMES:
-                    continue
-                arity_error = _arity_error(node)
-                if arity_error is not None:
-                    soft = arity_error
-                else:
-                    soft = BindError(f"misuse of aggregate function {node.name}()", node.position, ())
-                inside_aggregate = True
-            for operand in reversed(children(node)):
-                pending.append((operand, inside_aggregate))
+        soft = _walk_limit_offset_expr(expr, soft)
     if soft is not None:
         raise soft
 
@@ -224,6 +233,22 @@ def _check_ordinal(raw_expr: Expr, index: int, clause: str, item_count: int) -> 
 
 
 # --- GROUP BY (issue #69) ----------------------------------------------------
+
+
+def _reject_aggregate_keys(group_by: tuple[Expr, ...], keys: list[Expr | None]) -> tuple[Expr, ...]:
+    """Pass 3 of `_bind_group_by`: reject a key that is, or reaches, an
+    aggregate call, and return the keys, all bound, in clause order."""
+    bound_keys: list[Expr] = []
+    for raw_expr, key in zip(group_by, keys):
+        assert key is not None
+        if contains_aggregate(key):
+            raise BindError(
+                "aggregate functions are not allowed in the GROUP BY clause",
+                raw_expr.position,
+                (),
+            )
+        bound_keys.append(key)
+    return tuple(bound_keys)
 
 
 def _bind_group_by(
@@ -270,17 +295,7 @@ def _bind_group_by(
         if keys[index] is None:
             ordinal = _check_ordinal(raw_expr, index, "GROUP BY", len(bound_items))
             keys[index] = bound_items[ordinal - 1].expr
-    bound_keys: list[Expr] = []
-    for raw_expr, key in zip(group_by, keys):
-        assert key is not None
-        if contains_aggregate(key):
-            raise BindError(
-                "aggregate functions are not allowed in the GROUP BY clause",
-                raw_expr.position,
-                (),
-            )
-        bound_keys.append(key)
-    return tuple(bound_keys)
+    return _reject_aggregate_keys(group_by, keys)
 
 
 # --- ORDER BY (issue #61) ----------------------------------------------------

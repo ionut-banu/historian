@@ -379,6 +379,156 @@ def test_select_list_resolved_before_where():
     assert str(exc_info.value) == "no such column: ghost_select"
 
 
+# Issue #115: one test per adjacent step of the cross-clause order -
+# FROM (and an unknown `x.*` qualifier), LIMIT/OFFSET, the select
+# list, HAVING on a non-aggregate query, HAVING, WHERE, ORDER BY,
+# GROUP BY, the late aggregate misuse, then historian's own
+# rejections. Each expected message is the oracle's (sqlite3 module
+# 3.45.1); `tests/differential/test_error_order.py` checks the same
+# order live against it.
+
+
+def _bind_error(sql: str) -> BindError:
+    with pytest.raises(BindError) as exc_info:
+        _bind(sql)
+    return exc_info.value
+
+
+def test_order_qualified_star_table_before_select_list_names():
+    assert str(_bind_error("SELECT ghost_s, ghost.* FROM blame")) == "no such table: ghost"
+
+
+def test_order_from_table_before_limit():
+    assert str(_bind_error("SELECT path FROM ghost_t LIMIT ghost_l")) == "no such table: ghost_t"
+
+
+def test_order_limit_before_select_list():
+    assert str(_bind_error("SELECT ghost_s FROM blame LIMIT ghost_l")) == "no such column: ghost_l"
+
+
+def test_order_limit_before_offset():
+    assert str(_bind_error("SELECT path FROM blame LIMIT ghost_l OFFSET ghost_o")) == "no such column: ghost_l"
+
+
+def test_order_offset_column_before_limit_aggregate():
+    """An error inside an aggregate call in LIMIT only counts once
+    OFFSET has none: the oracle reports `ghost_f` here."""
+    assert str(_bind_error("SELECT path FROM blame LIMIT avg(1) OFFSET ghost_f")) == "no such column: ghost_f"
+
+
+def test_order_limit_aggregate_before_select_list():
+    assert str(_bind_error("SELECT ghost_s FROM blame LIMIT count(*)")).startswith(
+        "misuse of aggregate function count()"
+    )
+
+
+def test_limit_column_reference_names_the_column():
+    assert str(_bind_error("SELECT path FROM blame LIMIT path")) == "no such column: path"
+    assert str(_bind_error("SELECT path AS p FROM blame LIMIT p")) == "no such column: p"
+
+
+def test_limit_non_literal_still_rejected_last():
+    assert str(_bind_error("SELECT ghost_s FROM blame LIMIT 1+1")) == "no such column: ghost_s"
+    assert str(_bind_error("SELECT path FROM blame LIMIT 1+1")).startswith("LIMIT must be a literal integer")
+
+
+def test_order_select_list_before_having_non_aggregate():
+    assert str(_bind_error("SELECT ghost_s FROM blame HAVING path = 'x'")) == "no such column: ghost_s"
+
+
+def test_order_having_non_aggregate_before_having_names():
+    assert str(_bind_error("SELECT path FROM blame HAVING ghost_h = 1")).startswith("HAVING requires an aggregate query")
+
+
+def test_order_having_before_where():
+    message = str(_bind_error("SELECT count(*) FROM blame WHERE ghost_w = 1 HAVING ghost_h = 1"))
+    assert message == "no such column: ghost_h"
+
+
+def test_order_where_before_order_by():
+    assert str(_bind_error("SELECT path FROM blame WHERE ghost_w = 1 ORDER BY ghost_o")) == "no such column: ghost_w"
+
+
+def test_order_order_by_before_group_by():
+    assert str(_bind_error("SELECT path FROM blame GROUP BY ghost_g ORDER BY ghost_o")) == "no such column: ghost_o"
+
+
+def test_order_where_before_group_by():
+    """The issue's own case."""
+    assert str(_bind_error("SELECT path FROM blame WHERE ghost_w = 1 GROUP BY ghost_g")) == "no such column: ghost_w"
+
+
+def test_order_group_by_before_late_where_aggregate():
+    message = str(_bind_error("SELECT path FROM blame WHERE count(*) > 1 GROUP BY ghost_g"))
+    assert message == "no such column: ghost_g"
+
+
+def test_order_late_order_by_aggregate_after_everything():
+    assert str(_bind_error("SELECT path FROM blame ORDER BY count(*) LIMIT ghost_l")) == "no such column: ghost_l"
+    assert str(_bind_error("SELECT path FROM blame ORDER BY count(*), 99")) == (
+        "2nd ORDER BY term out of range - should be between 1 and 1"
+    )
+
+
+def test_where_aggregate_in_non_aggregate_query_is_in_place():
+    assert str(_bind_error("SELECT path FROM blame WHERE count(*) > 1 ORDER BY ghost_o")).startswith(
+        "misuse of aggregate function count()"
+    )
+
+
+def test_order_late_aggregate_before_historian_only_rejection():
+    assert str(_bind_error("SELECT path, count(*) FROM blame WHERE count(*) > 1")).startswith("misuse of aggregate")
+
+
+def test_historian_only_rejections_run_last():
+    assert str(_bind_error("SELECT path, count(*) FROM blame WHERE ghost_w = 1")) == "no such column: ghost_w"
+    assert str(_bind_error("SELECT line, count(*) FROM blame GROUP BY path ORDER BY ghost_o")) == (
+        "no such column: ghost_o"
+    )
+    assert str(_bind_error("SELECT DISTINCT path FROM blame ORDER BY line LIMIT ghost_l")) == "no such column: ghost_l"
+
+
+def test_historian_only_rejections_alone_unchanged():
+    assert str(_bind_error("SELECT path, count(*) FROM blame")) == (
+        "column path must appear in an aggregate function since this query has no GROUP BY"
+    )
+    assert str(_bind_error("SELECT DISTINCT path FROM blame ORDER BY line")) == (
+        "column line must appear in the select list to be used in ORDER BY together with SELECT DISTINCT"
+    )
+
+
+def test_within_order_by_names_before_ordinal():
+    assert str(_bind_error("SELECT path FROM blame ORDER BY 99, ghost_o")) == "no such column: ghost_o"
+
+
+def test_within_group_by_names_then_ordinal_then_aggregate():
+    assert str(_bind_error("SELECT path FROM blame GROUP BY 99, ghost_g")) == "no such column: ghost_g"
+    assert str(_bind_error("SELECT path FROM blame GROUP BY count(*), 99")) == (
+        "2nd GROUP BY term out of range - should be between 1 and 1"
+    )
+    assert str(_bind_error("SELECT path FROM blame GROUP BY count(*), ghost_g")) == "no such column: ghost_g"
+
+
+def test_ordinal_suffixes_match_sqlite():
+    many = ", ".join(["1"] * 10)
+    assert str(_bind_error(f"SELECT path FROM blame ORDER BY {many}, 99")) == (
+        "11th ORDER BY term out of range - should be between 1 and 1"
+    )
+    assert str(_bind_error("SELECT path FROM blame ORDER BY 1, 1, 99")) == (
+        "3rd ORDER BY term out of range - should be between 1 and 1"
+    )
+
+
+def test_one_call_arity_before_misuse():
+    assert str(_bind_error("SELECT path FROM blame WHERE avg() = 1")) == "wrong number of arguments to function avg()"
+
+
+def test_same_name_in_two_clauses_carries_the_where_position():
+    error = _bind_error("SELECT path FROM blame WHERE ghost = 1 GROUP BY ghost")
+    assert str(error) == "no such column: ghost"
+    assert error.position == Position(line=1, column=30, offset=29)
+
+
 # --- Aliases: no cross-item namespace, WHERE fallback (#32) ------------------
 
 

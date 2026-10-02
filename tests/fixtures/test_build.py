@@ -623,6 +623,119 @@ def test_casefold_repo_session_fixture_resolves_to_the_pinned_build(casefold_rep
 
 
 # ---------------------------------------------------------------------------
+# numeric (issue #109)
+# ---------------------------------------------------------------------------
+
+
+def test_numeric_lists_exactly_its_files(tmp_path):
+    repo = build.build_numeric(tmp_path / "numeric")
+    raw = build._run_git(repo, ["ls-tree", "-rz", "--name-only", "HEAD"])
+    assert tuple(p for p in raw.split("\0") if p) == ("long.txt", "mid.txt", "short.txt")
+
+
+def test_numeric_line_counts_are_one_two_and_three_digits(tmp_path):
+    repo = build.build_numeric(tmp_path / "numeric")
+    counts = {path: len(build._run_git(repo, ["show", f"HEAD:{path}"]).splitlines()) for path in build.NUMERIC_FILES}
+    assert counts == {"long.txt": 120, "mid.txt": 12, "short.txt": 3}
+
+
+def test_numeric_has_two_commits_by_two_authors(tmp_path):
+    repo = build.build_numeric(tmp_path / "numeric")
+    assert build._run_git(repo, ["rev-list", "--count", "HEAD"]).strip() == "2"
+    assert build._run_git(repo, ["log", "--reverse", "--format=%an"]).split() == ["Ana", "Bo"]
+    assert build._run_git(repo, ["log", "--merges", "--format=%H"]).strip() == ""
+
+
+def test_numeric_blame_splits_long_txt_between_the_authors(tmp_path):
+    repo = build.build_numeric(tmp_path / "numeric")
+    rows = build._numeric_blame_rows(repo)
+    assert len(rows) == 135
+    bo_lines = [line_no for path, line_no, author in rows if author == "Bo"]
+    assert bo_lines == list(range(10, 100))
+    assert {path for path, _, author in rows if author == "Bo"} == {"long.txt"}
+    assert len([1 for _, _, author in rows if author == "Ana"]) == 45
+
+
+def test_numeric_is_deterministic_and_matches_pinned_hash(tmp_path):
+    repo_a = build.build_numeric(tmp_path / "a")
+    repo_b = build.build_numeric(tmp_path / "b")
+    head_a = build._run_git(repo_a, ["rev-parse", "HEAD"]).strip()
+    assert head_a == build._run_git(repo_b, ["rev-parse", "HEAD"]).strip()
+    assert head_a == build.NUMERIC_HEAD
+
+
+def test_numeric_is_deterministic_under_hostile_ambient_config(monkeypatch, tmp_path):
+    hostile = tmp_path / "hostile.gitconfig"
+    hostile.write_text("[core]\n\tautocrlf = true\n[commit]\n\tgpgsign = true\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(hostile))
+    repo = build.build_numeric(tmp_path / "numeric")
+    assert build._run_git(repo, ["rev-parse", "HEAD"]).strip() == build.NUMERIC_HEAD
+
+
+def test_verify_numeric_raises_when_a_file_is_missing(tmp_path):
+    repo = build.build_numeric(tmp_path / "numeric")
+    build._run_git(repo, ["rm", "--quiet", "short.txt"])
+    build._commit(repo, "drop short.txt", author=("Ana", "ana@example.com"), timestamp="1800000000 +0000")
+    with pytest.raises(build.FixtureError, match="numeric"):
+        build._verify_numeric(repo)
+
+
+def test_verify_numeric_raises_when_a_line_count_changes(tmp_path):
+    repo = tmp_path / "short-mid"
+    files = dict(build.NUMERIC_FILES, **{"mid.txt": 11})
+    build._init_repo(repo, branch="main")
+    for path, count in files.items():
+        (repo / path).write_text("".join(f"{line}\n" for line in build._numeric_lines(path, count)))
+    build._run_git(repo, ["add", "-A"])
+    build._commit(repo, "c1", author=("Ana", "ana@example.com"), timestamp="1700000000 +0000")
+    long_lines = build._numeric_lines("long.txt", 120)
+    for n in range(10, 100):
+        long_lines[n - 1] = f"rewritten {n}"
+    (repo / "long.txt").write_text("".join(f"{line}\n" for line in long_lines))
+    build._run_git(repo, ["add", "-A"])
+    build._commit(repo, "c2", author=("Bo", "bo@example.com"), timestamp="1700003600 +0000")
+    with pytest.raises(build.FixtureError, match="mid.txt blames 11 lines"):
+        build._verify_numeric(repo)
+
+
+def test_verify_numeric_raises_when_bo_rewrites_the_wrong_lines(monkeypatch, tmp_path):
+    """Build with Bo's rewrite shifted to lines 11-99 (the builder then
+    stops at the HEAD pin, since the content changed), and verify the
+    result against the real 10-99 split."""
+    repo = tmp_path / "shifted"
+    monkeypatch.setattr(build, "NUMERIC_BO_LINES", (11, 99))
+    with pytest.raises(build.FixtureError, match="pinned NUMERIC_HEAD"):
+        build.build_numeric(repo)
+    monkeypatch.undo()
+    with pytest.raises(build.FixtureError, match="long.txt line 10 is attributed to 'Ana', expected 'Bo'"):
+        build._verify_numeric(repo)
+
+
+def test_verify_numeric_raises_when_numeric_and_text_order_agree(monkeypatch, tmp_path):
+    """The property the fixture exists for, checked through SQLite: a
+    fixture edited so every `line_no` is one digit is otherwise well
+    formed (two commits, two authors, the right attribution) but fails
+    the build, because `max(line_no)` is no longer 120."""
+    monkeypatch.setattr(build, "NUMERIC_FILES", {"long.txt": 9, "mid.txt": 5, "short.txt": 3})
+    monkeypatch.setattr(build, "NUMERIC_BO_LINES", (3, 5))
+    with pytest.raises(build.FixtureError, match=r"numeric: SQLite says 'SELECT max\(line_no\) FROM blame' is 9"):
+        build.build_numeric(tmp_path / "agreeing")
+
+
+def test_numeric_repo_session_fixture_resolves_to_the_pinned_build(numeric_repo):
+    assert build._run_git(numeric_repo, ["rev-parse", "HEAD"]).strip() == build.NUMERIC_HEAD
+
+
+def test_get_numeric_repo_reuses_a_cached_build(tmp_path):
+    first = build.get_numeric_repo(tmp_path)
+    marker = first / ".cache-marker"
+    marker.write_text("x")
+    second = build.get_numeric_repo(tmp_path)
+    assert second == first
+    assert marker.exists()
+
+
+# ---------------------------------------------------------------------------
 # large (#27)
 #
 # The builder is tested at a small size so these stay fast; only the

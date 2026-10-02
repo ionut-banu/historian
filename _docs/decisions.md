@@ -3204,3 +3204,25 @@ than left implicit: shape equality now handles `ColumnRef` (by table
 and name; only bound trees are compared in practice) and compares
 `BoundColumnRef.name` as well as its offset. Within one bound
 statement the offset determines the name, so no query changes.
+
+2026-10-02 - Grouping keys on an explicit values.group_key
+
+Issue #113. `GROUP BY`, `SELECT DISTINCT` and `count/sum/avg(DISTINCT
+x)` keyed on `values.order_key`, whose payload is the raw value. The
+groups were right, but only because Python's `1 == 1.0` and `hash(1)
+== hash(1.0)` compare an `int` against a `float` exactly. AGENTS.md
+says code leaning on Python's dynamism is redesigned rather than
+translated, and a Rust port has no exact, hash-consistent `i64 ==
+f64`. So the key is now explicit: `values.group_key` maps a value to a
+tag and a payload - NULL, Int, Real, Text - where every integer-valued
+numeric (every `int`, and a finite integral float inside `-2**63 <= f
+< 2**63`) keys as Int, and every other float keys as Real. No `int`
+ever meets a `float`. Checked against the oracle with bound values:
+`1`/`1.0`, `0`/`0.0`/`-0.0` and `-2**63`/`float(-2**63)` merge;
+`2**53 + 1`/`float(2**53)` and `2**63 - 1`/`float(2**63 - 1)` do not;
+the first value seen is the one a group shows. No row changes.
+
+This reverses the earlier note in `values.py`'s docstring that a
+plain `dict` on the raw value was correct and "no function is needed".
+`ORDER BY`, `min`/`max` and `values._compare` still lean on Python's
+int/float comparison; that is #154.

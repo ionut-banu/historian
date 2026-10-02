@@ -10,12 +10,22 @@ found §5 reads as one unit and is not one unit of work. In scope here:
 a required positional `QUERY`, `-C`/`--repo PATH` (default: the
 current working directory), and `table`-format output. Out of scope,
 each already filed: `-f`/`--file` (#40), the other `--format` values
-and the pretty position-aware error box (#41, M6 item 18), `--explain`
-and `--stats` (#42, M4 item 15), `--no-pushdown` (#43), the REPL
-(#44, M6 item 19). None of these five flags is registered with
-`argparse` below, so passing any of them hits `argparse`'s own
-"unrecognized arguments" handling and exits 2 - not silently accepted,
-not silently ignored.
+and the pretty position-aware error box (#41, M6 item 18),
+`--no-pushdown` (#43), the REPL (#44, M6 item 19). None of those flags
+is registered with `argparse` below, so passing any of them hits
+`argparse`'s own "unrecognized arguments" handling and exits 2 - not
+silently accepted, not silently ignored.
+
+`--explain` and `--stats` (#42, M4 item 15) are in scope. `--explain`
+prints the optimized operator tree to stdout (`plan/explain.py`) and
+runs nothing: its one `git` call is the `ls-tree` that says how many
+paths the scan would blame, never a `git blame`. `--stats` runs the
+query as usual, then writes three lines to stderr - paths blamed and
+skipped, git invocations, seconds - read from the scan object's own
+work record (spec §4), so stdout is byte-identical with and without
+it. Both together print the plan only. Stats follow a *successful*
+query only: no error path prints them. See `_docs/decisions.md`,
+2026-10-02.
 
 Two §5 rules apply in full even though the rest of the section does
 not, because both are cheap now and expensive to retrofit once output
@@ -126,11 +136,14 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
 from historian.catalog import SCAN_FACTORIES, SCHEMAS
 from historian.exec.expression import EvalError
+from historian.exec.operators import Operator, Scan, child_of
+from historian.plan.explain import format_plan
 from historian.plan.optimizer import optimize
 from historian.plan.planner import plan
 from historian.schema import Row, Schema
@@ -168,7 +181,45 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="repository to query (default: the current working directory)",
     )
+    parser.add_argument(
+        "--explain",
+        action="store_true",
+        help="print the plan, do not run it",
+    )
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="print the work done, after the results (to stderr)",
+    )
     return parser
+
+
+def _plural(count: int, singular: str, plural: str) -> str:
+    return f"{count} {singular if count == 1 else plural}"
+
+
+def _find_scan(tree: Operator) -> Scan:
+    node: Operator = tree
+    while not isinstance(node, Scan):
+        child = child_of(node)
+        if child is None:
+            raise AssertionError("cli.py: operator tree has no Scan")
+        node = child
+    return node
+
+
+def _render_stats(tree: Operator, seconds: float) -> str:
+    """The three `--stats` lines, read from the `Scan`'s source - the
+    work record the pushdown tests assert on (spec §4), not a counter
+    of the CLI's own."""
+    source = _find_scan(tree).source()
+    blamed = len(source.blamed_paths)
+    skipped = source.tracked_path_count - blamed
+    return (
+        f"{_plural(blamed, 'path', 'paths')} blamed, {skipped} skipped\n"
+        f"{_plural(source.git_invocations, 'git invocation', 'git invocations')}\n"
+        f"{seconds:.2f}s\n"
+    )
 
 
 def _format_value(value: Value) -> str:
@@ -266,13 +317,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     repo = Path(args.repo) if args.repo is not None else Path.cwd()
 
+    started = time.monotonic()
     try:
         tokens = tokenize(args.query)
         stmt = parse(tokens)
         bound = bind(stmt, catalog=SCHEMAS)
         tree = optimize(plan(bound, repo, tables=SCAN_FACTORIES))
+        if args.explain:
+            sys.stdout.write(format_plan(tree))
+            return 0
         rows = list(tree.rows())
         sys.stdout.write(_render_table(tree.schema, rows))
+        if args.stats:
+            sys.stdout.flush()
+            sys.stderr.write(_render_stats(tree, time.monotonic() - started))
     except (LexError, ParseError, BindError, EvalError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

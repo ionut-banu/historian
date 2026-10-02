@@ -102,7 +102,7 @@ An `IN` list blames in the list's own order (deduplicated); `=` and
 
 Every `scan()` call records what it did on the instance -
 `blamed_paths`, `git_invocations`, `tracked_path_count` - reset at the
-start of the call, so a test (and later `--stats`, #42) can assert
+start of the call, so a test (and `--stats`, #42) can assert
 the work was actually avoided rather than only that the rows are
 right (spec §4, "The pushdown layer").
 """
@@ -116,6 +116,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ..ascii import ascii_fold
+from ..exec.operators import ScanEstimate
 from ..schema import Column, ColumnType, Row, Schema
 from ..sql.ast import BinaryOp, Expr, In, Like, Literal, Operator
 from ..sql.binder import BoundColumnRef
@@ -381,6 +382,17 @@ def _narrow(candidates: list[str], selection: _PathSelection) -> list[str]:
     return narrowed
 
 
+def _narrow_all(candidates: list[str], pushed: Sequence[Expr]) -> list[str]:
+    """*candidates* narrowed by every accepted term in *pushed*, one
+    after another: the paths `scan()` blames, and what `estimate()`
+    counts. A term `accepts()` would reject narrows nothing."""
+    for term in pushed:
+        selection = _path_selection(term)
+        if selection is not None:
+            candidates = _narrow(candidates, selection)
+    return candidates
+
+
 class BlameScan:
     """The `blame` table's scan operator (spec §2, phase 1; §3's scan
     interface).
@@ -435,14 +447,23 @@ class BlameScan:
         self.tracked_path_count = 0
         return self._scan_rows(tuple(pushed))
 
+    def estimate(self, pushed: Sequence[Expr] = ()) -> ScanEstimate:
+        """How many paths `scan(pushed)` would blame, out of how many
+        are tracked at `HEAD` (`--explain`, #42). One `git ls-tree`,
+        no `git blame`: the work record afterwards says one git
+        invocation and no blamed path."""
+        self.blamed_paths = []
+        self.git_invocations = 1
+        candidates = list_paths(self._repo)
+        self.tracked_path_count = len(candidates)
+        narrowed = _narrow_all(candidates, tuple(pushed))
+        return ScanEstimate(name="BlameScan", selected=len(narrowed), total=len(candidates))
+
     def _scan_rows(self, pushed: tuple[Expr, ...]) -> Iterator[Row]:
         self.git_invocations += 1
         candidates = list_paths(self._repo)
         self.tracked_path_count = len(candidates)
-        for term in pushed:
-            selection = _path_selection(term)
-            if selection is not None:
-                candidates = _narrow(candidates, selection)
+        candidates = _narrow_all(candidates, pushed)
         for path in candidates:
             self.blamed_paths.append(path)
             self.git_invocations += 1

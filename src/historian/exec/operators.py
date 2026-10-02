@@ -115,6 +115,7 @@ __all__ = [
     "Project",
     "PushdownKind",
     "Scan",
+    "ScanEstimate",
     "ScanSource",
     "Sort",
     "SortKey",
@@ -152,6 +153,18 @@ PushdownKind = str
 Predicate = Expr
 
 
+@dataclass(frozen=True)
+class ScanEstimate:
+    """What a source reports for `--explain` (#42): its own name for
+    the `Scan` line, how many of its *total* units `scan()` would read
+    for the pushed terms (*selected*), and how many exist. Plain data,
+    so `plan/explain.py` can print it without knowing any table."""
+
+    name: str
+    selected: int
+    total: int
+
+
 class ScanSource(Protocol):
     """The interface a table's scan implementation exposes for `Scan`
     to wrap (spec §2, "The scan capability contract"). Structural, not
@@ -174,15 +187,28 @@ class ScanSource(Protocol):
     - `scan(pushed)`: every row, or - for accepted terms in `pushed` -
       a superset of the rows matching all of them. `pushed` only ever
       holds terms this source accepted, in offered order.
+    - `estimate(pushed)` (#42): the `Scan` line of `--explain`, as a
+      `ScanEstimate`. It reads as little as it can to know how many
+      paths `scan(pushed)` would blame and never produces a row.
+    - The work record (spec §4, "The pushdown layer"), read after a
+      run by `--stats` and by tests: `blamed_paths` (what the scan
+      did the expensive work on, in order), `git_invocations` (every
+      `git` process started) and `tracked_path_count` (how many
+      paths exist to be blamed). Reset by `scan()`, never by a reader.
     """
 
     schema: Schema
+    blamed_paths: list[str]
+    git_invocations: int
+    tracked_path_count: int
 
     def capabilities(self) -> set[PushdownKind]: ...
 
     def accepts(self, term: Predicate) -> bool: ...
 
     def scan(self, pushed: Sequence[Predicate] = ()) -> Iterator[Row]: ...
+
+    def estimate(self, pushed: Sequence[Predicate] = ()) -> ScanEstimate: ...
 
 
 class Scan:
@@ -861,6 +887,16 @@ class Aggregate:
         )
         self.schema = Schema(columns=group_columns + call_columns)
 
+    def group_by(self) -> tuple[Expr, ...]:
+        """The `GROUP BY` key expressions, over the child's schema -
+        read by `plan/explain.py`."""
+        return self._group_by
+
+    def calls(self) -> tuple[AggregateCall, ...]:
+        """The aggregate calls, in output-column order after the group
+        keys - read by `plan/explain.py`."""
+        return self._calls
+
     def rows(self) -> Iterator[Row]:
         child_schema = self._child.schema
         if not self._group_by:
@@ -959,6 +995,11 @@ class Project:
             )
         )
 
+    def select_list(self) -> tuple[BoundSelectItem, ...]:
+        """The select list this `Project` evaluates - read by
+        `plan/explain.py`."""
+        return self._select_list
+
     def rows(self) -> Iterator[Row]:
         child_schema = self._child.schema
         select_list = self._select_list
@@ -1027,6 +1068,10 @@ class Sort:
         self._keys = tuple(keys)
         self.schema = child.schema
 
+    def keys(self) -> tuple[SortKey, ...]:
+        """The sort keys, first key first - read by `plan/explain.py`."""
+        return self._keys
+
     def rows(self) -> Iterator[Row]:
         child_schema = self._child.schema
         rows = list(self._child.rows())
@@ -1085,6 +1130,15 @@ class Limit:
         # LIMIT/OFFSET only ever remove rows from the end or the start
         # of the sequence - never add, rename, or retype a column.
         self.schema = child.schema
+
+    def limit(self) -> int:
+        """The row limit; negative means no limit - read by
+        `plan/explain.py`."""
+        return self._limit
+
+    def offset(self) -> int:
+        """The rows skipped first, already clamped to 0 or more."""
+        return self._offset
 
     def rows(self) -> Iterator[Row]:
         child_iter = iter(self._child.rows())

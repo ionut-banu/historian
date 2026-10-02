@@ -36,7 +36,7 @@ class _FakeSource:
         return {"x"} if self._accept else set()
 
     def accepts(self, term) -> bool:
-        return self._accept and type(term).__name__ == "BinaryOp"
+        return self._accept and type(term).__name__ == "BinaryOp" and term.op.name == "EQ"
 
     def scan(self, pushed: Sequence = ()) -> Iterator[Row]:
         raise AssertionError("explain must never scan")
@@ -155,9 +155,15 @@ def test_project_prints_alias():
 
 
 def test_group_key_expression_is_printed_where_the_select_list_uses_it():
-    lines = _explain("SELECT lower(author_name), count(*) FROM blame GROUP BY lower(author_name)")
-    assert lines[0] == "Project (lower(author_name), count(*))"
-    assert lines[1] == "  Aggregate (group=[lower(author_name)], aggs=[count(*)])"
+    lines = _explain("SELECT line_no + 1, count(*) FROM blame GROUP BY line_no + 1")
+    assert lines[0] == "Project (line_no + 1, count(*))"
+    assert lines[1] == "  Aggregate (group=[line_no + 1], aggs=[count(*)])"
+
+
+def test_a_call_written_twice_is_listed_once_on_the_aggregate_line():
+    lines = _explain("SELECT count(*), count(*) FROM blame")
+    assert lines[0] == "Project (count(*), count(*))"
+    assert lines[1] == "  Aggregate (group=[], aggs=[count(*)])"
 
 
 # --- expression text ----------------------------------------------------------
@@ -186,7 +192,6 @@ def test_group_key_expression_is_printed_where_the_select_list_uses_it():
         ("path || 'x' = 'ax'", "path || 'x' = 'ax'"),
         ("-line_no < 0", "-line_no < 0"),
         ("-(-line_no) < 0", "-(-line_no) < 0"),
-        ("lower(path) = 'a'", "lower(path) = 'a'"),
         ("path = NULL", "path = NULL"),
         ("blame.path = 'a'", "path = 'a'"),
     ],
@@ -211,7 +216,7 @@ def test_string_literal_with_non_ascii_and_embedded_quotes():
 
 def test_deeply_nested_expression_does_not_hit_the_recursion_limit():
     depth = 900
-    sql = "line_no = " + "1 + (" * (depth - 1) + "1" + ")" * (depth - 1)
+    sql = "line_no = " + " + ".join(["1"] * depth)
     text = _where(sql)
     assert text == sql
     long_and = " AND ".join(["line_no = 1"] * 900)

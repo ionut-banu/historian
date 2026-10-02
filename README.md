@@ -32,6 +32,35 @@ than a table that already holds the answer.
 So `WHERE path LIKE 'src/auth/%'` does not filter four thousand blamed
 files down to twelve. It blames twelve.
 
+## Seeing the work
+
+`--explain` prints the plan without running the query: the operator
+tree, and what the optimizer pushed into the scan. It makes one
+`git ls-tree` call to count paths and never blames a file.
+
+```
+$ historian --explain "SELECT path, count(*) FROM blame WHERE path LIKE 'src/%' GROUP BY path"
+Project (path, count(*))
+  Aggregate (group=[path], aggs=[count(*)])
+    Filter (path LIKE 'src/%')
+      BlameScan (pushed: path LIKE 'src/%' -> 1 of 2 paths)
+```
+
+`--stats` runs the query as usual and then prints, on stderr, the
+work the scan actually did:
+
+```
+$ historian --stats "SELECT path, count(*) FROM blame WHERE path LIKE 'src/%' GROUP BY path"
+path          column_2
+src/utils.py  2
+1 path blamed, 1 skipped
+2 git invocations
+0.01s
+```
+
+The last line is the only part of any output that varies between two
+identical runs.
+
 ## How correctness is defined
 
 By SQLite, not by opinion.

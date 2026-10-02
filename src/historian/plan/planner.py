@@ -252,7 +252,10 @@ def _same_node_fields(a: Expr, b: Expr) -> bool:
         # now does (issue #103 round 2) - function names are ASCII-
         # case-insensitive in SQLite, and a `GROUP BY`/select-list pair
         # spelled `COUNT`/`count` must still match by shape here too.
-        return ascii_fold(a.name) == ascii_fold(b.name)
+        # The `distinct` flag mirrors the binder's copy (issue #131).
+        # Defensive here: no query reaches this with two aggregate
+        # calls, since `_split_expr` gives every call its own slot.
+        return ascii_fold(a.name) == ascii_fold(b.name) and a.distinct == b.distinct
     if isinstance(a, (UnaryOp, BinaryOp)):
         return a.op == b.op
     if isinstance(a, (Not, And, Or)):

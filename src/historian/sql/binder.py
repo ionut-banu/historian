@@ -63,7 +63,7 @@ to see whether any row would actually reach the trouble:
   argument (`count(count(*))`) - `sqlite3` calls this "misuse of
   aggregate function count()". `_bind_expr`'s `FunctionCall` branch
   checks every bound argument, after binding it, for an aggregate call
-  anywhere in its tree (`_contains_aggregate`) and raises immediately
+  anywhere in its tree (`contains_aggregate`, `sql/walk.py`) and raises immediately
   if one is found - this is why the check has to run *after* the
   argument is bound rather than on the raw AST: an argument that is a
   `ColumnRef` to a select-list alias only reveals whether it is
@@ -85,7 +85,7 @@ to see whether any row would actually reach the trouble:
   clause raises if that candidate's tree contains an aggregate call,
   the same rejection `_validate_function_call` already gives a
   *literal* aggregate call written directly in such a clause. Both
-  checks read only `_contains_aggregate` over an already-bound
+  checks read only `contains_aggregate` over an already-bound
   subtree - no new walk, no change to what nesting itself means.
 
 A second, separate check lives in `bind()` itself, after the whole
@@ -260,6 +260,14 @@ from historian.sql.ast import (
     UnaryOperator,
 )
 from historian.sql.lexer import Position
+from historian.sql.walk import (
+    BoundColumnRef,
+    children,
+    contains_aggregate,
+    expr_shape_equal,
+    is_aggregate_query,
+    with_children,
+)
 
 __all__ = [
     "BindError",
@@ -311,28 +319,12 @@ class BindError(Exception):
 # --- Bound tree ----------------------------------------------------------
 #
 # Frozen dataclasses, matching `sql/ast.py`'s own convention. Only one
-# new node type: every other `Expr` in a bound tree is one of
-# `sql/ast.py`'s own types, reused unchanged as a type and rebuilt
-# (via `dataclasses.replace`) only where a descendant changed.
-
-
-@dataclass(frozen=True)
-class BoundColumnRef(Expr):
-    """A resolved column reference: everywhere a `ColumnRef` used to be.
-
-    `offset` is the column's zero-based position in the FROM table's
-    schema, computed once via `Schema.index_of` - the mechanism spec
-    §3 describes for keeping row access by offset rather than by name.
-    `name` is the column's declared schema spelling (used for an
-    unaliased select-list item's output name; see `BoundSelectItem`).
-    `position` is inherited from the original `ColumnRef` (or, for a
-    `Star`-expansion item, from the `Star` itself), so an error found
-    later can still point at source text.
-    """
-
-    offset: int
-    name: str
-    position: Position
+# new node type, `BoundColumnRef`: every other `Expr` in a bound tree is
+# one of `sql/ast.py`'s own types, reused unchanged as a type and
+# rebuilt (via `dataclasses.replace`) only where a descendant changed.
+# `BoundColumnRef` is defined in `sql/walk.py` (issue #112), next to the
+# shared walks that must know it, and imported here, so `from
+# historian.sql.binder import BoundColumnRef` names the same class.
 
 
 @dataclass(frozen=True)
@@ -597,7 +589,7 @@ def _resolve_name(ref: ColumnRef, ctx: _Context) -> Expr:
     # the oracle - and it must be rejected unconditionally, before any
     # row is ever considered, the same way the literal-call case
     # already is.
-    if ctx.reject_aggregates and _contains_aggregate(resolved):
+    if ctx.reject_aggregates and contains_aggregate(resolved):
         _reject_aggregate(
             BindError(
                 f"misuse of aggregate: aliased column {ref.name} refers to an aggregate call, "
@@ -692,71 +684,6 @@ def _reject_aggregate(error: BindError, ctx: _Context) -> None:
         ctx.late_misuse.append(error)
 
 
-# --- Walking an expression tree without recursion (issue #107) --------------
-#
-# Every walk in this module over an expression tree is a loop over an
-# explicit stack - a plain list - rather than a function calling itself
-# once per level, in the same style as `plan/optimizer.py`'s
-# `split_conjuncts` (#121). The parser rejects any tree taller than
-# SQLite's own limit of 1000 (`sql/parser.py`'s `_expr_height`), but a
-# recursive walk here used one to three Python frames per level and
-# crashed with `RecursionError` well inside that limit, and a bound tree
-# can be taller than any parsed one (a select-list alias spliced into
-# `WHERE` roughly doubles it). An explicit stack does not grow Python's
-# stack at all, so what these walks can handle does not depend on the
-# recursion limit or on how deep the caller already is (`AGENTS.md`'s
-# determinism rule). `_operands` and `_with_operands` are the two
-# per-node-type tables every walk shares: what a node's children are,
-# left to right, and how to rebuild the node around new ones.
-
-
-def _operands(expr: Expr) -> tuple[Expr, ...]:
-    """*expr*'s direct sub-expressions, left to right - the order every
-    walk below visits them in, which is what keeps "the leftmost
-    unresolved name wins" (the module docstring's "Resolution order")
-    true without recursion. A leaf has none."""
-    if isinstance(expr, (Literal, ColumnRef, BoundColumnRef, Star)):
-        return ()
-    if isinstance(expr, FunctionCall):
-        return expr.args
-    if isinstance(expr, (UnaryOp, Not)):
-        return (expr.operand,)
-    if isinstance(expr, (BinaryOp, And, Or, Is)):
-        return (expr.left, expr.right)
-    if isinstance(expr, Like):
-        if expr.escape is None:
-            return (expr.left, expr.pattern)
-        return (expr.left, expr.pattern, expr.escape)
-    if isinstance(expr, In):
-        return (expr.left, *expr.values)
-    if isinstance(expr, Between):
-        return (expr.operand, expr.low, expr.high)
-    raise AssertionError(f"sql/binder.py: unhandled expression node type {type(expr).__name__}")
-
-
-def _with_operands(expr: Expr, operands: list[Expr]) -> Expr:
-    """*expr* rebuilt via `dataclasses.replace` with *operands* - one
-    per entry of `_operands(expr)`, in the same order - in place of its
-    own children."""
-    if isinstance(expr, FunctionCall):
-        return dataclasses.replace(expr, args=tuple(operands))
-    if isinstance(expr, (UnaryOp, Not)):
-        (operand,) = operands
-        return dataclasses.replace(expr, operand=operand)
-    if isinstance(expr, (BinaryOp, And, Or, Is)):
-        left, right = operands
-        return dataclasses.replace(expr, left=left, right=right)
-    if isinstance(expr, Like):
-        escape = operands[2] if expr.escape is not None else None
-        return dataclasses.replace(expr, left=operands[0], pattern=operands[1], escape=escape)
-    if isinstance(expr, In):
-        return dataclasses.replace(expr, left=operands[0], values=tuple(operands[1:]))
-    if isinstance(expr, Between):
-        operand, low, high = operands
-        return dataclasses.replace(expr, operand=operand, low=low, high=high)
-    raise AssertionError(f"sql/binder.py: unhandled expression node type {type(expr).__name__}")
-
-
 # --- General expression binding --------------------------------------------
 #
 # One case per `sql/ast.py` node type. Every type other than
@@ -776,8 +703,9 @@ def _bind_expr(expr: Expr, ctx: _Context) -> Expr:
     so the fallback applies to a `ColumnRef` at any depth in the tree,
     not only at the top.
 
-    Not recursive (issue #107, see "Walking an expression tree without
-    recursion" above): *pending* holds `(node, operands_done)` pairs and
+    Not recursive (issue #107; the children table it walks is
+    `sql/walk.py`'s `children`, shared with the planner and the
+    parser): *pending* holds `(node, operands_done)` pairs and
     *results* the bound subtrees finished so far. A node is first seen
     with `operands_done=False` - a leaf is bound on the spot; any other
     node is pushed back with `operands_done=True`, then its operands in
@@ -792,12 +720,12 @@ def _bind_expr(expr: Expr, ctx: _Context) -> Expr:
     while pending:
         node, operands_done = pending.pop()
         if operands_done:
-            first = len(results) - len(_operands(node))
+            first = len(results) - len(children(node))
             bound_operands = results[first:]
             del results[first:]
             if isinstance(node, FunctionCall):
                 _check_no_nested_aggregate(node, bound_operands, ctx)
-            results.append(_with_operands(node, bound_operands))
+            results.append(with_children(node, bound_operands))
             continue
         if isinstance(node, Literal):
             results.append(node)
@@ -840,10 +768,10 @@ def _bind_expr(expr: Expr, ctx: _Context) -> Expr:
                 results.append(node)
                 continue
         # #51: a LIKE's escape is an ordinary operand expression, bound
-        # the same way left/pattern already are - `_operands` leaves it
+        # the same way left/pattern already are - `children` leaves it
         # out when there is no ESCAPE clause, so there is nothing to bind.
         pending.append((node, True))
-        for operand in reversed(_operands(node)):
+        for operand in reversed(children(node)):
             pending.append((operand, False))
     (result,) = results
     return result
@@ -858,9 +786,9 @@ def _check_no_nested_aggregate(call: FunctionCall, bound_args: list[Expr], ctx: 
     resolution (`_resolve_name`) has spliced that alias's own bound
     expression in - a bound argument that is itself a `FunctionCall`,
     whether written directly or reached through a select-list alias, is
-    exactly what `_contains_aggregate` was already built to detect."""
+    exactly what `contains_aggregate` was already built to detect."""
     for raw_arg, bound_arg in zip(call.args, bound_args):
-        if not _contains_aggregate(bound_arg):
+        if not contains_aggregate(bound_arg):
             continue
         if isinstance(raw_arg, ColumnRef) and _find_alias_expr(raw_arg.name, ctx) is not None:
             # Reached through a select-list alias - `sqlite3`'s own
@@ -882,89 +810,8 @@ def _check_no_nested_aggregate(call: FunctionCall, bound_args: list[Expr], ctx: 
 # correction on this issue: `select b, count(*) from t group by 2`
 # raises the identical "aggregate functions are not allowed in the
 # GROUP BY clause" sqlite3 gives for the direct and alias forms, not
-# "ludicrous but legal"). `_contains_aggregate` is the one predicate
+# "ludicrous but legal"). `contains_aggregate` is the one predicate
 # every one of those three routes checks against, after binding.
-
-
-def _contains_aggregate(expr: Expr) -> bool:
-    """Whether *expr* (already bound - every surviving `FunctionCall`
-    is a real, validated aggregate call) contains an aggregate call
-    anywhere in its tree. A loop over an explicit stack of nodes still
-    to look at (issue #107); the order they are visited in does not
-    matter for a yes/no answer."""
-    pending: list[Expr] = [expr]
-    while pending:
-        node = pending.pop()
-        if isinstance(node, FunctionCall):
-            return True
-        if isinstance(node, ColumnRef):
-            raise AssertionError("sql/binder.py: _contains_aggregate needs a bound tree")
-        pending.extend(_operands(node))
-    return False
-
-
-def _expr_shape_equal(a: Expr, b: Expr) -> bool:
-    """Structural equality between two already-bound expressions,
-    ignoring `position` - two occurrences of the same `GROUP BY` key
-    written at different points in the query text (the `SELECT` list
-    and the `GROUP BY` clause, say) must compare equal even though
-    every node's `position` differs. One boring `isinstance` branch
-    per `sql/ast.py`/binder node type, matching this module's existing
-    walk style; `type(a) is not type(b)` up front so two different
-    node shapes are never accidentally treated as equal.
-
-    A loop over an explicit stack of node pairs still to compare (issue
-    #107): each pair's own fields are compared, then its operand pairs
-    are pushed. Nothing here has a side effect, so the order the pairs
-    are compared in cannot change the answer."""
-    pending: list[tuple[Expr, Expr]] = [(a, b)]
-    while pending:
-        x, y = pending.pop()
-        if not _same_node_fields(x, y):
-            return False
-        x_operands = _operands(x)
-        y_operands = _operands(y)
-        if len(x_operands) != len(y_operands):
-            return False
-        pending.extend(zip(x_operands, y_operands))
-    return True
-
-
-def _same_node_fields(a: Expr, b: Expr) -> bool:
-    """`_expr_shape_equal` for one pair of nodes, children aside:
-    the same node type and the same non-child fields."""
-    if type(a) is not type(b):
-        return False
-    if isinstance(a, Literal):
-        return type(a.value) is type(b.value) and a.value == b.value
-    if isinstance(a, BoundColumnRef):
-        return a.offset == b.offset
-    if isinstance(a, Star):
-        return a.table == b.table
-    if isinstance(a, FunctionCall):
-        # Function names are ASCII-case-insensitive in SQLite - `COUNT`
-        # in the select list and `count` in `ORDER BY` name the same
-        # aggregate - so shape equality folds them the same way
-        # `_validate_function_call` already does when it resolves a
-        # name against `_AGGREGATE_NAMES`. Folding here rather than on
-        # `FunctionCall.name` itself at bind time keeps the AST node's
-        # `name` as written, which error messages ("no such function:
-        # {call.name}") still want to echo verbatim. The argument
-        # count is compared by the caller, with the operands.
-        # `count(x)` and `count(DISTINCT x)` are different aggregates
-        # (issue #131), so the flag is compared as a plain field.
-        return ascii_fold(a.name) == ascii_fold(b.name) and a.distinct == b.distinct
-    if isinstance(a, (UnaryOp, BinaryOp)):
-        return a.op == b.op
-    if isinstance(a, (Not, And, Or)):
-        return True
-    if isinstance(a, Like):
-        # Whether an ESCAPE clause is present changes the operand
-        # count, which the caller compares.
-        return a.negated == b.negated
-    if isinstance(a, (Is, In, Between)):
-        return a.negated == b.negated
-    raise AssertionError(f"sql/binder.py: unhandled expression node type {type(a).__name__}")
 
 
 # --- Ordinal detection, shared by GROUP BY and ORDER BY (issue #61) --------
@@ -1105,7 +952,7 @@ def _check_limit_offset_names(exprs: tuple[Expr, ...]) -> None:
                 else:
                     soft = BindError(f"misuse of aggregate function {node.name}()", node.position, ())
                 inside_aggregate = True
-            for operand in reversed(_operands(node)):
+            for operand in reversed(children(node)):
                 pending.append((operand, inside_aggregate))
     if soft is not None:
         raise soft
@@ -1197,7 +1044,7 @@ def _bind_group_by(
     bound_keys: list[Expr] = []
     for raw_expr, key in zip(group_by, keys):
         assert key is not None
-        if _contains_aggregate(key):
+        if contains_aggregate(key):
             raise BindError(
                 "aggregate functions are not allowed in the GROUP BY clause",
                 raw_expr.position,
@@ -1272,7 +1119,7 @@ def _bind_order_by(
 # note), or a BindError. `_split_for_grouped_check` is
 # `_split_for_aggregate_check`'s own walk with one addition: at every
 # node, first check whether the whole subtree matches a GROUP BY key
-# by shape (`_expr_shape_equal`) - if so, that subtree is covered and
+# by shape (`expr_shape_equal`) - if so, that subtree is covered and
 # is never walked into for a bad bare column, whatever it contains.
 #
 # DISTINCT (issue #78) reuses this exact walk for a different question,
@@ -1364,14 +1211,14 @@ def _split_for_grouped_check(
             continue
         if isinstance(node, ColumnRef):
             raise AssertionError("sql/binder.py: _split_for_grouped_check needs a bound tree")
-        for operand in reversed(_operands(node)):
+        for operand in reversed(children(node)):
             pending.append(operand)
     return has_aggregate, bad
 
 
 def _matches_any_key(expr: Expr, group_keys: tuple[Expr, ...]) -> bool:
     for key in group_keys:
-        if _expr_shape_equal(expr, key):
+        if expr_shape_equal(expr, key):
             return True
     return False
 
@@ -1385,11 +1232,10 @@ def _check_grouped_select_list(
     (`group_by` is non-empty) or some select-list item already has an
     aggregate call somewhere (#60's original trigger, unchanged for a
     plain aggregate-free, GROUP BY-free query)."""
-    splits = [(item, *_split_for_grouped_check(item.expr, group_by)) for item in bound_items]
-    triggered = bool(group_by) or any(has_aggregate for _item, has_aggregate, _bad in splits)
-    if not triggered:
+    if not is_aggregate_query(group_by, [item.expr for item in bound_items]):
         return
-    for _item, _has_aggregate, bad_column in splits:
+    for item in bound_items:
+        _has_aggregate, bad_column = _split_for_grouped_check(item.expr, group_by)
         if bad_column is not None:
             reason = (
                 "must appear in the GROUP BY clause or be used in an aggregate function"
@@ -1490,11 +1336,10 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema]) -> BoundSelectStatem
     # HAVING or ORDER BY does not count (confirmed against sqlite3:
     # `select path from t having count(*) > 1` is still "HAVING clause
     # on a non-aggregate query"). Decides steps 4, 6 and 7.
-    select_has_aggregate = any(_contains_aggregate(item.expr) for item in items)
-    is_aggregate_query = bool(stmt.group_by) or select_has_aggregate
+    aggregate_query = is_aggregate_query(stmt.group_by, [item.expr for item in items])
 
     # 4. HAVING on a non-aggregate query, before HAVING's own names.
-    if stmt.having is not None and not is_aggregate_query:
+    if stmt.having is not None and not aggregate_query:
         # A `HAVING` clause only makes sense against an aggregate
         # query - confirmed live against `sqlite3 3.51.0`:
         # `select path from t having path = 'x'` (no GROUP BY, no
@@ -1543,7 +1388,7 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema]) -> BoundSelectStatem
         alias_fallback=True,
         alias_first=False,
         reject_aggregates=True,
-        late_misuse=late_misuse if is_aggregate_query else None,
+        late_misuse=late_misuse if aggregate_query else None,
     )
     bound_where = _bind_expr(stmt.where, where_ctx) if stmt.where is not None else None
 
@@ -1556,7 +1401,7 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema]) -> BoundSelectStatem
         select_items=items,
         alias_fallback=True,
         alias_first=True,
-        reject_aggregates=not is_aggregate_query,
+        reject_aggregates=not aggregate_query,
         late_misuse=late_misuse,
     )
     bound_order_by = _bind_order_by(stmt.order_by, order_ctx, items)
@@ -1602,7 +1447,7 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema]) -> BoundSelectStatem
                 bad_column.position,
                 (),
             )
-    if is_aggregate_query:
+    if aggregate_query:
         # The same "grouped but not a key" narrowing HAVING already
         # gets (2026-09-24's decisions.md entry), extended here: once
         # the query aggregates, every ORDER BY expression must be an

@@ -50,7 +50,7 @@ from historian.sql.binder import (
     _ordinal_value,
     bind,
 )
-from historian.sql import binder
+from historian.sql import binder, walk
 from historian.sql.lexer import Position, tokenize
 from historian.sql.parser import parse
 from historian.tables.blame import BLAME_SCHEMA
@@ -2096,13 +2096,13 @@ def _bound_count(distinct: bool) -> FunctionCall:
 
 
 def test_expr_shape_equal_count_differing_only_in_distinct_is_not_equal():
-    assert binder._expr_shape_equal(_bound_count(False), _bound_count(True)) is False
-    assert binder._expr_shape_equal(_bound_count(True), _bound_count(False)) is False
+    assert walk.expr_shape_equal(_bound_count(False), _bound_count(True)) is False
+    assert walk.expr_shape_equal(_bound_count(True), _bound_count(False)) is False
 
 
 def test_expr_shape_equal_count_with_equal_distinct_flags_is_equal():
-    assert binder._expr_shape_equal(_bound_count(True), _bound_count(True)) is True
-    assert binder._expr_shape_equal(_bound_count(False), _bound_count(False)) is True
+    assert walk.expr_shape_equal(_bound_count(True), _bound_count(True)) is True
+    assert walk.expr_shape_equal(_bound_count(False), _bound_count(False)) is True
 
 
 def test_distinct_without_order_by_and_grouped_binds_normally():

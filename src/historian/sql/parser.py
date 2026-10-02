@@ -213,6 +213,7 @@ from historian.sql.ast import (
     UnaryOperator,
 )
 from historian.sql.lexer import Position, Token, TokenType
+from historian.sql.walk import children as walk_children
 from historian.values import INT64_MAX
 
 __all__ = ["ParseError", "UnsupportedGrammarError", "parse"]
@@ -391,32 +392,6 @@ def _int_literal_value(text: str) -> int | float:
 # --- Expression tree height (issue #107) -----------------------------------
 
 
-def _height_children(node: Expr) -> tuple[Expr, ...]:
-    """*node*'s direct sub-expressions, left to right, for
-    `_expr_height`. Every child is listed, including `BETWEEN`'s bounds
-    (which add nothing to the `BETWEEN` node's own height but are still
-    checked as trees of their own) and `IN (...)`'s left operand when
-    the list is empty (discarded by SQLite, but only after being built
-    and checked)."""
-    if isinstance(node, (Literal, ColumnRef, Star)):
-        return ()
-    if isinstance(node, FunctionCall):
-        return node.args
-    if isinstance(node, (UnaryOp, Not)):
-        return (node.operand,)
-    if isinstance(node, (BinaryOp, And, Or, Is)):
-        return (node.left, node.right)
-    if isinstance(node, Like):
-        if node.escape is None:
-            return (node.left, node.pattern)
-        return (node.left, node.pattern, node.escape)
-    if isinstance(node, In):
-        return (node.left, *node.values)
-    if isinstance(node, Between):
-        return (node.operand, node.low, node.high)
-    raise AssertionError(f"sql/parser.py: unhandled expression node type {type(node).__name__}")
-
-
 @dataclass(frozen=True)
 class _Height:
     """What `_expr_height` knows about one finished subtree: its
@@ -433,7 +408,7 @@ class _Height:
 
 def _node_height(node: Expr, children: list[_Height]) -> _Height:
     """The `_Height` of *node*, given one for each of
-    `_height_children(node)`, in order - SQLite's own accounting
+    `children(node)` (`sql/walk.py`), in order - SQLite's own accounting
     (`exprSetHeight` in `expr.c` and the grammar actions in `parse.y`),
     measured against the oracle node kind by node kind (issue #107):
 
@@ -519,7 +494,12 @@ def _expr_height(root: Expr) -> int:
     node as it builds it, not only the root, which matters wherever a
     node's height is not simply 1 plus its tallest child: a `BETWEEN`
     bound or the left operand of `IN ()` can be too tall on its own
-    even though the node above it is not.
+    even though the node above it is not. Every child is visited, from
+    `sql/walk.py`'s shared `children` table (issue #112), including
+    `BETWEEN`'s bounds (which add nothing to the `BETWEEN` node's own
+    height but are still checked as trees of their own) and `IN
+    (...)`'s left operand when the list is empty (discarded by SQLite,
+    but only after being built and checked).
 
     Not recursive: an explicit stack of `(node, children_done)` pairs
     and a second stack of finished `_Height` results, in
@@ -532,7 +512,7 @@ def _expr_height(root: Expr) -> int:
     results: list[_Height] = []
     while pending:
         node, children_done = pending.pop()
-        children = _height_children(node)
+        children = walk_children(node)
         if children and not children_done:
             pending.append((node, True))
             for child in reversed(children):

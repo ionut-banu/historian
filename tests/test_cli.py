@@ -322,7 +322,7 @@ def test_no_query_argument_exits_2(capsys):
 
 @pytest.mark.parametrize(
     "flag",
-    ["--explain", "--stats", "--no-pushdown", "--format", "-f", "--file"],
+    ["--no-pushdown", "--format", "-f", "--file"],
 )
 def test_deferred_flags_are_unrecognized_and_exit_2(flag, capsys):
     """None of §5's other flags are implemented yet - passing any of
@@ -750,3 +750,308 @@ def test_outcome_does_not_depend_on_the_callers_stack_depth(tiny_repo, capsys, q
     else:
         assert outcomes[0][1] == ""
         assert outcomes[0][2] == _DEPTH_ERROR
+
+
+# --- --explain and --stats (issue #42, spec §5) -----------------------------
+
+import re  # noqa: E402
+
+from historian.tables.blame import BlameScan  # noqa: E402
+
+_SPEC_QUERY = (
+    "SELECT author_name, count(*) FROM blame WHERE path LIKE 'src/%' "
+    "GROUP BY author_name ORDER BY 2 DESC"
+)
+_SPEC_PLAN = (
+    "Project (author_name, count(*))\n"
+    "  Sort (count(*) DESC)\n"
+    "    Aggregate (group=[author_name], aggs=[count(*)])\n"
+    "      Filter (path LIKE 'src/%')\n"
+    "        BlameScan (pushed: path LIKE 'src/%' -> 1 of 2 paths)\n"
+)
+
+
+@pytest.fixture
+def built(monkeypatch):
+    """Capture every `BlameScan` `main()` builds, so a test can read
+    the scan's own work record after the run."""
+    scans: list[BlameScan] = []
+
+    def factory(repo):
+        scan = BlameScan(repo)
+        scans.append(scan)
+        return scan
+
+    monkeypatch.setitem(cli.SCAN_FACTORIES, "blame", factory)
+    return scans
+
+
+def _explain(repo, query, capsys, *extra):
+    ret = cli.main(["-C", str(repo), "--explain", *extra, query])
+    captured = capsys.readouterr()
+    return ret, captured.out, captured.err
+
+
+def _stats(repo, query, capsys):
+    ret = cli.main(["-C", str(repo), "--stats", query])
+    captured = capsys.readouterr()
+    return ret, captured.out, captured.err
+
+
+def test_explain_spec_query_exact_output(tiny_repo, capsys):
+    ret, out, err = _explain(tiny_repo, _SPEC_QUERY, capsys)
+    assert ret == 0
+    assert out == _SPEC_PLAN
+    assert err == ""
+
+
+def test_explain_never_blames_and_prints_no_rows(tiny_repo, capsys, built):
+    for query in [_SPEC_QUERY, "SELECT path FROM blame", "SELECT path FROM blame WHERE path = 'src/utils.py'"]:
+        built.clear()
+        ret, out, _err = _explain(tiny_repo, query, capsys)
+        assert ret == 0
+        (scan,) = built
+        assert scan.blamed_paths == []
+        assert scan.git_invocations == 1
+        assert "line_no" not in out and "src/utils.py\n" not in out.replace("'src/utils.py'", "")
+
+
+def test_explain_no_where(tiny_repo, capsys):
+    _ret, out, _err = _explain(tiny_repo, "SELECT path FROM blame", capsys)
+    assert out == "Project (path)\n  BlameScan (pushed: none -> 2 of 2 paths)\n"
+
+
+@pytest.mark.parametrize(
+    "where",
+    ["author_name = 'Ana Petrova'", "path = 'a' OR path = 'b'"],
+)
+def test_explain_nothing_pushable(tiny_repo, capsys, where):
+    _ret, out, _err = _explain(tiny_repo, f"SELECT path FROM blame WHERE {where}", capsys)
+    assert out == (
+        "Project (path)\n"
+        f"  Filter ({where})\n"
+        "    BlameScan (pushed: none -> 2 of 2 paths)\n"
+    )
+
+
+def test_explain_pushed_term_matching_nothing(tiny_repo, capsys):
+    _ret, out, _err = _explain(
+        tiny_repo, "SELECT path FROM blame WHERE path = 'does/not/exist.py'", capsys
+    )
+    assert out == (
+        "Project (path)\n"
+        "  Filter (path = 'does/not/exist.py')\n"
+        "    BlameScan (pushed: path = 'does/not/exist.py' -> 0 of 2 paths)\n"
+    )
+
+
+def test_explain_two_terms_intersect_and_filter_keeps_everything(tiny_repo, capsys):
+    _ret, out, _err = _explain(
+        tiny_repo,
+        "SELECT path FROM blame WHERE path LIKE 'src/%' AND path = 'src/utils.py'",
+        capsys,
+    )
+    assert out == (
+        "Project (path)\n"
+        "  Filter (path LIKE 'src/%' AND path = 'src/utils.py')\n"
+        "    BlameScan (pushed: path LIKE 'src/%', path = 'src/utils.py' -> 1 of 2 paths)\n"
+    )
+
+
+def test_explain_in_list_counts_paths_not_elements(awkward_repo, capsys):
+    _ret, out, _err = _explain(
+        awkward_repo,
+        "SELECT path FROM blame WHERE path IN ('café.py', 'empty.txt', 'nonexistent.txt')",
+        capsys,
+    )
+    assert out.splitlines()[-1] == (
+        "    BlameScan (pushed: path IN ('café.py', 'empty.txt', 'nonexistent.txt') -> 2 of 6 paths)"
+    )
+
+
+def test_explain_having_limit_distinct_sort(tiny_repo, capsys):
+    _ret, out, _err = _explain(
+        tiny_repo,
+        "SELECT DISTINCT author_name, count(*) FROM blame GROUP BY author_name "
+        "HAVING count(*) > 1 ORDER BY 2 DESC LIMIT 3",
+        capsys,
+    )
+    lines = out.splitlines()
+    assert lines[0] == "Limit (3)"
+    assert lines[1] == "  Distinct"
+    assert lines[2] == "    Project (author_name, count(*))"
+    assert lines[3] == "      Sort (count(*) DESC)"
+    assert lines[4] == "        Filter (count(*) > 1)"
+    assert lines[5].startswith("          Aggregate (group=[author_name], aggs=[count(*)")
+    assert lines[-1] == "            BlameScan (pushed: none -> 2 of 2 paths)"
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["SELEC path FROM blame", "SELECT path FROM", "SELECT nope FROM blame", "SELECT path FROM 'x"],
+)
+def test_explain_query_errors_exit_1_with_nothing_on_stdout(tiny_repo, capsys, query):
+    ret, out, err = _explain(tiny_repo, query, capsys)
+    assert ret == 1
+    assert out == ""
+    assert err.startswith("error: ")
+
+
+def test_explain_unreadable_repository_exits_3(tmp_path, capsys):
+    ret, out, err = _explain(tmp_path / "nope", "SELECT path FROM blame", capsys)
+    assert ret == 3
+    assert out == ""
+    assert err == f"error: could not read repository: {tmp_path / 'nope'}\n"
+
+
+def test_explain_with_stats_prints_the_plan_only(tiny_repo, capsys):
+    ret = cli.main(["-C", str(tiny_repo), "--explain", "--stats", _SPEC_QUERY])
+    captured = capsys.readouterr()
+    assert ret == 0
+    assert captured.out == _SPEC_PLAN
+    assert captured.err == ""
+
+
+_TIME_LINE = re.compile(r"^\d+\.\d\ds$")
+
+
+def test_stats_with_pushed_path(tiny_repo, capsys):
+    ret, out, err = _stats(tiny_repo, "SELECT path FROM blame WHERE path LIKE 'src/%'", capsys)
+    assert ret == 0
+    lines = err.splitlines()
+    assert lines[:2] == ["1 path blamed, 1 skipped", "2 git invocations"]
+    assert len(lines) == 3 and _TIME_LINE.match(lines[2])
+    assert out.splitlines()[0] == "path"
+    assert "stats" not in out and "blamed" not in out
+
+
+def test_stats_nothing_pushable(tiny_repo, capsys):
+    _ret, _out, err = _stats(tiny_repo, "SELECT path FROM blame WHERE author_name = 'Ana Petrova'", capsys)
+    assert err.splitlines()[:2] == ["2 paths blamed, 0 skipped", "3 git invocations"]
+
+
+def test_stats_predicate_matches_no_path(tiny_repo, capsys):
+    ret, out, err = _stats(tiny_repo, "SELECT path FROM blame WHERE path = 'does/not/exist.py'", capsys)
+    assert ret == 0
+    assert out == "path\n"
+    assert err.splitlines()[:2] == ["0 paths blamed, 2 skipped", "1 git invocation"]
+
+
+def test_stats_no_where(tiny_repo, capsys):
+    _ret, _out, err = _stats(tiny_repo, "SELECT path FROM blame", capsys)
+    assert err.splitlines()[:2] == ["2 paths blamed, 0 skipped", "3 git invocations"]
+
+
+def test_stats_singular_forms(tiny_repo, capsys):
+    _ret, _out, err = _stats(tiny_repo, "SELECT path FROM blame WHERE path = 'src/utils.py'", capsys)
+    assert err.splitlines()[0] == "1 path blamed, 1 skipped"
+
+
+def test_stats_reports_work_done_not_planned(tiny_repo, capsys, built):
+    ret, out, err = _stats(tiny_repo, "SELECT path FROM blame LIMIT 0", capsys)
+    assert ret == 0
+    assert out == "path\n"
+    assert err.splitlines()[:2] == ["0 paths blamed, 0 skipped", "0 git invocations"]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT path FROM blame",
+        "SELECT path FROM blame WHERE path LIKE 'src/%'",
+        "SELECT path FROM blame WHERE path = 'nope'",
+        "SELECT path FROM blame LIMIT 1",
+        "SELECT path FROM blame LIMIT 0",
+        "SELECT count(*) FROM blame WHERE author_name = 'Bo Lindqvist'",
+    ],
+)
+def test_stats_numbers_equal_the_scans_own_record(tiny_repo, capsys, built, query):
+    _ret, _out, err = _stats(tiny_repo, query, capsys)
+    (scan,) = built
+    blamed = len(scan.blamed_paths)
+    skipped = scan.tracked_path_count - blamed
+    noun = "path" if blamed == 1 else "paths"
+    inv = "invocation" if scan.git_invocations == 1 else "invocations"
+    assert err.splitlines()[:2] == [
+        f"{blamed} {noun} blamed, {skipped} skipped",
+        f"{scan.git_invocations} git {inv}",
+    ]
+
+
+def test_stdout_is_identical_with_and_without_stats(tiny_repo, capsys):
+    query = "SELECT path, author_name FROM blame WHERE path LIKE 'src/%'"
+    cli.main(["-C", str(tiny_repo), query])
+    plain = capsys.readouterr()
+    cli.main(["-C", str(tiny_repo), "--stats", query])
+    with_stats = capsys.readouterr()
+    assert plain.out == with_stats.out
+    assert plain.err == ""
+    assert with_stats.err != ""
+
+
+def test_two_runs_in_one_process_do_not_share_counters(tiny_repo, capsys):
+    _ret, _out, first = _stats(tiny_repo, "SELECT path FROM blame", capsys)
+    _ret, _out, second = _stats(tiny_repo, "SELECT path FROM blame WHERE path LIKE 'src/%'", capsys)
+    _ret, _out, third = _stats(tiny_repo, "SELECT path FROM blame", capsys)
+    assert first.splitlines()[:2] == third.splitlines()[:2]
+    assert second.splitlines()[:2] == ["1 path blamed, 1 skipped", "2 git invocations"]
+
+
+@pytest.mark.parametrize(
+    "query, code",
+    [("SELEC 1", 1), ("SELECT nope FROM blame", 1), ("SELECT sum(line_no) FROM blame GROUP BY", 1)],
+)
+def test_stats_prints_nothing_after_a_query_error(tiny_repo, capsys, query, code):
+    ret, out, err = _stats(tiny_repo, query, capsys)
+    assert ret == code
+    assert out == ""
+    assert err.startswith("error: ") and "blamed" not in err and "invocation" not in err
+
+
+def test_stats_prints_nothing_after_an_eval_error(tiny_repo, capsys):
+    ret, out, err = _stats(tiny_repo, "SELECT sum(9223372036854775807) FROM blame", capsys)
+    assert ret == 1
+    assert out == ""
+    assert err.startswith("error: ") and "blamed" not in err
+
+
+def test_stats_prints_nothing_for_an_unreadable_repository(tmp_path, capsys):
+    ret, out, err = _stats(tmp_path / "nope", "SELECT path FROM blame", capsys)
+    assert ret == 3
+    assert out == ""
+    assert "blamed" not in err
+
+
+def test_stats_prints_nothing_after_an_internal_error(tiny_repo, capsys, monkeypatch):
+    def boom(_tree):
+        raise ValueError("bug")
+
+    monkeypatch.setattr(cli, "_render_table", lambda *_a: boom(None))
+    ret, out, err = _stats(tiny_repo, "SELECT path FROM blame", capsys)
+    assert ret == 4
+    assert out == ""
+    assert "blamed" not in err
+
+
+def test_help_lists_explain_and_stats(capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["--help"])
+    assert excinfo.value.code == 0
+    out = capsys.readouterr().out
+    assert "--explain" in out and "--stats" in out
+
+
+def test_large_demo_stats_show_pushdown_work_avoided(large_repo, capsys):
+    from historian.tables.blame import list_paths
+
+    paths = list_paths(large_repo)
+    prefix = paths[0].split("/")[0] + "/" if "/" in paths[0] else paths[0][:3]
+    ret, _out, err = _stats(large_repo, f"SELECT path FROM blame WHERE path LIKE '{prefix}%'", capsys)
+    assert ret == 0
+    first = re.match(r"(\d+) paths? blamed, (\d+) skipped", err.splitlines()[0])
+    blamed, skipped = int(first[1]), int(first[2])
+    assert blamed < blamed + skipped == len(paths)
+
+    ret, _out, err = _stats(large_repo, "SELECT path FROM blame WHERE author_name = 'nobody'", capsys)
+    assert ret == 0
+    assert re.match(r"\d+ paths? blamed, 0 skipped", err.splitlines()[0])

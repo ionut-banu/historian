@@ -524,3 +524,29 @@ def test_scan_ignores_a_term_it_would_not_accept(tiny_repo):
     rows = list(source.scan(pushed=[_where("SELECT path FROM blame WHERE path != 'src/utils.py'")]))
     assert source.blamed_paths == TINY_PATHS
     assert {row[0] for row in rows} == set(TINY_PATHS)
+
+
+# --- estimate(): how many paths scan() would blame, without blaming (#42) ----
+
+
+def test_estimate_counts_paths_without_blaming(tiny_repo):
+    from historian.sql.ast import Like, Literal
+    from historian.sql.binder import BoundColumnRef
+    from historian.sql.lexer import Position
+
+    pos = Position(line=1, column=1, offset=0)
+    term = Like(
+        left=BoundColumnRef(offset=0, name="path", position=pos),
+        pattern=Literal("src/%", pos),
+        negated=False,
+        position=pos,
+    )
+    scan = BlameScan(tiny_repo)
+    estimate = scan.estimate([term])
+    assert (estimate.name, estimate.selected, estimate.total) == ("BlameScan", 1, 2)
+    assert scan.blamed_paths == []
+    assert scan.git_invocations == 1
+    assert scan.tracked_path_count == 2
+    none_pushed = scan.estimate()
+    assert (none_pushed.selected, none_pushed.total) == (2, 2)
+    assert scan.git_invocations == 1

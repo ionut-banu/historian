@@ -3157,3 +3157,18 @@ while `max(CAST(line_no AS TEXT))` is `'99'` and that `line_no > 9`
 holds for 114 rows against 10 as text, so an edit that restores
 agreement fails the build. Cost accepted: one more fixture to build,
 pin and cache. Spec §4's fixture list is updated alongside.
+
+2026-10-02 - Shape equality compares an aggregate's `DISTINCT` flag
+
+Issue #131. A bug fix to the implementation of #78 and #103, not a
+new decision: the rule is unchanged, and `count(x)` and `count(DISTINCT
+x)` were always meant to be different expressions. Both copies of
+`_same_node_fields` (`sql/binder.py` and `plan/planner.py`) compared a
+`FunctionCall` by folded name only, so under `SELECT DISTINCT` an
+`ORDER BY count(DISTINCT path)` matched a selected `COUNT(path)` and
+sorted by it. Each copy now also compares `distinct` as a plain field.
+The binder copy is the live fix: the query is now #78's
+unselected-aggregate `BindError`. The planner copy is defensive, kept
+mirrored for #112 to consolidate: `_split_expr` gives every call its
+own slot and `GROUP BY` keys cannot be aggregates, so no query reaches
+it with two aggregate calls.

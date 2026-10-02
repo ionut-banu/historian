@@ -1230,7 +1230,7 @@ def test_having_real_column_wins_over_alias_of_a_different_column():
 # `EvalError` rather than `BindError`. This query has no select-list
 # item that could be caught by any other check - both items are
 # themselves aggregate calls - so it exercises the ordinal-to-aggregate
-# rejection in `_bind_group_by_item` on its own, with nothing else able
+# rejection in `_bind_group_by` on its own, with nothing else able
 # to raise first.
 
 
@@ -1380,7 +1380,7 @@ def test_order_by_explicit_positive_ordinal_still_resolves():
 # vanish at parse time - `sql/parser.py`'s `_parse_primary`) around an
 # integer literal as an ordinal, in both GROUP BY and ORDER BY - not
 # just a bare `Literal` or one level of unary. `_ordinal_value` is the
-# one shared helper both `_bind_group_by_item` and `_bind_order_by_item`
+# one shared helper both `_bind_group_by` and `_bind_order_by`
 # now use. A direct unit test on the helper itself, plus both clauses
 # through `bind()`, since the helper is unreachable via `bind()` alone
 # for the "not an ordinal" shapes (a `BinaryOp` binds as an ordinary

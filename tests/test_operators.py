@@ -2192,3 +2192,78 @@ def test_distinct_streams_rather_than_materializing_the_child():
 
     assert first_three == list(rows[:3])
     assert source.pulled == 3
+
+
+# --- M3 review mutants (issue #108): ties, group key, avg ------------------
+#
+# Unit-only: `blame`'s `line_no` is always INTEGER, so no real query
+# can reach a column holding `1.0` then `1`. Oracle: Python's bundled
+# `sqlite3` (3.45.1 here), via `tests/oracle.py`.
+
+
+def test_min_max_tie_keeps_the_first_encountered_value_float_then_int():
+    """`create table t(x); insert into t values (1.0),(1); select
+    typeof(min(x)), typeof(max(x)) from t;` -> `real|real`, both
+    `1.0`. A tie never replaces the current extreme, so `<=`/`>=` in
+    place of `<`/`>` would return the later `1`."""
+    rows: list[Row] = [("a.py", 1.0, "e"), ("a.py", 1, "e")]
+    (row,) = tuple(
+        Aggregate(
+            _agg_child(rows), [_call("min", _col("line_no")), _call("max", _col("line_no"))]
+        ).rows()
+    )
+
+    assert row == (1.0, 1.0)
+    assert type(row[0]) is float
+    assert type(row[1]) is float
+
+
+def test_min_max_tie_keeps_the_first_encountered_value_int_then_float():
+    """The mirror: `insert into t values (1),(1.0)` -> `typeof(min(x))`
+    and `typeof(max(x))` both `integer`, both `1`."""
+    rows: list[Row] = [("a.py", 1, "e"), ("a.py", 1.0, "e")]
+    (row,) = tuple(
+        Aggregate(
+            _agg_child(rows), [_call("min", _col("line_no")), _call("max", _col("line_no"))]
+        ).rows()
+    )
+
+    assert row == (1, 1)
+    assert type(row[0]) is int
+    assert type(row[1]) is int
+
+
+def test_group_key_is_the_first_rows_value_float_then_int():
+    """`insert into t values (1.0),(1); select x, typeof(x), count(*)
+    from t group by x;` -> `1.0|real|2`: one group, keyed by the first
+    row's value, not the last's."""
+    rows: list[Row] = [("a.py", 1.0, "e"), ("a.py", 1, "e")]
+    (row,) = tuple(
+        Aggregate(_agg_child(rows), [_call("count")], group_by=[_col("line_no")]).rows()
+    )
+
+    assert row == (1.0, 2)
+    assert type(row[0]) is float
+
+
+def test_group_key_is_the_first_rows_value_int_then_float():
+    """The mirror: `insert into t values (1),(1.0)` -> `1|integer|2`."""
+    rows: list[Row] = [("a.py", 1, "e"), ("a.py", 1.0, "e")]
+    (row,) = tuple(
+        Aggregate(_agg_child(rows), [_call("count")], group_by=[_col("line_no")]).rows()
+    )
+
+    assert row == (1, 2)
+    assert type(row[0]) is int
+
+
+def test_avg_of_integers_rounds_the_sum_to_float_before_dividing():
+    """`insert into t values (3554420497468992166),
+    (-747961094045913286),(-9223372036854775808); select avg(x) from
+    t;` -> `-0x1.daf26ae3ccde3p+60`, which is `float(exact_sum) / 3`.
+    Dividing the exact integer sum (Python's correctly rounded int/int
+    division) gives `-0x1.daf26ae3ccde2p+60` instead, one ULP off."""
+    (value,) = _avg_rows([3554420497468992166, -747961094045913286, -9223372036854775808])
+
+    assert type(value) is float
+    assert value.hex() == "-0x1.daf26ae3ccde3p+60"

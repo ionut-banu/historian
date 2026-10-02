@@ -73,7 +73,6 @@ from pathlib import Path
 
 from collections.abc import Sequence
 
-from historian.ascii import ascii_fold
 from historian.exec.operators import (
     Aggregate,
     AggregateCall,
@@ -87,23 +86,9 @@ from historian.exec.operators import (
     Sort,
     SortKey,
 )
-from historian.sql.ast import (
-    And,
-    Between,
-    BinaryOp,
-    Expr,
-    FunctionCall,
-    In,
-    Is,
-    Like,
-    Literal,
-    Not,
-    OrderDirection,
-    Or,
-    Star,
-    UnaryOp,
-)
+from historian.sql.ast import Expr, FunctionCall, Literal, OrderDirection, Star
 from historian.sql.binder import BoundColumnRef, BoundOrderByItem, BoundSelectItem, BoundSelectStatement
+from historian.sql.walk import children, expr_shape_equal, is_aggregate_query, with_children
 
 __all__ = ["ScanFactory", "plan"]
 
@@ -132,9 +117,10 @@ ScanFactory = Callable[[Path], ScanSource]
 # own `Aggregate.__init__`).
 #
 # `_split_expr` walks one already-bound expression left to right.
-# Any subtree matching a `group_by` key by shape (`_expr_shape_equal`,
-# ignoring position - the same rule `sql/binder.py` already used to
-# decide the expression was legal at bind time) is replaced wholesale
+# Any subtree matching a `group_by` key by shape (`sql/walk.py`'s
+# `expr_shape_equal`, ignoring position - the same function
+# `sql/binder.py` used to decide the expression was legal at bind
+# time) is replaced wholesale
 # with a `BoundColumnRef` into that key's own slot in `Aggregate`'s
 # output row - `dataclasses.replace` structural equality, not `==` on
 # the raw AST node, because the two occurrences (SELECT/HAVING vs.
@@ -144,10 +130,10 @@ ScanFactory = Callable[[Path], ScanSource]
 # aggregate call - is replaced with a `BoundColumnRef` into `Aggregate`'s
 # own output row, at `len(group_by) + len(calls)` (group-key columns
 # come first), the offset its `AggregateCall` occupies once appended
-# to `calls`; every other node type is walked and rebuilt via
-# `dataclasses.replace`, mirroring `sql/binder.py`'s own `_bind_expr`
-# structure exactly (one boring, explicit isinstance branch per
-# `sql/ast.py` node type - AGENTS.md: no dynamic dispatch). `calls`
+# to `calls`; every other node type is walked and rebuilt through
+# `sql/walk.py`'s `children`/`with_children`, the same tables
+# `sql/binder.py`'s own `_bind_expr` walks (one boring, explicit
+# isinstance branch per node type - AGENTS.md: no dynamic dispatch). `calls`
 # accumulates across the *entire* select list and then HAVING, in one
 # flat, ordered, undeduplicated list, shared between the two so their
 # offsets never collide - `count(*)` written twice gets two slots, not
@@ -161,117 +147,13 @@ ScanFactory = Callable[[Path], ScanSource]
 # reason to know which.
 
 
-def _operands(expr: Expr) -> tuple[Expr, ...]:
-    """*expr*'s direct sub-expressions, left to right - this module's
-    own copy of `sql/binder.py`'s table of the same name (issue #107),
-    kept here for the same reason `_expr_shape_equal` is (see its
-    docstring). A leaf has none."""
-    if isinstance(expr, (Literal, BoundColumnRef, Star)):
-        return ()
-    if isinstance(expr, FunctionCall):
-        return expr.args
-    if isinstance(expr, (UnaryOp, Not)):
-        return (expr.operand,)
-    if isinstance(expr, (BinaryOp, And, Or, Is)):
-        return (expr.left, expr.right)
-    if isinstance(expr, Like):
-        if expr.escape is None:
-            return (expr.left, expr.pattern)
-        return (expr.left, expr.pattern, expr.escape)
-    if isinstance(expr, In):
-        return (expr.left, *expr.values)
-    if isinstance(expr, Between):
-        return (expr.operand, expr.low, expr.high)
-    raise AssertionError(f"plan/planner.py: unhandled expression node type {type(expr).__name__}")
-
-
-def _with_operands(expr: Expr, operands: list[Expr]) -> Expr:
-    """*expr* rebuilt via `dataclasses.replace` with *operands* - one
-    per entry of `_operands(expr)`, in the same order - in place of its
-    own children."""
-    if isinstance(expr, (UnaryOp, Not)):
-        (operand,) = operands
-        return dataclasses.replace(expr, operand=operand)
-    if isinstance(expr, (BinaryOp, And, Or, Is)):
-        left, right = operands
-        return dataclasses.replace(expr, left=left, right=right)
-    if isinstance(expr, Like):
-        escape = operands[2] if expr.escape is not None else None
-        return dataclasses.replace(expr, left=operands[0], pattern=operands[1], escape=escape)
-    if isinstance(expr, In):
-        return dataclasses.replace(expr, left=operands[0], values=tuple(operands[1:]))
-    if isinstance(expr, Between):
-        operand, low, high = operands
-        return dataclasses.replace(expr, operand=operand, low=low, high=high)
-    raise AssertionError(f"plan/planner.py: unhandled expression node type {type(expr).__name__}")
-
-
-def _expr_shape_equal(a: Expr, b: Expr) -> bool:
-    """Structural equality between two already-bound expressions,
-    ignoring `position` - mirrors `sql/binder.py`'s own
-    `_expr_shape_equal` exactly (the same question, asked again here
-    because a `GROUP BY` key and its matching `SELECT`/`HAVING`
-    occurrence are bound independently and never share a `position`).
-    Kept as this module's own copy rather than importing a private
-    name across modules - `sql/binder.py`'s `_bind_expr`/`plan/
-    planner.py`'s `_split_expr` are already two independent, mirrored
-    walks of the same shape for the same reason.
-
-    A loop over an explicit stack of node pairs (issue #107), not
-    recursion: each pair's own fields are compared, then its operand
-    pairs are pushed. Nothing here has a side effect, so the order the
-    pairs are compared in cannot change the answer."""
-    pending: list[tuple[Expr, Expr]] = [(a, b)]
-    while pending:
-        x, y = pending.pop()
-        if not _same_node_fields(x, y):
-            return False
-        x_operands = _operands(x)
-        y_operands = _operands(y)
-        if len(x_operands) != len(y_operands):
-            return False
-        pending.extend(zip(x_operands, y_operands))
-    return True
-
-
-def _same_node_fields(a: Expr, b: Expr) -> bool:
-    """`_expr_shape_equal` for one pair of nodes, children aside: the
-    same node type and the same non-child fields. The operand count
-    (a function's arguments, an `IN` list's length, whether `LIKE` has
-    an `ESCAPE`) is compared by the caller."""
-    if type(a) is not type(b):
-        return False
-    if isinstance(a, Literal):
-        return type(a.value) is type(b.value) and a.value == b.value
-    if isinstance(a, BoundColumnRef):
-        return a.offset == b.offset
-    if isinstance(a, Star):
-        return a.table == b.table
-    if isinstance(a, FunctionCall):
-        # Case-fold the name the same way `sql/binder.py`'s own copy
-        # now does (issue #103 round 2) - function names are ASCII-
-        # case-insensitive in SQLite, and a `GROUP BY`/select-list pair
-        # spelled `COUNT`/`count` must still match by shape here too.
-        # The `distinct` flag mirrors the binder's copy (issue #131).
-        # Defensive here: no query reaches this with two aggregate
-        # calls, since `_split_expr` gives every call its own slot.
-        return ascii_fold(a.name) == ascii_fold(b.name) and a.distinct == b.distinct
-    if isinstance(a, (UnaryOp, BinaryOp)):
-        return a.op == b.op
-    if isinstance(a, (Not, And, Or)):
-        return True
-    if isinstance(a, (Is, Like, In, Between)):
-        return a.negated == b.negated
-    raise AssertionError(f"plan/planner.py: unhandled expression node type {type(a).__name__}")
-
-
 def _group_key_index(expr: Expr, group_by: Sequence[Expr]) -> int | None:
     """The offset of *expr* among `Aggregate`'s group-key columns, if
     it matches one of `group_by`'s keys by shape - `None` otherwise.
     The first match wins, matching `group_by`'s own declared order
     (which is also `Aggregate`'s own output column order)."""
     for index, key in enumerate(group_by):
-        if _expr_shape_equal(expr, key):
+        if expr_shape_equal(expr, key):
             return index
     return None
 
@@ -322,10 +204,10 @@ def _split_expr(expr: Expr, calls: list[AggregateCall], group_by: Sequence[Expr]
     while pending:
         node, operands_done = pending.pop()
         if operands_done:
-            first = len(results) - len(_operands(node))
+            first = len(results) - len(children(node))
             rewritten = results[first:]
             del results[first:]
-            results.append(_with_operands(node, rewritten))
+            results.append(with_children(node, rewritten))
             continue
         key_index = _group_key_index(node, group_by)
         if key_index is not None:
@@ -342,7 +224,7 @@ def _split_expr(expr: Expr, calls: list[AggregateCall], group_by: Sequence[Expr]
             results.append(node)
             continue
         pending.append((node, True))
-        for operand in reversed(_operands(node)):
+        for operand in reversed(children(node)):
             pending.append((operand, False))
     (result,) = results
     return result
@@ -419,11 +301,12 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory])
     `ORDER BY` shape `sql/binder.py`'s own DISTINCT narrowing still
     allows to bind.
     `Aggregate` (and, above it, `HAVING`'s `Filter`) is inserted only
-    when the query needs it - `stmt.group_by` is non-empty, or the
-    aggregate/scalar split (`_split_select_list`/`_split_expr`, run
-    over the select list, then `HAVING`, then `ORDER BY`, sharing one
-    flat `calls` list so their offsets never collide) found at least
-    one aggregate call anywhere in any of the three. A `GROUP BY`-free,
+    when the query needs it - `stmt.group_by` is non-empty, or at
+    least one aggregate call appears anywhere in the select list,
+    `HAVING` or `ORDER BY` (`sql/walk.py`'s `is_aggregate_query`).
+    The aggregate/scalar split (`_split_select_list`/`_split_expr`,
+    run over the select list, then `HAVING`, then `ORDER BY`) shares
+    one flat `calls` list so their offsets never collide. A `GROUP BY`-free,
     aggregate-free query keeps issue #13's original two shapes exactly
     - neither `Aggregate` nor `HAVING`'s `Filter` ever appears for it.
     `Sort` is inserted only when `stmt.order_by` is non-empty, and
@@ -445,8 +328,7 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory])
     aggregate call anywhere in the select list or `HAVING` itself is a
     `BindError` there, matching `sqlite3`'s own "HAVING clause on a
     non-aggregate query" rejection - so `plan()` never legitimately
-    sees a bound `having` with `calls` empty and `stmt.group_by`
-    empty. The `elif having is not None` branch below only exists
+    sees a bound `having` in a query that does not aggregate. The `elif having is not None` branch below only exists
     for a `BoundSelectStatement` built by hand (as some planner unit
     tests do, bypassing `bind()`); it treats that shape as an
     ordinary predicate over the `Scan`/`Filter(WHERE)` row rather than
@@ -462,12 +344,20 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory])
     if stmt.where is not None:
         tree = Filter(tree, stmt.where)
 
+    # Aggregate when GROUP BY is written or an aggregate call appears
+    # in the select list, HAVING or ORDER BY - for a bound statement the
+    # same answer the binder's select-list-only call gives.
+    aggregate_exprs = [item.expr for item in stmt.select_list]
+    if stmt.having is not None:
+        aggregate_exprs.append(stmt.having)
+    aggregate_exprs.extend(item.expr for item in stmt.order_by)
+    aggregate_query = is_aggregate_query(stmt.group_by, aggregate_exprs)
     calls: list[AggregateCall] = []
     select_list = _split_select_list(stmt.select_list, calls, stmt.group_by)
     having = _split_expr(stmt.having, calls, stmt.group_by) if stmt.having is not None else None
     order_keys = _split_order_by(stmt.order_by, calls, stmt.group_by)
 
-    if calls or stmt.group_by:
+    if aggregate_query:
         tree = Aggregate(tree, calls, group_by=stmt.group_by)
         if having is not None:
             tree = Filter(tree, having)

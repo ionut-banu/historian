@@ -24,6 +24,7 @@ import pytest
 from historian.catalog import SCAN_FACTORIES
 from historian.exec.operators import Aggregate, Distinct, Filter, Limit, Project, Scan, Sort
 from historian.plan import planner
+from historian.sql import walk
 from historian.plan.planner import plan
 from historian.schema import Column, ColumnType, Row, Schema
 from historian.sql.ast import And, BinaryOp, FunctionCall, Is, Like, Literal, OrderDirection, Operator as Op, Star
@@ -423,10 +424,10 @@ def test_plan_min_max_distinct_threads_the_flag_too():
 # --- count(x) and count(DISTINCT x) keep separate slots (issue #131) ------
 #
 # `_split_expr` gives every call its own slot and never deduplicates, so
-# no query reaches the planner's `_expr_shape_equal` with two aggregate
-# calls. These pin that end to end, so adding the `distinct` comparison
-# to `_same_node_fields` (and any later consolidation, #112) cannot
-# start sharing a slot between the two.
+# no query reaches the planner's shape equality with two aggregate
+# calls. These pin that end to end, so the `distinct` comparison in
+# `sql/walk.py`'s shared shape equality cannot start sharing a slot
+# between the two.
 
 _TWO_PATHS_THREE_ROWS = [
     ("a.py", 1, "ana@x.com"),
@@ -1139,14 +1140,13 @@ def test_distinct_with_order_by_and_limit_through_the_real_pipeline_end_to_end()
     assert list(tree.rows()) == [("a", 1), ("b", 2), ("a", 3)]
 
 
-# --- LIKE ... ESCAPE joins this module's own `_expr_shape_equal` -------
-# --- and `_split_expr` (issue #101) -------------------------------------
+# --- LIKE ... ESCAPE joins shape equality and `_split_expr` (#101) -----
 #
-# `plan/planner.py` keeps its own independent copy of
-# `sql/binder.py`'s `_expr_shape_equal` (`_group_key_index`'s own
-# dependency) - a black-box query alone cannot prove this copy's `Like`
-# branch was fixed, since the binder's own copy (`tests/test_binder.py`)
-# already rejects the same query first. Pinned directly here instead.
+# The planner's shape equality (`_group_key_index`'s dependency) is
+# `sql/walk.py`'s `expr_shape_equal` since #112, shared with the
+# binder. A black-box query alone cannot prove the planner's use of it
+# handles `Like`, since the binder rejects the same query first.
+# Pinned directly here instead; `tests/test_walk.py` checks every field.
 
 
 def test_expr_shape_equal_like_differing_only_in_escape_is_not_equal():
@@ -1164,7 +1164,7 @@ def test_expr_shape_equal_like_differing_only_in_escape_is_not_equal():
         position=_POS,
         escape=None,
     )
-    assert planner._expr_shape_equal(with_escape, without_escape) is False
+    assert walk.expr_shape_equal(with_escape, without_escape) is False
 
 
 def test_expr_shape_equal_like_with_different_escape_operands_is_not_equal():
@@ -1174,48 +1174,48 @@ def test_expr_shape_equal_like_with_different_escape_operands_is_not_equal():
     escape_x = Like(
         left=_col("path"), pattern=_lit("c%"), negated=False, position=_POS, escape=_lit("x")
     )
-    assert planner._expr_shape_equal(escape_c, escape_x) is False
+    assert walk.expr_shape_equal(escape_c, escape_x) is False
 
 
 def test_expr_shape_equal_like_with_identical_escape_operands_is_equal():
     a = Like(left=_col("path"), pattern=_lit("c%"), negated=False, position=_POS, escape=_lit("c"))
     b = Like(left=_col("path"), pattern=_lit("c%"), negated=False, position=_POS, escape=_lit("c"))
-    assert planner._expr_shape_equal(a, b) is True
+    assert walk.expr_shape_equal(a, b) is True
 
 
 def test_expr_shape_equal_count_differing_only_in_distinct_is_not_equal():
-    """Issue #131: the planner's own copy of the binder's `distinct`
-    check. Unreachable from a query - `_split_expr` never compares two
+    """Issue #131: the `distinct` check, as the planner uses it.
+    Unreachable from a query - `_split_expr` never compares two
     aggregate calls - so hand-built nodes, in both argument orders."""
     plain = _func("count", _col("path"))
     flagged = _func("count", _col("path"), distinct=True)
-    assert planner._expr_shape_equal(plain, flagged) is False
-    assert planner._expr_shape_equal(flagged, plain) is False
+    assert walk.expr_shape_equal(plain, flagged) is False
+    assert walk.expr_shape_equal(flagged, plain) is False
 
 
 def test_expr_shape_equal_count_with_equal_distinct_flags_is_equal():
     """The reverse: equal flags still compare equal, both set and both
     clear."""
-    assert planner._expr_shape_equal(
+    assert walk.expr_shape_equal(
         _func("count", _col("path"), distinct=True), _func("count", _col("path"), distinct=True)
     ) is True
-    assert planner._expr_shape_equal(_func("count", _col("path")), _func("count", _col("path"))) is True
+    assert walk.expr_shape_equal(_func("count", _col("path")), _func("count", _col("path"))) is True
 
 
 def test_expr_shape_equal_literals_differing_only_in_int_versus_real_type_are_not_equal():
-    """Issue #108, A5: the planner's own copy of the binder's literal-
-    type check. `1 == 1.0` in Python, but they are different literals.
+    """Issue #108, A5: the literal-type check, as the planner uses
+    it. `1 == 1.0` in Python, but they are different literals.
     Unreachable from a query (the binder rejects first), so hand-built
     nodes."""
-    assert planner._expr_shape_equal(_lit(1), _lit(1.0)) is False
+    assert walk.expr_shape_equal(_lit(1), _lit(1.0)) is False
 
 
 def test_expr_shape_equal_is_differing_only_in_negated_is_not_equal():
-    """Issue #108, A5: the planner's own copy of the binder's
-    `Is.negated` check - `x IS NULL` against `x IS NOT NULL`."""
+    """Issue #108, A5: the `Is.negated` check, as the planner uses
+    it - `x IS NULL` against `x IS NOT NULL`."""
     is_null = Is(left=_col("path"), right=_lit(None), negated=False, position=_POS)
     is_not_null = Is(left=_col("path"), right=_lit(None), negated=True, position=_POS)
-    assert planner._expr_shape_equal(is_null, is_not_null) is False
+    assert walk.expr_shape_equal(is_null, is_not_null) is False
 
 
 def test_plan_split_expr_like_escape_column_matching_group_key_reads_from_aggregate_output():
@@ -1303,8 +1303,8 @@ def test_expr_shape_equal_on_deep_trees():
     a = _deep_chain(_DEEP, lambda: _col("line_no"))
     b = _deep_chain(_DEEP, lambda: _col("line_no"))
     c = _bin(Op.ADD, _deep_chain(_DEEP - 1, lambda: _col("line_no")), _col("path"))
-    assert planner._expr_shape_equal(a, b) is True
-    assert planner._expr_shape_equal(a, c) is False
+    assert walk.expr_shape_equal(a, b) is True
+    assert walk.expr_shape_equal(a, c) is False
 
 
 def test_plan_of_a_deep_where_select_and_order_by():

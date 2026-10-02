@@ -10,11 +10,11 @@ FROM blame
 WHERE path = 'AGENTS.md';
 ```
 
-**Status: early.** Single-table `SELECT` / `WHERE` queries over
-`blame` run today - see the example above. `GROUP BY`, aggregates,
-`ORDER BY`, joins, and the other tables are still being built;
-`_docs/spec.md` describes the finished shape and `_docs/process.md`
-how the work is tracked.
+**Status: early.** Single-table queries over `blame` run today - see
+the example above: `SELECT`, `WHERE`, `GROUP BY`, `HAVING`,
+`ORDER BY`, `LIMIT`, `DISTINCT` and the five aggregates. Joins do not
+exist yet, and `blame` is the only table. `_docs/spec.md` describes
+the planned shape and `_docs/process.md` how the work is tracked.
 
 ## Why this exists
 
@@ -61,6 +61,9 @@ src/utils.py  2
 The last line is the only part of any output that varies between two
 identical runs.
 
+The path counts and timings in these two examples are an illustration
+of a smaller repository; against a larger one the numbers are larger.
+
 `--no-pushdown` runs the query with nothing pushed into the scan, so
 it blames every path and returns the same rows. Combine it with
 `--stats` to see what pushdown saves.
@@ -77,20 +80,19 @@ get wrong — `NULL` comparison being neither true nor false, `sum` over
 zero rows being `NULL` while `count(*)` is `0`, an integer sorting
 before any string regardless of contents.
 
-On top of that, a fuzzer generates random queries within the supported
-grammar and diffs both engines. Hand-written tests only cover cases
-someone thought of; the bugs that survive are the ones nobody thought
-of. Every mismatch it finds is shrunk to the smallest failing query and
-committed as a permanent test.
-
-That is what the counts in this README will mean, once there are any.
+The differential harness in `tests/differential/` does this today: it
+loads the same rows into Python's bundled `sqlite3` module, runs
+hand-written queries through both engines, and asserts the results are
+identical. A fuzzer that generates queries is not built yet.
 
 ## Scope
 
 A deliberately small subset of SQL, over a git repository, read-only.
 
 Supported: `SELECT`, `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`,
-`LIMIT`, `DISTINCT`, `INNER JOIN`, and five aggregates.
+`LIMIT`, `DISTINCT`, and five aggregates, over the `blame` table.
+
+Not implemented yet: `INNER JOIN`, and the tables other than `blame`.
 
 Not supported, and not planned: subqueries, CTEs, window functions,
 `UNION`, outer joins, `INSERT` / `UPDATE` / `DELETE`, transactions.

@@ -9,6 +9,9 @@ Commands
 - `uv run pytest tests/test_parser.py` - one test file
 - `uv run historian "SELECT ..."` - run a query against the repo you
   are standing in
+- `uv run pytest tests/differential` - the differential suite:
+  historian against SQLite over the same rows; run during
+  development and as the check that nothing regressed
 - `uv run python tests/oracle.py "<setup SQL>" "<query SQL>"` - ask
   the oracle (Python's bundled `sqlite3` module) an ad hoc question;
   setup is optional - see `_docs/process.md`, "The oracle"
@@ -40,6 +43,10 @@ Layout
 - `tests/` - pytest tests, one file per module under test
 - `tests/extraction/` - tests checking the git-backed tables against
   `git` itself, e.g. `test_blame.py`
+- `tests/differential/` - historian against SQLite: the harness in
+  `conftest.py` and the hand-written differential tests
+- `tests/pushdown/` - work-done tests for scan pushdown: which paths
+  were blamed and how many git invocations were made
 - `tests/fixtures/` - scripts that build git repositories with known,
   asserted contents
 

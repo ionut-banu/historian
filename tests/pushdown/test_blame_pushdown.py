@@ -324,6 +324,33 @@ def test_pushed_path_term_beside_an_unpushable_one(tiny_repo):
     )
 
 
+def test_pushed_path_beside_a_numeric_line_no_filter(numeric_repo):
+    """#109: `path` narrows the scan to `long.txt` alone, and `line_no >
+    99` - which only holds numerically for 21 of its lines - stays in
+    the Filter above it."""
+    rows = _check(
+        "SELECT path, line_no FROM blame WHERE path = 'long.txt' AND line_no > 99",
+        numeric_repo,
+        blamed=["long.txt"],
+        invocations=2,
+        pushed=1,
+    )
+    assert sorted(rows) == [("long.txt", n) for n in range(100, 121)]
+
+
+def test_or_of_path_and_numeric_line_no_blames_every_file(numeric_repo):
+    """#109: an `OR` cannot push down, so all three files are blamed;
+    12 rows from `mid.txt` and 21 from `long.txt`."""
+    rows = _check(
+        "SELECT path, line_no FROM blame WHERE path = 'mid.txt' OR line_no > 99",
+        numeric_repo,
+        blamed=["long.txt", "mid.txt", "short.txt"],
+        invocations=4,
+        pushed=0,
+    )
+    assert len(rows) == 33
+
+
 def test_three_term_and_pushes_only_path(tiny_repo):
     _check(
         "SELECT path, line_no FROM blame WHERE path = 'src/utils.py' AND line_no >= 1",

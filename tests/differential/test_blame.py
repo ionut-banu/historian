@@ -2104,8 +2104,11 @@ def test_group_by_after_where_matching_zero_rows_is_zero_groups(tiny_repo):
 # `line_no` 1..6). An aggregate result or a computed `GROUP BY` key can
 # exceed one digit (`sum(line_no)` over `café.py` is 21, `line_no + 10`
 # is 11..16) even though no raw `line_no` does - that is what lets text
-# order and numeric order disagree here without touching any fixture
-# (#109 stays open for the bare-column case). Every expected value was
+# order and numeric order disagree here without touching any fixture.
+# The bare-column case needed one-, two- and three-digit `line_no`
+# values, which no fixture had: it is covered over `numeric_repo` by
+# the "Bare `line_no` compares, sorts and aggregates as a number (issue
+# #109)" section at the end of this file. Every expected value was
 # confirmed against the oracle before the fix landed.
 
 
@@ -4451,3 +4454,147 @@ def test_negated_computed_zero_under_a_pushable_predicate(tiny_repo, where):
     finally:
         conn.close()
     _assert_differential(tiny_repo, query)
+
+
+# --- Bare `line_no` compares, sorts and aggregates as a number (issue
+# #109) -----------------------------------------------------------------
+#
+# `tiny`'s largest `line_no` is 2 and `awkward`'s is 6, so on those
+# fixtures every comparison of a bare `line_no` agrees whether it is
+# done as a number or as text. `numeric_repo` (tests/fixtures/build.py)
+# has 135 blame rows: `long.txt` lines 1-120 (10-99 by Bo, the rest by
+# Ana), `mid.txt` 1-12 and `short.txt` 1-3 (both Ana's), so one-, two-
+# and three-digit values sit side by side and text order disagrees with
+# numeric order on every query below.
+#
+# Each case pins SQLite's own answer outright as well as diffing
+# historian against it, so a case cannot pass by both sides being
+# wrong the same way. Every expected value was confirmed with
+# `uv run python tests/oracle.py` over the real `blame` rows (sqlite3
+# module 3.45.1); the comment on each case names the text-order answer
+# it rules out where that differs.
+
+
+def _assert_numeric_case(repo, query: str, expected_rows, *, key_positions=None) -> None:
+    """`_assert_differential` (or `_order` when *key_positions* is
+    given, for a query with `ORDER BY`), plus SQLite's full answer
+    pinned - as a sorted multiset when unordered, in order when
+    ordered - with each cell's Python type checked too."""
+    conn = load_unfiltered(BlameScan, repo, BLAME_SCHEMA, "blame")
+    try:
+        sqlite_rows = conn.execute(query).fetchall()
+    finally:
+        conn.close()
+    if key_positions is None:
+        got, want = sorted(sqlite_rows, key=repr), sorted(expected_rows, key=repr)
+    else:
+        got, want = list(sqlite_rows), list(expected_rows)
+    assert [tuple(type(c) for c in row) for row in got] == [tuple(type(c) for c in row) for row in want]
+    assert got == want
+    _, historian_rows = run_historian(query, repo)
+    if key_positions is None:
+        assert_rows_match(sqlite_rows, historian_rows)
+    else:
+        assert_rows_match(sqlite_rows, historian_rows, ordered=True, key_positions=key_positions)
+
+
+@pytest.mark.parametrize(
+    "query,expected_rows",
+    [
+        # Text order: 10 rows ('9' and '9x').
+        ("SELECT count(*) FROM blame WHERE line_no > 9", [(114,)]),
+        # INTEGER column affinity converts the text literal to 9.
+        ("SELECT count(*) FROM blame WHERE line_no > '9'", [(114,)]),
+        # Text order: only '1' sorts below '10', so 3 rows.
+        ("SELECT count(*) FROM blame WHERE line_no < 10", [(21,)]),
+        ("SELECT path, count(*) FROM blame WHERE line_no >= 10 GROUP BY path", [("long.txt", 111), ("mid.txt", 3)]),
+        # Text order: nothing is both >= '9' and <= '11', so 0.
+        ("SELECT count(*) FROM blame WHERE line_no BETWEEN 9 AND 11", [(6,)]),
+        ("SELECT count(*) FROM blame WHERE line_no IN (10, 11)", [(4,)]),
+        # Text order: max '99', min '1'.
+        ("SELECT max(line_no), min(line_no) FROM blame", [(120, 1)]),
+        # The shape #99 found, over a bare column: as text, '12' and '3'
+        # are both above '100' too, so all three paths come back.
+        ("SELECT path, max(line_no) FROM blame GROUP BY path HAVING max(line_no) > 100", [("long.txt", 120)]),
+    ],
+)
+def test_numeric_bare_line_no_compares_and_aggregates_as_a_number(numeric_repo, query, expected_rows):
+    _assert_numeric_case(numeric_repo, query, expected_rows)
+
+
+# Nothing matches: four different answers to "no rows got through",
+# each its own case. A scalar aggregate over zero rows is still one row.
+
+
+def test_numeric_no_rows_count_is_one_zero_row(numeric_repo):
+    _assert_numeric_case(numeric_repo, "SELECT count(*) FROM blame WHERE line_no > 120", [(0,)])
+
+
+def test_numeric_no_rows_max_is_one_null_row(numeric_repo):
+    _assert_numeric_case(numeric_repo, "SELECT max(line_no) FROM blame WHERE line_no > 120", [(None,)])
+
+
+def test_numeric_no_rows_plain_select_is_empty(numeric_repo):
+    _assert_numeric_case(numeric_repo, "SELECT path FROM blame WHERE line_no > 120", [])
+
+
+def test_numeric_no_rows_grouped_aggregate_is_empty(numeric_repo):
+    _assert_numeric_case(numeric_repo, "SELECT path, count(*) FROM blame WHERE line_no > 120 GROUP BY path", [])
+
+
+def test_numeric_order_by_line_no_desc_limit(numeric_repo):
+    """Text order: '99', '98', '97'."""
+    _assert_numeric_case(
+        numeric_repo,
+        "SELECT line_no FROM blame ORDER BY line_no DESC LIMIT 3",
+        [(120,), (119,), (118,)],
+        key_positions=(0,),
+    )
+
+
+def test_numeric_order_by_line_no_ascending_within_one_file(numeric_repo):
+    """Text order puts 10, 11, 12 before 2."""
+    _assert_numeric_case(
+        numeric_repo,
+        "SELECT line_no FROM blame WHERE path = 'mid.txt' ORDER BY line_no",
+        [(n,) for n in range(1, 13)],
+        key_positions=(0,),
+    )
+
+
+def test_numeric_order_by_max_per_path_desc(numeric_repo):
+    """Sorting the maxima as text gives `short.txt` ('3') first; taking
+    the maxima as text ('99', '9', '3') keeps this order, which is why
+    the per-author case below exists too."""
+    _assert_numeric_case(
+        numeric_repo,
+        "SELECT path, max(line_no) FROM blame GROUP BY path ORDER BY max(line_no) DESC",
+        [("long.txt", 120), ("mid.txt", 12), ("short.txt", 3)],
+        key_positions=(1,),
+    )
+
+
+def test_numeric_order_by_max_per_author_desc(numeric_repo):
+    """Text order flips them: sorted as text, Bo's 99 is above Ana's
+    120; taken as text, Ana's max is '9' and Bo's '99'."""
+    _assert_numeric_case(
+        numeric_repo,
+        "SELECT author_name, max(line_no) FROM blame GROUP BY author_name ORDER BY max(line_no) DESC",
+        [("Ana", 120), ("Bo", 99)],
+        key_positions=(1,),
+    )
+
+
+def test_numeric_pushed_path_beside_a_filtered_line_no(numeric_repo):
+    """`path` pushes down to `long.txt`; `line_no > 99` stays in the
+    Filter. How much was blamed is tests/pushdown's concern."""
+    _assert_numeric_case(
+        numeric_repo, "SELECT count(*) FROM blame WHERE path = 'long.txt' AND line_no > 99", [(21,)]
+    )
+
+
+def test_numeric_or_of_path_and_line_no_cannot_push_down(numeric_repo):
+    """12 rows from `mid.txt` plus 21 from `long.txt`."""
+    _assert_numeric_case(
+        numeric_repo, "SELECT count(*) FROM blame WHERE path = 'mid.txt' OR line_no > 99", [(33,)]
+    )

@@ -995,6 +995,16 @@ to stderr after the results, so stdout is identical with and without
 the scan actually did: `LIMIT 0` never reads the scan and prints
 `0 paths blamed, 0 skipped`.
 
+### `--no-pushdown`
+
+Runs the query with nothing pushed into the scan: the optimizer step
+is skipped, so every scan does all of its work, as if no `WHERE` term
+could be pushed. The rows are the same as without the flag, and the
+`Filter` is unchanged. It is the same meaning of "pushdown disabled"
+that §4's differential harness uses. With `--explain` the scan line
+reads `pushed: none`, and with `--stats` the counts show every path
+blamed. It changes nothing about errors or exit codes.
+
 ### Errors
 
 Never a traceback. Position, cause, and what would have been valid:

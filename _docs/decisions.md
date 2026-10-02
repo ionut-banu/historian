@@ -3226,3 +3226,9 @@ This reverses the earlier note in `values.py`'s docstring that a
 plain `dict` on the raw value was correct and "no function is needed".
 `ORDER BY`, `min`/`max` and `values._compare` still lean on Python's
 int/float comparison; that is #154.
+
+2026-10-02 - Numeric text skips exactly space, \t, \n, \v, \f, \r
+
+Issue #136. `_NUMERIC_WHITESPACE` in `exec/expression.py` was `" \t\n\r\f"`, a default nobody had checked, and omitted `\v`, so `'\v12' + 0` was `0` in historian and `12` in SQLite. It is now the six ASCII characters 0x20, 0x09, 0x0A, 0x0B, 0x0C, 0x0D. `tests/oracle.py` (sqlite3 module 3.45.1, string as a quoted literal and as a bound parameter, same results): those six are skipped before the number by every conversion, and after it by the whole-string (affinity) conversion; 0x00-0x08, 0x0E-0x1F including `\x1c`-`\x1f`, 0x7F, `\x85`, `\xa0`, U+1680, U+2003, U+2028, U+3000 and U+FEFF are not (`'\x1c12' + 0` is `0`). Whitespace is not skipped between a sign and its digits, and whitespace-only text is `0` in arithmetic and stays TEXT under affinity. The one constant serves `_scan_number` (arithmetic, unary minus, truthiness, `sum`/`avg` values), `%`'s scan and `_strip_numeric_whitespace` (affinity, `sum`/`avg` classification), so all four change together. It stays a plain string, not `isspace()`/`strip()`, which are Unicode-aware, and stays separate from the lexer's `_WHITESPACE`, which rightly omits `\v`.
+
+This supersedes, by reference, the 2026-09-28 "Not changed: `_NUMERIC_WHITESPACE` omits `\v`" paragraph under issue #106; that paragraph is left as written. Spec §3 now names the six characters.

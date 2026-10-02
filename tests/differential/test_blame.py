@@ -4743,3 +4743,57 @@ def test_group_key_mixed_int_first_on_tiny(tiny_repo):
         f"SELECT {_MIXED_INT_FIRST} AS k, count(*) FROM blame GROUP BY k",
         [(4611686018427387904, 3)],
     )
+
+
+# --- Issue #136: numeric-text whitespace includes \v -------------------
+#
+# SQLite skips exactly space, \t, \n, \v, \f, \r before (and, for
+# whole-string affinity conversion, after) a number; `\x1c`-`\x1f`,
+# `\x85`, `\xa0` and Unicode spaces are not skipped. Quoted literals
+# only: historian has no bound parameters. The Python `\v` escape in
+# the SQL string is a real vertical tab inside the quoted literal.
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT '\v12' + 0 FROM blame",
+        "SELECT '\v12' % 5 FROM blame",
+        "SELECT -'\v12' FROM blame",
+        "SELECT sum('\v12'), avg('12\v') FROM blame",
+        "SELECT '\v12\v' + 0, '12\v' + 0, '\v' + 0, '\v-\v5' + 0 FROM blame",
+        "SELECT '\v1e2\v' + 0, '\v+7' + 0, '\v.5' + 0, '\v0x10' + 0, '1\v2' + 0 FROM blame",
+        "SELECT '\x1c12' + 0, '\xa012' + 0, '\x851' % 5 FROM blame",
+        "SELECT line_no FROM blame WHERE '\v1'",
+        "SELECT line_no FROM blame WHERE '\x1c1'",
+    ],
+)
+def test_numeric_text_whitespace_in_arithmetic(tiny_repo, query):
+    _assert_differential(tiny_repo, query)
+
+
+@pytest.mark.parametrize(
+    "where,expected",
+    [
+        ("line_no = '\v2'", [(2,)]),
+        ("line_no = '2\v'", [(2,)]),
+        ("line_no = '\v2\v'", [(2,)]),
+        ("line_no < '\v2\v'", [(1,), (1,)]),
+        ("line_no IN ('\v2')", [(2,)]),
+        ("line_no BETWEEN '\v2' AND '\v4'", [(2,)]),
+        ("'\v2' = line_no", [(2,)]),
+        ("'2\v' = line_no", [(2,)]),
+        ("line_no = '\x1c2'", []),
+        ("line_no = '2\x1c'", []),
+        ("line_no = '\xa02'", []),
+    ],
+)
+def test_numeric_text_whitespace_in_column_affinity(tiny_repo, where, expected):
+    """`line_no` is INTEGER (`tiny_repo` holds line numbers 1, 1, 2),
+    so the text operand converts only if the whole string, minus the
+    six whitespace characters, is a number. SQLite's own answer is
+    pinned, so an empty result cannot pass by accident; the `\\x1c`
+    and `\\xa0` controls match no row in either engine."""
+    _assert_differential_pinned_rows(
+        tiny_repo, f"SELECT line_no FROM blame WHERE {where}", expected
+    )

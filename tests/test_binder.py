@@ -530,6 +530,94 @@ def test_same_name_in_two_clauses_carries_the_where_position():
     assert error.position == Position(line=1, column=30, offset=29)
 
 
+# --- Error positions in sql/bind_clauses.py (#163) --------------------------
+#
+# SQLite reports no positions, so the rule decides: the position is the
+# start of the offending expression as the AST records it (the sign of
+# a unary sign, the inner expression of a parenthesised one). Every
+# column and offset below is counted by hand from the query text; the
+# prefix "SELECT path FROM blame " is 23 characters, so the first token
+# after it is at column 24, offset 23.
+
+
+@pytest.mark.parametrize(
+    ("sql", "column", "offset"),
+    [
+        ("SELECT path FROM blame LIMIT 1.5", 30, 29),
+        ("SELECT path FROM blame LIMIT 1 OFFSET 'a'", 39, 38),
+        ("SELECT path FROM blame LIMIT -1.5", 30, 29),
+        ("SELECT path FROM blame LIMIT (1.5)", 31, 30),
+    ],
+    ids=["limit-literal", "offset-literal", "limit-unary-sign", "limit-parenthesised"],
+)
+def test_limit_offset_not_literal_integer_error_position(sql, column, offset):
+    error = _bind_error(sql)
+    assert "must be a literal integer" in str(error)
+    assert error.position == Position(line=1, column=column, offset=offset)
+
+
+@pytest.mark.parametrize(
+    ("sql", "message", "column", "offset"),
+    [
+        ("SELECT path FROM blame LIMIT path", "no such column: path", 30, 29),
+        ("SELECT path FROM blame LIMIT 1 OFFSET ghost", "no such column: ghost", 39, 38),
+        ("SELECT path FROM blame LIMIT 1 + ghost", "no such column: ghost", 34, 33),
+        ("SELECT path FROM blame LIMIT blame.path", "no such column: blame.path", 30, 29),
+        ("SELECT path FROM blame LIMIT sum(ghost)", "no such column: ghost", 34, 33),
+    ],
+    ids=["limit-column", "offset-column", "limit-binary-op", "limit-qualified", "limit-inside-aggregate"],
+)
+def test_limit_offset_no_such_column_error_position(sql, message, column, offset):
+    error = _bind_error(sql)
+    assert str(error) == message
+    assert error.position == Position(line=1, column=column, offset=offset)
+
+
+@pytest.mark.parametrize(
+    ("sql", "column", "offset"),
+    [
+        ("SELECT path FROM blame LIMIT count(*)", 30, 29),
+        ("SELECT path FROM blame LIMIT 1 OFFSET count(*)", 39, 38),
+    ],
+    ids=["limit-aggregate", "offset-aggregate"],
+)
+def test_limit_offset_aggregate_misuse_error_position(sql, column, offset):
+    error = _bind_error(sql)
+    assert str(error) == "misuse of aggregate function count()"
+    assert error.position == Position(line=1, column=column, offset=offset)
+
+
+@pytest.mark.parametrize(
+    ("sql", "message", "column", "offset"),
+    [
+        ("SELECT path FROM blame ORDER BY 9", "1st ORDER BY term out of range - should be between 1 and 1", 33, 32),
+        ("SELECT path FROM blame GROUP BY 9", "1st GROUP BY term out of range - should be between 1 and 1", 33, 32),
+        ("SELECT path FROM blame ORDER BY path, 9", "2nd ORDER BY term out of range - should be between 1 and 1", 39, 38),
+        ("SELECT path FROM blame GROUP BY path, 2", "2nd GROUP BY term out of range - should be between 1 and 1", 39, 38),
+        ("SELECT path FROM blame ORDER BY 0", "1st ORDER BY term out of range - should be between 1 and 1", 33, 32),
+    ],
+    ids=["order-by-first", "group-by-first", "order-by-second", "group-by-second", "order-by-zero"],
+)
+def test_ordinal_out_of_range_error_position(sql, message, column, offset):
+    error = _bind_error(sql)
+    assert str(error) == message
+    assert error.position == Position(line=1, column=column, offset=offset)
+
+
+@pytest.mark.parametrize(
+    ("sql", "column", "offset"),
+    [
+        ("SELECT path FROM blame GROUP BY count(*)", 33, 32),
+        ("SELECT path FROM blame GROUP BY path, count(*)", 39, 38),
+    ],
+    ids=["group-by-first", "group-by-second"],
+)
+def test_group_by_aggregate_error_position(sql, column, offset):
+    error = _bind_error(sql)
+    assert str(error) == "aggregate functions are not allowed in the GROUP BY clause"
+    assert error.position == Position(line=1, column=column, offset=offset)
+
+
 # --- Aliases: no cross-item namespace, WHERE fallback (#32) ------------------
 
 

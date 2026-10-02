@@ -3350,6 +3350,65 @@ def test_distinct_order_by_unselected_aggregate_nested_in_expression_raises_bind
         )
 
 
+# --- DISTINCT ORDER BY: an aggregate's own DISTINCT flag (issue #131) ----
+#
+# `count(path)` and `count(DISTINCT path)` are different aggregates, so
+# selecting one and ordering by the other is #78's unselected-aggregate
+# `BindError`. `numeric_repo` is the fixture for the legal controls:
+# per author, `count(path)` is Ana 45, Bo 90 and `count(DISTINCT path)`
+# is Ana 3, Bo 1, so the two keys order the authors oppositely - a
+# control that sorted by the wrong one of the two would fail. Checked
+# with the oracle over the fixture's unfiltered rows: SQLite itself
+# accepts the rejected query and orders by the unselected key (Ana,
+# Bo), the opposite of what historian printed before this fix (Bo,
+# Ana, sorted by the selected `COUNT(path)`).
+
+
+def test_distinct_order_by_count_distinct_with_only_plain_count_selected_raises_bind_error(numeric_repo):
+    with pytest.raises(
+        BindError,
+        match=r"aggregate count\(\.\.\.\) must appear in the select list to be used in ORDER BY together with SELECT DISTINCT",
+    ):
+        run_historian(
+            "SELECT DISTINCT author_name, COUNT(path) FROM blame GROUP BY author_name, path "
+            "ORDER BY count(DISTINCT path) DESC",
+            numeric_repo,
+        )
+
+
+def test_distinct_order_by_plain_count_matching_selected_count_is_legal(numeric_repo):
+    """Flags both clear. Bo (90) before Ana (45); the scan's group order
+    is Ana first, so removing the `Sort` fails this."""
+    _order(
+        numeric_repo,
+        "SELECT DISTINCT author_name, COUNT(path) FROM blame GROUP BY author_name "
+        "ORDER BY count(path) DESC",
+        key_positions=(1,),
+    )
+
+
+def test_distinct_order_by_count_distinct_matching_selected_count_distinct_is_legal(numeric_repo):
+    """Flags both set, name case folded (#103). Ascending, not `DESC`:
+    `DESC` gives Ana (3) then Bo (1), which is already the unsorted
+    group order, so it would pass with the `Sort` removed. Ascending
+    gives Bo then Ana."""
+    _order(
+        numeric_repo,
+        "SELECT DISTINCT author_name, COUNT(DISTINCT path) FROM blame GROUP BY author_name "
+        "ORDER BY count(DISTINCT path)",
+        key_positions=(1,),
+    )
+
+
+@pytest.mark.parametrize("order_by", ["c DESC", "2 DESC"])
+def test_distinct_order_by_plain_count_by_alias_or_ordinal_is_legal(numeric_repo, order_by):
+    _order(
+        numeric_repo,
+        f"SELECT DISTINCT author_name, COUNT(path) AS c FROM blame GROUP BY author_name ORDER BY {order_by}",
+        key_positions=(1,),
+    )
+
+
 # --- Known disagreements that raise before producing rows --------------
 #
 # #25, #32 and #51 are open design questions ("whether it should stay

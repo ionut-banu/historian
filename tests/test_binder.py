@@ -50,6 +50,7 @@ from historian.sql.binder import (
     _ordinal_value,
     bind,
 )
+from historian.sql import binder
 from historian.sql.lexer import Position, tokenize
 from historian.sql.parser import parse
 from historian.tables.blame import BLAME_SCHEMA
@@ -1979,6 +1980,129 @@ def test_distinct_order_by_aggregate_matching_select_list_aggregate_case_insensi
         "ORDER BY count(*) DESC"
     )
     assert isinstance(bound.order_by[0].expr, FunctionCall)
+
+
+# --- Aggregate DISTINCT flag joins shape equality (issue #131) -----------
+#
+# `count(path)` and `count(DISTINCT path)` are different aggregates, but
+# `_same_node_fields` used to compare a `FunctionCall` by folded name
+# only, so the strict DISTINCT/ORDER BY match accepted one for the
+# other. SQLite itself accepts the rejected queries below (checked with
+# `tests/oracle.py`); the `BindError` is #78's deliberate narrowing:
+# the ORDER BY key is not a select-list item and is not determined by
+# the output row.
+
+_DISTINCT_AGG_ERROR = (
+    r"aggregate {name}\(\.\.\.\) must appear in the select list to be used in ORDER BY together with SELECT DISTINCT"
+)
+
+
+def test_distinct_order_by_count_distinct_with_only_plain_count_selected_is_a_bind_error():
+    """The QA query from #103's round 2 verdict, verbatim."""
+    with pytest.raises(BindError, match=_DISTINCT_AGG_ERROR.format(name="count")):
+        _bind(
+            "SELECT DISTINCT author_name, COUNT(path) FROM blame GROUP BY author_name, path "
+            "ORDER BY count(DISTINCT path) DESC"
+        )
+
+
+def test_distinct_order_by_plain_count_with_only_count_distinct_selected_is_a_bind_error():
+    with pytest.raises(BindError, match=_DISTINCT_AGG_ERROR.format(name="count")):
+        _bind(
+            "SELECT DISTINCT author_name, COUNT(DISTINCT path) FROM blame GROUP BY author_name, path "
+            "ORDER BY count(path) DESC"
+        )
+
+
+def test_distinct_order_by_count_distinct_mismatch_is_a_bind_error_with_where_0():
+    """Bind-time and data-independent: raised before any row is read.
+    The binder never sees a repository, so an empty repository cannot
+    change the answer either."""
+    with pytest.raises(BindError, match=_DISTINCT_AGG_ERROR.format(name="count")):
+        _bind(
+            "SELECT DISTINCT author_name, COUNT(path) FROM blame WHERE 0 GROUP BY author_name, path "
+            "ORDER BY count(DISTINCT path) DESC"
+        )
+
+
+@pytest.mark.parametrize("name", ["sum", "avg", "min", "max"])
+@pytest.mark.parametrize("selected_distinct", [False, True])
+def test_distinct_order_by_other_aggregates_differing_only_in_distinct_is_a_bind_error(name, selected_distinct):
+    selected = f"{name}(DISTINCT line_no)" if selected_distinct else f"{name}(line_no)"
+    ordered = f"{name}(line_no)" if selected_distinct else f"{name}(DISTINCT line_no)"
+    with pytest.raises(BindError, match=_DISTINCT_AGG_ERROR.format(name=name)):
+        _bind(
+            f"SELECT DISTINCT author_name, {selected} FROM blame GROUP BY author_name, path "
+            f"ORDER BY {ordered} DESC"
+        )
+
+
+def test_distinct_order_by_count_distinct_nested_in_an_expression_is_a_bind_error():
+    with pytest.raises(BindError, match=_DISTINCT_AGG_ERROR.format(name="count")):
+        _bind(
+            "SELECT DISTINCT author_name, COUNT(path) FROM blame GROUP BY author_name, path "
+            "ORDER BY count(DISTINCT path) + 0 DESC"
+        )
+
+
+@pytest.mark.parametrize(
+    ("sql", "distinct"),
+    [
+        (
+            "SELECT DISTINCT author_name, COUNT(DISTINCT path) FROM blame GROUP BY author_name, path "
+            "ORDER BY count(DISTINCT path) DESC",
+            True,
+        ),
+        (
+            "SELECT DISTINCT author_name, count(DISTINCT path) FROM blame GROUP BY author_name, path "
+            "ORDER BY COUNT(DISTINCT path) DESC",
+            True,
+        ),
+        (
+            "SELECT DISTINCT author_name, COUNT(path) FROM blame GROUP BY author_name, path "
+            "ORDER BY count(path) DESC",
+            False,
+        ),
+        (
+            "SELECT DISTINCT author_name, sum(DISTINCT line_no) FROM blame GROUP BY author_name, path "
+            "ORDER BY SUM(DISTINCT line_no) DESC",
+            True,
+        ),
+    ],
+)
+def test_distinct_order_by_aggregate_with_matching_distinct_flag_is_legal(sql, distinct):
+    """Positive control: equal flags (both set or both clear) still
+    match, with #103's name folding intact. Kills the reverse mutant
+    that treats every pair of aggregate calls as unequal."""
+    bound = _bind(sql)
+    key = bound.order_by[0].expr
+    assert isinstance(key, FunctionCall)
+    assert key.distinct is distinct
+    assert bound.select_list[1].expr.distinct is distinct
+
+
+@pytest.mark.parametrize("order_by", ["c", "2"])
+def test_distinct_order_by_plain_count_by_alias_or_ordinal_is_legal(order_by):
+    bound = _bind(
+        "SELECT DISTINCT author_name, COUNT(path) AS c FROM blame GROUP BY author_name, path "
+        f"ORDER BY {order_by}"
+    )
+    assert len(bound.order_by) == 1
+
+
+def _bound_count(distinct: bool) -> FunctionCall:
+    arg = BoundColumnRef(offset=BLAME_SCHEMA.index_of("path"), name="path", position=_POS)
+    return FunctionCall(name="count", args=(arg,), position=_POS, distinct=distinct)
+
+
+def test_expr_shape_equal_count_differing_only_in_distinct_is_not_equal():
+    assert binder._expr_shape_equal(_bound_count(False), _bound_count(True)) is False
+    assert binder._expr_shape_equal(_bound_count(True), _bound_count(False)) is False
+
+
+def test_expr_shape_equal_count_with_equal_distinct_flags_is_equal():
+    assert binder._expr_shape_equal(_bound_count(True), _bound_count(True)) is True
+    assert binder._expr_shape_equal(_bound_count(False), _bound_count(False)) is True
 
 
 def test_distinct_without_order_by_and_grouped_binds_normally():

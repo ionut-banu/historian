@@ -3005,3 +3005,112 @@ to `WHERE` (#141); constant folding (#51); evaluating the `IN` left
 side and the `BETWEEN` operand once (#137). `CASE WHEN` and `JOIN ...
 ON`, once they exist, are condition context and use
 `evaluate_condition()`.
+
+2026-10-02 - Binding errors are reported in SQLite's cross-clause
+order, and historian's own rejections come after all of them
+
+Issue #115, from the M3 review. `bind()` bound the select list, then
+`GROUP BY`, then `WHERE`, `HAVING`, `ORDER BY` and `LIMIT`, and ran
+historian's own narrowings in between, so `SELECT path FROM blame
+WHERE ghost_w = 1 GROUP BY ghost_g` named `ghost_g` where SQLite
+names `ghost_w`. Its docstrings described a third order. The order is
+now SQLite's rather than the docstrings corrected: §1 makes SQLite
+the definition of correct, the measured order is mechanical to
+follow, and the docstrings were wrong either way.
+
+The order, measured against the oracle (Python's `sqlite3` module,
+SQLite 3.45.1 - see #117; the PM's drift check on 3.51.1 was not
+re-run here):
+
+1. The `FROM` table, then the qualifier of any `x.*` select-list item.
+2. `LIMIT`, then `OFFSET`, for what SQLite rejects there: a column
+   reference outside every aggregate call (any column, even a real
+   one or an alias - `LIMIT` sees none) is reported at once; an error
+   from inside an aggregate call - its arity, else its misuse, then a
+   column reference among its arguments - is reported only after both
+   clauses, the last one found winning.
+3. The select list, items left to right.
+4. `HAVING` on a non-aggregate query.
+5. `HAVING`.
+6. `WHERE`; in a non-aggregate query an aggregate call is reported
+   here, in place.
+7. `ORDER BY`: all name errors, then an out-of-range ordinal.
+8. `GROUP BY`: all name errors, then an out-of-range ordinal, then an
+   aggregate key.
+9. An aggregate call in the `WHERE` of an aggregate query or the
+   `ORDER BY` of a non-aggregate one ("aggregate query": `GROUP BY`
+   written, or an aggregate call in the select list).
+10. historian's own rejections: the grouped narrowing in the select
+    list, `HAVING` and `ORDER BY` (2026-09-19, 2026-09-24), the
+    `DISTINCT` `ORDER BY` narrowing (2026-09-25, #103) and the
+    literal-only `LIMIT` (2026-09-25, #77), in that order.
+
+Within one call: unknown function, then arity, then misuse. A nested
+aggregate is reported where it is found, in every clause, like a name
+error. "Name error" here is no such column or function, wrong arity,
+or a nested aggregate.
+
+Evidence. A catalog of 27 erroring fragments in 7 clauses (unknown
+table, column and function, wrong arity, nested aggregate, aggregate
+in `WHERE`/`ORDER BY`/`LIMIT`/`GROUP BY`, out-of-range ordinal, an
+unknown `x.*`, an `OFFSET` column), each spliced in place of its
+clause into three base queries - grouped (`... WHERE line_no = 1
+GROUP BY path HAVING count(*) > 0 ORDER BY path LIMIT 1`), plain (no
+`GROUP BY`/`HAVING`) and aggregate by select list (`SELECT count(*)`,
+`HAVING`, no `GROUP BY`) - gives 79 single fragments, 874 pairs and
+5,242 triples from distinct clauses (the issue measured 241 pairs and
+1,306 triples on one base). The order above predicted SQLite's choice
+in every one, and `tests/differential/test_error_order.py` runs all
+of them against the live oracle by default (about five seconds,
+every case fails in `bind()`, so no git work), with the issue's 68
+rows and 33 further measured cases.
+
+Where the oracle contradicted the issue:
+
+- An aggregate call in `LIMIT` is not reported at `LIMIT`'s turn
+  before `OFFSET`: `LIMIT avg(1) OFFSET ghost_f` reports `ghost_f`,
+  and `LIMIT count(*) OFFSET sum(1)` reports `sum`. SQLite records
+  that misuse without stopping, and a later error overwrites it. It
+  is still reported before the select list (`SELECT ghost_s FROM
+  blame LIMIT count(*)` is the misuse). Columns among the call's
+  arguments behave the same way (`LIMIT count(ghost_x) OFFSET
+  ghost_f` reports `ghost_f`). Step 2 above is the oracle's rule.
+- The out-of-range message names the term: `ORDER BY 1, 99` is "2nd
+  ORDER BY term out of range", `3rd`, `11th`, `21st` likewise.
+  historian always wrote "1st", which was only right for the first
+  term. The issue pinned these messages exactly, so this was fixed.
+- `sum(*)` (and `avg`/`min`/`max`) is SQLite's arity error, "wrong
+  number of arguments to function sum()"; historian had its own
+  wording, a different kind, so `WHERE sum(*) > 1 GROUP BY ghost_g`
+  could not match by kind. It now uses SQLite's message.
+
+The issue's "51 of the 68 queries differ today" was recounted on the
+baseline (47af34d) with the new test file before any code change:
+51 of 68, correct. On the baseline 428 of the 874 pairs failed as
+well.
+
+Design. `bind()` is the ten steps above as straight-line code, one
+comment per step. Nothing is raised out of order and caught: the
+late misuse is collected rather than raised, through a
+`late_misuse: list[BindError] | None` on the binder's `_Context`.
+`None` raises on the spot; a list keeps the first error and binding
+goes on as if the aggregate were legal, and `bind()` raises it after
+`GROUP BY`. `WHERE` gets the list only in an aggregate query, `ORDER
+BY` always (it only rejects aggregates in a non-aggregate query).
+`GROUP BY` and `ORDER BY` bind in passes over their terms - non-
+ordinal terms, then ordinals, then (`GROUP BY`) aggregate keys - and
+build the same keys in clause order. `LIMIT`/`OFFSET` get one
+explicit-stack walk (#107) that finds what SQLite rejects there; the
+literal-only rule is unchanged and runs last. The "is this an
+aggregate query" decision is made once, after the select list, in
+the existing style; consolidating it with the others is #112. Every
+query the test suite binds - 13,599 of them, against the binder at
+47af34d - binds to the identical tree, and no query changed between
+binding and raising. No existing test pinned the old order.
+
+Not changed: the order of different error kinds inside one
+expression tree, a non-aggregate function call in `LIMIT`/`OFFSET`
+(still the literal-only rule, reported last), and aggregate-misuse
+messages that say `WHERE` for an `ORDER BY` - all #144. historian's
+wording for the aggregate-misuse and `HAVING` errors stays its own
+(#102).

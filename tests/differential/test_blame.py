@@ -1799,7 +1799,10 @@ def test_where_count_star_raises_bind_error(tiny_repo):
     is not a disagreement about semantics - it is one of §3's Errors
     categories (unsupported grammar in this position), asserted
     directly rather than diffed."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"misuse of aggregate function count\(\): aggregate calls are not allowed in WHERE",
+    ):
         run_historian("SELECT * FROM blame WHERE count(*) > 1", tiny_repo)
 
 
@@ -1809,7 +1812,10 @@ def test_select_bare_column_with_aggregate_raises_bind_error(tiny_repo):
     an arbitrary row's `path` here; historian raises `BindError`
     instead, deliberately, so there is nothing to diff a row result
     against."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"column path must appear in an aggregate function since this query has no GROUP BY",
+    ):
         run_historian("SELECT path, count(*) FROM blame", tiny_repo)
 
 
@@ -1817,14 +1823,14 @@ def test_sum_with_no_arguments_raises_bind_error(tiny_repo):
     """`SELECT sum() FROM blame` - confirmed a `Parse error` in
     `sqlite3` too (wrong arity), just not one either engine can
     diff a row result for."""
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"wrong number of arguments to function sum\(\)"):
         run_historian("SELECT sum() FROM blame", tiny_repo)
 
 
 def test_count_with_two_arguments_raises_bind_error(tiny_repo):
     """`SELECT count(path, line_no) FROM blame` - confirmed a `Parse
     error` in `sqlite3` too (wrong arity for `count`)."""
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"wrong number of arguments to function count\(\)"):
         run_historian("SELECT count(path, line_no) FROM blame", tiny_repo)
 
 
@@ -1833,7 +1839,7 @@ def test_nonexistent_function_raises_bind_error(tiny_repo):
     error` in `sqlite3` too (`no such function: nonexistent_fn`). This
     is #60's fix for #45's other half: the message is a real, specific
     `BindError`, not `exec/expression.py`'s old generic `EvalError`."""
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"no such function: nonexistent_fn"):
         run_historian("SELECT nonexistent_fn(path) FROM blame", tiny_repo)
 
 
@@ -1862,7 +1868,10 @@ def test_nested_aggregate_call_raises_bind_error(tiny_repo):
     aggregate call and only crashed later, in `exec/expression.py`,
     once a row actually reached it (`tiny_repo` has rows, so this one
     reproduced the crash, not the `BindError` this test now pins)."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"misuse of aggregate function count\(\): aggregate function calls cannot be nested",
+    ):
         run_historian("SELECT count(count(*)) FROM blame", tiny_repo)
 
 
@@ -1872,7 +1881,10 @@ def test_nested_aggregate_call_with_no_rows_reaching_it_raises_bind_error(tiny_r
     integers) - proves the rejection cannot be data-dependent. Before
     this fix, historian printed a `0` row at exit 0, because nothing
     ever reached the inner aggregate to crash on."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"misuse of aggregate function count\(\): aggregate function calls cannot be nested",
+    ):
         run_historian("SELECT count(count(*)) FROM blame WHERE line_no > 100000", tiny_repo)
 
 
@@ -1884,7 +1896,10 @@ def test_aggregate_alias_used_as_where_operand_raises_bind_error(tiny_repo):
     for a much larger repository) is the threshold that lets at least
     one of `tiny_repo`'s rows through here, reproducing the runtime
     crash this fix replaces with a `BindError`."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"misuse of aggregate: aliased column c refers to an aggregate call, which is not allowed here",
+    ):
         run_historian("SELECT count(*) AS c FROM blame WHERE line_no > 0 AND c > 1", tiny_repo)
 
 
@@ -1895,7 +1910,10 @@ def test_aggregate_alias_used_as_where_operand_with_no_rows_reaching_it_raises_b
     lets zero rows through - proves this rejection, too, cannot be
     data-dependent. Before this fix, historian printed a `0` row at
     exit 0."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"misuse of aggregate: aliased column c refers to an aggregate call, which is not allowed here",
+    ):
         run_historian(
             "SELECT count(*) AS c FROM blame WHERE line_no > 100000000 AND c > 1", tiny_repo
         )
@@ -1906,7 +1924,7 @@ def test_aggregate_alias_as_argument_to_another_aggregate_in_having_raises_bind_
     "misuse of aliased aggregate c". `c` is legal in `HAVING` used
     directly (see the regression guards below) but not as another
     aggregate call's own argument."""
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"misuse of aliased aggregate c"):
         run_historian("SELECT count(*) AS c FROM blame HAVING count(c) > 0", tiny_repo)
 
 
@@ -1916,7 +1934,7 @@ def test_aggregate_alias_as_argument_to_another_aggregate_in_order_by_raises_bin
     """`SELECT count(*) AS c FROM t GROUP BY path ORDER BY count(c)` ->
     `sqlite3`: "misuse of aliased aggregate c" - the identical rule,
     in `ORDER BY`."""
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"misuse of aliased aggregate c"):
         run_historian(
             "SELECT count(*) AS c FROM blame GROUP BY path ORDER BY count(c)", tiny_repo
         )
@@ -1927,7 +1945,7 @@ def test_aggregate_alias_nested_in_one_operand_of_a_having_predicate_raises_bind
     count(c)` -> `sqlite3`: "misuse of aliased aggregate c" - the
     nesting is reached through one operand of a larger `HAVING`
     predicate, not the whole clause, and must still be caught."""
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"misuse of aliased aggregate c"):
         run_historian(
             "SELECT count(*) AS c FROM blame GROUP BY path HAVING count(*) > count(c)", tiny_repo
         )
@@ -1963,7 +1981,7 @@ def test_select_list_alias_not_visible_to_other_select_items_stays_bind_error(ti
     (`_docs/decisions.md`'s #32 "finding 3"). A naive nested-aggregate
     fix could accidentally wire this path through the alias fallback
     instead; it must not."""
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"no such column: c"):
         run_historian("SELECT count(*) AS c, count(c) FROM blame", tiny_repo)
 
 
@@ -1974,7 +1992,7 @@ def test_group_by_nested_aggregate_via_alias_still_raises_bind_error(tiny_repo):
     rejects any aggregate in a `GROUP BY` key, nested-via-alias or not
     - out of scope for this issue, listed here only as a regression
     guard against this fix accidentally changing that outcome."""
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"misuse of aliased aggregate c"):
         run_historian("SELECT count(*) AS c FROM blame GROUP BY count(c)", tiny_repo)
 
 
@@ -2254,12 +2272,18 @@ def test_group_by_ordinal_pointing_at_an_aggregate_raises_bind_error(tiny_repo):
     that an ordinal resolving to an aggregate call is rejected
     identically to the direct and aliased forms below, not "ludicrous
     but legal"."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"aggregate functions are not allowed in the GROUP BY clause",
+    ):
         run_historian("SELECT path, count(*) FROM blame GROUP BY 2", tiny_repo)
 
 
 def test_group_by_direct_aggregate_call_raises_bind_error(tiny_repo):
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"aggregate functions are not allowed in the GROUP BY clause",
+    ):
         run_historian("SELECT path FROM blame GROUP BY count(*)", tiny_repo)
 
 
@@ -2279,19 +2303,28 @@ def test_group_by_plain_alias_of_a_column(tiny_repo):
 
 
 def test_group_by_ordinal_out_of_range_raises_bind_error(tiny_repo):
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"1st GROUP BY term out of range - should be between 1 and 1",
+    ):
         run_historian("SELECT path FROM blame GROUP BY 2", tiny_repo)
 
 
 def test_group_by_ordinal_zero_raises_bind_error(tiny_repo):
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"1st GROUP BY term out of range - should be between 1 and 1",
+    ):
         run_historian("SELECT path FROM blame GROUP BY 0", tiny_repo)
 
 
 def test_grouped_select_item_not_a_key_or_aggregate_raises_bind_error(tiny_repo):
     """Extends #60's narrowing to the grouped case: `path` is neither
     the `GROUP BY` key (`author_name`) nor an aggregate call."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"column path must appear in the GROUP BY clause or be used in an aggregate function",
+    ):
         run_historian(
             "SELECT path, author_name, count(*) FROM blame GROUP BY author_name", tiny_repo
         )
@@ -2302,7 +2335,10 @@ def test_having_with_no_group_by_and_no_aggregate_anywhere_raises_bind_error(tin
     path = 'x'` -> "HAVING clause on a non-aggregate query". Neither
     `GROUP BY` nor an aggregate call anywhere (select list or HAVING
     itself) is present here."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"HAVING requires an aggregate query - add GROUP BY or an aggregate function to the select list",
+    ):
         run_historian("SELECT path FROM blame HAVING path = 'src/utils.py'", tiny_repo)
 
 
@@ -2311,7 +2347,10 @@ def test_having_aggregate_only_in_having_itself_still_raises_bind_error(tiny_rep
     HAVING itself does not by itself make the query aggregate -
     `select path from t having count(*) > 1` still raises "HAVING
     clause on a non-aggregate query"."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"HAVING requires an aggregate query - add GROUP BY or an aggregate function to the select list",
+    ):
         run_historian("SELECT path FROM blame HAVING count(*) > 1", tiny_repo)
 
 
@@ -2328,7 +2367,10 @@ def test_having_bare_column_with_no_group_by_raises_bind_error(tiny_repo):
     an arbitrary row) - historian raises `BindError` instead, the
     same "grouped but not a key" narrowing #69's own decisions.md
     entry already gives for the select list, extended to HAVING."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"column path must appear in the GROUP BY clause or be used in an aggregate function",
+    ):
         run_historian("SELECT count(*) FROM blame HAVING path = 'src/utils.py'", tiny_repo)
 
 
@@ -2337,7 +2379,10 @@ def test_having_bare_column_not_a_group_key_raises_bind_error(tiny_repo):
     returns a row in `sqlite3`; historian raises `BindError` - `path`
     is neither the `GROUP BY` key (`line_no`) nor inside an aggregate
     call."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"column path must appear in the GROUP BY clause or be used in an aggregate function",
+    ):
         run_historian(
             "SELECT line_no, count(*) FROM blame GROUP BY line_no "
             "HAVING path = 'src/utils.py'",
@@ -2389,7 +2434,10 @@ def test_group_by_real_column_wins_over_alias_of_a_different_column(tiny_repo):
     branch raises `BindError`, and flipping
     `_bind_group_by_item`'s `alias_first` to `True` makes it return
     rows instead - the discriminating direction this test pins."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"column author_name must appear in the GROUP BY clause or be used in an aggregate function",
+    ):
         run_historian(
             "SELECT author_name AS path, count(*) FROM blame GROUP BY path", tiny_repo
         )
@@ -2411,7 +2459,10 @@ def test_having_real_column_wins_over_alias_of_a_different_column(tiny_repo):
     difference. Confirmed live against the real code: the unmutated
     branch raises `BindError`, and flipping the HAVING call site's
     `alias_first` to `True` makes it bind instead."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"column path must appear in the GROUP BY clause or be used in an aggregate function",
+    ):
         run_historian(
             "SELECT line_no AS path, count(*) FROM blame GROUP BY line_no "
             "HAVING path = 'src/utils.py'",
@@ -2686,17 +2737,26 @@ def test_order_by_same_query_twice_gives_identical_order(awkward_repo):
 
 
 def test_order_by_ordinal_zero_raises_bind_error(tiny_repo):
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"1st ORDER BY term out of range - should be between 1 and 1",
+    ):
         run_historian("SELECT path FROM blame ORDER BY 0", tiny_repo)
 
 
 def test_order_by_negative_ordinal_raises_bind_error(tiny_repo):
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"1st ORDER BY term out of range - should be between 1 and 1",
+    ):
         run_historian("SELECT path FROM blame ORDER BY -1", tiny_repo)
 
 
 def test_order_by_ordinal_past_the_end_raises_bind_error(tiny_repo):
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"1st ORDER BY term out of range - should be between 1 and 2",
+    ):
         run_historian("SELECT path, line_no FROM blame ORDER BY 3", tiny_repo)
 
 
@@ -2704,7 +2764,10 @@ def test_order_by_bare_ungrouped_column_in_an_aggregate_query_raises_bind_error(
     """Legal in sqlite3 (sorts by an arbitrary row's value per group) -
     historian's own narrowing, extending #69's GROUP BY/HAVING
     precedent to ORDER BY."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"column line_no must appear in the GROUP BY clause or be used in an aggregate function",
+    ):
         run_historian(
             "SELECT author_name, count(*) FROM blame GROUP BY author_name ORDER BY line_no",
             tiny_repo,
@@ -2715,7 +2778,10 @@ def test_order_by_aggregate_call_illegal_without_group_by_or_select_aggregate(ti
     """Legal in `HAVING`, illegal in `ORDER BY` unless the query
     already aggregates - confirmed against sqlite3: "misuse of
     aggregate: count()"."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"misuse of aggregate function count\(\): aggregate calls are not allowed in WHERE",
+    ):
         run_historian("SELECT path FROM blame ORDER BY count(*)", tiny_repo)
 
 
@@ -2726,7 +2792,10 @@ def test_group_by_constant_expression_still_raises_bind_error(tiny_repo):
     `1+0` is a constant expression, not an ordinal, so `path` in the
     select list is neither the (nonexistent) group key nor an
     aggregate - the intended narrowing this fix must not disturb."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"column path must appear in the GROUP BY clause or be used in an aggregate function",
+    ):
         run_historian("SELECT path, count(*) FROM blame GROUP BY 1+0", tiny_repo)
 
 
@@ -2910,7 +2979,10 @@ def test_limit_unary_paren_nested_literal_with_order_by(tiny_repo):
 
 def test_limit_rejects_arithmetic_expression_bind_error(tiny_repo):
     """`LIMIT 1+1` - legal in sqlite3 (2 rows), a `BindError` here."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"LIMIT must be a literal integer, optionally wrapped in unary \+/- and parentheses",
+    ):
         run_historian("SELECT path FROM blame LIMIT 1+1", tiny_repo)
 
 
@@ -2918,7 +2990,7 @@ def test_limit_rejects_column_reference_bind_error(tiny_repo):
     """`LIMIT line_no` - "no such column" in sqlite3 too, for a
     different reason (LIMIT has zero visible columns there); historian
     rejects every non-ordinal shape uniformly instead."""
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"no such column: line_no"):
         run_historian("SELECT path FROM blame LIMIT line_no", tiny_repo)
 
 
@@ -2926,7 +2998,10 @@ def test_limit_rejects_text_literal_bind_error(tiny_repo):
     """`LIMIT '2'` - legal in sqlite3 (numeric-affinity TEXT coercion,
     2 rows), deliberately not adopted here - see `_docs/decisions.md`.
     A genuine, intentional divergence from sqlite3, not a bug."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"LIMIT must be a literal integer, optionally wrapped in unary \+/- and parentheses",
+    ):
         run_historian("SELECT path FROM blame LIMIT '2'", tiny_repo)
 
 
@@ -3186,7 +3261,10 @@ def test_distinct_order_by_aggregate_matching_select_list_aggregate_case_insensi
 def test_distinct_order_by_column_not_in_select_list_raises_bind_error(tiny_repo):
     """`line_no` is never selected - legal, engine-defined-but-real SQL
     in sqlite3, a deliberate `BindError` here."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"column line_no must appear in the select list to be used in ORDER BY together with SELECT DISTINCT",
+    ):
         run_historian("SELECT DISTINCT path FROM blame ORDER BY line_no", tiny_repo)
 
 
@@ -3220,7 +3298,10 @@ def test_distinct_order_by_unselected_aggregate_raises_bind_error(awkward_repo):
     (`_docs/decisions.md`, 2026-09-25): an ORDER BY key SQLite's answer
     for has no documented, reproducible rule behind it is rejected
     outright rather than guessed at."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"aggregate count\(\.\.\.\) must appear in the select list to be used in ORDER BY together with SELECT DISTINCT",
+    ):
         run_historian(
             "SELECT DISTINCT author_name FROM blame GROUP BY author_name, path "
             "ORDER BY count(*) DESC",
@@ -3236,7 +3317,10 @@ def test_distinct_order_by_unselected_aggregate_raises_bind_error_even_with_alwa
     any row is read, whether or not a row would ever reach the
     aggregate - unlike the silent zero-row exit 0 this raised before
     the fix."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"aggregate count\(\.\.\.\) must appear in the select list to be used in ORDER BY together with SELECT DISTINCT",
+    ):
         run_historian(
             "SELECT DISTINCT author_name FROM blame WHERE line_no > 100000 "
             "GROUP BY author_name, path ORDER BY count(*) DESC",
@@ -3252,7 +3336,10 @@ def test_distinct_order_by_unselected_aggregate_nested_in_expression_raises_bind
     likewise does not reject `count(*) + 0` and gives the same `Sam
     Lee`, `Zoë Müller` order historian's own fix must refuse to guess
     at."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"aggregate count\(\.\.\.\) must appear in the select list to be used in ORDER BY together with SELECT DISTINCT",
+    ):
         run_historian(
             "SELECT DISTINCT author_name FROM blame GROUP BY author_name, path "
             "ORDER BY count(*) + 0 DESC",
@@ -3331,7 +3418,7 @@ def test_where_unmatched_name_raises_bind_error(tiny_repo):
     real-column resolution - confirmed `sqlite3` also rejects it
     (`no such column: ghost`), so there is nothing to diff a row
     result against; both engines error before producing any rows."""
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"no such column: ghost"):
         run_historian("SELECT path AS p FROM blame WHERE ghost = 1", tiny_repo)
 
 
@@ -3358,7 +3445,7 @@ def test_where_select_list_still_cannot_see_its_own_alias(tiny_repo):
     from t;"` -> `no such column: x`. Reproduced against `blame`: the
     second select-list item referencing the first item's alias still
     raises `BindError`, the same as before this issue."""
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"no such column: x"):
         run_historian("SELECT path AS x, x FROM blame", tiny_repo)
 
 

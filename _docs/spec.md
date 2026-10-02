@@ -754,7 +754,7 @@ the fixture repository as defense in depth. Without this, hashes and
 branch names differ per contributor machine, hash assertions are
 flaky, and no reported failure reproduces on anyone else's machine.
 
-Four fixtures:
+Five fixtures:
 
 - **tiny** — a handful of commits, two authors, a rename, a deletion,
   and a merge. The default for most tests, small enough to reason
@@ -775,6 +775,12 @@ Four fixtures:
   prefix pushdown, which must fold exactly what SQLite's `LIKE`
   folds. Its paths are written straight into the index, never to
   disk, so a case-insensitive file system cannot merge them.
+- **numeric** — two commits by two authors over `long.txt` (120
+  lines, 10-99 rewritten by the second author), `mid.txt` (12) and
+  `short.txt` (3): 135 blame rows whose `line_no` runs to one, two
+  and three digits, so numeric order and text order disagree on a
+  bare `line_no` (`max` is 120 as a number, `'99'` as text). The
+  builder checks that disagreement through SQLite.
 
 The fixture builder asserts what it built. A fixture that silently
 stops containing a merge commit takes a whole class of tests with it.

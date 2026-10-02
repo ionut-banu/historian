@@ -50,7 +50,7 @@ neither is written.
 before end-of-statement - `<expr>` is parsed generically via
 `_parse_expr()`, exactly like `ORDER BY`'s own item, deferring the
 literal-integer-vs-anything-else decision to the binder (`sql/
-binder.py`'s `_ordinal_value`, reused unchanged - see that module's
+bind_clauses.py`'s `_ordinal_value`, reused unchanged - see that module's
 own docstring). The one thing this module *does* decide is the comma
 form (`LIMIT m, n`): §1's grammar has no comma in it, it is a
 deliberate v2 non-goal (issue #77's own grooming), and a bound `LIMIT`

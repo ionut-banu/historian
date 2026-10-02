@@ -799,6 +799,11 @@ For each test query:
 1. Scan the table **with pushdown disabled**, giving the complete set
    of rows.
 2. Load those rows into an in-memory SQLite table with the same schema.
+   "The same schema" means each column keeps its affinity and every
+   value is bound exactly as scanned: a table with a `REAL` column is
+   a typeless table behind a view of that name selecting `CAST(col AS
+   REAL)`, so a scanned `-0.0` keeps its sign and the column still has
+   `REAL` affinity, and a scanned NaN fails the load.
 3. Run the query through SQLite.
 4. Run the query through historian, with pushdown enabled.
 5. Compare.

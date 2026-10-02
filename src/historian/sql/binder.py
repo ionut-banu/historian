@@ -26,7 +26,7 @@ Not in this module
 here; whether `'5'` needs coercing to compare against an `INTEGER`
 column is `exec/expression.py`'s job (#12), per spec §3's explicit
 split. **The rendered `error: ...` / caret / "blame has: ..."
-box from spec §5** - milestone item 18; `BindError` here carries
+box from spec §5** - `cli.py` (#41); `BindError` here carries
 structured fields (message, position, available names), not text to
 print.
 
@@ -118,12 +118,9 @@ the alias) - with the real column always winning when a name is both,
 *except* in `ORDER BY`, where the alias wins instead. `_resolve_name`
 below implements this as one function taking a precedence-direction
 flag (`alias_first`), rather than a `WHERE`-specific helper, because
-`GROUP BY`/`HAVING` (#60) and `ORDER BY` (#61) need the same rule with
-their own direction - `alias_first=False` for the former two,
-`alias_first=True` for `ORDER BY`. Only `WHERE` has a live caller
-today (`bind()` passes `alias_first=False`); `GROUP BY`, `HAVING` and
-`ORDER BY` have no grammar yet (#60, #61 add it) and are expected to
-call `_resolve_name` rather than reinvent it.
+`GROUP BY`, `HAVING` and `ORDER BY` need the same rule with their own
+direction: `bind()` passes `alias_first=False` for `WHERE`, `GROUP BY`
+and `HAVING`, and `alias_first=True` for `ORDER BY`.
 
 The match is a substitution, not a value lookup: a `ColumnRef` that
 resolves to an alias is replaced by a reference to that select-list
@@ -161,8 +158,7 @@ away entirely at the select-list level, into one `BoundColumnRef` per
 column of the FROM table's schema in declared order - except as the
 sole, unqualified argument of a `FunctionCall` (`count(*)`), where it
 is passed through untouched: `*` there means "no columns", not "all
-columns", and this module does not validate that the function name is
-real.
+columns"; `_validate_function_call` checks the function name.
 
 Because v1 has exactly one FROM table and no `JOIN`, a `BoundColumnRef`
 does not track which table it came from - the offset alone is
@@ -294,7 +290,7 @@ _AGGREGATE_NAMES = frozenset({"count", "sum", "avg", "min", "max"})
 # `.position` attribute, so a caller can report it per spec §5 without
 # a traceback ever reaching the user. `.available` is this module's own
 # addition - the names that *would* have resolved, for the eventual
-# "blame has: ..." rendering (#18), never used by this module itself.
+# "blame has: ..." rendering (#41), never used by this module itself.
 
 
 class BindError(Exception):
@@ -307,7 +303,7 @@ class BindError(Exception):
     lists what the caller could have referred to instead - table names
     for an unresolved table, column names in schema order for an
     unresolved column. Rendering this per spec §5 (the caret, "blame
-    has: ...") is milestone item 18, not this module.
+    has: ...") is `cli.py`'s job (#41), not this module.
     """
 
     def __init__(self, message: str, position: Position, available: tuple[str, ...]) -> None:
@@ -335,8 +331,8 @@ class BoundSelectItem:
     `alias`, used verbatim with no folding, when one was written;
     otherwise the declared schema spelling when `expr` is a
     `BoundColumnRef`; otherwise `None` - an unaliased, non-column
-    expression's header is not something this issue's criteria pin
-    down, and nothing downstream yet consumes it.
+    expression's header is not pinned down; `Project` falls back to a
+    positional placeholder (`exec/operators.py`).
     """
 
     expr: Expr
@@ -434,9 +430,9 @@ def _same_name(a: str, b: str) -> bool:
 # otherwise need threaded through separately. `select_items`/
 # `alias_fallback`/`alias_first` default to "no fallback", which is
 # what `_bind_select_item` binds every select-list item with (so
-# aliases stay invisible to each other - finding 3); `bind()` builds a
-# second `_Context`, via `dataclasses.replace`, with the fallback
-# turned on for `WHERE`.
+# aliases stay invisible to each other, #32); `bind()` builds further
+# `_Context`s, via `dataclasses.replace`, with the fallback turned on
+# for `WHERE`, `GROUP BY`, `HAVING` and `ORDER BY`.
 
 
 @dataclass(frozen=True)
@@ -447,11 +443,10 @@ class _Context:
     select_items: tuple[BoundSelectItem, ...] = ()
     alias_fallback: bool = False
     alias_first: bool = False
-    #: Issue #60: `True` while binding `WHERE` - the one clause a
-    #: `FunctionCall` can appear in today where an aggregate call is
-    #: never legal, regardless of name or arity. `False` (the default)
-    #: for the select list, where an aggregate call is exactly what
-    #: this issue exists to allow.
+    #: `True` while binding a clause where an aggregate call is never
+    #: legal, regardless of name or arity: `WHERE`, and `ORDER BY` of
+    #: a non-aggregate query. `False` (the default) for the select
+    #: list, `GROUP BY` and `HAVING`.
     reject_aggregates: bool = False
     #: Issue #115: where a rejected aggregate goes. `None` raises it on
     #: the spot (WHERE of a non-aggregate query). A list collects it
@@ -475,7 +470,7 @@ def _resolve_table(stmt: SelectStatement, catalog: dict[str, Schema]) -> _Contex
     `from_table` is a bare string on the AST with no position of its
     own to point a caret at. Confirmed this is not a gap to route
     around: `sqlite3`'s own CLI likewise prints no caret for "no such
-    table" (only for "no such column"), so a future renderer (#18) is
+    table" (only for "no such column"), so the renderer (#41) is
     not expected to place one here either.
     """
     for catalog_name, schema in catalog.items():
@@ -526,7 +521,7 @@ def _find_alias_expr(name: str, ctx: _Context) -> Expr | None:
     explicit alias matches `name`, ASCII case-insensitively via
     `_same_name` - `select b as x, c as x from t where x > ...`
     resolves `x` to `b`, the first occurrence, confirmed against
-    `sqlite3` (issue #32 finding 4). An item with no explicit `alias`
+    `sqlite3` (#32). An item with no explicit `alias`
     is never a candidate: only names written with `AS` participate in
     the fallback, per the issue's design recommendation ("select-list's
     aliases").
@@ -556,10 +551,9 @@ def _resolve_name(ref: ColumnRef, ctx: _Context) -> Expr:
     both a real-column match and an alias match are looked up, and
     `ctx.alias_first` decides which one wins when both exist: `False`
     for `WHERE`/`GROUP BY`/`HAVING` (the real column wins), `True` for
-    `ORDER BY` (#61; the alias wins instead - confirmed against
-    `sqlite3`, the one clause where the four are not uniform). Only
-    `alias_first=False` has a reachable caller today, from `bind()`'s
-    `WHERE` handling.
+    `ORDER BY` (the alias wins instead - confirmed against `sqlite3`,
+    the one clause where the four are not uniform). `bind()` calls it
+    with both values.
     """
     if ref.table is not None:
         return _bind_column_ref(ref, ctx)
@@ -698,8 +692,8 @@ def _bind_expr(expr: Expr, ctx: _Context) -> Expr:
     with select-list alias fallback (issue #32) when `ctx.alias_fallback`
     is set - off by default on the `_Context` every select-list item
     binds with (`_bind_select_item`), which is how aliases stay
-    invisible to each other (finding 3); on for the `_Context` `bind()`
-    builds for `WHERE`. `ctx` is the same for every node of the tree,
+    invisible to each other; on for the `_Context`s `bind()` builds
+    for the other clauses. `ctx` is the same for every node of the tree,
     so the fallback applies to a `ColumnRef` at any depth in the tree,
     not only at the top.
 
@@ -741,7 +735,7 @@ def _bind_expr(expr: Expr, ctx: _Context) -> Expr:
             # unqualified argument are handled by their own callers before
             # ever reaching here - see `_bind_select_item` and the
             # `FunctionCall` case below. Any other position is exactly the
-            # parser-permissiveness backstop the grooming asked for: `* AS
+            # parser-permissiveness backstop: `* AS
             # alias`, `*` inside a general expression, and `count(blame.*)`
             # (a *qualified* star as a function argument) all reach this
             # branch and are rejected here rather than crashing or
@@ -806,9 +800,8 @@ def _check_no_nested_aggregate(call: FunctionCall, bound_args: list[Expr], ctx: 
 # --- GROUP BY / HAVING (issue #69) ------------------------------------------
 #
 # An aggregate call cannot be a grouping key, however it is named -
-# direct, via a select-list alias, or by ordinal (orchestrator
-# correction on this issue: `select b, count(*) from t group by 2`
-# raises the identical "aggregate functions are not allowed in the
+# direct, via a select-list alias, or by ordinal (`select b, count(*)
+# from t group by 2` raises the identical "aggregate functions are not allowed in the
 # GROUP BY clause" sqlite3 gives for the direct and alias forms, not
 # "ludicrous but legal"). `contains_aggregate` is the one predicate
 # every one of those three routes checks against, after binding.
@@ -816,7 +809,7 @@ def _check_no_nested_aggregate(call: FunctionCall, bound_args: list[Expr], ctx: 
 
 # --- Ordinal detection, shared by GROUP BY and ORDER BY (issue #61) --------
 #
-# Orchestrator correction: SQLite treats *any* nesting of unary `+`/`-`
+# SQLite treats *any* nesting of unary `+`/`-`
 # and parentheses around an integer literal as an ordinal, in both
 # clauses - not just a bare `Literal` (`GROUP BY 2`) or one level of
 # unary (`ORDER BY -1`). Confirmed live against sqlite3 3.51.0:
@@ -1016,9 +1009,8 @@ def _bind_group_by(
        ordinal is not a name.
     3. A term that is, or reaches, an aggregate call - written
        directly, an alias of one, or an ordinal pointing at one - is
-       rejected identically, the uniform rule the orchestrator's
-       correction on #69 states: `GROUP BY count(*), 99` reports the
-       ordinal.
+       rejected identically, whichever route reaches it: `GROUP BY
+       count(*), 99` reports the ordinal.
 
     The keys come back in clause order, exactly as the one-pass
     version built them.
@@ -1059,7 +1051,7 @@ def _bind_group_by(
 # The one clause that reverses two rules every other clause here holds:
 # the select-list alias wins over a same-named real column
 # (`_resolve_name`'s `alias_first=True` - #32's own reserved-but-unused
-# direction, confirmed against sqlite3 during this issue's grooming:
+# direction, confirmed against sqlite3:
 # `select a as real_a, b as a from t order by a` sorts by the alias
 # `b`, not the real column `a`), and an aggregate call is legal even
 # when it resolves through an ordinal - `GROUP BY`'s ordinal rejects
@@ -1116,11 +1108,11 @@ def _bind_order_by(
 # is a BindError") extends here to grouped queries: a select-list
 # expression must be an aggregate call, a GROUP BY key (exactly, or
 # built purely from GROUP BY keys - `_docs/decisions.md`'s follow-on
-# note), or a BindError. `_split_for_grouped_check` is
-# `_split_for_aggregate_check`'s own walk with one addition: at every
-# node, first check whether the whole subtree matches a GROUP BY key
-# by shape (`expr_shape_equal`) - if so, that subtree is covered and
-# is never walked into for a bad bare column, whatever it contains.
+# note), or a BindError. `_split_for_grouped_check` walks the
+# expression and, at every node, first checks whether the whole
+# subtree matches a GROUP BY key by shape (`expr_shape_equal`) - if
+# so, that subtree is covered and is never walked into for a bad bare
+# column, whatever it contains.
 #
 # DISTINCT (issue #78) reuses this exact walk for a different question,
 # in `bind()` itself rather than a dedicated function here: when
@@ -1325,7 +1317,7 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema]) -> BoundSelectStatem
 
     # 3. The select list, left to right. Items bind against the plain
     # `ctx`, with no alias fallback, so aliases stay invisible to each
-    # other (#32 finding 3).
+    # other (#32).
     bound_items: list[BoundSelectItem] = []
     for item in stmt.select_list:
         bound_items.extend(_bind_select_item(item, ctx))
@@ -1422,7 +1414,7 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema]) -> BoundSelectStatem
     # narrowing, extended by #69 to GROUP BY keys.
     _check_grouped_select_list(bound_items, bound_group_by)
     if bound_having is not None:
-        # Orchestrator correction: a bare column reference in HAVING
+        # A bare column reference in HAVING
         # that is neither a GROUP BY key (matched by shape, exactly
         # `_check_grouped_select_list`'s own rule for the select list)
         # nor inside an aggregate call's own arguments is a BindError,

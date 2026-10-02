@@ -114,7 +114,7 @@ def test_no_such_table_error_position_is_select_statement_position():
     "no such table", confirmed directly, so there is no better position
     to give a future renderer (#18)."""
     stmt = parse(tokenize("SELECT path FROM ghost"))
-    with pytest.raises(BindError) as exc_info:
+    with pytest.raises(BindError, match=r"no such table: ghost") as exc_info:
         bind(stmt, SCHEMAS)
     assert exc_info.value.position == stmt.position
 
@@ -337,7 +337,7 @@ def test_no_such_column_error_carries_column_ref_position():
     tracking needed here."""
     stmt = parse(tokenize("SELECT authr_name FROM blame"))
     ref = stmt.select_list[0].expr
-    with pytest.raises(BindError) as exc_info:
+    with pytest.raises(BindError, match=r"no such column: authr_name") as exc_info:
         bind(stmt, SCHEMAS)
     assert exc_info.value.position == ref.position
 
@@ -346,7 +346,7 @@ def test_no_such_column_available_is_blame_columns_in_declared_order():
     """Matches spec §5's worked example for this exact query: `blame
     has: path, line_no, line, commit_hash, author_name, author_email,
     authored_at`."""
-    with pytest.raises(BindError) as exc_info:
+    with pytest.raises(BindError, match=r"no such column: authr_name") as exc_info:
         _bind("SELECT authr_name FROM blame")
     assert exc_info.value.available == _BLAME_COLUMNS
 
@@ -659,7 +659,10 @@ def test_star_with_alias_raises_defensive_error():
         offset=None,
         position=_POS,
     )
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"\* is only allowed as a whole select-list item or the sole argument to a function call",
+    ):
         bind(stmt, SCHEMAS)
 
 
@@ -680,7 +683,10 @@ def test_star_in_general_expression_position_raises_defensive_error():
         offset=None,
         position=_POS,
     )
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"\* is only allowed as a whole select-list item or the sole argument to a function call",
+    ):
         bind(stmt, SCHEMAS)
 
 
@@ -702,7 +708,10 @@ def test_qualified_star_as_function_argument_raises_defensive_error():
         offset=None,
         position=_POS,
     )
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"\* is only allowed as a whole select-list item or the sole argument to a function call",
+    ):
         bind(stmt, SCHEMAS)
 
 
@@ -711,7 +720,13 @@ def test_star_as_non_sole_function_argument_raises_defensive_error():
     rejected by historian's parser too. Checked directly against a
     hand-built tree: a `Star` alongside another argument is not "the
     sole argument" and is rejected rather than silently expanded or
-    passed through."""
+    passed through.
+
+    The error it gets today is the arity check, which `_validate_
+    function_call` runs before the `Star` check is reached: every
+    aggregate takes at most one argument, so a two-argument call never
+    gets as far as "* is only allowed ..." (issue #108's `match=`
+    sweep, pinning the message this query actually has)."""
     call = FunctionCall(
         name="count",
         args=(Star(table=None, position=_POS), ColumnRef(table=None, name="path", position=_POS)),
@@ -728,7 +743,7 @@ def test_star_as_non_sole_function_argument_raises_defensive_error():
         offset=None,
         position=_POS,
     )
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"wrong number of arguments to function count\(\)"):
         bind(stmt, SCHEMAS)
 
 
@@ -789,7 +804,7 @@ def test_sum_with_no_arguments_is_an_arity_error():
     """`SELECT sum() FROM blame` - confirmed a `Parse error` in
     `sqlite3` ("wrong number of arguments to function sum()"); `sum`
     (unlike `count`) always takes exactly one argument."""
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"wrong number of arguments to function sum\(\)"):
         _bind("SELECT sum() FROM blame")
 
 
@@ -797,14 +812,14 @@ def test_count_with_two_arguments_is_an_arity_error():
     """`SELECT count(path, line_no) FROM blame` - confirmed a `Parse
     error` in `sqlite3`; `count` takes zero, one bare expression, or
     `*`, never two."""
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"wrong number of arguments to function count\(\)"):
         _bind("SELECT count(path, line_no) FROM blame")
 
 
 def test_sum_of_star_is_not_valid():
     """`sum(*)` is not `sum(<every column>)` - `*` has no meaning for
     any aggregate but `count`."""
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"wrong number of arguments to function sum\(\)"):
         _bind("SELECT sum(*) FROM blame")
 
 
@@ -833,7 +848,10 @@ def test_aggregate_nested_inside_where_predicate_is_still_a_bind_error():
     """The WHERE-rejection applies at any depth, not only at the
     predicate's root - `ctx.reject_aggregates` threads through every
     recursive `_bind_expr` call unchanged."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"misuse of aggregate function count\(\): aggregate calls are not allowed in WHERE",
+    ):
         _bind("SELECT path FROM blame WHERE (count(*) > 1) AND path = 'a.py'")
 
 
@@ -910,7 +928,7 @@ def test_count_distinct_two_arguments_is_still_an_arity_error():
     """`count(DISTINCT a, b)` fails via the pre-existing `>1 argument`
     branch, unrelated to `DISTINCT` - confirmed live against `sqlite3`:
     identical rejection (differently worded) to plain `count(a, b)`."""
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"wrong number of arguments to function count\(\)"):
         _bind("SELECT count(DISTINCT path, line_no) FROM blame")
 
 
@@ -987,12 +1005,18 @@ def test_group_by_ordinal_pointing_at_an_aggregate_is_a_bind_error():
     aggregate call is rejected exactly like a direct or aliased one -
     `sqlite3` gives the identical "aggregate functions are not
     allowed in the GROUP BY clause" for all three."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"aggregate functions are not allowed in the GROUP BY clause",
+    ):
         _bind("SELECT path, count(*) FROM blame GROUP BY 2")
 
 
 def test_group_by_direct_aggregate_call_is_a_bind_error():
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"aggregate functions are not allowed in the GROUP BY clause",
+    ):
         _bind("SELECT path FROM blame GROUP BY count(*)")
 
 
@@ -1006,12 +1030,18 @@ def test_group_by_aggregate_via_alias_is_a_bind_error():
 
 
 def test_group_by_ordinal_zero_is_out_of_range():
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"1st GROUP BY term out of range - should be between 1 and 1",
+    ):
         _bind("SELECT path FROM blame GROUP BY 0")
 
 
 def test_group_by_ordinal_past_the_end_is_out_of_range():
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"1st GROUP BY term out of range - should be between 1 and 1",
+    ):
         _bind("SELECT path FROM blame GROUP BY 2")
 
 
@@ -1025,7 +1055,7 @@ def test_group_by_on_an_expression():
 
 
 def test_group_by_unknown_column_raises_no_such_column():
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"no such column: ghost_column"):
         _bind("SELECT path FROM blame GROUP BY ghost_column")
 
 
@@ -1041,7 +1071,10 @@ def test_grouped_select_item_not_a_key_and_not_an_aggregate_is_a_bind_error():
     """`SELECT path, author_name, count(*) ... GROUP BY author_name` -
     `path` is neither a group key nor an aggregate, extending #60's
     narrowing to the grouped case."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"column path must appear in the GROUP BY clause or be used in an aggregate function",
+    ):
         _bind("SELECT path, author_name, count(*) FROM blame GROUP BY author_name")
 
 
@@ -1049,7 +1082,10 @@ def test_group_by_with_no_aggregate_in_select_list_still_narrows():
     """`GROUP BY` alone - no aggregate anywhere - still triggers the
     narrowing: a select-list column that is not the group key is a
     BindError, the grouped analogue of #60's aggregate-only trigger."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"column path must appear in the GROUP BY clause or be used in an aggregate function",
+    ):
         _bind("SELECT path FROM blame GROUP BY author_name")
 
 
@@ -1091,7 +1127,7 @@ def test_having_without_group_by_binds():
 
 
 def test_having_unknown_column_raises_no_such_column():
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"no such column: ghost_column"):
         _bind("SELECT count(*) FROM blame HAVING ghost_column > 1")
 
 
@@ -1100,7 +1136,10 @@ def test_having_with_no_group_by_and_no_aggregate_anywhere_is_a_bind_error():
     path = 'x'` -> "HAVING clause on a non-aggregate query". Neither
     `GROUP BY` nor an aggregate call anywhere (select list or HAVING
     itself) is present here, so historian rejects it the same way."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"HAVING requires an aggregate query - add GROUP BY or an aggregate function to the select list",
+    ):
         _bind("SELECT path FROM blame HAVING path = 'src/utils.py'")
 
 
@@ -1119,7 +1158,10 @@ def test_having_with_aggregate_only_in_having_itself_is_still_a_bind_error():
     query - `select path from t having count(*) > 1` still raises
     "HAVING clause on a non-aggregate query". Only `GROUP BY` or an
     aggregate call in the select list decides that."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"HAVING requires an aggregate query - add GROUP BY or an aggregate function to the select list",
+    ):
         _bind("SELECT path FROM blame HAVING count(*) > 1")
 
 
@@ -1138,12 +1180,18 @@ def test_having_with_aggregate_only_in_having_itself_is_still_a_bind_error():
 def test_having_bare_column_with_no_group_by_is_a_bind_error():
     """No `GROUP BY` means no keys at all - every bare column outside
     an aggregate is rejected."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"column path must appear in the GROUP BY clause or be used in an aggregate function",
+    ):
         _bind("SELECT count(*) FROM blame HAVING path = 'src/utils.py'")
 
 
 def test_having_bare_column_not_a_group_key_is_a_bind_error():
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"column path must appear in the GROUP BY clause or be used in an aggregate function",
+    ):
         _bind("SELECT line_no, count(*) FROM blame GROUP BY line_no HAVING path = 'src/utils.py'")
 
 
@@ -1207,7 +1255,10 @@ def test_group_by_real_column_wins_over_alias_of_a_different_column():
     `author_name`, which then trivially matches itself and the query
     would bind without error - a silent, wrong-direction resolution
     this test is built to catch."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"column author_name must appear in the GROUP BY clause or be used in an aggregate function",
+    ):
         _bind("SELECT author_name AS path, count(*) FROM blame GROUP BY path")
 
 
@@ -1219,7 +1270,10 @@ def test_having_real_column_wins_over_alias_of_a_different_column():
     instead resolve through the alias to `line_no`, which matches the
     group key by shape and binds legally - a real difference in what
     binds, not just in the error text."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"column path must appear in the GROUP BY clause or be used in an aggregate function",
+    ):
         _bind(
             "SELECT line_no AS path, count(*) FROM blame GROUP BY line_no "
             "HAVING path = 'src/utils.py'"
@@ -1239,7 +1293,10 @@ def test_having_real_column_wins_over_alias_of_a_different_column():
 
 
 def test_group_by_ordinal_to_aggregate_is_a_bind_error_with_no_other_check_reachable():
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"aggregate functions are not allowed in the GROUP BY clause",
+    ):
         _bind("SELECT count(*), sum(line_no) FROM blame GROUP BY 1")
 
 
@@ -1312,7 +1369,7 @@ def test_order_by_qualified_reference_never_falls_back_to_alias():
 
 
 def test_order_by_unknown_column_raises_no_such_column():
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"no such column: ghost_column"):
         _bind("SELECT path FROM blame ORDER BY ghost_column")
 
 
@@ -1349,7 +1406,10 @@ def test_order_by_ordinal_pointing_at_an_aggregate_is_legal():
 
 
 def test_order_by_ordinal_zero_is_out_of_range():
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"1st ORDER BY term out of range - should be between 1 and 1",
+    ):
         _bind("SELECT path FROM blame ORDER BY 0")
 
 
@@ -1359,12 +1419,18 @@ def test_order_by_negative_ordinal_is_out_of_range():
     rejected as out of range, confirmed against sqlite3: "1st ORDER BY
     term out of range - should be between 1 and 1" for a single-column
     select list."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"1st ORDER BY term out of range - should be between 1 and 1",
+    ):
         _bind("SELECT path FROM blame ORDER BY -1")
 
 
 def test_order_by_ordinal_past_the_end_is_out_of_range():
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"1st ORDER BY term out of range - should be between 1 and 1",
+    ):
         _bind("SELECT path FROM blame ORDER BY 2")
 
 
@@ -1478,7 +1544,10 @@ def test_group_by_constant_expression_still_raises_bind_error():
     """`GROUP BY 1+0` must stay a `BindError` - a constant key, so the
     select list's non-key, non-aggregate column stays ungrouped, the
     intended narrowing this fix must not disturb."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"column path must appear in the GROUP BY clause or be used in an aggregate function",
+    ):
         _bind("SELECT path, count(*) FROM blame GROUP BY 1+0")
 
 
@@ -1490,7 +1559,10 @@ def test_order_by_aggregate_call_with_no_group_by_and_no_select_aggregate_is_a_b
     (no GROUP BY, no aggregate in the select list) is "misuse of
     aggregate: count()" - the same rejection WHERE gets, not the
     HAVING-style allowance."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"misuse of aggregate function count\(\): aggregate calls are not allowed in WHERE",
+    ):
         _bind("SELECT path FROM blame ORDER BY count(*)")
 
 
@@ -1525,7 +1597,10 @@ def test_order_by_bare_column_not_a_group_key_is_a_bind_error():
     narrows HAVING (`_docs/decisions.md`, 2026-09-19/2026-09-24 and
     this issue's own follow-on): a bare, non-key, non-aggregate column
     in an aggregating query's ORDER BY is a BindError."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"column line_no must appear in the GROUP BY clause or be used in an aggregate function",
+    ):
         _bind("SELECT author_name, count(*) FROM blame GROUP BY author_name ORDER BY line_no")
 
 
@@ -1535,7 +1610,10 @@ def test_order_by_bare_column_not_a_group_key_is_a_bind_error_whole_table_aggreg
     ORDER BY is then a BindError, the same "no keys means every bare
     column is rejected" reasoning HAVING already uses with no GROUP
     BY."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"column path must appear in the GROUP BY clause or be used in an aggregate function",
+    ):
         _bind("SELECT count(*) FROM blame ORDER BY path")
 
 
@@ -1640,7 +1718,10 @@ def test_limit_rejects_arithmetic_expression():
     """`LIMIT 1+1` - legal in sqlite3 (confirmed during this issue's
     grooming), but a `BinaryOp` is never an ordinal shape - deliberate
     narrowing, see `_docs/decisions.md`."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"LIMIT must be a literal integer, optionally wrapped in unary \+/- and parentheses",
+    ):
         _bind("SELECT path FROM blame LIMIT 1+1")
 
 
@@ -1649,7 +1730,7 @@ def test_limit_rejects_column_reference():
     expression has zero visible columns there), but for a different
     reason: historian rejects every non-ordinal shape uniformly,
     sqlite3 rejects a column reference specifically."""
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"no such column: line_no"):
         _bind("SELECT path FROM blame LIMIT line_no")
 
 
@@ -1658,7 +1739,7 @@ def test_limit_rejects_select_list_alias():
     limit n` still raises "no such column: n" - LIMIT gets no alias
     fallback there either. historian rejects it too, for the uniform
     narrowing reason rather than by replicating that specific rule."""
-    with pytest.raises(BindError):
+    with pytest.raises(BindError, match=r"no such column: n"):
         _bind("SELECT path AS n FROM blame LIMIT n")
 
 
@@ -1666,7 +1747,10 @@ def test_limit_rejects_text_literal():
     """`LIMIT '2'` - legal in sqlite3 (numeric-affinity TEXT
     coercion), deliberately not adopted here - see `_docs/
     decisions.md`."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"LIMIT must be a literal integer, optionally wrapped in unary \+/- and parentheses",
+    ):
         _bind("SELECT path FROM blame LIMIT '2'")
 
 
@@ -1674,27 +1758,42 @@ def test_limit_rejects_real_literal_even_with_zero_fractional_part():
     """`LIMIT 2.0` - legal in sqlite3 (`MustBeInt`'s exact-zero-
     fractional-part rule), deliberately not adopted - a REAL `Literal`
     is never an ordinal shape regardless of its value."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"LIMIT must be a literal integer, optionally wrapped in unary \+/- and parentheses",
+    ):
         _bind("SELECT path FROM blame LIMIT 2.0")
 
 
 def test_limit_rejects_null():
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"LIMIT must be a literal integer, optionally wrapped in unary \+/- and parentheses",
+    ):
         _bind("SELECT path FROM blame LIMIT NULL")
 
 
 def test_limit_rejects_function_call():
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"LIMIT must be a literal integer, optionally wrapped in unary \+/- and parentheses",
+    ):
         _bind("SELECT path FROM blame LIMIT abs(-2)")
 
 
 def test_offset_rejects_arithmetic_expression():
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"OFFSET must be a literal integer, optionally wrapped in unary \+/- and parentheses",
+    ):
         _bind("SELECT path FROM blame LIMIT 5 OFFSET 1+1")
 
 
 def test_offset_rejects_text_literal():
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"OFFSET must be a literal integer, optionally wrapped in unary \+/- and parentheses",
+    ):
         _bind("SELECT path FROM blame LIMIT 5 OFFSET '2'")
 
 
@@ -1747,7 +1846,10 @@ def test_distinct_order_by_a_column_not_in_the_select_list_is_a_bind_error():
     documented, reproducible rule behind it (see `_docs/decisions.md`
     for the full discriminating arithmetic), so historian raises
     `BindError` instead of guessing at it."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"column line_no must appear in the select list to be used in ORDER BY together with SELECT DISTINCT",
+    ):
         _bind("SELECT DISTINCT path FROM blame ORDER BY line_no")
 
 
@@ -1792,7 +1894,10 @@ def test_distinct_order_by_group_key_not_in_select_list_is_a_bind_error():
     is present - `SELECT DISTINCT count(*)` never selects it - so the
     DISTINCT narrowing rejects it even though the GROUP BY narrowing
     would not."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"column author_name must appear in the select list to be used in ORDER BY together with SELECT DISTINCT",
+    ):
         _bind(
             "SELECT DISTINCT count(*) FROM blame GROUP BY author_name "
             "ORDER BY author_name"
@@ -1808,7 +1913,10 @@ def test_distinct_order_by_unselected_aggregate_is_a_bind_error():
     select-list item like any other ORDER BY key touch. `count(*)` is
     never selected, so this must raise `BindError` the same way a bare
     unselected column already does."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"aggregate count\(\.\.\.\) must appear in the select list to be used in ORDER BY together with SELECT DISTINCT",
+    ):
         _bind(
             "SELECT DISTINCT author_name FROM blame GROUP BY author_name, path "
             "ORDER BY count(*) DESC"
@@ -1820,7 +1928,10 @@ def test_distinct_order_by_unselected_aggregate_is_a_bind_error_even_with_always
     #102 established for nested-aggregate rejection): it must fire
     before any row is read, whether or not a row would ever reach the
     aggregate."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"aggregate count\(\.\.\.\) must appear in the select list to be used in ORDER BY together with SELECT DISTINCT",
+    ):
         _bind(
             "SELECT DISTINCT author_name FROM blame WHERE line_no > 100000 "
             "GROUP BY author_name, path ORDER BY count(*) DESC"
@@ -1831,7 +1942,10 @@ def test_distinct_order_by_unselected_aggregate_nested_in_an_expression_is_a_bin
     """The unselected aggregate does not have to be the whole ORDER BY
     key - `count(*) + 0` still contains it, and the walk must find it
     inside the arithmetic rather than only at the top level."""
-    with pytest.raises(BindError):
+    with pytest.raises(
+        BindError,
+        match=r"aggregate count\(\.\.\.\) must appear in the select list to be used in ORDER BY together with SELECT DISTINCT",
+    ):
         _bind(
             "SELECT DISTINCT author_name FROM blame GROUP BY author_name, path "
             "ORDER BY count(*) + 0 DESC"

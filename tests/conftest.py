@@ -17,7 +17,13 @@ from pathlib import Path
 
 import pytest
 
-from fixtures.build import get_awkward_repo, get_casefold_repo, get_large_repo, get_tiny_repo
+from fixtures.build import (
+    get_awkward_repo,
+    get_casefold_repo,
+    get_large_repo,
+    get_numeric_repo,
+    get_tiny_repo,
+)
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -44,6 +50,14 @@ def casefold_repo() -> Path:
     """Paths differing only by ASCII or non-ASCII letter case, plus one
     spelled `5` - built for `blame`'s `path` pushdown tests (#122)."""
     return get_casefold_repo()
+
+
+@pytest.fixture(scope="session")
+def numeric_repo() -> Path:
+    """`line_no` values of one, two and three digits over two authors
+    and three files, so numeric and text order disagree on a bare
+    `line_no` column (#109)."""
+    return get_numeric_repo()
 
 
 @pytest.fixture(scope="session")

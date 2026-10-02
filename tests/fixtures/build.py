@@ -6,8 +6,8 @@ for what was found beyond the spec's original six GIT_* environment
 variables and why the fix is "inherit nothing" rather than "override
 the settings we know about."
 
-`tiny`, `awkward` and `casefold` are correctness fixtures, built and
-cached on demand. `large` (#27) is a benchmark fixture: it is never
+`tiny`, `awkward`, `casefold` and `numeric` are correctness fixtures,
+built and cached on demand. `large` (#27) is a benchmark fixture: it is never
 built by `uv run pytest`, only on request - see the `large` section
 below.
 
@@ -23,6 +23,7 @@ import hashlib
 import os
 import random
 import shutil
+import sqlite3
 import subprocess
 from pathlib import Path
 from typing import Sequence
@@ -662,6 +663,156 @@ def _verify_casefold(repo: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# numeric
+#
+# Not one of spec.md §4's original fixtures: a small supporting
+# repository (issue #109) whose `blame.line_no` values run to one, two
+# and three digits, so numeric order and text order disagree on a bare
+# `line_no` column. `tiny`'s largest `line_no` is 2 and `awkward`'s is
+# 6, where every comparison agrees as number or text; adding a long
+# file to either would change every existing differential case's row
+# set (measured on #109: 18 existing tests fail), so this is a fifth
+# fixture, following the `casefold` precedent.
+#
+#   C1 (Ana)  add long.txt (120 lines), mid.txt (12), short.txt (3)
+#   C2 (Bo)   rewrite long.txt lines 10-99 (90 lines), nothing else
+#
+# Every line's content is distinct, so blame cannot merge lines. Blame
+# at HEAD is 135 rows: long.txt 1-9 and 100-120 are Ana's, 10-99 Bo's,
+# and all of mid.txt and short.txt are Ana's.
+# ---------------------------------------------------------------------------
+
+_NUMERIC_ANA = ("Ana", "ana@example.com")
+_NUMERIC_BO = ("Bo", "bo@example.com")
+
+#: Each file at HEAD and its line count, in `git ls-tree` order.
+NUMERIC_FILES = {"long.txt": 120, "mid.txt": 12, "short.txt": 3}
+#: The 1-based, inclusive range of `long.txt` lines Bo's commit rewrites.
+NUMERIC_BO_LINES = (10, 99)
+
+# Filled in once, from this builder's own first deterministic build,
+# and then pinned - see the note on TINY_HEAD above.
+NUMERIC_HEAD = "50619ca88540eb5855041510f84801dcc58b991d"
+
+
+def _numeric_lines(path: str, count: int) -> list[str]:
+    stem = path.split(".", 1)[0]
+    return [f"{stem} line {n}" for n in range(1, count + 1)]
+
+
+def build_numeric(dest: Path) -> Path:
+    """Build the `numeric` fixture at dest, verify it, and return dest.
+
+    Raises FixtureError if the built repository does not match what
+    this function was told to build, including a determinism
+    regression against the pinned NUMERIC_HEAD.
+    """
+    if dest.exists():
+        shutil.rmtree(dest)
+    _init_repo(dest, branch="main")
+    clock = _Clock()
+
+    for path, count in NUMERIC_FILES.items():
+        (dest / path).write_text("".join(f"{line}\n" for line in _numeric_lines(path, count)))
+    _run_git(dest, ["add", "-A"])
+    _commit(dest, "Add files of one-, two- and three-digit length", author=_NUMERIC_ANA, timestamp=clock.tick())
+
+    first, last = NUMERIC_BO_LINES
+    lines = _numeric_lines("long.txt", NUMERIC_FILES["long.txt"])
+    for n in range(first, last + 1):
+        lines[n - 1] = f"long line {n} rewritten by Bo"
+    (dest / "long.txt").write_text("".join(f"{line}\n" for line in lines))
+    _run_git(dest, ["add", "-A"])
+    _commit(dest, "Rewrite long.txt lines 10 to 99", author=_NUMERIC_BO, timestamp=clock.tick())
+
+    _verify_numeric(dest)
+
+    head = _run_git(dest, ["rev-parse", "HEAD"]).strip()
+    if head != NUMERIC_HEAD:
+        raise FixtureError(
+            f"numeric: HEAD is {head}, pinned NUMERIC_HEAD is {NUMERIC_HEAD} - "
+            "this is a determinism regression, not a content change, "
+            "unless build_numeric was deliberately edited (update the "
+            "pinned constant in the same commit if so)"
+        )
+    return dest
+
+
+def _numeric_blame_rows(repo: Path) -> list[tuple[str, int, str]]:
+    """(path, line_no, author_name) for every line at HEAD, read from
+    `git blame --line-porcelain` directly - never through historian, so
+    `_verify_numeric` checks the fixture and not the engine."""
+    rows = []
+    for path in NUMERIC_FILES:
+        porcelain = _run_git(repo, ["blame", "--line-porcelain", "HEAD", "--", path])
+        line_no = None
+        author = None
+        for line in porcelain.splitlines():
+            if line.startswith("\t"):
+                rows.append((path, line_no, author))
+                continue
+            head = line.split(" ")
+            if len(head[0]) == 40 and len(head) >= 3:
+                line_no = int(head[2])
+            elif line.startswith("author "):
+                author = line[len("author ") :]
+    return rows
+
+
+def _verify_numeric(repo: Path) -> None:
+    """Assert that repo matches what build_numeric is supposed to
+    build, through git itself (per the same reasoning as _verify_tiny),
+    and that numeric and text order really do disagree over its blame
+    rows - through Python's bundled `sqlite3`, not through historian."""
+    count = int(_run_git(repo, ["rev-list", "--count", "HEAD"]).strip())
+    if count != 2:
+        raise FixtureError(f"numeric: expected exactly 2 commits, found {count}")
+
+    identities = set(_run_git(repo, ["log", "--format=%an <%ae>"]).strip().splitlines())
+    expected_identities = {f"{name} <{email}>" for name, email in (_NUMERIC_ANA, _NUMERIC_BO)}
+    if identities != expected_identities:
+        raise FixtureError(f"numeric: expected author identities {expected_identities}, found {identities}")
+
+    raw = _run_git(repo, ["ls-tree", "-rz", "--name-only", "HEAD"])
+    listed = tuple(p for p in raw.split("\0") if p)
+    if listed != tuple(NUMERIC_FILES):
+        raise FixtureError(f"numeric: HEAD lists {listed}, expected exactly {tuple(NUMERIC_FILES)}")
+
+    rows = _numeric_blame_rows(repo)
+    for path, expected in NUMERIC_FILES.items():
+        line_nos = [line_no for p, line_no, _ in rows if p == path]
+        if line_nos != list(range(1, expected + 1)):
+            raise FixtureError(f"numeric: {path} blames {len(line_nos)} lines at HEAD, expected {expected}")
+
+    first, last = NUMERIC_BO_LINES
+    ana, bo = _NUMERIC_ANA[0], _NUMERIC_BO[0]
+    for path, line_no, author in rows:
+        want = bo if path == "long.txt" and first <= line_no <= last else ana
+        if author != want:
+            raise FixtureError(f"numeric: {path} line {line_no} is attributed to {author!r}, expected {want!r}")
+
+    # The property the fixture exists for, asked of SQLite itself: a
+    # later edit that quietly restores agreement between numeric and
+    # text order fails the build here.
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE blame (path TEXT, line_no INTEGER, author_name TEXT)")
+        conn.executemany("INSERT INTO blame VALUES (?, ?, ?)", rows)
+        checks = [
+            ("SELECT max(line_no) FROM blame", 120),
+            ("SELECT max(CAST(line_no AS TEXT)) FROM blame", "99"),
+            ("SELECT count(*) FROM blame WHERE line_no > 9", 114),
+            ("SELECT count(*) FROM blame WHERE CAST(line_no AS TEXT) > '9'", 10),
+        ]
+        for query, expected in checks:
+            (got,) = conn.execute(query).fetchone()
+            if type(got) is not type(expected) or got != expected:
+                raise FixtureError(f"numeric: SQLite says {query!r} is {got!r}, expected {expected!r}")
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # large
 #
 # "generated, hundreds of commits. Benchmarks only, never correctness" -
@@ -669,7 +820,7 @@ def _verify_casefold(repo: Path) -> None:
 # thousands of paths to skip: `path LIKE 'src/auth/%'` matches 12 of
 # 4,013 paths here.
 #
-# Differences from the three fixtures above, each deliberate (#27):
+# Differences from the correctness fixtures above, each deliberate (#27):
 #
 # - It is never built by `uv run pytest`. Hundreds of commits on every
 #   suite run is a recurring cost for a fixture that gates no
@@ -867,6 +1018,13 @@ def get_casefold_repo(cache_dir: Path = CACHE_DIR) -> Path:
     return _cached(cache_dir, "casefold", build_casefold)
 
 
+def get_numeric_repo(cache_dir: Path = CACHE_DIR) -> Path:
+    """Return the path to a built `numeric` repository (issue #109),
+    building (or rebuilding, if build.py has changed since the cached
+    one) it first if necessary."""
+    return _cached(cache_dir, "numeric", build_numeric)
+
+
 if __name__ == "__main__":
     # Manual invocation for debugging: `uv run python -m tests.fixtures.build`
     # builds the correctness fixtures into the cache directory and prints
@@ -878,9 +1036,10 @@ if __name__ == "__main__":
         "tiny": get_tiny_repo,
         "awkward": get_awkward_repo,
         "casefold": get_casefold_repo,
+        "numeric": get_numeric_repo,
         "large": get_large_repo,
     }
-    wanted = sys.argv[1:] or ["tiny", "awkward", "casefold"]
+    wanted = sys.argv[1:] or ["tiny", "awkward", "casefold", "numeric"]
     unknown = [name for name in wanted if name not in getters]
     if unknown:
         sys.exit(f"unknown fixture(s): {unknown}; choose from {sorted(getters)}")

@@ -497,8 +497,8 @@ class _Accumulator:
     def __init__(self, call: AggregateCall) -> None:
         self._call = call
         self._count = 0  # count(*)/count(): every row, NULL or not
-        self._non_null_count = 0  # count(<expr>), and avg's denominator
-        self._sum_seen = False  # sum: whether any non-NULL value has been accumulated yet
+        # count(<expr>); avg's denominator; and sum's "any value seen" test
+        self._non_null_count = 0
         self._sum_int = 0  # exact integer running total (SumCtx.iSum) - sum and avg each own one
         self._sum_r_sum = 0.0  # KBN running sum (SumCtx.rSum), meaningful once self._sum_approx
         self._sum_r_err = 0.0  # KBN compensation term (SumCtx.rErr)
@@ -558,8 +558,6 @@ class _Accumulator:
             # whole-string numeric reading: '3abc', 'abc', '') are
             # both "non-integer" and fold into the KBN pair through
             # the leading-prefix coercion.
-            if call.kind == "sum":
-                self._sum_seen = True
             classified = try_numeric_affinity(value)
             if isinstance(classified, int):
                 if not self._sum_approx:
@@ -605,7 +603,7 @@ class _Accumulator:
         if call.kind == "count":
             return self._count if call.arg is None else self._non_null_count
         if call.kind == "sum":
-            if not self._sum_seen:
+            if self._non_null_count == 0:
                 return None  # NULL: no non-NULL value was ever seen
             # Raise only here, never mid-accumulation, and only if the
             # exact integer total left int64 at some point and every

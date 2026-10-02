@@ -1499,6 +1499,27 @@ def test_aggregate_of_null_literal_over_non_empty_result(tiny_repo):
     )
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        # Integer totals of 0 are 0, not NULL: sum has seen values.
+        "SELECT sum(line_no - line_no) FROM blame",
+        # 1 and -1 (via DISTINCT over 1, 1, -1) total 0.
+        "SELECT sum(DISTINCT line_no % 2 * 2 - 1) FROM blame",
+        "SELECT path, sum(line_no - line_no) FROM blame GROUP BY path ORDER BY path",
+        "SELECT path, sum(DISTINCT line_no % 2 * 2 - 1) FROM blame GROUP BY path ORDER BY path",
+        # Only NULLs, whole-table, DISTINCT, and grouped: NULL, not 0.
+        "SELECT sum(DISTINCT NULL) FROM blame",
+        "SELECT path, sum(NULL) FROM blame GROUP BY path ORDER BY path",
+        "SELECT path, sum(DISTINCT NULL) FROM blame GROUP BY path ORDER BY path",
+    ],
+)
+def test_aggregate_sum_zero_total_versus_only_null(tiny_repo, query):
+    """`sum` is `NULL` only when no non-NULL value was seen; a total of
+    `0` is `0`. Whole-table and grouped (#157)."""
+    _assert_differential(tiny_repo, query)
+
+
 def test_aggregate_call_plus_literal(tiny_repo):
     """`count(*) + 1`: the planner's aggregate/scalar split handles an
     aggregate call embedded in a larger expression, not only a bare

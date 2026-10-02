@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from historian.sql import binder, walk
+from historian.sql import binder, grouped, walk
 from historian.sql.ast import (
     And,
     Between,
@@ -347,7 +347,7 @@ def test_function_names_are_compared_ascii_case_insensitively():
 def test_shape_equality_without_group_by_keys_matches_nothing():
     """With no `GROUP BY` keys there is nothing to match: the binder's
     `_matches_any_key` over `()` is `False`."""
-    assert binder._matches_any_key(Literal(1, _POS), ()) is False
+    assert grouped._matches_any_key(Literal(1, _POS), ()) is False
 
 
 # --- Every node type handled; an unknown one is not ----------------------------

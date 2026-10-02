@@ -47,9 +47,9 @@ from historian.sql.binder import (
     BindError,
     BoundColumnRef,
     BoundSelectStatement,
-    _ordinal_value,
     bind,
 )
+from historian.sql.bind_clauses import _ordinal_value
 from historian.sql import binder, walk
 from historian.sql.lexer import Position, tokenize
 from historian.sql.parser import parse

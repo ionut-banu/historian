@@ -40,6 +40,15 @@ Layout
   `BoundColumnRef`. Adding a field to an expression node is one edit
   here, and `tests/test_walk.py` fails until it is made. Imports only
   the stdlib, `historian.ascii`, `sql/ast.py` and `sql/lexer.py`.
+- `src/historian/sql/binder.py` - `bind()` and one plain function per
+  step of the documented resolution order; re-exports the public
+  names. Imports the four modules below, which are layered, each
+  importing only those before it:
+  - `sql/bound.py` - `BindError` and the bound statement types
+  - `sql/bind_expr.py` - name resolution and single-expression binding
+  - `sql/bind_clauses.py` - per-clause binding: ordinals, LIMIT/OFFSET,
+    GROUP BY, ORDER BY, the select list
+  - `sql/grouped.py` - the grouped and DISTINCT narrowing checks
 - `tests/` - pytest tests, one file per module under test
 - `tests/extraction/` - tests checking the git-backed tables against
   `git` itself, e.g. `test_blame.py`

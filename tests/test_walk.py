@@ -332,6 +332,12 @@ def test_nodes_of_different_types_are_not_shape_equal():
     assert expr_shape_equal(Not(operand=left, position=_POS), UnaryOp(UnaryOperator.POS, left, _POS)) is False
 
 
+def test_literals_differing_only_in_int_versus_real_type_are_not_shape_equal():
+    """`1 == 1.0` in Python, but they are different literals."""
+    assert expr_shape_equal(Literal(1, _POS), Literal(1.0, _POS)) is False
+    assert expr_shape_equal(Literal(1.0, _POS), Literal(1, _POS)) is False
+
+
 def test_function_names_are_compared_ascii_case_insensitively():
     upper = FunctionCall(name="COUNT", args=(), position=_POS)
     lower = FunctionCall(name="count", args=(), position=_OTHER_POS)

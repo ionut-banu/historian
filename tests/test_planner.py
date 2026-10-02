@@ -26,7 +26,7 @@ from historian.exec.operators import Aggregate, Distinct, Filter, Limit, Project
 from historian.plan import planner
 from historian.plan.planner import plan
 from historian.schema import Column, ColumnType, Row, Schema
-from historian.sql.ast import BinaryOp, FunctionCall, Like, Literal, OrderDirection, Operator as Op, Star
+from historian.sql.ast import BinaryOp, FunctionCall, Is, Like, Literal, OrderDirection, Operator as Op, Star
 from historian.sql.binder import BoundColumnRef, BoundOrderByItem, BoundSelectItem, BoundSelectStatement, bind
 from historian.sql.lexer import Position, tokenize
 from historian.sql.parser import parse
@@ -1121,6 +1121,22 @@ def test_expr_shape_equal_like_with_identical_escape_operands_is_equal():
     a = Like(left=_col("path"), pattern=_lit("c%"), negated=False, position=_POS, escape=_lit("c"))
     b = Like(left=_col("path"), pattern=_lit("c%"), negated=False, position=_POS, escape=_lit("c"))
     assert planner._expr_shape_equal(a, b) is True
+
+
+def test_expr_shape_equal_literals_differing_only_in_int_versus_real_type_are_not_equal():
+    """Issue #108, A5: the planner's own copy of the binder's literal-
+    type check. `1 == 1.0` in Python, but they are different literals.
+    Unreachable from a query (the binder rejects first), so hand-built
+    nodes."""
+    assert planner._expr_shape_equal(_lit(1), _lit(1.0)) is False
+
+
+def test_expr_shape_equal_is_differing_only_in_negated_is_not_equal():
+    """Issue #108, A5: the planner's own copy of the binder's
+    `Is.negated` check - `x IS NULL` against `x IS NOT NULL`."""
+    is_null = Is(left=_col("path"), right=_lit(None), negated=False, position=_POS)
+    is_not_null = Is(left=_col("path"), right=_lit(None), negated=True, position=_POS)
+    assert planner._expr_shape_equal(is_null, is_not_null) is False
 
 
 def test_plan_split_expr_like_escape_column_matching_group_key_reads_from_aggregate_output():

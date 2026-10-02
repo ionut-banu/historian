@@ -2264,8 +2264,18 @@ def test_group_by_direct_aggregate_call_raises_bind_error(tiny_repo):
 
 
 def test_group_by_aggregate_via_alias_raises_bind_error(tiny_repo):
-    with pytest.raises(BindError):
+    """The alias must resolve (issue #108): without alias fallback this
+    would still be a `BindError`, but "no such column: c"."""
+    with pytest.raises(
+        BindError, match=r"aggregate functions are not allowed in the GROUP BY clause"
+    ):
         run_historian("SELECT count(*) AS c FROM blame GROUP BY c", tiny_repo)
+
+
+def test_group_by_plain_alias_of_a_column(tiny_repo):
+    """`GROUP BY p` resolves through the select-list alias to `path`
+    (issue #108) - the ordinary alias form, which no other case runs."""
+    _assert_differential(tiny_repo, "SELECT path AS p, count(*) FROM blame GROUP BY p")
 
 
 def test_group_by_ordinal_out_of_range_raises_bind_error(tiny_repo):
@@ -3182,21 +3192,20 @@ def test_distinct_order_by_column_not_in_select_list_raises_bind_error(tiny_repo
 
 def test_distinct_order_by_ordinal_is_legal(tiny_repo):
     """An ordinal already points at a select-list item verbatim, by
-    construction - no `BindError`, unlike the bare-column case above."""
-    _, rows = run_historian(
-        "SELECT DISTINCT path, line_no FROM blame ORDER BY 2", tiny_repo
-    )
-    assert rows
+    construction - no `BindError`, unlike the bare-column case above.
+    Compared in order against SQLite (issue #108). `DESC`, because
+    `tiny_repo`'s natural DISTINCT order already is the ascending
+    order, so an ascending case would pass with the `Sort` removed."""
+    _order(tiny_repo, "SELECT DISTINCT path, line_no FROM blame ORDER BY 2 DESC", key_positions=(1,))
 
 
 def test_distinct_order_by_expression_built_from_selected_column_is_legal(tiny_repo):
     """`line_no + 1` is built purely from the selected `line_no` column
     - legal, the same "built purely from" allowance the GROUP BY
-    narrowing already gives its own keys."""
-    _, rows = run_historian(
-        "SELECT DISTINCT line_no FROM blame ORDER BY line_no + 1", tiny_repo
-    )
-    assert rows
+    narrowing already gives its own keys. Compared in order against
+    SQLite (issue #108); `DESC` for the same reason as the ordinal
+    case above."""
+    _order(tiny_repo, "SELECT DISTINCT line_no FROM blame ORDER BY line_no + 1 DESC", key_positions=(0,))
 
 
 def test_distinct_order_by_unselected_aggregate_raises_bind_error(awkward_repo):

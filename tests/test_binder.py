@@ -997,7 +997,11 @@ def test_group_by_direct_aggregate_call_is_a_bind_error():
 
 
 def test_group_by_aggregate_via_alias_is_a_bind_error():
-    with pytest.raises(BindError):
+    """The alias must resolve (issue #108): without alias fallback this
+    would still be a `BindError`, but "no such column: c"."""
+    with pytest.raises(
+        BindError, match=r"aggregate functions are not allowed in the GROUP BY clause"
+    ):
         _bind("SELECT count(*) AS c FROM blame GROUP BY c")
 
 
@@ -2159,3 +2163,73 @@ def test_999_operator_not_and_unary_chains_bind():
         assert isinstance(node, UnaryOp)
         node = node.operand
     assert isinstance(node, BoundColumnRef)
+
+
+# --- M3 review mutants (issue #108) ---------------------------------------
+#
+# Each test below kills one mutant the M3 milestone review found
+# surviving (diff `6517c67..53a9f0d`). Every query here is accepted by
+# SQLite - these are historian's deliberate binder narrowings (spec
+# §3), so they are unit tests and cannot be differential. Each message
+# was observed at this checkout before the test was written, and each
+# test was shown to fail with its mutant applied by hand, then reverted.
+
+
+def test_group_by_key_with_aggregate_only_in_like_escape_is_a_bind_error():
+    """A1, `_contains_aggregate`: the only aggregate call in the GROUP
+    BY key sits in `Like.escape`. A walk that does not visit `escape`
+    sees no aggregate and accepts the key."""
+    with pytest.raises(
+        BindError, match=r"aggregate functions are not allowed in the GROUP BY clause"
+    ):
+        _bind("SELECT path FROM blame GROUP BY path LIKE 'a' ESCAPE count(*)")
+
+
+def test_ungrouped_aggregate_query_with_bare_column_only_in_like_escape_is_a_bind_error():
+    """A1, `_split_for_grouped_check`: the only bare column in the
+    select item sits in `Like.escape`. A walk that does not visit
+    `escape` finds no bad column and accepts the query."""
+    with pytest.raises(
+        BindError,
+        match=r"column author_name must appear in an aggregate function since this query has no GROUP BY",
+    ):
+        _bind("SELECT 'a' LIKE 'a' ESCAPE author_name, count(*) FROM blame")
+
+
+def test_group_by_literal_differing_only_in_int_versus_real_type_is_a_bind_error():
+    """A2: `1.0` and `1` are equal as Python values but different
+    literals, so `line_no + 1.0` does not shape-match the key `line_no
+    + 1`. Positive control: `test_group_by_on_an_expression` binds the
+    same query with `+ 1` on both sides."""
+    with pytest.raises(
+        BindError,
+        match=r"column line_no must appear in the GROUP BY clause or be used in an aggregate function",
+    ):
+        _bind("SELECT line_no + 1.0, count(*) FROM blame GROUP BY line_no + 1")
+
+
+def test_group_by_is_differing_only_in_negation_is_a_bind_error():
+    """A3: `line_no IS NULL` does not shape-match the key `line_no IS
+    NOT NULL`."""
+    with pytest.raises(
+        BindError,
+        match=r"column line_no must appear in the GROUP BY clause or be used in an aggregate function",
+    ):
+        _bind("SELECT line_no IS NULL, count(*) FROM blame GROUP BY line_no IS NOT NULL")
+
+
+def test_group_by_is_with_matching_negation_binds():
+    """A3's positive control: the same `IS NULL` on both sides matches
+    its key and binds."""
+    bound = _bind("SELECT line_no IS NULL, count(*) FROM blame GROUP BY line_no IS NULL")
+    assert len(bound.group_by) == 1
+
+
+def test_group_by_plain_alias_resolves_to_the_select_items_expression():
+    """A4: `GROUP BY p` falls back to the select-list alias `p`, so the
+    bound key is the select item's own bound expression (`path`).
+    Without alias fallback it would be "no such column: p"."""
+    bound = _bind("SELECT path AS p, count(*) FROM blame GROUP BY p")
+    assert bound.group_by[0] == bound.select_list[0].expr
+    assert isinstance(bound.group_by[0], BoundColumnRef)
+    assert bound.group_by[0].name == "path"

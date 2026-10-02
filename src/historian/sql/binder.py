@@ -951,7 +951,9 @@ def _same_node_fields(a: Expr, b: Expr) -> bool:
         # `name` as written, which error messages ("no such function:
         # {call.name}") still want to echo verbatim. The argument
         # count is compared by the caller, with the operands.
-        return ascii_fold(a.name) == ascii_fold(b.name)
+        # `count(x)` and `count(DISTINCT x)` are different aggregates
+        # (issue #131), so the flag is compared as a plain field.
+        return ascii_fold(a.name) == ascii_fold(b.name) and a.distinct == b.distinct
     if isinstance(a, (UnaryOp, BinaryOp)):
         return a.op == b.op
     if isinstance(a, (Not, And, Or)):

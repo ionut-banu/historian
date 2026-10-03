@@ -618,6 +618,218 @@ def test_group_by_aggregate_error_position(sql, column, offset):
     assert error.position == Position(line=1, column=column, offset=offset)
 
 
+# --- Error positions in sql/bind_expr.py, binder.py, grouped.py (#167) -------
+#
+# Same rule as above: the start of the offending expression as the AST
+# records it. Columns and offsets are counted by hand from the query
+# text (column 1-based, offset 0-based). "SELECT " is 7 characters, so
+# the first select item is at column 8, offset 7.
+
+
+@pytest.mark.parametrize(
+    ("sql", "message", "column", "offset"),
+    [
+        ("SELECT ghost.path FROM blame", "no such column: ghost.path", 8, 7),
+        ("SELECT ghost.* FROM blame", "no such table: ghost", 8, 7),
+        ("SELECT nosuch(path) FROM blame", "no such function: nosuch", 8, 7),
+        (
+            "SELECT path FROM blame WHERE count(*) > 1",
+            "misuse of aggregate function count(): aggregate calls are not allowed in WHERE",
+            30,
+            29,
+        ),
+        ("SELECT count(path, line) FROM blame", "wrong number of arguments to function count()", 8, 7),
+        ("SELECT sum(*) FROM blame", "wrong number of arguments to function sum()", 8, 7),
+        ("SELECT sum() FROM blame", "wrong number of arguments to function sum()", 8, 7),
+        (
+            "SELECT count(*) AS c FROM blame WHERE c > 1",
+            "misuse of aggregate: aliased column c refers to an aggregate call, which is not allowed here",
+            39,
+            38,
+        ),
+        (
+            "SELECT count(count(*)) FROM blame",
+            "misuse of aggregate function count(): aggregate function calls cannot be nested",
+            14,
+            13,
+        ),
+        ("SELECT count(*) AS c FROM blame ORDER BY sum(c)", "misuse of aliased aggregate c", 46, 45),
+    ],
+    ids=[
+        "no-such-column-qualified",
+        "no-such-table-qualified-star",
+        "no-such-function",
+        "aggregate-in-where",
+        "count-two-arguments",
+        "sum-star",
+        "sum-no-arguments",
+        "aliased-aggregate-in-where",
+        "nested-aggregate",
+        "aliased-aggregate-nested-in-order-by",
+    ],
+)
+def test_bind_expr_error_position(sql, message, column, offset):
+    """Every query here is an error in SQLite too (`no such column:
+    ghost.path`, `no such table: ghost`, `no such function: nosuch`,
+    `misuse of aggregate function count()`, `wrong number of arguments
+    to function ...`, `misuse of aggregate: count()`, `misuse of
+    aliased aggregate c`); SQLite reports no position, so the AST rule
+    decides. `x.*` sits at the qualifier, the nested call at the inner
+    call, the alias at the `c` argument."""
+    error = _bind_error(sql)
+    assert str(error) == message
+    assert error.position == Position(line=1, column=column, offset=offset)
+
+
+def test_star_backstop_in_where_error_position():
+    """Unreachable from SQL text: the parser rejects `*` in an
+    expression (`WHERE * > 1`: `expected expression, found '*'`), and
+    SQLite also reports a syntax error. Hand-built tree, with a position
+    distinct from `_POS` so the error must carry the star's own."""
+    where = Star(table="blame", position=Position(1, 30, 29))
+    stmt = SelectStatement(
+        select_list=(SelectItem(expr=Literal(1, _POS), alias=None, position=_POS),),
+        from_table="blame",
+        where=where,
+        group_by=(),
+        having=None,
+        order_by=(),
+        limit=None,
+        offset=None,
+        position=_POS,
+    )
+    with pytest.raises(BindError) as exc_info:
+        bind(stmt, SCHEMAS)
+    assert str(exc_info.value).startswith("* is only allowed as a whole select-list item")
+    assert exc_info.value.position == Position(line=1, column=30, offset=29)
+
+
+def test_star_backstop_as_function_argument_error_position():
+    """Unreachable from SQL text: `count(blame.*)` is `expected a
+    column name after '.'` to the parser and a syntax error to SQLite.
+    Hand-built tree whose call and star have different positions; the
+    error is the star's (1:14:13), not the call's (1:8:7)."""
+    call = FunctionCall(
+        name="count",
+        args=(Star(table="blame", position=Position(1, 14, 13)),),
+        position=Position(1, 8, 7),
+    )
+    stmt = SelectStatement(
+        select_list=(SelectItem(expr=call, alias=None, position=Position(1, 8, 7)),),
+        from_table="blame",
+        where=None,
+        group_by=(),
+        having=None,
+        order_by=(),
+        limit=None,
+        offset=None,
+        position=_POS,
+    )
+    with pytest.raises(BindError) as exc_info:
+        bind(stmt, SCHEMAS)
+    assert str(exc_info.value).startswith("* is only allowed as a whole select-list item")
+    assert exc_info.value.position == Position(line=1, column=14, offset=13)
+
+
+def test_star_with_alias_backstop_error_position():
+    """Unreachable from SQL text: `SELECT * AS x FROM blame` is `AS is
+    not allowed after '*'` to the parser and `near "AS": syntax error`
+    to SQLite. Hand-built tree whose item (1:8:7) and star (1:50:49)
+    differ; the error is the select item's, not the star's."""
+    stmt = SelectStatement(
+        select_list=(
+            SelectItem(
+                expr=Star(table=None, position=Position(1, 50, 49)),
+                alias="x",
+                position=Position(1, 8, 7),
+            ),
+        ),
+        from_table="blame",
+        where=None,
+        group_by=(),
+        having=None,
+        order_by=(),
+        limit=None,
+        offset=None,
+        position=_POS,
+    )
+    with pytest.raises(BindError) as exc_info:
+        bind(stmt, SCHEMAS)
+    assert str(exc_info.value).startswith("* is only allowed as a whole select-list item")
+    assert exc_info.value.position == Position(line=1, column=8, offset=7)
+
+
+def test_having_on_plain_query_error_position():
+    """SQLite: `HAVING clause on a non-aggregate query`. The position is
+    the first token of the `HAVING` expression (the `1`), not the
+    keyword."""
+    error = _bind_error("SELECT path FROM blame HAVING 1")
+    assert str(error).startswith("HAVING requires an aggregate query")
+    assert error.position == Position(line=1, column=31, offset=30)
+
+
+@pytest.mark.parametrize(
+    ("sql", "message", "column", "offset"),
+    [
+        (
+            "SELECT path FROM blame GROUP BY path HAVING line_no > 1",
+            "column line_no must appear in the GROUP BY clause or be used in an aggregate function",
+            45,
+            44,
+        ),
+        (
+            "SELECT count(*) FROM blame GROUP BY path ORDER BY line",
+            "column line must appear in the GROUP BY clause or be used in an aggregate function",
+            51,
+            50,
+        ),
+        (
+            "SELECT DISTINCT path FROM blame ORDER BY line",
+            "column line must appear in the select list to be used in ORDER BY together with SELECT DISTINCT",
+            42,
+            41,
+        ),
+        (
+            "SELECT DISTINCT path FROM blame GROUP BY path ORDER BY count(*)",
+            "aggregate count(...) must appear in the select list to be used in ORDER BY together with SELECT DISTINCT",
+            56,
+            55,
+        ),
+        (
+            "SELECT path, line FROM blame GROUP BY path",
+            "column line must appear in the GROUP BY clause or be used in an aggregate function",
+            14,
+            13,
+        ),
+        (
+            "SELECT count(*), line FROM blame",
+            "column line must appear in an aggregate function since this query has no GROUP BY",
+            18,
+            17,
+        ),
+    ],
+    ids=[
+        "having-ungrouped-column",
+        "aggregate-query-order-by-ungrouped-column",
+        "distinct-order-by-column",
+        "distinct-group-by-order-by-aggregate",
+        "select-list-ungrouped-column",
+        "select-list-bare-column-no-group-by",
+    ],
+)
+def test_historian_narrowing_error_position(sql, message, column, offset):
+    """Historian's own narrowing, not an SQLite error: SQLite 3.45.1
+    accepts every query here and returns rows (spec §3 "Errors",
+    "Aggregate misuse": the bare column that is neither a `GROUP BY`
+    key nor inside an aggregate, and the `SELECT DISTINCT ... ORDER BY`
+    key; `_docs/decisions.md` 2026-09-25). Do not make the query valid
+    to "fix" this test. The position is the offending column or
+    aggregate call itself."""
+    error = _bind_error(sql)
+    assert str(error) == message
+    assert error.position == Position(line=1, column=column, offset=offset)
+
+
 # --- Aliases: no cross-item namespace, WHERE fallback (#32) ------------------
 
 

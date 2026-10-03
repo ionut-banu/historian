@@ -170,7 +170,7 @@ def _check_limit_offset_names(exprs: tuple[Expr, ...]) -> None:
     them against no columns at all and with no select-list alias, so
     every column reference is "no such column", real column or not.
 
-    Measured against the oracle (3.45.1), two strengths of error:
+    Measured against the oracle, two strengths of error:
 
     - A column reference outside every aggregate call is reported at
       once (`LIMIT ghost_l OFFSET ghost_f` reports `ghost_l`).

@@ -604,8 +604,9 @@ evaluation stops depends on where the expression is used:
   stops `OR`. `x BETWEEN low AND high` is `x >= low AND x <= high` and
   stops the same way; `x NOT BETWEEN ...` is `NOT (x BETWEEN ...)`.
 - `IN` stops at the first list element equal to its left side, in
-  both contexts. A `NULL` element or left side does not stop it, and
-  `IN ()` evaluates nothing.
+  both contexts. A `NULL` element or left side does not stop it. `IN ()`
+  evaluates nothing in condition context and its left side in value
+  context.
 
 The evaluator has one entry point per context: `evaluate()` for a
 value, `evaluate_condition()` for `Filter`. A future `CASE WHEN` or
@@ -682,8 +683,9 @@ Four kinds, all of them the user's fault and none of them tracebacks:
   an actual row.
 
 When a statement has more than one binding error, historian reports
-the one SQLite reports. SQLite's order, measured on 3.45.1
-(`_docs/decisions.md`, 2026-10-02): the `FROM` table and the
+the one SQLite reports. SQLite's order, measured against the oracle
+(`_docs/decisions.md`, 2026-10-02, re-checked under the pinned oracle
+in #117): the `FROM` table and the
 qualifier of any `x.*` select-list item; `LIMIT`, then `OFFSET`, for
 what SQLite rejects there (a column reference, reported at once, or
 an aggregate call, reported only once neither clause has a column

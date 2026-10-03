@@ -216,7 +216,7 @@ __all__ = [
 #: 0x0D), exactly - leading and trailing for the whole-string (affinity)
 #: conversion, leading only for the arithmetic and `%` scans, and never
 #: between a sign and its digits or inside a number. Confirmed with
-#: `tests/oracle.py` (sqlite3 module 3.45.1), a quoted literal and a
+#: `tests/oracle.py` (the oracle), a quoted literal and a
 #: bound parameter alike: every other character is a non-number
 #: character - 0x00-0x08, 0x0E-0x1F (`\x1c`-`\x1f` included), 0x7F,
 #: `\x85`, `\xa0` and the Unicode spaces (`'\x1c12' + 0` and
@@ -263,6 +263,7 @@ class _Step(Enum):
     FINISH_NOT = auto()
     FINISH_LIKE = auto()
     IN_AFTER_ELEMENT = auto()
+    FINISH_EMPTY_IN = auto()
     FINISH_BETWEEN = auto()
     BETWEEN_AFTER_LOW = auto()
     FINISH_BETWEEN_HIGH = auto()
@@ -363,7 +364,7 @@ def _run(expr: Expr, row: Row, schema: Schema, context: _Context) -> Value | Boo
     - `IN` evaluates the left operand and the first element, compares
       them, and stops on a match (`IN_AFTER_ELEMENT`), in both
       contexts; otherwise the next element, the left operand again
-      (#137), and so on. `IN ()` evaluates nothing.
+      (#137), and so on. `IN ()` evaluates nothing in condition context.
     - `LIKE` evaluates `left`, `pattern`, then `escape`, before any
       check on the escape.
 
@@ -425,6 +426,9 @@ def _run(expr: Expr, row: Row, schema: Schema, context: _Context) -> Value | Boo
             pattern = results.pop()
             left = results.pop()
             results.append(_finish_like(node, left, pattern, escape))
+        elif step is _Step.FINISH_EMPTY_IN:
+            results.pop()
+            results.append(values.not3(False) if node.negated else False)
         elif step is _Step.IN_AFTER_ELEMENT:
             element = results.pop()
             left = results.pop()
@@ -517,21 +521,27 @@ def _start(
             # evaluates both sides of `WHERE +(a AND b)` (issue #111).
             work.append((_Step.EVAL, node.operand, value, 0))
             return
+        # Unary plus between the `-` and a literal does not stop the
+        # fold: the oracle (see `tests/conftest.py`) treats `-(+0.0)`
+        # as `-0.0` and `-(+9223372036854775808)` as INT64_MIN (#117).
+        literal_operand = node.operand
+        while isinstance(literal_operand, UnaryOp) and literal_operand.op is UnaryOperator.POS:
+            literal_operand = literal_operand.operand
         if (
-            isinstance(node.operand, Literal)
-            and isinstance(node.operand.value, float)
-            and node.operand.value == _INT64_MIN_MAGNITUDE_AS_FLOAT
+            isinstance(literal_operand, Literal)
+            and isinstance(literal_operand.value, float)
+            and literal_operand.value == _INT64_MIN_MAGNITUDE_AS_FLOAT
         ):
             # `-9223372036854775808` written in source - see
             # `_finish_negate`'s docstring.
             results.append(INT64_MIN)
             return
-        if isinstance(node.operand, Literal) and isinstance(node.operand.value, float):
+        if isinstance(literal_operand, Literal) and isinstance(literal_operand.value, float):
             # A REAL literal directly under `-` (parentheses are not a
             # node): SQLite folds it to a negative literal, a true sign
             # flip, so `-(0.0)` is `-0.0` - unlike `_finish_negate`'s
             # `0 - x` for everything else (issue #110).
-            results.append(-node.operand.value)
+            results.append(-literal_operand.value)
             return
         work.append((_Step.FINISH_NEGATE, node, value, 0))
         work.append((_Step.EVAL, node.operand, value, 0))
@@ -570,7 +580,14 @@ def _start(
         return
     if isinstance(node, In):
         if not node.values:
-            # `IN ()` is FALSE, and the left operand is never evaluated.
+            # `IN ()` is FALSE. In condition context the left operand is
+            # never evaluated; in value context it is, and an error in
+            # it surfaces (measured on the oracle, #117; an older
+            # SQLite, 3.45.1, did not evaluate it there).
+            if context is _Context.VALUE:
+                work.append((_Step.FINISH_EMPTY_IN, node, value, 0))
+                work.append((_Step.EVAL, node.left, value, 0))
+                return
             results.append(values.not3(False) if node.negated else False)
             return
         # The result so far - FALSE, matched by nothing yet - then the
@@ -1013,7 +1030,7 @@ def _strip_numeric_whitespace(text: str) -> str:
     ends - not Python's `str.strip()`, which trims a broader,
     Unicode-aware set. SQLite's whole-string numeric-affinity check
     trims exactly those six ASCII characters (`\\x1c`, `\\x85` and
-    `\\xa0` are not trimmed; sqlite3 3.45.1, issue #136)."""
+    `\\xa0` are not trimmed; the oracle, issue #136)."""
     return text.strip(_NUMERIC_WHITESPACE)
 
 
@@ -1518,7 +1535,7 @@ def _modulo_text_operand(text: str) -> tuple[int, bool]:
     non-digit, clamped to int64. A `.` or an exponent is never part of
     it, so `'1e3'` reads `1`, `'1.5e2'` reads `1`, `'1e400'` reads `1`
     (never `inf`), and no digits at all reads `0`. Confirmed with
-    tests/oracle.py (module sqlite3 3.45.1): `'1e3' % 7` is `1.0`,
+    tests/oracle.py (the oracle): `'1e3' % 7` is `1.0`,
     `'99999999999999999999e0' % 7` is `0.0` (int64 max % 7).
 
     `_scan_number` is not touched: `+ - * /` and `sum`/`avg` still

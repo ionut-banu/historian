@@ -48,7 +48,7 @@ Resolution order
 
 When a statement has more than one error, `bind()` reports the one
 SQLite reports (issue #115, spec §3 "Errors"). Measured against the
-oracle - Python's `sqlite3` module, SQLite 3.45.1 - by splicing one,
+oracle - Python's `sqlite3` module (the version `tests/conftest.py` pins) - by splicing one,
 two and three erroring fragments from different clauses into a base
 query (`tests/differential/test_error_order.py`), the order is:
 

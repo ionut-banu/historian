@@ -12,7 +12,7 @@ Each query runs through the real pipeline (`tokenize -> parse -> bind
 -> plan -> optimize -> rows()`), with a `blame` factory that keeps the
 `BlameScan` it built so the record can be read afterwards.
 
-Expected rows were confirmed with `tests/oracle.py` (SQLite 3.45.1);
+Expected rows were confirmed with `tests/oracle.py` (the oracle);
 the one-line setup/query for each is on the issue.
 """
 

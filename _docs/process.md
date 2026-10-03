@@ -241,13 +241,27 @@ data, and the results must be identical. See §1 of `_docs/spec.md`.
 The oracle is precisely SQLite as exposed by Python's bundled
 `sqlite3` module - the same module `tests/differential/conftest.py`
 uses to build the harness's SQLite side. Not the system `sqlite3`
-CLI. The module's current version, checked with:
+CLI. The module's version, checked with:
 
     uv run python3 -c "import sqlite3; print(sqlite3.sqlite_version)"
 
-is `3.50.4` (as of 2026-09-25). This can differ from `sqlite3
---version`'s CLI build - `3.51.0`, an Apple-patched build, on the
-same machine - and the two are already different versions here.
+is whatever that command prints, and it is one value for every
+machine. The SQLite version follows the Python build, not the Python
+version, and a system Python links the operating system's libsqlite,
+so `.python-version` pins an exact uv-managed CPython and
+`python-preference = "only-managed"` in `pyproject.toml` stops uv
+from taking a system one. The expected value is written in one place,
+`EXPECTED_ORACLE_SQLITE_VERSION` in `tests/conftest.py`: pytest aborts
+the whole run before collecting anything if the module reports any
+other version, and every pytest header prints `oracle: sqlite3
+<version> (python <version>)`, so a pasted log says which oracle ran.
+This can differ from `sqlite3 --version`'s CLI build (an
+Apple-patched one, on one machine), which is never the oracle.
+
+The version-drift policy follows from that: whoever changes
+`.python-version`, `requires-python`, or the way uv selects a Python
+changes the constant and re-runs the whole suite in the same commit,
+and re-measures whatever fails rather than editing it to green.
 
 Reach the module directly for an ad hoc check instead of the CLI.
 For a query with no setup:

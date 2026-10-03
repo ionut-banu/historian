@@ -384,8 +384,8 @@ def test_select_list_resolved_before_where():
 # FROM (and an unknown `x.*` qualifier), LIMIT/OFFSET, the select
 # list, HAVING on a non-aggregate query, HAVING, WHERE, ORDER BY,
 # GROUP BY, the late aggregate misuse, then historian's own
-# rejections. Each expected message is the oracle's (sqlite3 module
-# 3.45.1); `tests/differential/test_error_order.py` checks the same
+# rejections. Each expected message is the oracle's (sqlite3 module);
+# `tests/differential/test_error_order.py` checks the same
 # order live against it.
 
 
@@ -818,7 +818,7 @@ def test_having_on_plain_query_error_position():
     ],
 )
 def test_historian_narrowing_error_position(sql, message, column, offset):
-    """Historian's own narrowing, not an SQLite error: SQLite 3.45.1
+    """Historian's own narrowing, not an SQLite error: SQLite
     accepts every query here and returns rows (spec §3 "Errors",
     "Aggregate misuse": the bare column that is neither a `GROUP BY`
     key nor inside an aggregate, and the `SELECT DISTINCT ... ORDER BY`
@@ -908,7 +908,7 @@ def _assert_where_operand_is_path_column(sql: str) -> None:
 
 
 def test_where_real_column_wins_over_alias_of_count_star():
-    """#165, oracle (3.45.1): `select count(*) as path from blame
+    """#165, oracle: `select count(*) as path from blame
     where path = 'feature/thing.py'` returns `1` - one row, the count
     of rows matching the real column; with `'nosuch'` it returns `0`.
     No `misuse of aggregate` error, because `path` is the column. The
@@ -917,14 +917,14 @@ def test_where_real_column_wins_over_alias_of_count_star():
 
 
 def test_where_real_column_wins_over_alias_of_sum():
-    """#165, oracle (3.45.1): `select sum(line_no) as path from blame
+    """#165, oracle: `select sum(line_no) as path from blame
     where path = 'src/utils.py'` returns `3` (1 + 2), filtering on the
     real column. Same resolution as the `count(*)` form."""
     _assert_where_operand_is_path_column("SELECT sum(line_no) AS path FROM blame WHERE path = 'x'")
 
 
 def test_where_real_column_wins_over_alias_of_different_case():
-    """#165, oracle (3.45.1): `select count(*) as PATH from blame
+    """#165, oracle: `select count(*) as PATH from blame
     where path = 'src/utils.py'` returns `2` - the alias spelled in a
     different case still names the real column's row set, not the
     aggregate. The WHERE operand binds to `path`'s own offset."""
@@ -932,7 +932,7 @@ def test_where_real_column_wins_over_alias_of_different_case():
 
 
 def test_group_by_real_column_wins_over_alias_of_count_star():
-    """#165, oracle (3.45.1): `select count(*) as path from blame
+    """#165, oracle: `select count(*) as path from blame
     group by path` returns `1` and `2` - one row per path, grouped by
     the column. Not `aggregate functions are not allowed in the GROUP
     BY clause`. The one group key is the `path` column ref."""
@@ -944,7 +944,7 @@ def test_group_by_real_column_wins_over_alias_of_count_star():
 
 
 def test_having_real_column_wins_over_alias_of_count_star():
-    """#165, oracle (3.45.1): `select count(*) as path from blame
+    """#165, oracle: `select count(*) as path from blame
     group by path having path = 'feature/thing.py'` returns `1` (one
     group); with `'nosuch'` it returns no rows. HAVING filters on the
     column, so its operand is the `path` column ref, not the
@@ -956,7 +956,7 @@ def test_having_real_column_wins_over_alias_of_count_star():
 
 
 def test_order_by_alias_of_aggregate_wins_over_real_column():
-    """#165, oracle (3.45.1): `select -count(*) as path from blame
+    """#165, oracle: `select -count(*) as path from blame
     group by path order by path` returns `-2`, `-1` (sorted by the
     aggregate; sorting by the path text would give `-1`, `-2`), and
     `desc` reverses it. ORDER BY is the one clause where the alias
@@ -969,7 +969,7 @@ def test_order_by_alias_of_aggregate_wins_over_real_column():
 
 
 def test_limit_and_offset_see_neither_column_nor_alias():
-    """#165, oracle (3.45.1): `select count(*) as path from blame limit
+    """#165, oracle: `select count(*) as path from blame limit
     path` and `... limit 1 offset path` both fail with `no such column:
     path` - neither the real column nor the alias is visible there."""
     with pytest.raises(BindError, match=r"no such column: path"):
@@ -2359,7 +2359,7 @@ def test_distinct_order_by_aggregate_matching_select_list_aggregate_case_insensi
     names are ASCII-case-insensitive in SQLite - `COUNT(*)` in the
     select list and `count(*)` in `ORDER BY` name the same aggregate,
     and the sort key *is* fully determined by the output row. Confirmed
-    against the oracle (`tests/oracle.py`, sqlite3 3.45.1) that this
+    against the oracle (`tests/oracle.py`) that this
     exact query is accepted and returns 2 rows, no error. Before this
     fix, `sql/walk.py`'s `expr_shape_equal` `FunctionCall` branch compared raw,
     un-folded names, so `strict_function_calls=True` wrongly rejected

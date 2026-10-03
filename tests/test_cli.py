@@ -537,8 +537,8 @@ def test_directory_without_git_still_exits_3_with_its_message(tmp_path, capsys):
 
 # --- Expression depth (issue #107) -----------------------------------------
 #
-# Expected values below are the oracle's (`tests/oracle.py`, sqlite3
-# 3.45.1): a chain of n `1`s joined by `+` is n, up to 1000 terms; 1001
+# Expected values below are the oracle's (`tests/oracle.py`):
+# a chain of n `1`s joined by `+` is n, up to 1000 terms; 1001
 # is "Expression tree is too large (maximum depth 1000)".
 
 _DEPTH_ERROR = "error: Expression tree is too large (maximum depth 1000)\n"

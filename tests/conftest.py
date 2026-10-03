@@ -13,6 +13,8 @@ so rebuilding per test would only cost time for no isolation benefit.
 
 from __future__ import annotations
 
+import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -24,6 +26,35 @@ from fixtures.build import (
     get_numeric_repo,
     get_tiny_repo,
 )
+
+
+#: The one place the oracle's SQLite version is written down (#117). The
+#: oracle is Python's bundled `sqlite3` module (`_docs/process.md`, "The
+#: oracle"), and which SQLite that is follows the Python build, so the
+#: repository pins a uv-managed CPython (`.python-version` and
+#: `python-preference = "only-managed"` in `pyproject.toml`) and the
+#: session aborts below if the running module is anything else. Whoever
+#: changes the pin changes this constant and re-runs the suite in the
+#: same commit. There is deliberately no way to bypass the check.
+EXPECTED_ORACLE_SQLITE_VERSION = "3.50.4"
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """Abort the whole run, before anything is collected, when the
+    oracle is not the expected SQLite - a hard abort, not a skip."""
+    if sqlite3.sqlite_version != EXPECTED_ORACLE_SQLITE_VERSION:
+        raise pytest.UsageError(
+            f"the oracle must be sqlite3 {EXPECTED_ORACLE_SQLITE_VERSION}, "
+            f"but this Python's sqlite3 module is {sqlite3.sqlite_version}.\n"
+            f"  sys.version:    {sys.version}\n"
+            f"  sys.executable: {sys.executable}\n"
+            "Run `uv sync` (and `uv run pytest`) so the pinned managed Python is "
+            'used; see `_docs/process.md`, "The oracle".'
+        )
+
+
+def pytest_report_header(config: pytest.Config) -> str:
+    return f"oracle: sqlite3 {sqlite3.sqlite_version} (python {sys.version.split()[0]})"
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:

@@ -473,7 +473,7 @@ def test_modulo_text_operand_goes_through_leading_prefix_coercion(text, expected
 # `OP_Remainder` via `sqlite3VdbeIntValue`), never accepting `.` or an
 # exponent, clamped to int64 - while the REAL-vs-INTEGER class still
 # comes from the general conversion (`numericType`). tests/oracle.py,
-# module sqlite3 3.45.1: `'1e3' % 7` -> 1.0, `'1.5e2' % 7` -> 1.0,
+# module the oracle: `'1e3' % 7` -> 1.0, `'1.5e2' % 7` -> 1.0,
 # `'-1e2' % 7` -> -1.0, `'2E1' % 7` -> 2.0, `'1e2abc' % 7` -> 1.0,
 # `'1e400' % 3` -> 1.0, `'99999999999999999999e0' % 7` -> 0.0 (int64
 # max % 7), `'-9223372036854775808e0' % 7` -> -1.0, `'5e' % 3` -> 2
@@ -530,7 +530,7 @@ def test_modulo_text_operand_scan_stops_at_the_first_non_digit(
 )
 def test_modulo_text_operand_with_an_exponent_through_evaluate(text, expected):
     """`text % 7` - the digit-stop value, reported REAL. Values from
-    tests/oracle.py, 3.45.1 (`'1e400' % 7` -> 1.0 likewise)."""
+    tests/oracle.py (`'1e400' % 7` -> 1.0 likewise)."""
     from historian.exec.expression import evaluate
 
     result = evaluate(_bin(Operator.MOD, _lit(text), _lit(7)), _ROW, _SCHEMA)
@@ -562,7 +562,7 @@ def test_int64_truncated_clamps_negative_infinity_to_int64_min():
     ],
 )
 def test_modulo_infinite_real_operand_clamps_instead_of_crashing(left, right, expected):
-    """tests/oracle.py, 3.45.1: `('1e400'+0) % 3` -> 1.0, `5 %
+    """tests/oracle.py: `('1e400'+0) % 3` -> 1.0, `5 %
     ('1e400'+0)` -> 5.0, `5 % (-('1e400'+0))` -> 5.0, `('1e400'+0) %
     ('1e400'+0)` -> 0.0."""
     from historian.exec.expression import evaluate
@@ -823,8 +823,8 @@ def test_negated_int64_min_literal_arithmetic_stays_exact():
 # SQLite negates a computed value as `0 - x`, not by flipping the sign
 # bit, so `-(0.0 * 1)` is `+0.0`; only a REAL literal directly under
 # `-` (parentheses are not a node) is folded to a negative literal, so
-# `-(0.0)` is `-0.0`. Checked with `tests/oracle.py` (sqlite3 module
-# 3.45.1), `SELECT <expr> FROM blame` over one row with `line_no = 3`,
+# `-(0.0)` is `-0.0`. Checked with `tests/oracle.py` (the oracle),
+# `SELECT <expr> FROM blame` over one row with `line_no = 3`,
 # REALs by `float.hex()`. Here `n` (5) stands in for `line_no`; any
 # non-negative integer times 0.0 is `+0.0`.
 
@@ -845,7 +845,9 @@ def _neg(operand):
         pytest.param(
             _neg(_bin(Operator.ADD, _neg(_lit(0.0)), _lit(0))), "0x0.0p+0", id="-(-0.0 + 0)"
         ),
-        pytest.param(_neg(_unary(UnaryOperator.POS, _lit(0.0))), "0x0.0p+0", id="-(+0.0)"),
+        # Unary plus does not stop the literal fold on the pinned oracle
+        # (`-(+0.0)` is `-0.0`); `0.0` was a SQLite 3.45.1 artefact (#117).
+        pytest.param(_neg(_unary(UnaryOperator.POS, _lit(0.0))), "-0x0.0p+0", id="-(+0.0)"),
         pytest.param(_neg(_lit("0.0")), "0x0.0p+0", id="-'0.0'"),
         pytest.param(_neg(_lit("0.0abc")), "0x0.0p+0", id="-'0.0abc'"),
         pytest.param(_neg(_lit("1e-400")), "0x0.0p+0", id="-'1e-400'"),
@@ -1746,7 +1748,7 @@ def test_like_escape_column_operand_null_row_value_is_null():
 # --- AND / OR: where evaluation stops (issue #51, corrected by #111) ---
 #
 # #51 made AND/OR stop after a decided left operand everywhere. #111
-# measured SQLite (sqlite3 module 3.45.1, an exhaustive sweep in
+# measured SQLite (the oracle, an exhaustive sweep in
 # tests/differential/test_evaluation_order.py) and found the rule
 # depends on where the expression is used:
 #
@@ -1854,7 +1856,7 @@ def test_a_null_left_side_that_stops_a_condition_leaves_null_not_false():
 # pass every differential test. These count reads instead: each leaf is
 # a bare column, and the row records which offsets were read, in order.
 # Leaf values are 1 (TRUE), 0 (FALSE) and None (NULL). Every expected
-# read list follows from the rule measured against sqlite3 3.45.1 (see
+# read list follows from the rule measured against the oracle (see
 # tests/differential/test_evaluation_order.py and _docs/decisions.md,
 # 2026-10-01):
 #
@@ -2039,10 +2041,16 @@ def test_in_results_are_unchanged_by_stopping(entry):
     assert _reads(entry, negated, 6, 5, 7)[0] is True
 
 
-@pytest.mark.parametrize("entry", ["evaluate", "evaluate_condition"])
-def test_empty_in_reads_nothing(entry):
-    assert _reads(entry, _in(_A, ()), 1) == (False, [])
-    assert _reads(entry, _in(_A, (), negated=True), 1) == (True, [])
+def test_empty_in_reads_nothing_in_condition_context():
+    assert _reads("evaluate_condition", _in(_A, ()), 1) == (False, [])
+    assert _reads("evaluate_condition", _in(_A, (), negated=True), 1) == (True, [])
+
+
+def test_empty_in_reads_its_left_side_in_value_context():
+    """On the pinned oracle a value-context `x IN ()` still evaluates
+    `x` (so an error in it surfaces); 3.45.1 did not (#117)."""
+    assert _reads("evaluate", _in(_A, ()), 1) == (False, [0])
+    assert _reads("evaluate", _in(_A, (), negated=True), 1) == (True, [0])
 
 
 @pytest.mark.parametrize("negated", [False, True])
@@ -2754,7 +2762,7 @@ def test_comparison_of_a_null_predicate_result_stays_null():
 # exponent - is an `int` only if it fits int64; otherwise it is the
 # `float` of the digit *text* (never `float()` of a Python `int`, which
 # raises `OverflowError` for a large enough one), `inf` if it overflows
-# a double. Confirmed with `tests/oracle.py` (`sqlite3` 3.45.1):
+# a double. Confirmed with `tests/oracle.py`:
 # `select '9223372036854775808' + 0` -> 9.223372036854776e+18
 # (`0x1.0000000000000p+63`), `select '999...9' + 0` (320 nines) -> inf.
 
@@ -2869,7 +2877,7 @@ def test_huge_digit_run_text_plus_zero_is_inf():
 # its own right. These trees are built by hand, far past 1000 levels,
 # and evaluated at the interpreter's default recursion limit. Expected
 # values are plain arithmetic/logic on the leaves, each checked against
-# sqlite3 3.45.1 (tests/oracle.py) at a height SQLite accepts:
+# the oracle (tests/oracle.py) at a height SQLite accepts:
 # `SELECT 1+1+...` (n terms) is n, a NULL anywhere makes it NULL, and
 # `1 AND ... AND 0 AND ...` is 0.
 
@@ -3073,7 +3081,7 @@ def test_deep_is_like_in_between_chains(entry):
 
 # --- Issue #136: numeric-text whitespace is exactly the six characters
 # SQLite skips (space, \t, \n, \v, \f, \r), leading and trailing, and
-# nothing else. Oracle: tests/oracle.py (sqlite3 module 3.45.1), the
+# nothing else. Oracle: tests/oracle.py (the oracle), the
 # string as a quoted literal and as a bound parameter, same results:
 #   select '\v12'+0, '\v12'%5, -'\v12', '\x1c12'+0, '\xa012'+0;
 #     -> 12|2|-12|0|0

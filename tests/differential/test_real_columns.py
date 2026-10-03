@@ -11,7 +11,7 @@ bound `-0.0` as `0.0` and an `int` as a float, and a column with no
 declared type keeps the bits but loses `REAL` affinity. The harness
 loads a typeless raw table behind a `CAST(r AS REAL)` view named `t`
 (`conftest.load_table_sql`), which keeps both. Measured with Python's
-bundled `sqlite3` (3.45.1), by `float.hex()`; `_docs/decisions.md`,
+bundled `sqlite3`, by `float.hex()`; `_docs/decisions.md`,
 2026-10-02.
 
 Mutant checks (issue #140): making `load_table_sql` return the plain

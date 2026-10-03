@@ -435,8 +435,11 @@ def _node_height(node: Expr, children: list[_Height]) -> _Height:
 
     "Constant" is SQLite's `sqlite3ExprIsConstant` as it stands at
     parse time, before any name is resolved: no column reference and
-    no function call (every function, `LIKE` included, is only marked
-    constant later, by name resolution) anywhere in the tree.
+    no function call anywhere in the tree - except `LIKE`, whose
+    arguments all being constant makes it constant on the pinned
+    oracle. (Other deterministic scalar functions with constant
+    arguments, `abs(1)` or `min(1, 2)`, are constant there too; they
+    are not modelled - the binder rejects every scalar function call.)
     SQLite also treats the bare identifiers `true`/`false` as constant
     (and `false` as always false); historian has no boolean literals
     and resolves those names as columns, so here they are columns like
@@ -465,8 +468,15 @@ def _node_height(node: Expr, children: list[_Height]) -> _Height:
         left, right = children
         return _Height(1 + max(left.height, right.height), left.constant and right.constant, False)
     if isinstance(node, Like):
+        # `like()` is a deterministic scalar function, so the oracle
+        # (SQLite 3.46+ measured on the pinned one, #117) counts it as
+        # constant when all its arguments are; 3.45.1 never did.
         height = 1 + max(child.height for child in children)
-        return _Height(height + 1 if node.negated else height, False, False)
+        return _Height(
+            height + 1 if node.negated else height,
+            all(child.constant for child in children),
+            False,
+        )
     if isinstance(node, In):
         left = children[0]
         values = children[1:]

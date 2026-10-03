@@ -13,7 +13,7 @@ kinds whose wording is historian's own, whose kind is SQLite's (every
 query`). The SQLite side is computed live, never hard-coded.
 
 The order, re-measured against the oracle (Python's `sqlite3` module,
-SQLite 3.45.1 - see #117) with the pair/triple sweep below: the FROM
+the oracle - see #117) with the pair/triple sweep below: the FROM
 table and an unknown `x.*` qualifier; LIMIT then OFFSET (a column
 reference outside any aggregate call at once; an error inside an
 aggregate call only after both, the last one found winning); the

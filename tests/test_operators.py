@@ -1276,8 +1276,8 @@ def test_sum_overflow_table_row_8_negative_overflow_with_a_real_suppresses_it():
 # accumulation, all three of which the issue found disagreeing with
 # SQLite simultaneously on at least one row below (case I). Every
 # expected value is `sqlite3`'s own answer, obtained through Python's
-# bundled `sqlite3` module (3.50.4, matching `tests/differential/
-# conftest.py`'s oracle - never the system CLI, which is an Apple-
+# bundled `sqlite3` module (the oracle; its version is the constant in
+# `tests/conftest.py` - never the system CLI, which is an Apple-
 # patched build that computes different bit patterns for exactly this
 # kind of adversarial float sum, per issue #93) and compared
 # bit-exact via `float.hex()`, never a tolerance-based `==` on the
@@ -2198,7 +2198,7 @@ def test_distinct_streams_rather_than_materializing_the_child():
 #
 # Unit-only: `blame`'s `line_no` is always INTEGER, so no real query
 # can reach a column holding `1.0` then `1`. Oracle: Python's bundled
-# `sqlite3` (3.45.1 here), via `tests/oracle.py`.
+# `sqlite3` (the oracle), via `tests/oracle.py`.
 
 
 def test_min_max_tie_keeps_the_first_encountered_value_float_then_int():
@@ -2273,7 +2273,7 @@ def test_avg_of_integers_rounds_the_sum_to_float_before_dividing():
 #
 # `Aggregate` with `GROUP BY`, `Distinct`, and `count/sum/avg(DISTINCT x)`
 # all key on `values.group_key`. Every expected value below came from the
-# oracle (Python's bundled sqlite3, 3.45.1 here) with the numbers bound as
+# oracle (Python's bundled sqlite3) with the numbers bound as
 # parameters, never as float literals - e.g. for the `[1.0, 1]` row:
 #
 #   uv run python tests/oracle.py "" \
@@ -2374,8 +2374,7 @@ def test_count_sum_avg_distinct_key_on_sql_equality(column, expected):
 def test_sum_avg_skip_vertical_tab_around_text_numbers():
     """`create table t(s text); insert into t values ('\\v12'); select
     sum(s), typeof(sum(s)) from t;` -> 12|integer, and with `'12\\v'`
-    `avg(s), typeof(avg(s))` -> 12.0|real (tests/oracle.py, sqlite3
-    module 3.45.1). Two rows `'\\v12'`, `'12\\v'`: `sum` 24 integer,
+    `avg(s), typeof(avg(s))` -> 12.0|real (tests/oracle.py). Two rows `'\\v12'`, `'12\\v'`: `sum` 24 integer,
     `avg` 12.0 real."""
     leading = [("a.py", "\v12", "e")]
     trailing = [("a.py", "12\v", "e")]

@@ -8,7 +8,7 @@ character` in both engines. `ERR` below is that expression. A query
 passes when the two engines agree on the outcome - the same rows, or
 both raising that exact message.
 
-The rule, measured against the oracle (sqlite3 module 3.45.1):
+The rule, measured against the oracle:
 
 - Value context (a select-list item, an `ORDER BY`/`GROUP BY` key,
   an aggregate argument, any operand of a comparison, arithmetic,
@@ -196,9 +196,12 @@ ALREADY_AGREED_CASES = [
 
 #: The `IN ()` and empty-input criteria.
 EDGE_CASES = [
-    # `IN ()` is FALSE (`NOT IN ()` TRUE) without evaluating the left.
-    (f"SELECT ({ERR}) IN () FROM blame", "rows"),
-    (f"SELECT ({ERR}) NOT IN () FROM blame", "rows"),
+    # `IN ()` is FALSE (`NOT IN ()` TRUE) without evaluating the left in
+    # condition context (the WHERE cases below) but, on the pinned
+    # oracle, with evaluating it in value context: the select-list
+    # cases raise. "rows" here was a SQLite 3.45.1 artefact (#117).
+    (f"SELECT ({ERR}) IN () FROM blame", "error"),
+    (f"SELECT ({ERR}) NOT IN () FROM blame", "error"),
     (f"SELECT path FROM blame WHERE ({ERR}) IN ()", "rows"),
     (f"SELECT path FROM blame WHERE ({ERR}) NOT IN ()", "rows"),
     # A raising left side of a one-element `IN` still raises.

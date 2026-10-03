@@ -5,6 +5,8 @@ is and `_docs/decisions.md` for why. Tasks live as GitHub issues; see
 Commands
 
 - `uv sync` - install dependencies
+- The first `uv run` downloads the pinned managed Python (`.python-version`);
+  a run on any other SQLite aborts at start (`tests/conftest.py`)
 - `uv run pytest` - the whole suite
 - `uv run pytest tests/test_parser.py` - one test file
 - `uv run historian "SELECT ..."` - run a query against the repo you

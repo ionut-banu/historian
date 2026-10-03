@@ -546,7 +546,7 @@ def test_order_key_does_not_compare_int_against_str():
 # --- Grouping / DISTINCT equality: group_key (issue #113) -----------------
 #
 # Every expected value below was checked against the oracle (Python's
-# bundled sqlite3, 3.45.1 here) with the numbers *bound as parameters*,
+# bundled sqlite3) with the numbers *bound as parameters*,
 # never typed as float literals, e.g.:
 #
 #   uv run python tests/oracle.py "" \

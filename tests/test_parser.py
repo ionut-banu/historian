@@ -1323,7 +1323,10 @@ _HEIGHT_BOUNDARIES = [
     ("in-column-chain", lambda n: f"SELECT {_in_chain(n, 'line_no')} FROM blame", 999),
     ("in-qualified-column-chain", lambda n: f"SELECT {_in_chain(n, 'blame.line_no')} FROM blame", 998),
     ("in-count-star-chain", lambda n: f"SELECT {_in_chain(n, 'count(*)')} FROM blame", 999),
-    ("in-like-chain", lambda n: f"SELECT {_in_chain(n, chr(39) + 'a' + chr(39) + ' LIKE ' + chr(39) + 'a' + chr(39))} FROM blame", 998),
+    # Was 998 on SQLite 3.45.1; on the pinned oracle a `LIKE` over
+    # constants is itself constant, so the `IN` around it costs a level
+    # more: re-measured 997 (#117).
+    ("in-like-chain", lambda n: f"SELECT {_in_chain(n, chr(39) + 'a' + chr(39) + ' LIKE ' + chr(39) + 'a' + chr(39))} FROM blame", 997),
     ("in-in-chain", lambda n: f"SELECT {_in_chain(n, '1 IN (2)')} FROM blame", 996),
     ("in-not-in-chain", lambda n: f"SELECT {_in_chain(n, '1 NOT IN (1)')} FROM blame", 995),
     ("in-not-between-chain", lambda n: f"SELECT {_in_chain(n, '1 NOT BETWEEN 0 AND 1')} FROM blame", 996),

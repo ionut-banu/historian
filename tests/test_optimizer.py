@@ -14,7 +14,7 @@ it accepted and every `scan()` call as plain instance attributes -
 never module-level state (spec §4, "The pushdown layer").
 
 Expected row sets were confirmed against the oracle
-(`tests/oracle.py`, SQLite 3.45.1) over the same rows loaded into a
+(`tests/oracle.py`) over the same rows loaded into a
 table `g(a INTEGER, b INTEGER, c INTEGER)`.
 """
 

@@ -959,7 +959,7 @@ def test_modulo_in_order_by_position(tiny_repo):
 # bounded the result, so `'9223372036854775808' - 1` came back as the
 # INTEGER `9223372036854775807`, and a digit run too large for a double
 # crashed with `OverflowError`. Every expected value in the docstrings
-# was confirmed with `tests/oracle.py` (module `sqlite3` 3.45.1), the
+# was confirmed with `tests/oracle.py` (the oracle), the
 # literal reaching both engines as text in the query string.
 
 
@@ -1070,8 +1070,7 @@ def test_modulo_text_operand_past_int64_is_a_real_operand(tiny_repo, query):
 # two `line_no` aggregate/WHERE pins), so each value reaches both
 # engines as query text, parsed independently by each - `1e400` is
 # reached through `'1e400'+0` since exponent literals are #6. Each case
-# also pins the oracle's own answer (tests/oracle.py, module sqlite3
-# 3.45.1), REALs by `float.hex()`, so an oracle version drift (#117)
+# also pins the oracle's own answer (tests/oracle.py), REALs by `float.hex()`, so an oracle version drift (#117)
 # shows up as a failure here rather than silently moving the target.
 
 
@@ -1747,7 +1746,7 @@ def test_aggregate_sum_avg_count_distinct_of_alternating_infinities(awkward_repo
 # TEXT literal whose whole string is integer-shaped but outside int64
 # range is REAL at conversion time in `sqlite3`, so it is never fed to
 # `sum`'s exact-int64 path. Every expected value was confirmed with
-# `tests/oracle.py` (module `sqlite3` 3.45.1), the literal reaching
+# `tests/oracle.py` (the oracle), the literal reaching
 # both engines as text in the query string.
 
 _NINES_320 = "9" * 320
@@ -2248,7 +2247,7 @@ def test_split_expr_like_escape_column_matching_group_key_with_aggregate(awkward
     like `left`/`pattern` - here `line_no` (the GROUP BY key) doubles
     as the escape operand, so it must resolve against `Aggregate`'s
     group-key output column rather than stay a raw pre-aggregation row
-    offset. Oracle-confirmed (`3.45.1`, matching this project's
+    offset. Oracle-confirmed (the oracle, matching this project's
     resolved module version)."""
     query = (
         "SELECT line_no, count(*), 'x%' LIKE ('x' || line_no || '%') ESCAPE line_no "
@@ -3314,7 +3313,7 @@ def test_distinct_order_by_unselected_aggregate_raises_bind_error(awkward_repo):
     """Issue #103, the exact gap the M3 milestone review found (diff
     `6517c67..53a9f0d`): `count(*)` is never selected, so this is a
     `BindError` here - confirmed live against the oracle (loading
-    `awkward_repo`'s own unfiltered blame rows through sqlite3 3.45.1)
+    `awkward_repo`'s own unfiltered blame rows through the oracle)
     that SQLite itself does *not* reject this query, returning `Sam
     Lee` then `Zoë Müller` - the opposite order from what historian
     printed before this fix (`Zoë Müller` then `Sam Lee`, exit 0, no
@@ -3497,7 +3496,7 @@ def test_where_real_column_wins_over_alias_of_a_different_column(tiny_repo):
 # --- Alias naming an aggregate, with a real column of the same name (#165) -
 #
 # `count(*) AS path` names an aggregate and `path` is a real `blame`
-# column. Measured on the oracle (3.45.1): WHERE, GROUP BY and HAVING
+# column. Measured on the oracle: WHERE, GROUP BY and HAVING
 # resolve `path` to the column; ORDER BY resolves it to the alias.
 # `tiny_repo`'s `blame` has `feature/thing.py` (1 row) and
 # `src/utils.py` (2 rows). Each test pins SQLite's own answer as well as
@@ -4538,7 +4537,7 @@ def test_deep_where_chain_pushes_the_path_term_and_keeps_the_filter(tiny_repo, p
 # parentheses, which are not a node) to a negative literal, so `-(0.0)`
 # is `-0.0`. Historian used to flip the sign bit for every REAL, and the
 # harness's old `==` comparison could not see the difference. Every
-# REAL below was checked with `tests/oracle.py` (sqlite3 module 3.45.1)
+# REAL below was checked with `tests/oracle.py` (the oracle)
 # by `float.hex()`; the pinned cases fail loudly if the oracle drifts
 # (#117).
 #
@@ -4582,7 +4581,10 @@ def test_negated_computed_zero_is_positive_zero_on_every_row(awkward_repo):
         ("-(0.0 % 5)", 0.0),
         ("-(1 - 1.0)", 0.0),
         ("-(-0.0 + 0)", 0.0),
-        ("-(+0.0)", 0.0),  # unary plus is its own node: no literal fold
+        # Unary plus does not stop the literal fold on the pinned oracle:
+        # `-(+0.0)` is `-0.0`. The earlier expectation (`0.0`, "unary plus
+        # is its own node") was a SQLite 3.45.1 artefact (#117).
+        ("-(+0.0)", -0.0),
         ("-'0.0'", 0.0),
         ("-'0.0abc'", 0.0),
         ("-'1e-400'", 0.0),
@@ -4692,8 +4694,8 @@ def test_negated_computed_zero_under_a_pushable_predicate(tiny_repo, where):
 # Each case pins SQLite's own answer outright as well as diffing
 # historian against it, so a case cannot pass by both sides being
 # wrong the same way. Every expected value was confirmed with
-# `uv run python tests/oracle.py` over the real `blame` rows (sqlite3
-# module 3.45.1); the comment on each case names the text-order answer
+# `uv run python tests/oracle.py` over the real `blame` rows (the oracle);
+# the comment on each case names the text-order answer
 # it rules out where that differs.
 
 

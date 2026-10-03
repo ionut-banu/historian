@@ -397,7 +397,7 @@ def _arity_error(call: FunctionCall) -> BindError | None:
     arguments, `*` or one expression; `sum`/`avg`/`min`/`max` take
     exactly one expression and never `*` - `sum(*)` is not `sum(<every
     column>)`, and SQLite reports it as the same arity error (checked
-    against the oracle, 3.45.1)."""
+    against the oracle)."""
     message = f"wrong number of arguments to function {call.name}()"
     if ascii_fold(call.name) == "count":
         # count() and count(*) are both zero-column forms (`*` is one

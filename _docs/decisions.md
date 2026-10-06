@@ -3268,3 +3268,101 @@ Measured against the oracle, bound TEXT through `SELECT ? * 1.0`, hex compared: 
 The platform and version dependence is real: #105's engineer measured 3.45.1 on x86_64 taking a `long double` path with about a hundredth of these mismatches. 3.50.4 has no such path in the source, so its answer may well be the same on other IEEE-double platforms, but a compiler is free to fuse `a*b + c` into one rounding, which would change it, and only measurement can say (#176). So `tests/differential/atof_gate.py` asks the oracle for every pinned vector once per session: if any differs, the oracle-facing cases (the #134 differential cases and the sampling test) skip with a reason naming the platform and #176; they are still collected, so the differential count does not change. historian itself does not change by platform: it always follows this macOS arm64 model, and choosing a conversion at import time was rejected because historian's answers would then depend on the machine. A separate test asserts the gate is open on macOS arm64, and the unit-tested vectors are never gated.
 
 Mutants: replacing the body with `float(text)` fails the vector test, the sampling test (nine of the thirteen families) and the #134 differential cases. A one-ULP change to a power of ten, a 25- or 27-bit split, dropping any product from the Dekker step, not renormalising, a zero initial error term, skipping the exponent fold, the zero stripping, the 10^100 loop or the 10^-10 loop, or a correction term set to zero or off by a power of ten, each fail the sampling test (the 10^-10 loop only in the subnormal and u64-edge families). The u64 and exponent limits off by one, or `<` for `<=` in their comparisons, are seen only by the u64-edge and clamped-exponent families, which exist for that. Not killed, and not killable by sampling: a one-ULP change to one of the four correction terms, or regrouping `x0*yy + x1*y + cc`, moves the double-double by about 2^-106 of the value, which changes the rounded result with a probability around 2^-50 per sample (0 of 300,000 random 16-to-26-digit texts for each of the eight one-ULP changes and the regrouping); changing the last printed digit of `-1.5902891109759918046e83` gives the same double.
+
+2026-10-06 - Replicate SQLite's HAVING-to-WHERE move
+
+Issue #141. The owner chose "Replicate" on the decision card
+"Document SQLite's HAVING/WHERE rewrites as accepted divergence, or
+replicate them?" (2026-10-03). The other option was to record the
+difference next to constant folding (#51); it is rejected because the
+difference is an error versus no error on a query a user can write,
+and §1 makes SQLite the definition of correct. #142 (constant
+propagation in `WHERE`) was decided the same way and is its own issue.
+
+Grooming measured the rule on 3.45.1 and 3.50.4; the implementation
+re-measured every answer the issue quotes on the oracle #117 pinned
+(Python `sqlite3` 3.50.4), with `tests/oracle.py` and the
+differential harness's loader over `tiny`, and each is pinned as a
+test's expected outcome in `tests/differential/test_having_hoist.py`.
+SQLite moves a term of `HAVING` into `WHERE` only when the query has a
+`GROUP BY` (`SELECT count(*) FROM blame HAVING count(*) > 100 AND 'a'
+LIKE 'a' ESCAPE 'ab'` returns no rows and does not raise). `HAVING` is
+split on every `AND`, nested ones included (`count(*) > 5 AND
+(count(*) > 1 AND ERR)` and `(count(*) > 5 AND ERR) AND count(*) > 1`
+both raise), and an `OR` or `NOT (...)` is one term. A term moves when
+it has no aggregate and every column in it is a `GROUP BY` key or
+inside a key's expression (`GROUP BY path || 'x'` moves `(path || 'x')
+|| 'y' LIKE ...`; an alias of a key, an ordinal key and a two-key
+`GROUP BY` behave the same), or when it has no column at all. A term
+with an aggregate stays put, `OR` branches included: `count(*) > 5 AND
+(ERR OR count(*) > 1)` returns no rows. A `DISTINCT`, an `ORDER BY`
+and a `LIMIT 0` change nothing. Moved terms run after the query's own
+`WHERE` terms and in `HAVING` order: `WHERE ERR GROUP BY path HAVING
+path > 'zzzz'` raises, `WHERE line_no > 5 GROUP BY path HAVING ERR`
+does not, `HAVING count(*) > 5 AND ERR AND path > 'zzzz'` raises and
+`HAVING count(*) > 5 AND path > 'zzzz' AND ERR` does not.
+
+One answer differs from the groomed rule, and SQLite is followed: on
+3.50.4 a term that is an integer literal `0` does not move. `GROUP BY
+path HAVING 0 AND ERR` raises, as do `(0) AND ERR`, `00 AND ERR`,
+`count(*) > 5 AND 0 AND ERR` and `ERR AND 0`, so the `0` stayed in
+`HAVING` and `ERR` alone moved. Every other constant moves and, being
+false and in front, stops `ERR` per row: `0.0 AND ERR`, `-0 AND ERR`,
+`NULL AND ERR`, `1 > 2 AND ERR`, `1 = 0 AND ERR`, `'0' AND ERR` and
+`NOT 1 AND ERR` all return no rows. That matches
+SQLite's source, where `havingToWhereExprCb` skips a term with
+`ExprAlwaysFalse`, a flag the parser sets on an integer literal whose
+value is 0 (and on `FALSE`, which v1 does not have). The literal `0`
+was the version-dependent case grooming kept out of the tests; with
+the oracle pinned it is deterministic, so the planner keeps a
+`Literal` of `int` value `0` in `HAVING` and the tests pin it. Not
+replicated: SQLite's parser also folds `x AND 0` to `0` when neither
+side calls a function, so `HAVING path > 'zzzz' AND 0 AND ERR` raises
+in SQLite (the folded `0` stays, `ERR` moves) and returns no rows in
+historian. That is parse-time constant folding, the difference #51
+already accepted, and no test pins it. Measured too, and recorded on
+#141 for #171: on 3.50.4 `SELECT path FROM blame WHERE ERR AND 0` and
+`... WHERE 0 AND ERR` both return no rows (the constant is evaluated
+before any row), which is not the "raises on 3.50.4" #171 records.
+
+A moved term changes rows, not only errors, when the rows of one group
+differ in a way the key hides: over rows with `line` equal to `'1'`,
+`'1.0'`, `'1'` and `line_no` 1, 2, 3, `SELECT count(*), sum(line_no)
+FROM blame GROUP BY line + 0 HAVING (line + 0) || 'x' = '1x'` is `(2,
+4)` in SQLite and was `(3, 6)` in historian, and with `'1.0x'` it is
+`(1, 2)` against no rows. The issue went on to say a copy of the
+moved term left in `HAVING` would also change the answer; it would
+not. The group's key comes from a row that passed the moved term, and
+the term reads only the key, so the copy is always `TRUE`. The
+planner leaves no copy because SQLite leaves none (it replaces the term
+with `1`) and a copy is wasted work; the mutant that keeps one is
+caught by the plan-shape tests, not by the rows test.
+
+Design: the rewrite is in `plan()`, not the optimizer, because it is
+needed for correctness and `--no-pushdown` must still do it. The
+moved terms, bound as written (offsets into the scan row), are joined
+into one left-deep `And` in `HAVING` order and become one `Filter`
+between the `WHERE` `Filter` (or the `Scan`) and the `Aggregate`. Two
+stacked `Filter`s evaluate per row in the order of one `AND` chain, so
+"after `WHERE`, in `HAVING` order" is position in the tree and in the
+chain. The kept terms are joined the same way and split into
+aggregate slots as before; a moved term has no aggregate, so no slot
+moves, and a `HAVING` from which nothing moves is planned exactly as
+before. `split_conjuncts` moved to `sql/walk.py`, shared by the
+planner and the optimizer, beside `join_conjuncts` and
+`references_only_keys`; all three are explicit-stack loops (#107).
+The moved `Filter` is not offered to the scan, because a pushed term
+can hide an error raised by an earlier one, and `HAVING ERR AND path
+LIKE 'zzz%'` agrees with SQLite only while it is not pushed (#172). It
+is marked by an explicit `negotiable=False` on `Filter`, which
+`optimize()` reads, rather than inferred from position: with no
+`WHERE` it is the operator directly above the `Scan`. "The `Filter`
+is never removed" still holds: no pushed term is involved, and every
+term lives in exactly one `Filter`.
+
+Left out, each with its own issue: a column-free term is evaluated by
+SQLite once, before any row, which historian does not do for `WHERE`
+either (#171), so a trailing constant such as `HAVING ERR AND NULL`
+still differs; pushing moved terms down (#172). Terms of the form
+`column = constant` are kept out of the new tests because SQLite
+propagates them (#142).

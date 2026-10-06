@@ -190,6 +190,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from historian.atof import text_to_real
 from historian.sql.ast import (
     And,
     Between,
@@ -382,10 +383,16 @@ def _int_literal_value(text: str) -> int | float:
     converted - see the module docstring and `_docs/decisions.md`,
     2026-09-01. int64-min is deliberately not special-cased: see
     `UnaryOp`'s docstring in `sql/ast.py`.
+
+    Past int64 the REAL comes from `historian.atof.text_to_real`,
+    SQLite's own text-to-REAL algorithm, not `float()` (issue #134):
+    `18823239210196293635` is `0x1.05399454f5f45p+64` in SQLite, one
+    ULP from `float()`'s correctly rounded answer. The REAL literal in
+    `_parse_primary` uses the same function.
     """
     value = int(text)
     if value > INT64_MAX:
-        return float(text)
+        return text_to_real(text)
     return value
 
 
@@ -1183,7 +1190,7 @@ class _Parser:
             return Literal(value=value, position=token.position)
         if token.type is TokenType.REAL:
             self._advance()
-            return Literal(value=float(token.text), position=token.position)
+            return Literal(value=text_to_real(token.text), position=token.position)
         if token.type is TokenType.STRING:
             self._advance()
             return Literal(value=token.text, position=token.position)

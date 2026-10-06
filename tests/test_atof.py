@@ -197,6 +197,11 @@ def test_the_gate_is_open_on_the_reference_platform():
 
 SAMPLES_PER_FAMILY = 2000
 
+#: Families that need more than the default to hit the C's exact edges
+#: often enough: a one-unit change to one of those limits shows in only
+#: a few dozen of these texts.
+SAMPLES = {"u64_edges": 10000}
+
 
 def _digits(rng: random.Random, count: int) -> str:
     """*count* random digits, the first nonzero."""
@@ -231,7 +236,37 @@ def _mixed(rng: random.Random) -> str:
     return sign + mantissa + exponent
 
 
-#: #134's measurement table, one generator per row, plus `mixed`.
+#: The significands at which the C changes course: where digits stop
+#: being added (`(2**64 - 10) // 10`), where a positive exponent stops
+#: being folded into the significand (`(2**64 - 0x800) // 10`), and the
+#: largest double a u64 can hold (`18446744073709549568`, the one-ULP
+#: interval around it is 2048 wide).
+_U64_EDGES = ((2**64 - 10) // 10, (2**64 - 0x800) // 10, 18446744073709549568)
+
+
+def _u64_edge(rng: random.Random) -> str:
+    base = rng.choice(_U64_EDGES)
+    spread = 1100 if base > 10**19 else 1
+    digits = str(base + rng.randint(-spread, spread))
+    if rng.random() < 0.5:
+        digits += "".join(rng.choice("0123456789") for _ in range(rng.randint(1, 3)))
+    if rng.random() < 0.3:
+        digits = _with_point(rng, digits)
+    exponent = rng.choice(["", f"e{rng.randint(1, 3)}", f"e-{rng.randint(1, 3)}", f"e{rng.randint(-345, 330)}"])
+    return digits + exponent
+
+
+def _clamped_exponent(rng: random.Random) -> str:
+    """An exponent too long for SQLite's int, which it clamps to 10000,
+    against about 10000 digits that bring the value back in range."""
+    if rng.random() < 0.5:
+        return "0." + "0" * rng.randint(9700, 10010) + _digits(rng, rng.randint(1, 20)) + "e" + _digits(rng, rng.randint(6, 25))
+    return _digits(rng, rng.randint(1, 20)) + "0" * rng.randint(9700, 10010) + "e-" + _digits(rng, rng.randint(6, 25))
+
+
+#: #134's measurement table, one generator per row, then `mixed`, and
+#: two families aimed at the C's limits, which random text almost never
+#: reaches (they make a one-unit change to those constants visible).
 FAMILIES = {
     "digit_run_19_to_320": lambda rng: _digits(rng, rng.randint(19, 320)),
     "decimal_17_digits": lambda rng: _with_point(rng, _digits(rng, 17)),
@@ -241,8 +276,11 @@ FAMILIES = {
     "exponent_200_to_300": lambda rng: _scientific(rng, 200, 300),
     "exponent_minus_300_to_minus_200": lambda rng: _scientific(rng, -300, -200),
     "exponent_minus_20_to_20": lambda rng: _scientific(rng, -20, 20),
+    "exponent_minus_325_to_minus_300": lambda rng: _scientific(rng, -325, -300),
     "up_to_15_digits_plain": _short,
     "mixed": _mixed,
+    "u64_edges": _u64_edge,
+    "clamped_exponent": _clamped_exponent,
 }
 
 
@@ -250,7 +288,7 @@ FAMILIES = {
 def test_text_to_real_matches_the_oracle_on_sampled_text(family):
     skip_unless_atof_gate_open()
     rng = random.Random(f"issue-134-{family}")
-    texts = [FAMILIES[family](rng) for _ in range(SAMPLES_PER_FAMILY)]
+    texts = [FAMILIES[family](rng) for _ in range(SAMPLES.get(family, SAMPLES_PER_FAMILY))]
     conn = sqlite3.connect(":memory:")
     try:
         mismatches = []

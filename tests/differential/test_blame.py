@@ -29,14 +29,16 @@ import pytest
 
 from historian.catalog import SCHEMAS
 from historian.exec.expression import EvalError
-from historian.exec.operators import ScanSource
-from historian.plan.planner import ScanFactory
+from historian.exec.operators import Filter, Scan, ScanSource, child_of
+from historian.plan.optimizer import optimize
+from historian.plan.planner import ScanFactory, plan
 from historian.schema import Row
 from historian.sql.binder import BindError, bind
 from historian.sql.lexer import LexError, tokenize
 from historian.sql.parser import ParseError, parse
 from historian.tables.blame import BLAME_SCHEMA, BlameScan
 
+from differential.atof_gate import PINNED_VECTORS, skip_unless_atof_gate_open
 from differential.conftest import (
     assert_rows_match,
     create_table_sql,
@@ -1053,6 +1055,148 @@ def test_modulo_text_operand_past_int64_is_a_real_operand(tiny_repo, query):
     /`, so #105 changes it too: a digit run past int64 is now a REAL
     operand, truncated and clamped like any other REAL (issue #75).
     `%`'s own TEXT grammar (exponents, an infinite operand) is #106."""
+    _assert_differential(tiny_repo, query)
+
+
+# --- Text to REAL by SQLite's own algorithm (issue #134) -----------------
+#
+# SQLite 3.50.4's `sqlite3AtoF` is not correctly rounded; Python's
+# `float(text)` is. historian now converts with `historian.atof.
+# text_to_real`, a port of it, at every site text becomes a REAL: TEXT
+# operands (`_scan_number`), `sum`/`avg` over TEXT, and the parser's
+# decimal and past-int64 integer literals. Each REAL below differs from
+# `float()`'s answer (by one ULP, or for the subnormal case by the
+# whole value) and is compared by hex in `assert_rows_match`. The text
+# reaches both engines as written in the query.
+#
+# Gated (`differential/atof_gate.py`): on a platform whose oracle
+# converts the pinned vectors differently, these are skipped naming
+# #176, not failed. They are collected everywhere.
+
+_ATOF_MISMATCH_TEXTS = [text for text, _expected, float_hex in PINNED_VECTORS if float_hex is not None]
+
+
+@pytest.mark.parametrize("text", _ATOF_MISMATCH_TEXTS, ids=[t[:32] for t in _ATOF_MISMATCH_TEXTS])
+def test_text_times_one_converts_like_sqlite_not_like_float(tiny_repo, text):
+    skip_unless_atof_gate_open()
+    _assert_differential(tiny_repo, f"SELECT '{text}' * 1.0 FROM blame")
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        # 0x1.05399454f5f45p+64 - float() gives ...f46p+64
+        "SELECT 18823239210196293635 * 1.0 FROM blame",
+        # 0x1.3b6c8d2e437a1p+87 - float() gives ...437a2p+87
+        "SELECT 190662126541657448781964697 * 1.0 FROM blame",
+        # 0x1.653ef8ff56532p+37 - float() gives ...56533p+37
+        "SELECT 191794978794.7906036428205 * 1.0 FROM blame",
+        # 0x1.5482f28793c41p-56 - float() gives ...93c42p-56
+        "SELECT 0.000000000000000018459166118821173147 * 1.0 FROM blame",
+    ],
+    ids=["integer_literal_20_digits", "integer_literal_27_digits", "decimal_literal", "small_decimal_literal"],
+)
+def test_numeric_literals_convert_like_sqlite_not_like_float(tiny_repo, query):
+    skip_unless_atof_gate_open()
+    _assert_differential(tiny_repo, query)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT sum('18823239210196293635') FROM blame",
+        "SELECT avg('191794978794.7906036428205') FROM blame",
+        "SELECT avg('18823239210196293635') FROM blame",
+    ],
+    ids=["sum", "avg", "avg_distinguishing"],
+)
+def test_sum_and_avg_over_text_convert_like_sqlite(tiny_repo, query):
+    """`tiny_repo` has 3 rows. #134 names `avg('191794978794.79...')`,
+    but three copies of either conversion of that text average to the
+    same double, so it agrees before the port too; `avg('1882...')`
+    is added because it does not (oracle `avg` over the bound
+    `float()` value differs from `avg` over the text)."""
+    skip_unless_atof_gate_open()
+    _assert_differential(tiny_repo, query)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT -18823239210196293635 * 1.0 FROM blame",
+        "SELECT -'18823239210196293635' * 1.0 FROM blame",
+    ],
+    ids=["negated_literal", "negated_text"],
+)
+def test_sign_is_applied_after_the_conversion(tiny_repo, query):
+    """-0x1.05399454f5f45p+64 on both sides: the magnitude is
+    converted, then negated, so the sign cannot change the rounding."""
+    skip_unless_atof_gate_open()
+    _assert_differential(tiny_repo, query)
+
+
+def test_sum_of_text_over_no_rows_is_null(tiny_repo):
+    """No row reaches the conversion: `(None,)` on both sides."""
+    skip_unless_atof_gate_open()
+    query = "SELECT sum('18823239210196293635') FROM blame WHERE path = 'no-such-file'"
+    _assert_differential(tiny_repo, query)
+    assert run_historian(query, tiny_repo)[1] == [(None,)]
+
+
+def test_text_times_one_over_no_rows_is_no_rows(tiny_repo):
+    """No row reaches the conversion: zero rows on both sides."""
+    skip_unless_atof_gate_open()
+    query = "SELECT '18823239210196293635' * 1.0 FROM blame WHERE path = 'no-such-file'"
+    _assert_differential(tiny_repo, query)
+    assert run_historian(query, tiny_repo)[1] == []
+
+
+@pytest.mark.parametrize("path", ["README.md", "src/utils.py"])
+def test_conversion_in_where_stays_in_the_filter_with_and_without_pushdown(tiny_repo, path):
+    """Only the `path` term can push down; the conversion is evaluated
+    by the `Filter` above the scan, which is never removed. The rows
+    match SQLite with pushdown on and off (`--no-pushdown` is `plan()`
+    without `optimize()`, #43). `README.md` is #134's own case and is
+    not in `tiny_repo`, so it is zero rows; `src/utils.py` is, so rows
+    actually reach the conversion."""
+    skip_unless_atof_gate_open()
+    query = f"SELECT path FROM blame WHERE path = '{path}' AND '18823239210196293635' * 1.0 > 1.0"
+    conn = load_unfiltered(BlameScan, tiny_repo, BLAME_SCHEMA, "blame")
+    try:
+        sqlite_rows = conn.execute(query).fetchall()
+    finally:
+        conn.close()
+    bound = bind(parse(tokenize(query)), catalog=SCHEMAS)
+    unoptimized = plan(bound, tiny_repo, tables={"blame": BlameScan})
+    optimized = optimize(plan(bound, tiny_repo, tables={"blame": BlameScan}))
+    assert_rows_match(sqlite_rows, list(unoptimized.rows()))
+    assert_rows_match(sqlite_rows, list(optimized.rows()))
+    filters = 0
+    node = optimized
+    while not isinstance(node, Scan):
+        filters += isinstance(node, Filter)
+        node = child_of(node)
+    assert filters == 1
+    assert len(node.pushed()) == 1
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        # (9223372036854775807,) INTEGER - in-range text stays INTEGER
+        "SELECT '9223372036854775807' + 0 FROM blame",
+        # (9.223372036854776e+18,) REAL - past int64, REAL at conversion
+        "SELECT '9223372036854775808' - 1 FROM blame",
+        # (100000.0,) REAL
+        "SELECT '1e5' + 0 FROM blame",
+        # (5,) INTEGER - an exponent with no digits is not an exponent
+        "SELECT '5e' + 0 FROM blame",
+        # (1,) INTEGER - hex is not recognised in TEXT
+        "SELECT '0x10' + 1 FROM blame",
+    ],
+)
+def test_text_to_number_regression_pins_around_the_new_conversion(tiny_repo, query):
+    """Not gated: none of these depends on how a long numeral rounds."""
     _assert_differential(tiny_repo, query)
 
 

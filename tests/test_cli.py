@@ -886,6 +886,23 @@ def test_explain_having_limit_distinct_sort(tiny_repo, capsys):
     assert lines[-1] == "            BlameScan (pushed: none -> 2 of 2 paths)"
 
 
+_MOVED_HAVING_QUERY = "SELECT count(*) FROM blame GROUP BY path HAVING count(*) > 5 AND path LIKE 'a' ESCAPE 'ab'"
+
+
+def test_explain_shows_a_moved_having_term_below_aggregate(tiny_repo, capsys):
+    """#141: the moved term is its own `Filter` line, with column names,
+    under the `Aggregate`; nothing from `HAVING` is pushed."""
+    ret, out, _err = _explain(tiny_repo, _MOVED_HAVING_QUERY, capsys)
+    assert ret == 0
+    assert out == (
+        "Project (count(*))\n"
+        "  Filter (count(*) > 5)\n"
+        "    Aggregate (group=[path], aggs=[count(*)])\n"
+        "      Filter (path LIKE 'a' ESCAPE 'ab')\n"
+        "        BlameScan (pushed: none -> 2 of 2 paths)\n"
+    )
+
+
 @pytest.mark.parametrize(
     "query",
     ["SELEC path FROM blame", "SELECT path FROM", "SELECT nope FROM blame", "SELECT path FROM 'x"],
@@ -1104,6 +1121,16 @@ def _both(repo, query, capsys, *, ordered=False):
 def _record(result):
     scans = result[3]
     return [(s.blamed_paths, s.git_invocations) for s in scans]
+
+
+@pytest.mark.parametrize("flags", [(), ("--no-pushdown",)])
+def test_a_moved_having_term_raises_with_and_without_pushdown(tiny_repo, capsys, flags):
+    """#141: the move is `plan()`'s, not the optimizer's, so
+    `--no-pushdown` moves the same term and raises as SQLite does."""
+    ret, out, err, _scans = _run(tiny_repo, _MOVED_HAVING_QUERY, capsys, *flags)
+    assert ret == 1
+    assert out == ""
+    assert err == "error: ESCAPE expression must be a single character\n"
 
 
 def test_no_pushdown_blames_every_path_and_scans_with_nothing_pushed(tiny_repo, capsys, monkeypatch):

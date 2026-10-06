@@ -28,10 +28,12 @@ Two parts: the queries the issue lists by hand, against `tiny`
 through the real pipeline, and an exhaustive sweep over generated
 formulas. The sweep loads SQLite once from `tiny`'s unfiltered scan
 (the harness's step 1) and runs historian through `run_historian`
-with a factory serving those same rows, so each of its ~14,000
+with a factory serving those same rows, so each of its ~34,000
 queries costs one parse-to-rows pass and no `git blame`. Nothing is
-pushed down for any sweep query (no leaf constrains `path`), so the
-rows the scan serves are the rows the real scan would.
+pushed down for any sweep query (the factory declares no
+capabilities, and the `HAVING` leaves that constrain `path` move below
+the aggregate, where nothing is negotiated - #141), so the rows the
+scan serves are the rows the real scan would.
 
 The sweep's leaves avoid `column = constant`. SQLite propagates such
 a top-level `WHERE` conjunct into the other conjuncts and folds what
@@ -261,13 +263,21 @@ def test_condition_context_results_are_nonempty_where_expected(tiny_repo, tiny_c
 # the same as another leaf - NOT TRUE is FALSE, NOT NULL is NULL, NOT
 # ERR still raises - so it adds cases only where it is the whole
 # formula's shape.) Leaves are TRUE, FALSE, NULL and ERR. Each formula
-# runs in five placements: WHERE, HAVING (over aggregate leaves, so no
-# term moves to WHERE - #141), the select list, ORDER BY and GROUP BY.
+# runs in six placements: WHERE, HAVING over aggregate leaves (no term
+# moves below the aggregate), HAVING over key-only leaves (every
+# top-level term moves - #141), the select list, ORDER BY and GROUP BY.
 #
-# The k = 3 part is 81,920 formulas, about 410,000 queries and five
+# A seventh placement, `having_mixed`, is HAVING with each leaf
+# independently a key-only leaf or the aggregate leaf of the same truth
+# value, so moved and kept terms interleave (#141). Its alphabet is
+# eight leaves, not four, so it stays at two operators even when
+# HISTORIAN_SWEEP_OPERATORS=3 (8^4 leaf assignments per skeleton would
+# make the k = 3 part about 1.3 million queries).
+#
+# The k = 3 part is 81,920 formulas, about 490,000 queries and several
 # minutes of historian time, so it runs only when
-# HISTORIAN_SWEEP_OPERATORS=3 is set; the default is 2 (11,560
-# queries). See _docs/decisions.md (2026-10-01, #111) for the full
+# HISTORIAN_SWEEP_OPERATORS=3 is set; the default is 2 (13,872
+# queries, plus 17,424 for `having_mixed`). See _docs/decisions.md (2026-10-01, #111) for the full
 # k <= 3 run against both engines.
 
 _SWEEP_OPERATORS = int(os.environ.get("HISTORIAN_SWEEP_OPERATORS", "2"))
@@ -283,6 +293,23 @@ AGG_LEAVES = {
     "F": "max(line_no) > 5",
     "N": "max(line_no) < NULL",
     "E": AGG_ERR,
+}
+#: Leaves over the `GROUP BY path` key only: a term made of them has no
+#: aggregate and no other column, so it moves below the aggregate.
+KEY_LEAVES = {
+    "T": "path >= ''",
+    "F": "path > 'zzzz'",
+    "N": "path < NULL",
+    "E": ERR,
+}
+#: `having_mixed`'s alphabet: upper case a key-only leaf, lower case the
+#: aggregate leaf with the same truth value.
+MIXED_LEAVES = {
+    **KEY_LEAVES,
+    "t": AGG_LEAVES["T"],
+    "f": AGG_LEAVES["F"],
+    "n": AGG_LEAVES["N"],
+    "e": AGG_LEAVES["E"],
 }
 
 
@@ -316,7 +343,7 @@ def _fill(shape, ops: Iterator[str], nots: Iterator[bool], leaves: Iterator[str]
     return ("NOT", formula) if negated else formula
 
 
-def _formula_groups(max_operators: int) -> Iterator[tuple[str, list[tuple]]]:
+def _formula_groups(max_operators: int, alphabet: str = "TFNE") -> Iterator[tuple[str, list[tuple]]]:
     """The sweep's formulas, grouped by everything but their leaves:
     one group per tree shape, operator choice and NOT placement on the
     operators, holding every leaf assignment (and, up to one operator,
@@ -333,7 +360,7 @@ def _formula_groups(max_operators: int) -> Iterator[tuple[str, list[tuple]]]:
                 for nots in itertools.product([False, True], repeat=k):
                     formulas = [
                         _fill(shape, iter(ops), iter(nots), iter(leaves), iter(leaf_nots))
-                        for leaves in itertools.product("TFNE", repeat=leaf_count)
+                        for leaves in itertools.product(alphabet, repeat=leaf_count)
                         for leaf_nots in leaf_not_choices
                     ]
                     skeleton = _fill(shape, iter(ops), iter(nots), iter("?" * leaf_count), iter((False,) * leaf_count))
@@ -359,6 +386,7 @@ def _name(formula) -> str:
 _PLACEMENTS = {
     "where": lambda f: f"SELECT path, line_no FROM blame WHERE {_sql(f, ROW_LEAVES)}",
     "having": lambda f: f"SELECT path FROM blame GROUP BY path HAVING {_sql(f, AGG_LEAVES)}",
+    "having_keys": lambda f: f"SELECT path FROM blame GROUP BY path HAVING {_sql(f, KEY_LEAVES)}",
     "select": lambda f: f"SELECT {_sql(f, ROW_LEAVES)} FROM blame",
     "orderby": lambda f: f"SELECT path, line_no FROM blame ORDER BY {_sql(f, ROW_LEAVES)}",
     "groupby": lambda f: f"SELECT count(*) FROM blame GROUP BY {_sql(f, ROW_LEAVES)}",
@@ -368,6 +396,18 @@ _SWEEP_GROUPS = [
     pytest.param([_PLACEMENTS[placement](f) for f in formulas], id=f"{placement}-{name}")
     for name, formulas in _formula_groups(_SWEEP_OPERATORS)
     for placement in _PLACEMENTS
+]
+
+#: The most operators `having_mixed` goes to, whatever
+#: HISTORIAN_SWEEP_OPERATORS says (see the comment above).
+_HAVING_MIXED_OPERATORS = min(_SWEEP_OPERATORS, 2)
+
+_HAVING_MIXED_GROUPS = [
+    pytest.param(
+        [f"SELECT path FROM blame GROUP BY path HAVING {_sql(f, MIXED_LEAVES)}" for f in formulas],
+        id=f"having_mixed-{name}",
+    )
+    for name, formulas in _formula_groups(_HAVING_MIXED_OPERATORS, alphabet="TFNEtfne")
 ]
 
 
@@ -442,17 +482,28 @@ def test_sweep_cached_rows_are_tinys_real_rows(tiny_repo, tiny_rows, cached_tabl
 
 def test_sweep_size():
     """The enumeration is what the docstring says it is: 2,312 formulas
-    up to two operators (8 + 256 + 2,048), five placements each, and
-    1,240 IN plus 128 BETWEEN expressions in two placements each."""
+    up to two operators (8 + 256 + 2,048), six placements each;
+    17,424 `having_mixed` formulas up to two operators (16 + 1,024 +
+    16,384: eight leaves, leaf NOTs up to one operator); and 1,240 IN
+    plus 128 BETWEEN expressions in two placements each."""
+    assert len(_PLACEMENTS) == 6
     formulas = sum(len(param.values[0]) for param in _SWEEP_GROUPS) // len(_PLACEMENTS)
     if _SWEEP_OPERATORS == 2:
         assert formulas == 2312
+    if _SWEEP_OPERATORS >= 2:
+        assert len(_HAVING_MIXED_GROUPS) == 1 + 4 + 32
+        assert sum(len(param.values[0]) for param in _HAVING_MIXED_GROUPS) == 17424
     in_between = sum(len(param.values[0]) for param in _IN_BETWEEN_GROUPS)
     assert in_between == 2 * (1240 + 128)
 
 
 @pytest.mark.parametrize("queries", _SWEEP_GROUPS)
 def test_and_or_not_sweep(tiny_repo, tiny_conn, cached_tables, queries):
+    _assert_all_agree(tiny_conn, tiny_repo, queries, cached_tables)
+
+
+@pytest.mark.parametrize("queries", _HAVING_MIXED_GROUPS)
+def test_having_mixed_sweep(tiny_repo, tiny_conn, cached_tables, queries):
     _assert_all_agree(tiny_conn, tiny_repo, queries, cached_tables)
 
 

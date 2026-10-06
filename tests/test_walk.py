@@ -445,3 +445,120 @@ def test_an_aggregate_only_in_having_or_order_by_is_not_on_the_binders_select_li
     assert is_aggregate_query((), select_exprs) is False
     assert is_aggregate_query((), [*select_exprs, having]) is True
     assert is_aggregate_query((), [*select_exprs, order_key]) is True
+
+
+# --- split_conjuncts, join_conjuncts, references_only_keys (#141) -------------
+#
+# Reached as `walk.<name>` rather than imported by name, so that this
+# module still collects when one of them is missing.
+
+
+def _and(left: Expr, right: Expr) -> And:
+    return And(left=left, right=right, position=_POS)
+
+
+def test_split_conjuncts_is_the_one_the_optimizer_uses():
+    from historian.plan import optimizer
+
+    assert optimizer.split_conjuncts is walk.split_conjuncts
+
+
+def test_split_conjuncts_splits_every_and_left_to_right():
+    a, b, c, d = (Literal(index, _POS) for index in range(4))
+    assert walk.split_conjuncts(_and(_and(a, b), _and(c, d))) == [a, b, c, d]
+    assert walk.split_conjuncts(_and(a, _and(b, _and(c, d)))) == [a, b, c, d]
+    whole = Or(left=_and(a, b), right=c, position=_POS)
+    assert walk.split_conjuncts(whole) == [whole]
+    negated = Not(operand=_and(a, b), position=_POS)
+    assert walk.split_conjuncts(negated) == [negated]
+
+
+def test_join_conjuncts_builds_a_left_deep_chain_in_order():
+    a, b, c = (Literal(index, _POS) for index in range(3))
+    joined = walk.join_conjuncts([a, b, c])
+    assert isinstance(joined, And) and isinstance(joined.left, And)
+    assert joined.left.left is a and joined.left.right is b and joined.right is c
+    got = walk.split_conjuncts(joined)
+    assert len(got) == 3 and all(x is y for x, y in zip(got, [a, b, c]))
+
+
+def test_join_conjuncts_of_one_term_is_that_term():
+    a = Literal(1, _POS)
+    assert walk.join_conjuncts([a]) is a
+
+
+def test_join_conjuncts_of_nothing_is_an_error():
+    with pytest.raises(AssertionError):
+        walk.join_conjuncts([])
+
+
+def test_split_and_join_are_iterative_over_a_deep_chain():
+    terms = [Literal(index, _POS) for index in range(20000)]
+    joined = walk.join_conjuncts(terms)
+    got = walk.split_conjuncts(joined)
+    assert len(got) == len(terms) and all(x is y for x, y in zip(got, terms))
+
+
+_KEY = BoundColumnRef(offset=0, name="path", position=_POS)
+_NOT_KEY = BoundColumnRef(offset=1, name="line_no", position=_POS)
+
+
+@pytest.mark.parametrize("cls", [cls for cls in _TYPES if cls is not ColumnRef], ids=lambda cls: cls.__name__)
+def test_references_only_keys_handles_every_node_type(cls):
+    """Built around literal sentinels, every node type but a column
+    reference has no column at all, so it references only keys."""
+    node, _ = _build(cls, _Sentinels())
+    if cls is BoundColumnRef:
+        assert walk.references_only_keys(node, ()) is False
+        assert walk.references_only_keys(node, (node,)) is True
+        return
+    assert walk.references_only_keys(node, ()) is True
+
+
+def test_references_only_keys_rejects_an_unbound_tree():
+    with pytest.raises(AssertionError, match="bound"):
+        walk.references_only_keys(ColumnRef(table=None, name="path", position=_POS), ())
+
+
+@pytest.mark.parametrize(
+    ("cls", "index"), _CHILD_CASES, ids=[f"{cls.__name__}[{index}]" for cls, index in _CHILD_CASES]
+)
+def test_references_only_keys_looks_into_every_child_slot(cls, index):
+    """A column that is not a key, in any one child slot, makes the
+    node reference something else; the key column in the same slot
+    does not; and a key written at another position still matches."""
+    node, kids = _build(cls, _Sentinels())
+    for column, expected in ((_NOT_KEY, False), (_KEY, True)):
+        replaced = list(kids)
+        replaced[index] = column
+        assert walk.references_only_keys(with_children(node, replaced), (_KEY,)) is expected
+    moved_key = BoundColumnRef(offset=0, name="path", position=_OTHER_POS)
+    replaced = list(kids)
+    replaced[index] = moved_key
+    assert walk.references_only_keys(with_children(node, replaced), (_KEY,)) is True
+
+
+def test_references_only_keys_accepts_a_column_inside_a_key_subexpression():
+    key = BinaryOp(op=Operator.CONCAT, left=_KEY, right=Literal("x", _POS), position=_POS)
+    inside = BinaryOp(op=Operator.CONCAT, left=key, right=Literal("y", _POS), position=_OTHER_POS)
+    assert walk.references_only_keys(inside, (key,)) is True
+    bare = BinaryOp(op=Operator.GT, left=_KEY, right=Literal("a", _POS), position=_POS)
+    assert walk.references_only_keys(bare, (key,)) is False
+    assert walk.references_only_keys(bare, (_NOT_KEY, key, _KEY)) is True
+
+
+def test_references_only_keys_on_a_deep_tree():
+    node: Expr = _KEY
+    for _ in range(20000):
+        node = BinaryOp(op=Operator.ADD, left=node, right=_KEY, position=_POS)
+    assert walk.references_only_keys(node, (_KEY,)) is True
+    assert walk.references_only_keys(BinaryOp(op=Operator.ADD, left=node, right=_NOT_KEY, position=_POS), (_KEY,)) is False
+
+
+def test_references_only_keys_raises_on_an_unknown_node_type():
+    @dataclass(frozen=True)
+    class Unknown(Expr):
+        position: Position
+
+    with pytest.raises(AssertionError, match="unhandled expression node type Unknown"):
+        walk.references_only_keys(Unknown(_POS), ())

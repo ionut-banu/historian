@@ -1,6 +1,7 @@
 """The shared expression-tree walks: what a node's children are, how to
 rebuild a node around new ones, whether two trees have the same shape,
-and whether a query aggregates.
+whether a query aggregates, how a condition splits into `AND`-terms and
+joins back, and whether a term reads only `GROUP BY` keys.
 
 Issue #112. Before it, `sql/binder.py`, `plan/planner.py` and
 `sql/parser.py` each kept their own copy of the children table, and the
@@ -59,6 +60,9 @@ __all__ = [
     "contains_aggregate",
     "expr_shape_equal",
     "is_aggregate_query",
+    "join_conjuncts",
+    "references_only_keys",
+    "split_conjuncts",
     "with_children",
 ]
 
@@ -226,5 +230,84 @@ def is_aggregate_query(group_by: Sequence[Expr], exprs: Iterable[Expr]) -> bool:
         return True
     for expr in exprs:
         if contains_aggregate(expr):
+            return True
+    return False
+
+
+def split_conjuncts(expr: Expr) -> list[Expr]:
+    """The conjunctive terms of *expr*, left to right.
+
+    Every `And` reached through `And`s from the root is split; anything
+    else, `Or` and `Not` included, is one term. Parens produce no AST
+    node, so `(x AND y) AND z` and `x AND (y AND z)` both give `[x, y,
+    z]` - `AND` is associative, and a term's own evaluation is
+    unchanged by where it came from.
+
+    `plan/optimizer.py` splits `WHERE` with it for pushdown (#121) and
+    `plan/planner.py` splits `HAVING` with it to find the terms that
+    move below the aggregate (#141): one implementation of "split on
+    `AND`".
+
+    Iterative with an explicit stack rather than recursive: the parser
+    builds `x1 AND x2 AND ... AND xn` as a left-deep chain, and its
+    depth must not be bounded by Python's recursion limit here.
+    """
+    terms: list[Expr] = []
+    stack: list[Expr] = [expr]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, And):
+            # Right pushed first so left is popped - and emitted - first.
+            stack.append(node.right)
+            stack.append(node.left)
+        else:
+            terms.append(node)
+    return terms
+
+
+def join_conjuncts(terms: Sequence[Expr]) -> Expr:
+    """*terms* joined by `AND`, left to right, as the left-deep chain
+    the parser builds for `t1 AND t2 AND ... AND tn` - so
+    `split_conjuncts` gives the same terms back, and `evaluate_condition`
+    stops the chain at the first term that is not `TRUE`, in order. One
+    term comes back as itself. Each `And` takes the first term's
+    position, as the parser's does. A loop, not a recursion."""
+    assert len(terms) > 0, "sql/walk.py: join_conjuncts needs at least one term"
+    joined = terms[0]
+    for term in terms[1:]:
+        joined = And(left=joined, right=term, position=terms[0].position)
+    return joined
+
+
+def references_only_keys(expr: Expr, keys: Sequence[Expr]) -> bool:
+    """Whether every column reference in *expr* - already bound - lies
+    inside a subexpression that matches one of *keys* by shape
+    (`expr_shape_equal`, ignoring position). An expression with no
+    column reference at all qualifies.
+
+    This is the column half of SQLite's test for a `HAVING` term that
+    can move below the aggregate (#141). It says nothing about
+    aggregate calls: `count(*)` has no column and qualifies, so the
+    planner checks `contains_aggregate` separately.
+
+    A loop over an explicit stack of nodes still to look at (#107). A
+    node matching a key is not looked into; any other column reference
+    is a `False`; every other node's children are pushed."""
+    pending: list[Expr] = [expr]
+    while pending:
+        node = pending.pop()
+        if _matches_a_key(node, keys):
+            continue
+        if isinstance(node, BoundColumnRef):
+            return False
+        if isinstance(node, ColumnRef):
+            raise AssertionError("sql/walk.py: references_only_keys needs a bound tree")
+        pending.extend(children(node))
+    return True
+
+
+def _matches_a_key(expr: Expr, keys: Sequence[Expr]) -> bool:
+    for key in keys:
+        if expr_shape_equal(expr, key):
             return True
     return False

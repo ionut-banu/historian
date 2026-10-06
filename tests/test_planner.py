@@ -1418,8 +1418,9 @@ def test_moved_term_gets_its_own_filter_below_the_aggregate():
     """`GROUP BY path HAVING count(*) > 5 AND ERR`: `Scan -> Filter(ERR,
     over the scan row) -> Aggregate -> Filter(count(*) > 5, over the
     aggregate's slots) -> Project`. The moved term is the bound term
-    itself, column offsets into the scan row; the kept one reads slot 1
-    (`count(*)`, after the one group key)."""
+    itself, column offsets into the scan row; the kept one reads slot 2
+    (after the group key and the select list's own `count(*)`, which
+    has a slot of its own, as before #141)."""
     bound, tree = _planned(f"SELECT count(*) FROM widgets GROUP BY path HAVING count(*) > 5 AND {_ERR}")
     assert _kinds(tree) == ["Project", "Filter", "Aggregate", "Filter", "Scan"]
     _project, kept, _aggregate, moved, _scan = _chain(tree)
@@ -1428,7 +1429,7 @@ def test_moved_term_gets_its_own_filter_below_the_aggregate():
     assert moved.negotiable() is False
     slot = kept.predicate()
     assert isinstance(slot, BinaryOp) and slot.op is Op.GT and slot.right is count_term.right
-    assert isinstance(slot.left, BoundColumnRef) and slot.left.offset == 1
+    assert isinstance(slot.left, BoundColumnRef) and slot.left.offset == 2
 
 
 def test_moved_filter_sits_above_the_where_filter():
@@ -1512,7 +1513,13 @@ def test_aggregate_calls_and_kept_slots_are_unchanged_by_a_moved_term():
     assert _kinds(expected) == ["Project", "Sort", "Filter", "Aggregate", "Scan"]
     aggregate = _chain(tree)[3]
     assert [call.kind for call in aggregate.calls()] == ["count", "max", "max", "sum", "count", "min"]
-    assert aggregate.calls() == _chain(expected)[3].calls()
+    expected_calls = _chain(expected)[3].calls()
+    assert len(aggregate.calls()) == len(expected_calls)
+    for got, want in zip(aggregate.calls(), expected_calls):
+        # Positions differ: the term was cut out of the query text.
+        assert (got.kind, got.distinct) == (want.kind, want.distinct)
+        assert (got.arg is None) == (want.arg is None)
+        assert got.arg is None or walk.expr_shape_equal(got.arg, want.arg)
     assert walk.expr_shape_equal(_chain(tree)[2].predicate(), _chain(expected)[2].predicate())
     assert walk.expr_shape_equal(_chain(tree)[0].select_list()[1].expr, _chain(expected)[0].select_list()[1].expr)
     rows = [("a.py", 1, None), ("a.py", 2, None), ("b.py", 3, None)]

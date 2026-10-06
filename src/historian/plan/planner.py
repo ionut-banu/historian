@@ -83,7 +83,16 @@ from historian.exec.operators import (
 )
 from historian.sql.ast import Expr, FunctionCall, Literal, OrderDirection, Star
 from historian.sql.binder import BoundColumnRef, BoundOrderByItem, BoundSelectItem, BoundSelectStatement
-from historian.sql.walk import children, expr_shape_equal, is_aggregate_query, with_children
+from historian.sql.walk import (
+    children,
+    contains_aggregate,
+    expr_shape_equal,
+    is_aggregate_query,
+    join_conjuncts,
+    references_only_keys,
+    split_conjuncts,
+    with_children,
+)
 
 __all__ = ["ScanFactory", "plan"]
 
@@ -261,6 +270,63 @@ def _split_order_by(
     )
 
 
+# --- HAVING terms that move below the aggregate (#141) ----------------------
+#
+# `_docs/spec.md` §3, "`HAVING` terms that move below the aggregate".
+# SQLite (`havingToWhere`) moves each `AND`-term of `HAVING` that no
+# group can disagree on into `WHERE`, where it runs once per input row,
+# after the query's own `WHERE` terms. Which terms is observable - an
+# error raised per row that the per-group evaluation never reached,
+# and the rows of a group that differ in a way the key hides - so the
+# planner moves the same ones. It is part of building the tree, not
+# the optimizer's: `--no-pushdown` skips `optimize()` and must still
+# move them.
+#
+# The moved terms are the bound terms as bound, with column offsets
+# into the scan row, joined back into one left-deep `And` in `HAVING`
+# order and put in one `Filter` between the `WHERE` `Filter` (or the
+# `Scan`) and the `Aggregate`. That `Filter` is not negotiable: a
+# moved term is never offered to the scan (#172). The kept terms are
+# joined the same way and go through `_split_expr` as `HAVING` always
+# did; a moved term has no aggregate call, so no slot changes.
+
+
+def _moves_below_aggregate(term: Expr, group_by: Sequence[Expr]) -> bool:
+    """Whether one `AND`-term of `HAVING` moves: it has no aggregate
+    call, every column in it lies inside a `GROUP BY` key subexpression
+    (or it has no column), and it is not an integer literal `0` - the
+    always-false term SQLite 3.50.4 leaves in `HAVING`
+    (`ExprAlwaysFalse` in `havingToWhereExprCb`; measured, #141)."""
+    if contains_aggregate(term):
+        return False
+    if not references_only_keys(term, group_by):
+        return False
+    if isinstance(term, Literal) and type(term.value) is int and term.value == 0:
+        return False
+    return True
+
+
+def _move_having_terms(stmt: BoundSelectStatement) -> tuple[Expr | None, Expr | None]:
+    """`(moved, kept)`: the `HAVING` terms that move below the
+    aggregate, and those that stay, each joined into one left-deep
+    `And` in `HAVING` order, or `None` when there are none. With no
+    `GROUP BY`, or when no term moves, `kept` is `stmt.having` itself,
+    so the tree is exactly the one built before #141. *stmt* is not
+    changed."""
+    if stmt.having is None or len(stmt.group_by) == 0:
+        return None, stmt.having
+    moved: list[Expr] = []
+    kept: list[Expr] = []
+    for term in split_conjuncts(stmt.having):
+        if _moves_below_aggregate(term, stmt.group_by):
+            moved.append(term)
+        else:
+            kept.append(term)
+    if len(moved) == 0:
+        return None, stmt.having
+    return join_conjuncts(moved), (join_conjuncts(kept) if len(kept) > 0 else None)
+
+
 def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory]) -> Operator:
     """Build the operator tree for *stmt*, a repository at *repo*.
 
@@ -275,8 +341,12 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory])
     `historian.catalog.SCAN_FACTORIES`.
 
     Tree shape, per `_docs/spec.md` §3: `Scan -> Filter (WHERE) ->
+    Filter (HAVING terms moved below the aggregate, not negotiable) ->
     Aggregate (grouped or whole-table) -> Filter (HAVING) -> Sort ->
-    Project -> Distinct -> Limit`. `Limit` is outermost, present only
+    Project -> Distinct -> Limit`. The moved-terms `Filter` exists only
+    with a `GROUP BY` and at least one term that moves
+    (`_move_having_terms`, #141); the `HAVING` `Filter` holds the terms
+    that stay, and is left out when every term moved. `Limit` is outermost, present only
     when `stmt.limit is not None`; `stmt.offset` defaults to 0 when
     absent (`OFFSET` cannot appear without `LIMIT` per §1's grammar).
     `Distinct` sits directly above `Project`, present whenever
@@ -328,6 +398,9 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory])
     tree: Operator = Scan(source)
     if stmt.where is not None:
         tree = Filter(tree, stmt.where)
+    moved_having, kept_having = _move_having_terms(stmt)
+    if moved_having is not None:
+        tree = Filter(tree, moved_having, negotiable=False)
 
     # Aggregate when GROUP BY is written or an aggregate call appears
     # in the select list, HAVING or ORDER BY - for a bound statement the
@@ -339,7 +412,7 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory])
     aggregate_query = is_aggregate_query(stmt.group_by, aggregate_exprs)
     calls: list[AggregateCall] = []
     select_list = _split_select_list(stmt.select_list, calls, stmt.group_by)
-    having = _split_expr(stmt.having, calls, stmt.group_by) if stmt.having is not None else None
+    having = _split_expr(kept_having, calls, stmt.group_by) if kept_having is not None else None
     order_keys = _split_order_by(stmt.order_by, calls, stmt.group_by)
 
     if aggregate_query:

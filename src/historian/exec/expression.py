@@ -133,15 +133,16 @@ Numeric comparison stays exact
 Per the 2026-08-27 decision, comparing an `int` against a `float`
 must never go through `float()` - past 2^53 that loses the integer's
 exact value and can reverse the answer. This module's comparison path
-(`_apply_affinity` and everything it calls) never does this; the only
-`float()` calls anywhere in this file are the three named in
+(`_apply_affinity` and everything it calls) never does this. The only
+functions in this file allowed a `float()` call are the three named in
 `tests/test_expression.py`'s
-`test_no_stray_float_calls_outside_the_named_exceptions` - two
-matching the issue's own list (affinity's text-to-number conversion,
-the float formatting helper) plus a third this module's own
-int64-overflow handling needs (see that test's docstring for why a
-third is unavoidable and why it cannot be confused with the
-comparison path).
+`test_no_stray_float_calls_outside_the_named_exceptions`: the float
+formatting helper, and the two that produce an arithmetic result from
+an exact `int` (`_int64_bounded`, `_mod_result`) - see that test's
+docstring for why neither can be confused with the comparison path.
+Text-to-number conversion is not among them: since issue #134 it
+calls `historian.atof.text_to_real`, SQLite's own text-to-REAL
+algorithm, which is not correctly rounded the way `float()` is.
 """
 
 from __future__ import annotations
@@ -152,6 +153,7 @@ from enum import Enum, auto
 
 from historian import values
 from historian.ascii import ascii_fold, is_ascii_digit
+from historian.atof import text_to_real
 from historian.schema import ColumnType, Row, Schema
 from historian.sql.ast import (
     And,
@@ -1317,12 +1319,21 @@ def _scan_number(text: str, start: int) -> tuple[int | float, int] | None:
     fits int64; otherwise it is REAL, right here at conversion time,
     before any operator sees it (issue #105, SQLite's own rule:
     `'9223372036854775808' - 1` is `9.22337203685478e+18`, not the
-    exact `9223372036854775807`). That REAL is `float()` of the digit
-    *text*, never of a Python `int`: `float(text)` overflows a huge
-    numeral to `inf` as SQLite does, while `float(int(text))` raises
-    `OverflowError`, and `int(text)` itself raises `ValueError` past
-    Python's 4300-digit limit - so `_int64_digit_run` decides the
-    range from the digit text alone and never builds a big `int`.
+    exact `9223372036854775807`). That REAL is converted from the digit
+    *text*, never from a Python `int`: `float(int(text))` raises
+    `OverflowError` on a huge numeral, and `int(text)` itself raises
+    `ValueError` past Python's 4300-digit limit - so `_int64_digit_run`
+    decides the range from the digit text alone and never builds a big
+    `int`.
+
+    Every REAL here - a digit run past int64, or text with a `.` or an
+    exponent - comes from `historian.atof.text_to_real`, SQLite
+    3.50.4's own `sqlite3AtoF`, not from `float()`, which is correctly
+    rounded where SQLite is not (issue #134:
+    `'18823239210196293635' * 1.0` is `0x1.05399454f5f45p+64` in
+    SQLite, `0x1.05399454f5f46p+64` from `float()`). The scan above
+    has already isolated the number, sign included and whitespace
+    excluded, which is the input `text_to_real` expects.
     """
     n = len(text)
     i = start
@@ -1358,16 +1369,16 @@ def _scan_number(text: str, start: int) -> tuple[int | float, int] | None:
             is_float = True
     end = exponent_end
     number_text = text[mantissa_start:end]
-    # Constructing a new Value from source text, per this module's own
-    # float()-call test - not a lossy comparison cast, the thing the
-    # 2026-08-27 decision actually forbids. See that test's docstring.
+    # A REAL from source text goes through SQLite's own conversion
+    # (`text_to_real`, issue #134), never Python's correctly rounded
+    # `float()`.
     value: int | float
     if is_float:
-        value = float(number_text)
+        value = text_to_real(number_text)
     else:
         exact = _int64_digit_run(number_text)
         if exact is None:
-            value = float(number_text)
+            value = text_to_real(number_text)
         else:
             value = exact
     return value, end

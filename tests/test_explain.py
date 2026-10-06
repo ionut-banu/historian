@@ -122,6 +122,35 @@ def test_having_filter_is_its_own_line_above_aggregate():
     assert lines[2].startswith("    Aggregate (group=[author_name], aggs=[count(*)")
 
 
+def test_moved_having_term_is_its_own_filter_line_below_aggregate():
+    """#141: `path LIKE ... ESCAPE ...` moves below the `Aggregate` and
+    prints with column names, between it and the scan; the kept `HAVING`
+    term stays above it, printed through the aggregate's slots."""
+    lines = _explain("SELECT count(*) FROM blame GROUP BY path HAVING count(*) > 5 AND path LIKE 'a' ESCAPE 'ab'")
+    assert lines == [
+        "Project (count(*))",
+        "  Filter (count(*) > 5)",
+        "    Aggregate (group=[path], aggs=[count(*)])",
+        "      Filter (path LIKE 'a' ESCAPE 'ab')",
+        "        FakeScan (pushed: none -> 0 of 5 paths)",
+    ]
+
+
+def test_moved_having_filter_line_sits_above_the_where_filter_line():
+    lines = _explain(
+        "SELECT count(*) FROM blame WHERE path = 'a' GROUP BY path "
+        "HAVING count(*) > 5 AND path > 'b' AND path LIKE 'a' ESCAPE 'ab'"
+    )
+    assert lines == [
+        "Project (count(*))",
+        "  Filter (count(*) > 5)",
+        "    Aggregate (group=[path], aggs=[count(*)])",
+        "      Filter (path > 'b' AND path LIKE 'a' ESCAPE 'ab')",
+        "        Filter (path = 'a')",
+        "          FakeScan (pushed: path = 'a' -> 1 of 5 paths)",
+    ]
+
+
 def test_limit_offset_distinct_and_sort_lines():
     lines = _explain(
         "SELECT DISTINCT author_name FROM blame ORDER BY author_name LIMIT 5 OFFSET 2"

@@ -577,3 +577,48 @@ def test_estimate_counts_paths_without_blaming(tiny_repo):
     none_pushed = scan.estimate()
     assert (none_pushed.selected, none_pushed.total) == (2, 2)
     assert scan.git_invocations == 1
+
+
+# --- HAVING terms that move below the aggregate (#141) ---------------------
+
+
+def test_a_moved_having_term_is_not_pushed(tiny_repo):
+    """`path = 'src/utils.py'` in `HAVING` moves below the aggregate but
+    is never offered to the scan (#172): every tracked path is blamed,
+    with the same three git invocations (`ls-tree` and two `blame`s) as
+    before #141. Oracle: `2`."""
+    rows = _check(
+        "SELECT count(*) FROM blame GROUP BY path HAVING path = 'src/utils.py'",
+        tiny_repo,
+        blamed=TINY_PATHS,
+        invocations=3,
+        pushed=0,
+    )
+    assert rows == [(2,)]
+
+
+def test_where_is_still_pushed_beside_a_moved_term(tiny_repo):
+    """The `WHERE` term is pushed and only `src/utils.py` is blamed; the
+    moved `ERR` then raises on its rows, as SQLite does."""
+    from historian.exec.expression import EvalError
+
+    built: list[BlameScan] = []
+
+    def factory(r: Path) -> BlameScan:
+        source = BlameScan(r)
+        built.append(source)
+        return source
+
+    query = (
+        "SELECT count(*) FROM blame WHERE path = 'src/utils.py' GROUP BY path "
+        "HAVING path LIKE 'a' ESCAPE 'ab' AND count(*) > 0"
+    )
+    tree = optimize(plan(bind(parse(tokenize(query)), catalog=SCHEMAS), tiny_repo, tables={"blame": factory}))
+    node = tree
+    while not isinstance(node, Scan):
+        node = child_of(node)
+    assert len(node.pushed()) == 1
+    with pytest.raises(EvalError, match="ESCAPE expression must be a single character"):
+        list(tree.rows())
+    assert built[0].blamed_paths == ["src/utils.py"]
+    assert built[0].git_invocations == 2

@@ -22,12 +22,13 @@ from pathlib import Path
 import pytest
 
 from historian.catalog import SCAN_FACTORIES
-from historian.exec.operators import Aggregate, Distinct, Filter, Limit, Project, Scan, Sort
+from historian.exec.operators import Aggregate, Distinct, Filter, Limit, Project, Scan, ScanEstimate, Sort, child_of
 from historian.plan import planner
 from historian.sql import walk
+from historian.plan.explain import format_plan
 from historian.plan.planner import plan
 from historian.schema import Column, ColumnType, Row, Schema
-from historian.sql.ast import And, BinaryOp, FunctionCall, Is, Like, Literal, OrderDirection, Operator as Op, Star
+from historian.sql.ast import And, BinaryOp, FunctionCall, Is, Like, Literal, Not, OrderDirection, Operator as Op, Star
 from historian.sql.binder import BoundColumnRef, BoundOrderByItem, BoundSelectItem, BoundSelectStatement, bind
 from historian.sql.lexer import Position, tokenize
 from historian.sql.parser import parse
@@ -1368,3 +1369,249 @@ def test_plan_of_a_deep_where_select_and_order_by():
     source = _FakeSource([("a.py", 1, None), ("b.py", 2, None)])
     tree = plan(stmt, Path("/unused"), tables=_fake_tables(source))
     assert list(tree.rows()) == [(_DEEP,), (_DEEP,)]
+
+
+# --- HAVING terms that move below the aggregate (#141) -----------------------
+#
+# Bound through the real parser and binder against `widgets` (the same
+# `_SCHEMA`), planned against `_EstimatingSource`: no git anywhere.
+# `ERR` is the one expression that can raise at run time.
+
+_ERR = "path LIKE 'a' ESCAPE 'ab'"
+
+
+class _EstimatingSource(_FakeSource):
+    """`_FakeSource` plus the `estimate()` `format_plan` asks for."""
+
+    def estimate(self, pushed: Sequence[object] = ()) -> ScanEstimate:
+        return ScanEstimate(name="WidgetScan", selected=0, total=0)
+
+
+def _bound(sql: str) -> BoundSelectStatement:
+    return bind(parse(tokenize(sql)), catalog={"widgets": _SCHEMA})
+
+
+def _planned(sql: str, rows: Sequence[Row] = ()):
+    bound = _bound(sql)
+    return bound, plan(bound, Path("/nonexistent"), tables=_fake_tables(_EstimatingSource(rows)))
+
+
+def _chain(tree) -> list:
+    """The operators of *tree*, root first."""
+    ops = []
+    node = tree
+    while node is not None:
+        ops.append(node)
+        node = child_of(node)
+    return ops
+
+
+def _kinds(tree) -> list[str]:
+    return [type(op).__name__ for op in _chain(tree)]
+
+
+def _having_terms(bound: BoundSelectStatement) -> list:
+    return walk.split_conjuncts(bound.having)
+
+
+def test_moved_term_gets_its_own_filter_below_the_aggregate():
+    """`GROUP BY path HAVING count(*) > 5 AND ERR`: `Scan -> Filter(ERR,
+    over the scan row) -> Aggregate -> Filter(count(*) > 5, over the
+    aggregate's slots) -> Project`. The moved term is the bound term
+    itself, column offsets into the scan row; the kept one reads slot 1
+    (`count(*)`, after the one group key)."""
+    bound, tree = _planned(f"SELECT count(*) FROM widgets GROUP BY path HAVING count(*) > 5 AND {_ERR}")
+    assert _kinds(tree) == ["Project", "Filter", "Aggregate", "Filter", "Scan"]
+    _project, kept, _aggregate, moved, _scan = _chain(tree)
+    count_term, err_term = _having_terms(bound)
+    assert moved.predicate() is err_term
+    assert moved.negotiable() is False
+    slot = kept.predicate()
+    assert isinstance(slot, BinaryOp) and slot.op is Op.GT and slot.right is count_term.right
+    assert isinstance(slot.left, BoundColumnRef) and slot.left.offset == 1
+
+
+def test_moved_filter_sits_above_the_where_filter():
+    bound, tree = _planned(
+        f"SELECT count(*) FROM widgets WHERE line_no > 0 GROUP BY path HAVING count(*) > 5 AND {_ERR}"
+    )
+    assert _kinds(tree) == ["Project", "Filter", "Aggregate", "Filter", "Filter", "Scan"]
+    _project, _kept, _aggregate, moved, where, _scan = _chain(tree)
+    assert where.predicate() is bound.where
+    assert where.negotiable() is True
+    assert moved.predicate() is _having_terms(bound)[1]
+    assert moved.negotiable() is False
+
+
+def test_two_moved_terms_are_one_left_deep_and_in_having_order():
+    bound, tree = _planned(
+        f"SELECT count(*) FROM widgets GROUP BY path HAVING {_ERR} AND count(*) > 5 AND path > 'x' AND path < 'y'"
+    )
+    terms = _having_terms(bound)
+    moved = _chain(tree)[3]
+    predicate = moved.predicate()
+    assert isinstance(predicate, And) and isinstance(predicate.left, And)
+    assert predicate.right is terms[3]
+    assert predicate.left.left is terms[0] and predicate.left.right is terms[2]
+    got = walk.split_conjuncts(predicate)
+    assert len(got) == 3 and all(a is b for a, b in zip(got, [terms[0], terms[2], terms[3]]))
+
+
+def test_when_every_term_moves_there_is_no_filter_above_the_aggregate():
+    _bound_stmt, tree = _planned(f"SELECT count(*) FROM widgets GROUP BY path HAVING path > 'x' AND {_ERR}")
+    assert _kinds(tree) == ["Project", "Aggregate", "Filter", "Scan"]
+
+
+#: Queries in which no `HAVING` term moves, and the plan `main` printed
+#: for each before #141 (with no pushdown: `plan()` alone).
+_UNMOVED_PLANS = {
+    # Aggregate-only HAVING.
+    "SELECT path, count(*) FROM widgets GROUP BY path HAVING count(*) > 1 AND max(line_no) < 5": (
+        "Project (path, count(*))\n"
+        "  Filter (count(*) > 1 AND max(line_no) < 5)\n"
+        "    Aggregate (group=[path], aggs=[count(*), max(line_no)])\n"
+        "      WidgetScan (pushed: none -> 0 of 0 paths)\n"
+    ),
+    # An OR at the root is one term, and it has an aggregate.
+    f"SELECT path FROM widgets GROUP BY path HAVING count(*) > 1 OR {_ERR}": (
+        "Project (path)\n"
+        "  Filter (count(*) > 1 OR path LIKE 'a' ESCAPE 'ab')\n"
+        "    Aggregate (group=[path], aggs=[count(*)])\n"
+        "      WidgetScan (pushed: none -> 0 of 0 paths)\n"
+    ),
+    # No GROUP BY: nothing moves, a constant term included.
+    "SELECT count(*) FROM widgets WHERE line_no > 0 HAVING count(*) > 1 AND 'a' LIKE 'a' ESCAPE 'ab'": (
+        "Project (count(*))\n"
+        "  Filter (count(*) > 1 AND 'a' LIKE 'a' ESCAPE 'ab')\n"
+        "    Aggregate (group=[], aggs=[count(*)])\n"
+        "      Filter (line_no > 0)\n"
+        "        WidgetScan (pushed: none -> 0 of 0 paths)\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("sql", list(_UNMOVED_PLANS))
+def test_when_nothing_moves_the_tree_is_the_one_main_built(sql):
+    _bound_stmt, tree = _planned(sql)
+    assert format_plan(tree) == _UNMOVED_PLANS[sql]
+
+
+def test_aggregate_calls_and_kept_slots_are_unchanged_by_a_moved_term():
+    """Aggregates in the select list, `HAVING` and `ORDER BY`, and one
+    key term in the middle of `HAVING`: `Aggregate.calls()` and the
+    kept `Filter`'s predicate are exactly what the same query without
+    that term plans to - the term had no aggregate, so no slot moves."""
+    with_term = (
+        "SELECT path, count(*), max(line_no) FROM widgets GROUP BY path "
+        "HAVING max(line_no) >= 1 AND path >= '' AND sum(line_no) > 0 ORDER BY count(*) DESC, min(line_no)"
+    )
+    without_term = with_term.replace("AND path >= '' ", "")
+    _b1, tree = _planned(with_term)
+    _b2, expected = _planned(without_term)
+    assert _kinds(tree) == ["Project", "Sort", "Filter", "Aggregate", "Filter", "Scan"]
+    assert _kinds(expected) == ["Project", "Sort", "Filter", "Aggregate", "Scan"]
+    aggregate = _chain(tree)[3]
+    assert [call.kind for call in aggregate.calls()] == ["count", "max", "max", "sum", "count", "min"]
+    assert aggregate.calls() == _chain(expected)[3].calls()
+    assert walk.expr_shape_equal(_chain(tree)[2].predicate(), _chain(expected)[2].predicate())
+    assert walk.expr_shape_equal(_chain(tree)[0].select_list()[1].expr, _chain(expected)[0].select_list()[1].expr)
+    rows = [("a.py", 1, None), ("a.py", 2, None), ("b.py", 3, None)]
+    _b3, tree = _planned(with_term, rows)
+    assert list(tree.rows()) == [("a.py", 2, 2), ("b.py", 1, 3)]
+
+
+def test_a_term_built_on_an_expression_key_moves():
+    bound, tree = _planned(
+        "SELECT count(*) FROM widgets GROUP BY path || 'x' HAVING count(*) > 5 AND ((path || 'x') || 'y') > 'a'"
+    )
+    assert _kinds(tree) == ["Project", "Filter", "Aggregate", "Filter", "Scan"]
+    assert _chain(tree)[3].predicate() is _having_terms(bound)[1]
+
+
+def test_a_column_outside_the_key_expression_keeps_the_term():
+    """Hand-built, since the binder rejects it: `GROUP BY path || 'x'`
+    with `path > 'a'` in `HAVING` - `path` is not inside a key
+    subexpression, so the term stays."""
+    key = _bin(Op.CONCAT, _col("path"), _lit("x"))
+    having = And(left=_bin(Op.GT, _count_star(), _lit(5)), right=_bin(Op.GT, _col("path"), _lit("a")), position=_POS)
+    stmt = _stmt([_select_item(_count_star())], group_by=[key], having=having)
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(_FakeSource([])))
+    assert _kinds(tree) == ["Project", "Filter", "Aggregate", "Scan"]
+
+
+def test_a_constant_term_moves():
+    bound, tree = _planned("SELECT count(*) FROM widgets GROUP BY path HAVING count(*) > 5 AND 1")
+    assert _kinds(tree) == ["Project", "Filter", "Aggregate", "Filter", "Scan"]
+    assert _chain(tree)[3].predicate() is _having_terms(bound)[1]
+
+
+def test_an_integer_literal_zero_term_stays():
+    """SQLite 3.50.4 leaves an always-false term (an integer literal
+    `0`) in `HAVING` and moves the rest (`tests/differential/
+    test_having_hoist.py`). `0.0` and `-0` are not that literal."""
+    bound, tree = _planned(f"SELECT count(*) FROM widgets GROUP BY path HAVING count(*) > 5 AND 0 AND {_ERR}")
+    assert _kinds(tree) == ["Project", "Filter", "Aggregate", "Filter", "Scan"]
+    count_term, zero, err_term = _having_terms(bound)
+    assert _chain(tree)[3].predicate() is err_term
+    kept = walk.split_conjuncts(_chain(tree)[1].predicate())
+    assert len(kept) == 2 and kept[1] is zero
+    for constant in ("0.0", "-0"):
+        _b, tree = _planned(f"SELECT count(*) FROM widgets GROUP BY path HAVING count(*) > 5 AND {constant}")
+        assert _kinds(tree) == ["Project", "Filter", "Aggregate", "Filter", "Scan"], constant
+
+
+def test_not_over_and_is_one_term_and_moves_whole():
+    bound, tree = _planned(f"SELECT count(*) FROM widgets GROUP BY path HAVING count(*) > 5 AND NOT (path > 'a' AND {_ERR})")
+    moved = _chain(tree)[3].predicate()
+    assert isinstance(moved, Not)
+    assert moved is _having_terms(bound)[1]
+
+
+def test_planning_does_not_mutate_the_bound_statement():
+    sql = f"SELECT count(*) FROM widgets WHERE line_no > 0 GROUP BY path HAVING count(*) > 5 AND {_ERR} AND path > 'a'"
+    bound = _bound(sql)
+    having_before = bound.having
+    snapshot = repr(bound)
+    plan(bound, Path("/nonexistent"), tables=_fake_tables(_FakeSource([])))
+    assert bound.having is having_before
+    assert repr(bound) == snapshot
+    assert bound == _bound(sql)
+
+
+def test_moved_terms_filter_rows_end_to_end():
+    rows = [("a.py", 1, None), ("a.py", 2, None), ("b.py", 3, None)]
+    _bound_stmt, tree = _planned(
+        "SELECT path, count(*) FROM widgets GROUP BY path HAVING count(*) > 0 AND path > 'a.py'", rows
+    )
+    assert list(tree.rows()) == [("b.py", 1)]
+
+
+def test_a_900_term_having_half_moved_plans_and_runs():
+    """900 terms joined by `AND` through the real parser and binder,
+    alternating a key term (moves) and an aggregate term (stays)."""
+    terms = []
+    for index in range(450):
+        terms.append(f"path >= '{index % 3}'")
+        terms.append(f"count(*) > {index % 2 - 1}")
+    sql = f"SELECT path, count(*) FROM widgets GROUP BY path HAVING {' AND '.join(terms)}"
+    rows = [("a.py", 1, None), ("a.py", 2, None), ("b.py", 3, None), ("0.py", 4, None)]
+    _bound_stmt, tree = _planned(sql, rows)
+    assert _kinds(tree) == ["Project", "Filter", "Aggregate", "Filter", "Scan"]
+    assert len(walk.split_conjuncts(_chain(tree)[1].predicate())) == 450
+    assert len(walk.split_conjuncts(_chain(tree)[3].predicate())) == 450
+    assert list(tree.rows()) == [("a.py", 2), ("b.py", 1)]
+    format_plan(tree)
+
+
+def test_a_5000_term_hand_built_having_plans_and_runs():
+    """Deeper than the parser allows, so a recursive split, partition or
+    join would hit the recursion limit."""
+    having = _bin(Op.GE, _col("path"), _lit(""))
+    for index in range(1, _DEEP):
+        term = _bin(Op.GE, _col("path"), _lit("")) if index % 2 == 0 else _bin(Op.GT, _count_star(), _lit(0))
+        having = And(left=having, right=term, position=_POS)
+    stmt = _stmt([_select_item(_col("path"))], group_by=[_col("path")], having=having)
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(_FakeSource([("a.py", 1, None), ("b.py", 2, None)])))
+    assert len(walk.split_conjuncts(_chain(tree)[1].predicate())) == _DEEP // 2
+    assert len(walk.split_conjuncts(_chain(tree)[3].predicate())) == _DEEP // 2
+    assert list(tree.rows()) == [("a.py",), ("b.py",)]

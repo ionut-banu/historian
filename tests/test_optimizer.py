@@ -368,3 +368,55 @@ def test_whole_table_aggregate_over_where_still_negotiates():
     assert isinstance(child_of(tree), Aggregate)
     assert list(tree.rows()) == [(2,)]
     assert list(source.scan_calls[0]) == [bound.where.left]
+
+
+# --- HAVING terms that move below the aggregate (#141) -----------------------
+
+
+class _AcceptEverythingSource(_RecordingGadgetSource):
+    """Accepts every term it is offered and narrows by none of them -
+    a superset, which pushdown allows. So anything offered shows up in
+    `offered` and in `Scan.pushed()`."""
+
+    def accepts(self, term: object) -> bool:
+        self.offered.append(term)
+        self.accepted.append(term)
+        return True
+
+    def scan(self, pushed: Sequence[object] = ()) -> Iterator[Row]:
+        self.scan_calls.append(pushed)
+        yield from self._rows
+
+
+def test_a_moved_filter_directly_above_the_scan_is_not_negotiated():
+    """No `WHERE`: the `Filter` of the moved `b > 1` is the operator
+    directly above the `Scan`, and a source that accepts everything is
+    still offered nothing - as on `main`, where `b > 1` sat above the
+    `Aggregate`. Oracle: `2`, `5`."""
+    source = _AcceptEverythingSource()
+    tree = _optimized("SELECT b FROM gadgets GROUP BY b HAVING b > 1", source)
+    scan = _scan_of(tree)
+    assert isinstance(child_of(child_of(tree)), Filter)
+    assert child_of(child_of(tree)).negotiable() is False
+    assert source.offered == []
+    assert scan.pushed() == ()
+    assert sorted(tree.rows()) == [(2,), (5,)]
+    assert source.scan_calls == [()]
+
+
+def test_with_a_where_only_the_where_term_is_negotiated():
+    """Oracle: `(2, 2)`, `(5, 1)`."""
+    source = _AcceptEverythingSource()
+    bound = _bind("SELECT b, count(*) FROM gadgets WHERE a = 1 GROUP BY b HAVING b > 1")
+    tree = optimize(plan(bound, Path("/nonexistent"), tables={"gadgets": lambda repo: source}))
+    assert source.offered == [bound.where]
+    assert list(_scan_of(tree).pushed()) == [bound.where]
+    assert sorted(tree.rows()) == [(2, 2), (5, 1)]
+
+
+def test_a_moved_term_the_scan_would_reject_is_not_offered_either():
+    source = _RecordingGadgetSource()
+    tree = _optimized("SELECT b FROM gadgets GROUP BY b HAVING b > 1 AND count(*) > 0", source)
+    assert source.offered == []
+    assert _scan_of(tree).pushed() == ()
+    assert sorted(tree.rows()) == [(2,), (5,)]

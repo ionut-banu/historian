@@ -273,9 +273,10 @@ class Filter:
     `TypeError`.
     """
 
-    def __init__(self, child: Operator, predicate: Expr) -> None:
+    def __init__(self, child: Operator, predicate: Expr, negotiable: bool = True) -> None:
         self._child = child
         self._predicate = predicate
+        self._negotiable = negotiable
         # A predicate can only remove rows, never add, rename, or
         # retype a column - the output schema is exactly the child's.
         self.schema = child.schema
@@ -284,6 +285,16 @@ class Filter:
         """The predicate this `Filter` enforces - read by the
         optimizer, never replaced by it."""
         return self._predicate
+
+    def negotiable(self) -> bool:
+        """Whether the optimizer may offer this `Filter`'s terms to the
+        scan beneath it. `True` for `WHERE`; `False` for the `Filter`
+        of `HAVING` terms that moved below the aggregate (#141), which
+        can sit directly above the `Scan` when there is no `WHERE` and
+        is never negotiated (#172). An explicit flag, read by
+        `plan/optimizer.py`, rather than anything inferred from the
+        tree's shape."""
+        return self._negotiable
 
     def rows(self) -> Iterator[Row]:
         child_schema = self._child.schema

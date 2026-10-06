@@ -6,9 +6,13 @@ pushed into scans"). Issue #121.
 "Pushdown negotiation", its four steps and nothing else:
 
 1. Split the `WHERE` predicate - the `Filter` directly above the
-   `Scan` - on top-level `AND` into conjunctive terms, left to right
-   (`split_conjuncts`). `OR` is never split; `NOT (x AND y)` is one
-   term too, since its `And` is not at the top.
+   `Scan`, when it is negotiable - on top-level `AND` into conjunctive
+   terms, left to right (`split_conjuncts`, `sql/walk.py`). `OR` is
+   never split; `NOT (x AND y)` is one term too, since its `And` is not
+   at the top. The `Filter` of `HAVING` terms that moved below the
+   aggregate (#141) is marked not negotiable (`Filter.negotiable()`)
+   and is never split or offered, even when there is no `WHERE` and it
+   sits directly above the `Scan` (#172).
 2. Offer each term to the scan, in that order, by calling
    `source.accepts(term)` - unless `source.capabilities()` is empty,
    in which case nothing is offered at all.
@@ -40,50 +44,30 @@ no dispatch tables (AGENTS.md), so it ports to Rust as a `match`.
 from __future__ import annotations
 
 from historian.exec.operators import Filter, Operator, Predicate, Scan, child_of
-from historian.sql.ast import And, Expr
+from historian.sql.walk import split_conjuncts
 
+# `split_conjuncts` lives in `sql/walk.py` (#141), shared with the
+# planner's `HAVING` split, and is re-exported here.
 __all__ = ["optimize", "split_conjuncts"]
-
-
-def split_conjuncts(expr: Expr) -> list[Predicate]:
-    """The conjunctive terms of *expr*, left to right.
-
-    Every top-level `And` is split; anything else, `Or` included, is
-    one term. Parens produce no AST node, so `(x AND y) AND z` and
-    `x AND (y AND z)` both give `[x, y, z]` - `AND` is associative,
-    and a term's own evaluation is unchanged by where it came from.
-
-    Iterative with an explicit stack rather than recursive: the parser
-    builds `x1 AND x2 AND ... AND xn` as a left-deep chain, and its
-    depth must not be bounded by Python's recursion limit here.
-    """
-    terms: list[Predicate] = []
-    stack: list[Expr] = [expr]
-    while stack:
-        node = stack.pop()
-        if isinstance(node, And):
-            # Right pushed first so left is popped - and emitted - first.
-            stack.append(node.right)
-            stack.append(node.left)
-        else:
-            terms.append(node)
-    return terms
 
 
 def optimize(tree: Operator) -> Operator:
     """Negotiate pushdown for *tree*'s one `Scan`; return *tree*.
 
     Walks the operator chain down to its `Scan`. If the operator
-    directly above that `Scan` is a `Filter` - the `WHERE` filter
-    `plan()` puts there - and the scan declares at least one
+    directly above that `Scan` is a negotiable `Filter` - the `WHERE`
+    filter `plan()` puts there - and the scan declares at least one
     capability, each of that filter's conjunctive terms is offered to
     the scan's source in order, and the accepted ones become the
-    `Scan`'s pushed terms. Otherwise (no `WHERE`, or a scan that can
-    push nothing) the `Scan` is left pushing nothing.
+    `Scan`'s pushed terms. Otherwise (no `WHERE`, a scan that can push
+    nothing, or only the `Filter` of moved `HAVING` terms above the
+    scan) the `Scan` is left pushing nothing.
 
-    A `Filter` anywhere else - `HAVING`, above `Aggregate` - is never
-    negotiated: its terms range over aggregate output rows, not scan
-    rows.
+    A `Filter` anywhere else is never negotiated: `HAVING`, above
+    `Aggregate`, ranges over aggregate output rows, and the moved
+    `HAVING` terms (#141), above the `WHERE` `Filter` or marked not
+    negotiable when directly above the `Scan`, are kept out of
+    pushdown on purpose (#172).
     """
     parent: Operator | None = None
     node: Operator = tree
@@ -98,7 +82,7 @@ def optimize(tree: Operator) -> Operator:
     # Negotiation always starts from nothing pushed, so running this
     # twice over one tree gives the same result as running it once.
     scan.set_pushed(())
-    if not isinstance(parent, Filter):
+    if not isinstance(parent, Filter) or not parent.negotiable():
         return tree
     source = scan.source()
     if not source.capabilities():

@@ -36,6 +36,12 @@ Layout
   Unicode-aware rules. Imports nothing beyond the stdlib, so every
   layer - lexer, binder, expression evaluator - can import it without
   creating a cycle or pulling in git/subprocess.
+- `src/historian/atof.py` - `text_to_real`, SQLite 3.50.4's own
+  text-to-REAL conversion (`sqlite3AtoF`), which is not correctly
+  rounded the way Python's `float()` is. Every place SQL-derived text
+  becomes a REAL calls it. Stdlib only and imports nothing from
+  `historian`, like `ascii.py`, so the parser and the evaluator can
+  both use it.
 - `src/historian/sql/walk.py` - the shared expression-tree walks: a
   node's children, rebuilding a node around new children, shape
   equality, `contains_aggregate`, the aggregate-query predicate, and

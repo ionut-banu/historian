@@ -601,6 +601,53 @@ Generators are used inside `rows()`, but the operator is an object
 rather than a bare generator function, so the tree can be inspected,
 printed by `EXPLAIN`, and asserted on in tests.
 
+### `HAVING` terms that move below the aggregate
+
+SQLite does not run every `HAVING` term once per group. When the query
+has a `GROUP BY`, it takes each term of `HAVING` that no group can
+disagree on and runs it once per input row, in `WHERE`, before any
+grouping. The planner does the same, so the two engines raise the same
+errors (today only a `LIKE ... ESCAPE` whose escape is not one
+character can raise) and keep the same rows. The rule, measured
+against the oracle (`_docs/decisions.md`, 2026-10-06, #141):
+
+- It applies only to a query with a `GROUP BY`. With none, nothing
+  moves.
+- `HAVING` is split into terms on every `AND`, through nested `AND`s
+  and parentheses, left to right. An `OR`, a `NOT (...)`, a
+  comparison or anything else that is not an `AND` is one term and is
+  never split further.
+- A term moves when it contains no aggregate call and every column
+  reference in it lies inside a subexpression that matches a `GROUP BY`
+  key by shape, or when it contains no column reference at all. A term
+  with an aggregate anywhere in it stays in `HAVING`, `OR` branches
+  included.
+- A term that is an integer literal `0` (`0`, `00`, `(0)`) stays in
+  `HAVING`: SQLite does not move a term it knows is always false.
+  Every other constant moves, `0.0`, `-0`, `NULL` and `1 > 2`
+  included.
+- The moved terms run in `HAVING` order, after every term of the
+  query's own `WHERE`, and each is evaluated as written, over the
+  scan's row. They leave `HAVING`: the planner builds one `Filter`
+  holding them, between the `WHERE` `Filter` (or the `Scan`) and the
+  `Aggregate`, and a `HAVING` left with no terms gets no `Filter`.
+  A moved term is not copied back: it filters rows, so a group
+  survives with only the rows that passed, and `count`, `sum` and the
+  rest see only those. That differs from filtering the group only when
+  the rows of one group differ in a way the key does not (`GROUP BY
+  line + 0` puts `'1'` and `'1.0'` in one group, and `HAVING (line +
+  0) || 'x' = '1x'` keeps only the first), and SQLite's answer is the
+  per-row one.
+- A moved term is never offered to the scan. Pushdown negotiation (next
+  section) looks only at the query's own `WHERE`, and a moved term is
+  not part of it; the planner does this, not the optimizer, so
+  `--no-pushdown` moves the same terms.
+
+A term with no column reference is a constant. SQLite evaluates a
+constant `WHERE` term once before any row, which historian does not do
+yet (#171), so a moved constant behaves as a constant in a plain
+`WHERE` does.
+
 ### Expression evaluation
 
 `exec/expression.py` walks an expression against a row and returns a
@@ -648,7 +695,10 @@ The optimizer's one job in v1.
    scan accepts the whole thing.
 2. Offer each term to the scan beneath it, left to right, one
    `accepts(term)` call per term. Only the `WHERE` filter directly
-   above the scan is negotiated - never `HAVING`.
+   above the scan is negotiated - never `HAVING`, and never the
+   `Filter` of `HAVING` terms that moved below the aggregate (see
+   above), which sits above it, or directly above the scan when there
+   is no `WHERE`, and is marked not negotiable.
 3. Pass the accepted terms to the scan as scan arguments, recorded on
    the `Scan` operator so the plan shows them.
 4. Leave the `Filter` in place, unchanged, with every term still in it.

@@ -120,6 +120,22 @@ def test_exec_operators_alone_does_not_import_subprocess():
     assert result.returncode == 0, result.stderr
 
 
+def test_atof_alone_imports_no_subprocess_and_nothing_from_historian():
+    """`atof.py` (issue #134) has the same standing as `ascii.py`: the
+    parser and the expression evaluator both import it, so it imports
+    nothing from `historian` and touches no git. Importing it pulls in
+    no other `historian` module."""
+    code = (
+        "import historian.atof, sys; "
+        "assert 'subprocess' not in sys.modules, 'subprocess'; "
+        "extra = sorted(m for m in sys.modules if m.startswith('historian') "
+        "and m not in ('historian', 'historian.atof')); "
+        "assert not extra, extra"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
 # --- #52: the binder's and planner's views can't diverge -------------------
 
 

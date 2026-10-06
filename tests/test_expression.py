@@ -2508,12 +2508,13 @@ def test_no_stray_float_calls_outside_the_named_exceptions():
 
     Walks this module's own source with `ast`, and asserts every
     `float(` call site sits inside a function on an explicit allowlist
-    of three - not the issue body's stated two:
+    of three. Text-to-number *conversion* is not on it: since issue
+    #134, `_scan_number` converts text to a REAL with
+    `historian.atof.text_to_real` (SQLite's own, not correctly rounded,
+    algorithm), never `float()`, so a `float(` call there now fails
+    this test too.
 
-    - `_scan_number` - exception (a): affinity's/arithmetic's own
-      text-to-number *conversion*, constructing a new `Value` from a
-      string. Not a lossy comparison cast.
-    - `_format_float` - exception (b): the float-formatting helper for
+    - `_format_float` - the float-formatting helper for
       `||`/text-affinity, converting a number *to* text, never used to
       convert a number *for* comparison. Named here because the issue
       names it, even though this implementation's `_format_float`
@@ -2521,9 +2522,8 @@ def test_no_stray_float_calls_outside_the_named_exceptions():
       already-`float` argument) - nothing about this test should
       depend on that being true if a future change makes it call
       `float()` too, e.g. to normalize an int argument.
-    - `_int64_bounded` - a third, genuine exception this issue's own
-      int64-overflow criteria require and the "two named exceptions"
-      list does not mention: `9223372036854775807 + 1` must become
+    - `_int64_bounded` - an exception the int64-overflow criteria
+      require: `9223372036854775807 + 1` must become
       `REAL`, which needs converting an already-overflowed *exact*
       Python `int` (computed first with unbounded `int` arithmetic) to
       `float`. This is arithmetic *result production*, a different
@@ -2533,7 +2533,7 @@ def test_no_stray_float_calls_outside_the_named_exceptions():
       own function, never called from `_apply_affinity`, `_eval_is`,
       `_eval_in`, `_eval_between`, or the comparison branch of
       `_eval_binary`.
-    - `_mod_result` - a fourth exception, the same "arithmetic result
+    - `_mod_result` - the same "arithmetic result
       production" shape as `_int64_bounded`, added for `%` (issue
       #75): `%`'s remainder is always computed as an exact `int`, but
       its storage class follows the *original* operands (REAL if
@@ -2550,7 +2550,7 @@ def test_no_stray_float_calls_outside_the_named_exceptions():
 
     from historian.exec import expression
 
-    allowed_functions = {"_scan_number", "_format_float", "_int64_bounded", "_mod_result"}
+    allowed_functions = {"_format_float", "_int64_bounded", "_mod_result"}
     tree = ast.parse(inspect.getsource(expression))
 
     violations: list[tuple[str, int]] = []

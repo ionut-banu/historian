@@ -353,6 +353,7 @@ is testable against in-memory fixtures with no repository present.
 ```
 src/historian/
   values.py        SQL values, comparison, three-valued logic
+  atof.py          text -> REAL by SQLite 3.50.4's own algorithm
   sql/lexer.py     text -> tokens
   sql/ast.py       AST node definitions
   sql/parser.py    tokens -> AST
@@ -474,6 +475,32 @@ operator sees it, and a run too large for a double is `inf`:
 
 This is conversion, not comparison, and does not weaken the rule
 above. See `_docs/decisions.md`, 2026-09-28.
+
+Text becomes a REAL by SQLite 3.50.4's own algorithm, not by correct
+rounding. `sqlite3AtoF` reads about 19 significant digits into a
+64-bit integer and scales it by powers of ten in double-double
+arithmetic, so for long numerals and large or small exponents its
+answer is sometimes one ULP from the correctly rounded double that
+Python's `float()` gives. `atof.py`'s `text_to_real` is a port of it,
+and it is the only conversion used wherever text becomes a REAL:
+`_scan_number` (TEXT operands, affinity, `sum`/`avg`), and the
+parser's decimal literals and integer literals past int64. `float()`
+is never called on SQL-derived text.
+
+```
+'18823239210196293635' * 1.0          0x1.05399454f5f45p+64   (float(): ...f46p+64)
+'191794978794.7906036428205' * 1.0    0x1.653ef8ff56532p+37   (float(): ...56533p+37)
+'2.4703282292062328e-324' * 1.0       0.0                     (float(): 5e-324)
+```
+
+The model is the pinned oracle (SQLite 3.50.4) as measured on macOS
+arm64. Other SQLite versions convert differently (3.45.1 on x86_64
+used an 80-bit `long double` path), and other platforms' oracles are
+not yet measured (#176): the differential and sampling tests that
+compare this conversion with the live oracle skip, naming #176, where
+the oracle does not reproduce the pinned vectors, and historian still
+follows the macOS arm64 model there. See `_docs/decisions.md`,
+2026-10-06, issue #134.
 
 `%` reads each operand as an int64, not through `_scan_number`'s
 value. A REAL is truncated toward zero and clamped to int64, infinity

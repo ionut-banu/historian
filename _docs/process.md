@@ -305,7 +305,7 @@ double parser. A value bound as a parameter (`execute('... = ?',
 (1.5,))`) is Python's exact double, untouched. These are not
 always the same result: SQLite's literal parser is not correctly
 rounded on this platform for some large-exponent, 17-significant-
-digit values - measured directly, comparing `select <lit>` against
+digit values (historian reproduces it, #134) - measured directly, comparing `select <lit>` against
 Python's own `float(<lit>)` for literals of that shape, 1622 of
 10000 differ by one ULP, against 0 of 10000 for six-, fifteen-, or
 seventeen-digit literals at ordinary exponents and 0 of 10000 for

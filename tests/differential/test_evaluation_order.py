@@ -290,7 +290,7 @@ def test_condition_context_results_are_nonempty_where_expected(tiny_repo, tiny_c
 # SQLite's constant propagation replaces every `line_no` in the formula
 # with `5`. Its alphabet is seven leaves: 11,774 queries up to two
 # operators, and 768,320 more for k = 3 - but each runs over three rows
-# with nothing to group, so the k = 3 part is about three minutes and
+# with nothing to group, so the k = 3 part is about four minutes and
 # it is not capped.
 
 _SWEEP_OPERATORS = int(os.environ.get("HISTORIAN_SWEEP_OPERATORS", "2"))

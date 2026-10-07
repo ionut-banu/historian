@@ -3366,3 +3366,146 @@ either (#171), so a trailing constant such as `HAVING ERR AND NULL`
 still differs; pushing moved terms down (#172). Terms of the form
 `column = constant` are kept out of the new tests because SQLite
 propagates them (#142).
+
+2026-10-07 - Replicate SQLite's constant propagation in WHERE
+
+Issue #142. The owner's "Replicate" on the decision card used for
+#141 ("Document SQLite's HAVING/WHERE rewrites as accepted divergence,
+or replicate them?") covers this issue too, confirmed on the issue on
+2026-10-07, together with negotiating the rewritten terms with the
+scan. This entry supersedes the sentence in the 2026-10-01 (#111)
+entry that calls the propagation "the constant-folding difference #51
+already accepted": it is not accepted any more, it is replicated. The
+#51 accepted difference narrows to a `WHERE` conjunct with no column,
+which SQLite decides once before any row (#171), including a conjunct
+the propagation leaves with no column (#180), and to sources whose
+constant is an expression and SQLite's second pass (#179). Nothing of
+it remains once those land.
+
+The rule. SQLite (`propagateConstants` in select.c) splits `WHERE` on
+its top-level `AND`s and takes each term `X = K`, `K = X` or `X IN
+(K)` with one element (the parser turns that into `X = +K`), `X` a
+column and `K` a constant with no affinity, as a source; then every
+other occurrence of `X` in the `WHERE` becomes a column node marked
+`EP_FixedCol` that codes `K` and applies the column's affinity to it
+(`OP_Affinity`). historian takes `K` to be a literal or a chain of
+unary `+`/`-` over a numeric literal, as the issue does; any other
+constant is #179.
+
+Re-measured on the pinned oracle (Python `sqlite3` 3.50.4) through
+the differential harness's loader over `tiny`, every answer the issue
+quotes held, with these differences, where the oracle is followed:
+
+- Of two sources for one column, which one is used is observable, and
+  it is the last: `WHERE line_no = 5 AND NOT (line_no = 5 AND ERRA)
+  AND line_no = 5` raises (the first source became `5 = 5`, true, and
+  the guard ran), and so do `... AND line_no = 5.0`, `line_no = 5.0
+  AND ... AND line_no = 5` and `line_no = 5 AND (NOT (...) AND line_no
+  = 5)`. SQLite's `findConstInWhere` walks right before left and
+  ignores a column it already has. The issue had called the choice
+  unobservable and its plan-shape criterion kept the first; the
+  planner keeps the last. So `WHERE path = 'feature/thing.py' AND path
+  = 'src/utils.py'` pushes `path = 'src/utils.py'` and blames that
+  path (two git invocations, `count(*)` 0), not `feature/thing.py`.
+- The replacement's value is SQLite's storage conversion, which the
+  comparison conversion cannot produce: `line_no = 5.0`, `'5.0'` and
+  `'5e0'` give the INTEGER `5` (`line_no || 'x' = '5x'` holds), `5.5`
+  and `'5.5'` stay REAL, `-0.0` gives `0`, `9223372036854775808` stays
+  REAL (`'9.22337203685478e+18x'`); in a REAL column `r = 1`, `'1'`
+  and `' 1 '` give `1.0` and `r = 9007199254740993` gives
+  `9007199254740992.0`; in a TEXT column `line = 5.0` gives `'5.0'`.
+  The issue asked to reuse `_apply_affinity` and write no second
+  affinity implementation; `_apply_affinity` leaves `5.0` a REAL and
+  `1` an INTEGER, which `||` tells apart. `apply_column_affinity` in
+  `exec/expression.py` reuses the comparison's whole-string text rule
+  (`try_numeric_affinity`) and its number-to-text rule
+  (`_coerce_to_text`) and adds the two storage steps: a whole REAL
+  strictly inside int64 becomes an INTEGER
+  (`sqlite3VdbeIntegerAffinity`), and an INTEGER in a REAL column
+  becomes the nearest double (`_int_as_real`, the one new `float()`
+  call, added to the allowlist in `tests/test_expression.py`).
+- A REAL column loaded through the #140 harness view is not propagated
+  at all: the view's column is `CAST(raw.r AS REAL)`, not a column, so
+  `NOT (r = 7 AND ERR) AND r = 7` returns no rows there and raises over
+  a plain `REAL` table. historian's REAL column is a column, so the
+  REAL/INTEGER cases load a plain table (their rows hold no `-0.0` and
+  no `int` in `r`, the two things the view exists for), and a test pins
+  the view's answer as the reason.
+- `line_no == 5` and a table alias (`FROM blame AS b`) are not in the
+  v1 grammar and are parse errors, so they have no test. The issue's
+  three `HAVING` shapes group by `line_no` and use `author_name`, which
+  historian refuses to bind (not grouped); the tests use `GROUP BY
+  line_no, path` with `ERR`, and an aggregate guard. Every one returns
+  no rows on both engines.
+- The "not sources" list returns no rows as the issue says, except
+  `line_no <> 5`, `NOT (line_no = 5)`, `line_no NOT IN (5)` and
+  `line_no = line_no`, which return all three rows, with no error.
+  `LIMIT 1` raises like `LIMIT 0` does not.
+
+Design. The rewrite is `plan()`'s (`_propagate_constants`), like
+#141's move, because `--no-pushdown` skips `optimize()` and must still
+raise. The replacement is a new leaf, `FixedColumnRef` in
+`sql/walk.py` (offset, name, value, position), SQLite's
+`EP_FixedCol`: it evaluates to its value, and `_affinity_of` gives it
+the column's declared affinity, so `line_no > '4'` with `line_no`
+fixed at `5` is `5 > 4`. It is not a subclass of `BoundColumnRef`, so
+nothing that recognises a column (a scan's `accepts()`, `GROUP BY` key
+typing) mistakes it for one. The value is converted once, at plan
+time. `fix_columns` and `replace_conjuncts` in `sql/walk.py` are
+explicit-stack walks (#107); the `AND` shape of the `WHERE` is kept,
+an unchanged term stays the same object, and a `WHERE` with no source
+is the bound one, so its plan is unchanged. `--explain` prints a
+fixed column as its constant. The optimizer is unchanged and offers
+the rewritten terms, the very objects the `Filter` keeps. The issue's
+criterion said a fake scan that accepts everything is offered only the
+source of `path = 'src/utils.py' AND path LIKE 'src/%'`; it is offered
+both terms, the second as `'src/utils.py' LIKE 'src/%'`, because the
+optimizer offers every term and its constraint expected no optimizer
+change. The real `BlameScan` rejects the rewritten term, so it pushes
+only the source, which is what the work-done tests pin.
+
+Not replicated, noted: SQLite does not propagate a comparison whose
+collation is not `BINARY`, and treats a column with `BLOB` affinity
+specially (`bHasAffBlob`). v1 has neither `COLLATE` nor a column
+without a declared type, so a future `COLLATE`, or a table column with
+no affinity, has to revisit this. Join `ON` clauses are propagated too
+in SQLite; v1 has no join.
+
+Found and not fixed: historian reads `-9223372036854775808.0` as the
+INTEGER int64 minimum, everywhere (`SELECT -9223372036854775808.0 ||
+'x'` is `'-9223372036854775808x'` in historian and
+`'-9.22337203685478e+18x'` in SQLite), because the REAL literal and the
+overflowed INTEGER literal are the same `float` once parsed. It is a
+literal bug, not propagation's, and its two differential cases were
+replaced by `-9223372036854774784.0`.
+
+Sweep. The evaluation-order sweep gains a `propagated` placement,
+`WHERE NOT (<formula>) AND line_no = 5` over seven leaves (`line_no =
+5`, `<> 5`, `> 4`, `< 5`, `>= 1`, `< NULL`, `ERR`): 11,774 queries in
+37 groups up to two operators (about 4 s), and 768,320 more in 320
+groups at three operators (about 4 minutes), all agreeing with the
+oracle. The whole `HISTORIAN_SWEEP_OPERATORS=3` run took 6.5 minutes.
+
+Mutants, each run by hand and reverted, each caught: rewriting only the
+terms after the source (`test_each_source_form_propagates_and_raises`);
+not descending into `OR` (`test_or_not_and_arithmetic`, the `(line_no
+= 5 OR ERRA)` case); the raw constant without affinity
+(`test_the_replacement_has_the_columns_affinity`, `'05'`, `5.0`); no
+affinity for the fixed column in comparisons
+(`test_the_replacement_keeps_the_columns_affinity_in_comparisons`,
+`line_no > '4'`); `<>`, `IS`, `LIKE` or `BETWEEN` as a source
+(`test_terms_that_are_not_sources` and the planner's
+`test_terms_that_are_not_sources_leave_the_where_as_bound`); a source
+under `NOT` or `OR` (the same two, `NOT (line_no = 5)` and `(line_no =
+5 OR line_no = 6)`); replacing the source's own column
+(`test_the_source_position_and_depth`, `test_or_not_and_arithmetic`);
+propagating inside `HAVING` (`test_having_is_not_touched`) or from
+`WHERE` into `HAVING` (`test_having_is_neither_a_source_nor_a_target`
+only: a `WHERE` source reaching a `HAVING` term changes nothing a row
+can show, since every row that reaches `HAVING` passed the source); the
+rewrite in `optimize()` (`test_a_propagated_constant_raises_with_and_without_pushdown[--no-pushdown]`);
+negotiating the original terms and filtering on the rewritten ones
+(the three `#142` work-done tests in
+`tests/pushdown/test_blame_pushdown.py` and the optimizer's), and the
+reverse (the differential error cases, the planner and `--explain`
+tests).

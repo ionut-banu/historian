@@ -2947,7 +2947,7 @@ def test_order_by_aggregate_call_illegal_without_group_by_or_select_aggregate(ti
     aggregate: count()"."""
     with pytest.raises(
         BindError,
-        match=r"misuse of aggregate function count\(\): aggregate calls are not allowed in WHERE",
+        match=r"misuse of aggregate function count\(\): aggregate calls are not allowed in ORDER BY",
     ):
         run_historian("SELECT path FROM blame ORDER BY count(*)", tiny_repo)
 

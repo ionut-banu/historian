@@ -224,6 +224,7 @@ def _step6_where(
         alias_first=False,
         reject_aggregates=True,
         late_misuse=late_misuse if aggregate_query else None,
+        clause="WHERE",
     )
     return _bind_expr(stmt.where, where_ctx) if stmt.where is not None else None
 
@@ -246,6 +247,7 @@ def _step7_order_by(
         alias_first=True,
         reject_aggregates=not aggregate_query,
         late_misuse=late_misuse,
+        clause="ORDER BY",
     )
     return _bind_order_by(stmt.order_by, order_ctx, items)
 

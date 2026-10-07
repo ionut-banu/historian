@@ -671,3 +671,56 @@ def test_replace_conjuncts_on_a_deep_chain():
     rebuilt = walk.replace_conjuncts(walk.join_conjuncts(terms), new_terms)
     got = walk.split_conjuncts(rebuilt)
     assert len(got) == len(new_terms) and all(x is y for x, y in zip(got, new_terms))
+
+
+# --- SQLite's name-resolution order (issue #144) -------------------------------
+#
+# The binder walks a tree in the order SQLite resolves names, which is
+# `children` except for `LIKE`: SQLite's tree holds `x LIKE y ESCAPE z`
+# as the call `like(y, x, z)`, so the pattern comes first.
+
+
+def _resolution_order_of(node: Expr, kids: tuple[Expr, ...]) -> tuple[Expr, ...]:
+    if isinstance(node, Like):
+        return (kids[1], kids[0], *kids[2:])
+    return kids
+
+
+@pytest.mark.parametrize("cls", _TYPES, ids=lambda cls: cls.__name__)
+@pytest.mark.parametrize("many_length", [0, 1, 3])
+@pytest.mark.parametrize("optional_present", [True, False])
+def test_resolution_children_are_the_children_with_like_pattern_first(cls, many_length, optional_present):
+    node, expected = _build(cls, _Sentinels(), many_length=many_length, optional_present=optional_present)
+    assert _same_objects(walk.resolution_children(node), _resolution_order_of(node, expected))
+
+
+def test_resolution_children_of_like_are_pattern_left_escape():
+    left, pattern, escape = Literal(1, _POS), Literal(2, _POS), Literal(3, _POS)
+    node = Like(left=left, pattern=pattern, negated=False, position=_POS, escape=escape)
+    assert _same_objects(walk.resolution_children(node), (pattern, left, escape))
+    node = Like(left=left, pattern=pattern, negated=True, position=_POS)
+    assert _same_objects(walk.resolution_children(node), (pattern, left))
+
+
+@pytest.mark.parametrize("cls", _TYPES, ids=lambda cls: cls.__name__)
+@pytest.mark.parametrize("many_length", [0, 1, 3])
+@pytest.mark.parametrize("optional_present", [True, False])
+def test_rebuilding_in_resolution_order_puts_each_child_in_its_own_slot(cls, many_length, optional_present):
+    node, _old = _build(cls, _Sentinels(start=1000), many_length=many_length, optional_present=optional_present)
+    direct, new = _build(cls, _Sentinels(start=5000), many_length=many_length, optional_present=optional_present)
+    rebuilt = walk.with_resolution_children(node, list(_resolution_order_of(direct, new)))
+    assert type(rebuilt) is cls
+    assert _same_objects(children(rebuilt), new)
+    assert rebuilt == direct
+
+
+def test_resolution_order_raises_on_an_unknown_node_type():
+    @dataclass(frozen=True)
+    class Unknown(Expr):
+        position: Position
+
+    node = Unknown(_POS)
+    with pytest.raises(AssertionError, match="unhandled expression node type Unknown"):
+        walk.resolution_children(node)
+    with pytest.raises(AssertionError, match="unhandled expression node type Unknown"):
+        walk.with_resolution_children(node, [])

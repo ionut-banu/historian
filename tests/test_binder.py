@@ -24,6 +24,7 @@ issue's own grooming notes).
 """
 
 import dataclasses
+import sys
 
 import pytest
 
@@ -2860,3 +2861,229 @@ def test_group_by_plain_alias_resolves_to_the_select_items_expression():
     assert bound.group_by[0] == bound.select_list[0].expr
     assert isinstance(bound.group_by[0], BoundColumnRef)
     assert bound.group_by[0].name == "path"
+
+
+# --- One expression, several errors (issue #144) -----------------------------
+#
+# Which error is reported is compared against the oracle in
+# `tests/differential/test_error_walk.py`. What SQLite does not report
+# is asserted here: the position of the reported error, the names
+# offered with it, the clause a misuse message names, and that the walk
+# does not recurse.
+
+_AGGREGATES = ("avg", "count", "max", "min", "sum")
+
+
+@pytest.mark.parametrize(
+    ("sql", "message", "column", "offset", "available"),
+    [
+        ("SELECT nofn(1) + ghost FROM blame", "no such column: ghost", 18, 17, _BLAME_COLUMNS),
+        ("SELECT nofn(ghost) FROM blame", "no such column: ghost", 13, 12, _BLAME_COLUMNS),
+        ("SELECT nofn(path) + sum(ghost, 1) FROM blame", "no such column: ghost", 25, 24, _BLAME_COLUMNS),
+        ("SELECT sum(ghost, 1) + nofn(path) FROM blame", "no such function: nofn", 24, 23, _AGGREGATES),
+        ("SELECT nofn(1, ghost) FROM blame", "no such function: nofn", 8, 7, _AGGREGATES),
+        ("SELECT ghost1 LIKE ghost2 FROM blame", "no such column: ghost2", 20, 19, _BLAME_COLUMNS),
+        ("SELECT ghost1 IS ghost2 FROM blame", "no such column: ghost2", 18, 17, _BLAME_COLUMNS),
+        ("SELECT path FROM blame LIMIT avg() OFFSET -ghost", "wrong number of arguments to function avg()", 30, 29, ()),
+        ("SELECT path FROM blame LIMIT nofn(1) OFFSET ghost", "no such column: ghost", 45, 44, ()),
+    ],
+    ids=[
+        "column-after-call",
+        "column-inside-call",
+        "column-inside-second-call",
+        "call-after-call",
+        "call-before-tripped-argument",
+        "like-pattern-first",
+        "is-right-first",
+        "limit-arity-kept",
+        "offset-column-overwrites",
+    ],
+)
+def test_reported_error_carries_the_recording_nodes_position(sql, message, column, offset, available):
+    error = _bind_error(sql)
+    assert str(error) == message
+    assert error.position == Position(line=1, column=column, offset=offset)
+    assert error.available == available
+
+
+def test_nested_aggregate_is_reported_at_the_inner_call():
+    """`sum(1 + count(*))`: the inner call records the misuse, so the
+    error points at `count`, not at the argument it sits in."""
+    error = _bind_error("SELECT sum(1 + count(*)) FROM blame")
+    assert str(error).startswith("misuse of aggregate function count()")
+    assert error.position == Position(line=1, column=16, offset=15)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT path FROM blame ORDER BY count(*)",
+        "SELECT DISTINCT path FROM blame ORDER BY count(*)",
+        "SELECT path FROM blame ORDER BY path, 1 + count(*)",
+    ],
+)
+def test_order_by_misuse_names_order_by(sql):
+    message = str(_bind_error(sql))
+    assert message.startswith("misuse of aggregate")
+    assert "ORDER BY" in message
+    assert "WHERE" not in message
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT path FROM blame WHERE count(*) > 1",
+        "SELECT count(*) FROM blame WHERE count(*) > 1",
+        "SELECT path FROM blame WHERE count(*) > 1 GROUP BY path",
+    ],
+    ids=["non-aggregate-query", "aggregate-query-late", "group-by-late"],
+)
+def test_where_misuse_names_where(sql):
+    message = str(_bind_error(sql))
+    assert message.startswith("misuse of aggregate")
+    assert "WHERE" in message
+    assert "ORDER BY" not in message
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT sum(count(*)) FROM blame",
+        "SELECT path FROM blame ORDER BY sum(count(*))",
+        "SELECT count(*) FROM blame HAVING sum(count(*)) > 1",
+        "SELECT path FROM blame LIMIT count(*)",
+        "SELECT path FROM blame LIMIT 1 OFFSET count(*)",
+        "SELECT count(*) AS c FROM blame HAVING sum(c) > 1",
+    ],
+)
+def test_misuse_outside_where_and_order_by_names_neither(sql):
+    message = str(_bind_error(sql))
+    assert message.startswith("misuse of")
+    assert "WHERE" not in message
+    assert "ORDER BY" not in message
+
+
+_VERY_DEEP = 20_000
+
+
+@pytest.fixture
+def recursion_limit_1000():
+    previous = sys.getrecursionlimit()
+    sys.setrecursionlimit(1000)
+    yield
+    sys.setrecursionlimit(previous)
+
+
+def _deep_chain_with_ends(deepest, middle, last):
+    """`deepest + middle + ... + middle + last`, _VERY_DEEP terms, as
+    the parser's left-deep chain: *deepest* is the first leaf the walk
+    reaches and *last* the last."""
+    node = deepest()
+    for index in range(_VERY_DEEP - 1):
+        right = last() if index == _VERY_DEEP - 2 else middle()
+        node = BinaryOp(op=Operator.ADD, left=node, right=right, position=_POS)
+    return node
+
+
+def _place(clause: str, expr) -> SelectStatement:
+    from historian.sql.ast import OrderByItem
+
+    path = SelectItem(expr=ColumnRef(None, "path", _POS), alias=None, position=_POS)
+    count = SelectItem(expr=FunctionCall("count", (Star(None, _POS),), _POS), alias=None, position=_POS)
+    fields = {
+        "select_list": (path,),
+        "from_table": "blame",
+        "where": None,
+        "group_by": (),
+        "having": None,
+        "order_by": (),
+        "limit": None,
+        "offset": None,
+        "position": _POS,
+    }
+    if clause == "select":
+        fields["select_list"] = (SelectItem(expr=expr, alias=None, position=_POS),)
+    elif clause == "where":
+        fields["where"] = expr
+    elif clause == "having":
+        fields["select_list"] = (count,)
+        fields["having"] = expr
+    elif clause == "group_by":
+        fields["select_list"] = (count,)
+        fields["group_by"] = (expr,)
+    elif clause == "order_by":
+        fields["order_by"] = (OrderByItem(expr=expr, direction=OrderDirection.ASC, position=_POS),)
+    elif clause == "limit":
+        fields["limit"] = expr
+    else:
+        fields["limit"] = Literal(1, _POS)
+        fields["offset"] = expr
+    return SelectStatement(**fields)
+
+
+_CLAUSES = ["select", "where", "having", "group_by", "order_by", "limit", "offset"]
+
+
+@pytest.mark.parametrize("clause", _CLAUSES)
+def test_deep_tree_reports_the_first_recorded_error_when_the_rest_trips(clause, recursion_limit_1000):
+    """`nofn(1) + 1 + ... + 1 + ghost`: the call records, the first
+    literal after it stops the whole root, `ghost` is never reached."""
+    expr = _deep_chain_with_ends(
+        lambda: FunctionCall("nofn", (Literal(1, _POS),), _POS),
+        lambda: Literal(1, _POS),
+        lambda: ColumnRef(None, "ghost", _POS),
+    )
+    with pytest.raises(BindError, match=r"^no such function: nofn$"):
+        bind(_place(clause, expr), SCHEMAS)
+
+
+@pytest.mark.parametrize("clause", ["select", "where", "having", "group_by", "order_by"])
+def test_deep_tree_reports_the_error_at_the_far_end(clause, recursion_limit_1000):
+    """`nofn(1) + path + ... + path + ghost`: a resolved column never
+    trips, so the walk reaches the far end and `ghost` overwrites."""
+    expr = _deep_chain_with_ends(
+        lambda: FunctionCall("nofn", (Literal(1, _POS),), _POS),
+        lambda: ColumnRef(None, "path", _POS),
+        lambda: ColumnRef(None, "ghost", _POS),
+    )
+    with pytest.raises(BindError, match=r"^no such column: ghost$"):
+        bind(_place(clause, expr), SCHEMAS)
+
+
+@pytest.mark.parametrize("clause", ["limit", "offset"])
+def test_deep_limit_reports_the_error_at_the_far_end(clause, recursion_limit_1000):
+    """In LIMIT and OFFSET no column resolves, so the far-end call is
+    reached only through literals and calls: `1 + ... + 1 + nofn(1)`."""
+    expr = _deep_chain_with_ends(
+        lambda: Literal(1, _POS),
+        lambda: Literal(1, _POS),
+        lambda: FunctionCall("nofn", (Literal(1, _POS),), _POS),
+    )
+    with pytest.raises(BindError, match=r"^no such function: nofn$"):
+        bind(_place(clause, expr), SCHEMAS)
+
+
+@pytest.mark.parametrize("clause", _CLAUSES)
+def test_deep_tree_without_errors_binds_or_reaches_historians_own_rejection(clause, recursion_limit_1000):
+    expr = _deep_chain_with_ends(
+        lambda: Literal(1, _POS),
+        lambda: Literal(1, _POS),
+        lambda: Literal(1, _POS),
+    )
+    if clause in ("limit", "offset"):
+        with pytest.raises(BindError, match="must be a literal integer"):
+            bind(_place(clause, expr), SCHEMAS)
+    else:
+        bind(_place(clause, expr), SCHEMAS)
+
+
+def test_deep_nested_calls_unwind_one_argument_list_at_a_time(recursion_limit_1000):
+    """`nofn(nofn(... nofn(ghost, 1) ..., 1), 1)`: `ghost` overwrites
+    every call's own error and stops only the innermost argument list;
+    each enclosing list then meets its `1` with an error recorded and
+    stops there."""
+    expr = FunctionCall("nofn", (ColumnRef(None, "ghost", _POS), Literal(1, _POS)), _POS)
+    for _ in range(_VERY_DEEP):
+        expr = FunctionCall("nofn", (expr, Literal(1, _POS)), _POS)
+    with pytest.raises(BindError, match=r"^no such column: ghost$"):
+        bind(_place("where", expr), SCHEMAS)

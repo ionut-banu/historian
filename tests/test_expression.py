@@ -3186,3 +3186,103 @@ def test_non_whitespace_controls_are_not_skipped_by_affinity(ctl):
 
     assert try_numeric_affinity(ctl + "12") == ctl + "12"
     assert try_numeric_affinity("12" + ctl) == "12" + ctl
+
+
+# --- Constant propagation (#142): the stored value and the fixed column -------
+#
+# `apply_column_affinity` is SQLite's storage conversion (`OP_Affinity`),
+# the value a constant would have if stored in the column - what the
+# planner puts in a `FixedColumnRef`. Measured on the pinned oracle
+# through `||` on the replaced column (`tests/differential/
+# test_where_propagation.py`).
+
+
+@pytest.mark.parametrize(
+    "column_type, value, expected",
+    [
+        (ColumnType.INTEGER, 5, 5),
+        (ColumnType.INTEGER, "05", 5),
+        (ColumnType.INTEGER, " 5", 5),
+        (ColumnType.INTEGER, "5.0", 5),
+        (ColumnType.INTEGER, "5e0", 5),
+        (ColumnType.INTEGER, 5.0, 5),
+        (ColumnType.INTEGER, -0.0, 0),
+        (ColumnType.INTEGER, 5.5, 5.5),
+        (ColumnType.INTEGER, "5.5", 5.5),
+        (ColumnType.INTEGER, "x", "x"),
+        (ColumnType.INTEGER, None, None),
+        (ColumnType.INTEGER, 9223372036854775807, 9223372036854775807),
+        (ColumnType.INTEGER, 9223372036854775808.0, 9223372036854775808.0),
+        (ColumnType.INTEGER, -9223372036854775808.0, -9223372036854775808.0),
+        (ColumnType.INTEGER, -9223372036854774784.0, -9223372036854774784),
+        (ColumnType.INTEGER, float("inf"), float("inf")),
+        (ColumnType.REAL, 1, 1.0),
+        (ColumnType.REAL, "1", 1.0),
+        (ColumnType.REAL, " 1 ", 1.0),
+        (ColumnType.REAL, 1.5, 1.5),
+        (ColumnType.REAL, 9007199254740993, 9007199254740992.0),
+        (ColumnType.REAL, "y", "y"),
+        (ColumnType.REAL, None, None),
+        (ColumnType.TEXT, 5, "5"),
+        (ColumnType.TEXT, 5.0, "5.0"),
+        (ColumnType.TEXT, "05", "05"),
+        (ColumnType.TEXT, None, None),
+        (None, "05", "05"),
+        (None, 5.0, 5.0),
+    ],
+)
+def test_apply_column_affinity_is_the_stored_value(column_type, value, expected):
+    from historian.exec.expression import apply_column_affinity
+
+    got = apply_column_affinity(value, column_type)
+    assert type(got) is type(expected)
+    if isinstance(expected, float):
+        assert got.hex() == expected.hex()
+    else:
+        assert got == expected
+
+
+def _fixed(name: str, value):
+    from historian.sql.walk import FixedColumnRef
+
+    return FixedColumnRef(offset=_SCHEMA.index_of(name), name=name, value=value, position=_POS)
+
+
+def test_a_fixed_column_evaluates_to_its_value_not_the_rows():
+    from historian.exec.expression import evaluate
+
+    assert evaluate(_fixed("n", 7), _ROW, _SCHEMA) == 7
+    assert evaluate(_bin(Operator.CONCAT, _fixed("n", 7), _lit("x")), _ROW, _SCHEMA) == "7x"
+
+
+@pytest.mark.parametrize(
+    "expr, expected",
+    [
+        # `n` fixed to 5 keeps INTEGER affinity: `5 > '4'` compares numerically.
+        (lambda: _bin(Operator.GT, _fixed("n", 5), _lit("4")), True),
+        (lambda: _bin(Operator.LT, _lit("4"), _fixed("n", 5)), True),
+        (lambda: _bin(Operator.EQ, _fixed("n", 5), _lit("5")), True),
+        (lambda: Is(left=_fixed("n", 5), right=_lit("5"), negated=False, position=_POS), True),
+        (lambda: In(left=_fixed("n", 5), values=(_lit("5"),), negated=False, position=_POS), True),
+        (lambda: Between(operand=_fixed("n", 5), low=_lit("4"), high=_lit("6"), negated=False, position=_POS), True),
+        # An IN list element has no affinity, fixed or not.
+        (lambda: In(left=_lit("5"), values=(_fixed("n", 5),), negated=False, position=_POS), False),
+        # Inside an expression there is no affinity.
+        (lambda: _bin(Operator.EQ, _bin(Operator.ADD, _fixed("n", 5), _lit(0)), _lit("5")), False),
+        # TEXT: `'5' < '10'` is FALSE as text, `'5' > 4` TRUE.
+        (lambda: _bin(Operator.LT, _fixed("s", "5"), _lit("10")), False),
+        (lambda: _bin(Operator.GT, _fixed("s", "5"), _lit(4)), True),
+        # REAL fixed to 1.0 against '1'.
+        (lambda: _bin(Operator.EQ, _fixed("r", 1.0), _lit("1")), True),
+        # Two fixed columns: numeric affinity wins.
+        (lambda: _bin(Operator.EQ, _fixed("s", "5"), _fixed("n", 5)), True),
+    ],
+)
+def test_a_fixed_column_keeps_its_columns_affinity_in_comparisons(expr, expected):
+    """Oracle: `t(n INTEGER, s TEXT, r REAL)` with the `WHERE` shapes in
+    `tests/differential/test_where_propagation.py`. The row is `(5,
+    '5', 5.0)` but a fixed column never reads it, so a row value that
+    disagrees would not change the answer either."""
+    from historian.exec.expression import evaluate
+
+    assert evaluate(expr(), (99, "99", 99.0), _SCHEMA) is expected

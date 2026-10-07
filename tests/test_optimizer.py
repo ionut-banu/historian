@@ -420,3 +420,45 @@ def test_a_moved_term_the_scan_would_reject_is_not_offered_either():
     assert source.offered == []
     assert _scan_of(tree).pushed() == ()
     assert sorted(tree.rows()) == [(2,), (5,)]
+
+
+# --- Constant propagation in WHERE (#142) -------------------------------------
+#
+# `plan()` rewrites the `WHERE` before `optimize()` sees it, and the terms
+# offered are the rewritten ones - the same objects the `Filter` keeps.
+
+
+def test_the_rewritten_terms_are_the_ones_offered_and_kept():
+    """`a > 0 AND a = 1`: the source `a = 1` is kept as bound, and `a >
+    0` becomes `1 > 0` with the constant in `a`'s place. A source that
+    accepts everything is offered exactly the `Filter`'s own terms, in
+    order, and pushes both. Oracle: `2`, `5`, `NULL`, `2`."""
+    source = _AcceptEverythingSource()
+    bound = _bind("SELECT b FROM gadgets WHERE a > 0 AND a = 1")
+    tree = optimize(plan(bound, Path("/nonexistent"), tables={"gadgets": lambda repo: source}))
+    from historian.sql.walk import FixedColumnRef
+
+    filter_terms = split_conjuncts(child_of(tree).predicate())
+    assert len(source.offered) == 2
+    assert all(offered is kept for offered, kept in zip(source.offered, filter_terms))
+    rewritten, kept_source = source.offered
+    assert kept_source is bound.where.right
+    assert rewritten is not bound.where.left
+    assert isinstance(rewritten.left, FixedColumnRef) and rewritten.left.value == 1
+    assert rewritten.right is bound.where.left.right
+    assert list(_scan_of(tree).pushed()) == [rewritten, kept_source]
+    assert sorted(tree.rows(), key=repr) == sorted([(2,), (5,), (None,), (2,)], key=repr)
+
+
+def test_a_rewritten_earlier_source_is_not_accepted():
+    """`a = 1 AND a = 1`: the last source is used, the first becomes
+    `1 = 1`, which is not `a = <literal>`, so the recording double
+    accepts only the last."""
+    source = _RecordingGadgetSource()
+    bound = _bind("SELECT b FROM gadgets WHERE a = 1 AND a = 1")
+    tree = optimize(plan(bound, Path("/nonexistent"), tables={"gadgets": lambda repo: source}))
+    assert len(source.offered) == 2
+    assert source.offered[0] is not bound.where.left
+    assert source.accepted == [bound.where.right]
+    assert list(_scan_of(tree).pushed()) == [bound.where.right]
+    assert sorted(tree.rows(), key=repr) == sorted([(2,), (5,), (None,), (2,)], key=repr)

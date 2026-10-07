@@ -562,3 +562,108 @@ def test_references_only_keys_raises_on_an_unknown_node_type():
 
     with pytest.raises(AssertionError, match="unhandled expression node type Unknown"):
         walk.references_only_keys(Unknown(_POS), ())
+
+
+# --- Constant propagation helpers (#142) ------------------------------------------
+#
+# `FixedColumnRef`, `fix_columns` and `replace_conjuncts` are looked up on
+# the module at run time.
+
+
+def _fixed(offset: int = 1, value: object = 5, position: Position = _POS):
+    return walk.FixedColumnRef(offset=offset, name="line_no", value=value, position=position)
+
+
+def test_a_fixed_column_ref_is_a_leaf_whose_value_is_part_of_its_shape():
+    node = _fixed()
+    assert children(node) == ()
+    assert with_children(node, ()) is node
+    assert expr_shape_equal(node, _fixed(position=_OTHER_POS)) is True
+    assert expr_shape_equal(node, _fixed(value=6)) is False
+    assert expr_shape_equal(node, _fixed(value=5.0)) is False
+    assert expr_shape_equal(node, _fixed(offset=2)) is False
+    assert expr_shape_equal(node, _NOT_KEY) is False
+
+
+@pytest.mark.parametrize(
+    ("cls", "index"), _CHILD_CASES, ids=[f"{cls.__name__}[{index}]" for cls, index in _CHILD_CASES]
+)
+def test_fix_columns_replaces_a_listed_column_in_every_child_slot(cls, index):
+    """A column whose offset is listed becomes a `FixedColumnRef` with
+    that value, keeping its name and position; every other child is
+    the same object; a column not listed is left as it is."""
+    node, kids = _build(cls, _Sentinels())
+    replaced = list(kids)
+    replaced[index] = _NOT_KEY
+    rebuilt = walk.fix_columns(with_children(node, replaced), {1: 5})
+    got = children(rebuilt)
+    assert got[index] == walk.FixedColumnRef(offset=1, name="line_no", value=5, position=_NOT_KEY.position)
+    assert all(got[i] is replaced[i] for i in range(len(replaced)) if i != index)
+    replaced[index] = _KEY
+    untouched = with_children(node, replaced)
+    assert walk.fix_columns(untouched, {1: 5}) is untouched
+
+
+def test_fix_columns_with_nothing_listed_is_the_same_object():
+    expr = BinaryOp(op=Operator.GT, left=_NOT_KEY, right=Literal(1, _POS), position=_POS)
+    assert walk.fix_columns(expr, {}) is expr
+    assert walk.fix_columns(_NOT_KEY, {1: None}) == _fixed(value=None)
+
+
+def test_fix_columns_rejects_an_unbound_tree():
+    with pytest.raises(AssertionError, match="bound"):
+        walk.fix_columns(ColumnRef(table=None, name="path", position=_POS), {0: "a"})
+
+
+def test_fix_columns_raises_on_an_unknown_node_type():
+    @dataclass(frozen=True)
+    class Unknown(Expr):
+        position: Position
+
+    with pytest.raises(AssertionError, match="unhandled expression node type Unknown"):
+        walk.fix_columns(Unknown(_POS), {0: "a"})
+
+
+def test_fix_columns_on_a_deep_tree():
+    node: Expr = _NOT_KEY
+    for _ in range(20000):
+        node = BinaryOp(op=Operator.ADD, left=node, right=_KEY, position=_POS)
+    rebuilt = walk.fix_columns(node, {1: 7})
+    deepest = rebuilt
+    while isinstance(deepest, BinaryOp):
+        assert deepest.right is _KEY
+        deepest = deepest.left
+    assert deepest == _fixed(value=7)
+
+
+def test_replace_conjuncts_keeps_the_and_shape():
+    a, b, c, d = (Literal(index, _POS) for index in range(4))
+    w, x, y, z = (Literal(index + 10, _POS) for index in range(4))
+    left = _and(a, b)
+    right = _and(c, d)
+    whole = _and(left, right)
+    rebuilt = walk.replace_conjuncts(whole, [w, b, c, z])
+    assert isinstance(rebuilt, And) and isinstance(rebuilt.left, And) and isinstance(rebuilt.right, And)
+    assert rebuilt.left.left is w and rebuilt.left.right is b
+    assert rebuilt.right.left is c and rebuilt.right.right is z
+    assert rebuilt.position == whole.position
+    assert walk.replace_conjuncts(whole, [a, b, c, d]) is whole
+    partly = walk.replace_conjuncts(whole, [a, b, y, d])
+    assert partly.left is left and partly.right is not right
+    assert walk.replace_conjuncts(a, [x]) is x
+
+
+def test_replace_conjuncts_needs_one_term_per_conjunct():
+    a, b = Literal(1, _POS), Literal(2, _POS)
+    with pytest.raises(AssertionError):
+        walk.replace_conjuncts(_and(a, b), [a])
+    with pytest.raises(AssertionError):
+        walk.replace_conjuncts(_and(a, b), [a, b, a])
+
+
+def test_replace_conjuncts_on_a_deep_chain():
+    terms = [Literal(index, _POS) for index in range(20000)]
+    new_terms = [Literal(-index, _POS) for index in range(20000)]
+    rebuilt = walk.replace_conjuncts(walk.join_conjuncts(terms), new_terms)
+    got = walk.split_conjuncts(rebuilt)
+    assert len(got) == len(new_terms) and all(x is y for x, y in zip(got, new_terms))

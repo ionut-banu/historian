@@ -151,6 +151,29 @@ def test_moved_having_filter_line_sits_above_the_where_filter_line():
     ]
 
 
+def test_a_propagated_constant_prints_in_the_columns_place():
+    """#142: the source keeps its column; every other `line_no` prints
+    as the constant, converted by the column's affinity (`'05'` is the
+    INTEGER `5`). The fake accepts `=` terms, so the source is pushed."""
+    lines = _explain(
+        "SELECT path FROM blame WHERE NOT (line_no = 5 AND path LIKE 'a' ESCAPE 'ab') AND line_no = '05'"
+    )
+    assert lines == [
+        "Project (path)",
+        "  Filter (NOT (5 = 5 AND path LIKE 'a' ESCAPE 'ab') AND line_no = '05')",
+        "    FakeScan (pushed: line_no = '05' -> 1 of 5 paths)",
+    ]
+
+
+def test_a_propagated_text_constant_prints_as_text():
+    """`path` is TEXT: the INTEGER `5` becomes the text `'5'`."""
+    assert _where("path || 'x' > 'a' AND path = 5") == "'5' || 'x' > 'a' AND path = 5"
+
+
+def test_a_where_with_no_source_prints_as_before():
+    assert _where("line_no <> 5 AND path > 'a'") == "line_no <> 5 AND path > 'a'"
+
+
 def test_limit_offset_distinct_and_sort_lines():
     lines = _explain(
         "SELECT DISTINCT author_name FROM blame ORDER BY author_name LIMIT 5 OFFSET 2"

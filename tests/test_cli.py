@@ -903,6 +903,22 @@ def test_explain_shows_a_moved_having_term_below_aggregate(tiny_repo, capsys):
     )
 
 
+_PROPAGATED_QUERY = "SELECT path FROM blame WHERE NOT (line_no = 5 AND path LIKE 'a' ESCAPE 'ab') AND line_no = 5"
+
+
+def test_explain_shows_a_propagated_constant_in_the_columns_place(tiny_repo, capsys):
+    """#142: the source term still names its column and the guard shows
+    the constant where `line_no` was; nothing is pushed (`line_no`
+    never is)."""
+    ret, out, _err = _explain(tiny_repo, _PROPAGATED_QUERY, capsys)
+    assert ret == 0
+    assert out == (
+        "Project (path)\n"
+        "  Filter (NOT (5 = 5 AND path LIKE 'a' ESCAPE 'ab') AND line_no = 5)\n"
+        "    BlameScan (pushed: none -> 2 of 2 paths)\n"
+    )
+
+
 @pytest.mark.parametrize(
     "query",
     ["SELEC path FROM blame", "SELECT path FROM", "SELECT nope FROM blame", "SELECT path FROM 'x"],
@@ -1128,6 +1144,16 @@ def test_a_moved_having_term_raises_with_and_without_pushdown(tiny_repo, capsys,
     """#141: the move is `plan()`'s, not the optimizer's, so
     `--no-pushdown` moves the same term and raises as SQLite does."""
     ret, out, err, _scans = _run(tiny_repo, _MOVED_HAVING_QUERY, capsys, *flags)
+    assert ret == 1
+    assert out == ""
+    assert err == "error: ESCAPE expression must be a single character\n"
+
+
+@pytest.mark.parametrize("flags", [(), ("--no-pushdown",)])
+def test_a_propagated_constant_raises_with_and_without_pushdown(tiny_repo, capsys, flags):
+    """#142: the rewrite is `plan()`'s, not the optimizer's, so
+    `--no-pushdown` rewrites the same guard and raises as SQLite does."""
+    ret, out, err, _scans = _run(tiny_repo, _PROPAGATED_QUERY, capsys, *flags)
     assert ret == 1
     assert out == ""
     assert err == "error: ESCAPE expression must be a single character\n"

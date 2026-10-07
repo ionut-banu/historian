@@ -36,6 +36,12 @@ depends on the node it meets (`_visit`, one branch per rule):
    recorded an error.
 6. Every other node ABORTs at once if an error is already recorded;
    otherwise it walks its children and passes an ABORT up.
+7. `x [NOT] IN (e)`, one element and that element constant (no column
+   and no function call in it, `sql/walk.py`'s `is_constant`), is
+   SQLite's `x = +e` (`NOT (x = +e)`): the node trips like rule 6,
+   `x` is walked, then the `+` trips if anything is recorded, then `e`
+   is walked. The `+` is what tells it apart from an `IN` list: `e`
+   itself may be a node that never trips (`IS NULL`, `LIKE`).
 
 An ABORT unwinds to the nearest enclosing call, `LIKE` or `IS NULL`,
 which returns normally, or ends the root. A root is one select-list
@@ -158,6 +164,7 @@ from historian.sql.ast import (
     ColumnRef,
     Expr,
     FunctionCall,
+    In,
     Is,
     Like,
     Literal,
@@ -169,6 +176,7 @@ from historian.sql.walk import (
     BoundColumnRef,
     children,
     contains_aggregate,
+    is_constant,
     resolution_children,
     with_resolution_children,
 )
@@ -541,11 +549,14 @@ def _is_star_call(call: FunctionCall) -> bool:
 # `_RETURN` does the same for a function call, `LIKE` or `IS NULL`, and
 # is also the frame marker an ABORT unwinds to. `_IS_RIGHT` is rule 5's
 # right-hand column, already resolved, met again after the left operand.
+# `_IN_PLUS` is rule 7's `+`, between a one-element `IN`'s left operand
+# and its element.
 
 _VISIT = 0
 _REBUILD = 1
 _RETURN = 2
 _IS_RIGHT = 3
+_IN_PLUS = 4
 
 #: The walk's explicit stack of `(node, step, permission)` entries.
 _Pending = list[tuple[Expr, int, int]]
@@ -624,6 +635,19 @@ def _visit_is_column(
     return None, False
 
 
+def _visit_one_element_in(node: In, element: Expr, permission: int, pending: _Pending) -> None:
+    """Rule 7: the left operand, then SQLite's `+` (`_IN_PLUS`), then
+    the element. Whether the element is constant is asked only when the
+    `+` is reached with an error recorded - the only time the answer
+    matters - so a chain of nested one-element lists is not checked once
+    per level: an `IN` met with an error recorded trips at its own visit
+    and never reaches its `+`."""
+    pending.append((node, _REBUILD, permission))
+    pending.append((element, _VISIT, permission))
+    pending.append((element, _IN_PLUS, permission))
+    pending.append((node.left, _VISIT, permission))
+
+
 def _visit(
     node: Expr, permission: int, tripped: bool, ctx: _Context, pending: _Pending, results: list[Expr]
 ) -> tuple[BindError | None, bool]:
@@ -658,6 +682,9 @@ def _visit(
     # Rule 6: every other node trips on a recorded error.
     if tripped:
         return None, True
+    if isinstance(node, In) and len(node.values) == 1:
+        _visit_one_element_in(node, node.values[0], permission, pending)
+        return None, False
     operands = resolution_children(node)
     if len(operands) == 0:
         results.append(node)
@@ -715,6 +742,8 @@ def _bind_exprs(roots: tuple[Expr, ...], ctx: _Context) -> tuple[Expr, ...]:
                 abort = True
             else:
                 results.append(node)
+        elif step == _IN_PLUS:
+            abort = recorded is not None and is_constant(node)
         else:
             error, abort = _visit(node, permission, recorded is not None, ctx, pending, results)
             if error is not None:

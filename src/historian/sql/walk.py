@@ -1,7 +1,8 @@
 """The shared expression-tree walks: what a node's children are (and in
 which order SQLite resolves their names, #144), how to
 rebuild a node around new ones, whether two trees have the same shape,
-whether a query aggregates, how a condition splits into `AND`-terms and
+whether a tree is what SQLite's parser calls constant (#144), whether a
+query aggregates, how a condition splits into `AND`-terms and
 joins back, whether a term reads only `GROUP BY` keys, and how a column
 is replaced by a constant (#142).
 
@@ -67,6 +68,7 @@ __all__ = [
     "expr_shape_equal",
     "fix_columns",
     "is_aggregate_query",
+    "is_constant",
     "join_conjuncts",
     "references_only_keys",
     "replace_conjuncts",
@@ -279,6 +281,30 @@ def contains_aggregate(expr: Expr) -> bool:
             raise AssertionError("sql/walk.py: contains_aggregate needs a bound tree")
         pending.extend(children(node))
     return False
+
+
+def is_constant(expr: Expr) -> bool:
+    """Whether *expr* is constant the way SQLite's parser decides it
+    (`sqlite3ExprIsConstant`, before any name is resolved): no column
+    reference and no function call anywhere in its tree. `LIKE` is
+    SQLite's built-in `like()`, a constant function, so it is constant
+    when its operands are. Any `FunctionCall` is not: historian's are
+    aggregates or unknown names, neither constant to SQLite - and a
+    built-in scalar SQLite would count (`abs(1)`) is an unknown name to
+    historian until #183. SQLite's parser also folds `x AND 0` and `x IN
+    ()` (with no call in `x`) to a constant first; historian does not
+    fold them (#185), so here a column under such a fold still makes the
+    tree not constant. (`sql/parser.py`'s `_node_height` keeps its own
+    constant flag, for heights.) The binder uses this for a one-element
+    `IN` list (#144). A loop over an explicit stack of nodes (#107); the
+    order they are visited in does not matter for a yes/no answer."""
+    pending: list[Expr] = [expr]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ColumnRef, BoundColumnRef, FixedColumnRef, FunctionCall, Star)):
+            return False
+        pending.extend(children(node))
+    return True
 
 
 def is_aggregate_query(group_by: Sequence[Expr], exprs: Iterable[Expr]) -> bool:

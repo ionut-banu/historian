@@ -648,6 +648,61 @@ constant `WHERE` term once before any row, which historian does not do
 yet (#171), so a moved constant behaves as a constant in a plain
 `WHERE` does.
 
+### Constant propagation in `WHERE`
+
+SQLite rewrites a `WHERE` before it runs it: a top-level term of the
+form `column = constant` is propagated into every other term, which
+changes which sub-expressions are evaluated and so which queries raise.
+It never changes which rows pass - a row that passes the source already
+has that value in that column. The planner does the same rewrite, so
+`WHERE NOT (line_no = 5 AND path LIKE 'a' ESCAPE 'ab') AND line_no = 5`
+raises in both engines. The rule, measured against the oracle
+(`_docs/decisions.md`, 2026-10-07, #142):
+
+- `WHERE` is split into terms on every `AND`, through nested `AND`s and
+  parentheses, left to right, as `HAVING` is above. A term is a
+  *source* when it is `X = K`, `K = X` or `X IN (K)` with exactly one
+  element (SQLite reads that as `X = K`), where `X` is a column
+  reference, bare or qualified, and `K` is a literal (`NULL` included)
+  or a chain of unary `+`/`-` over a numeric literal, any parentheses
+  on either. Nothing else is a source: not `IS`, `<>`, `BETWEEN`,
+  `LIKE`, `NOT IN`, a two-element `IN`, `+X = K`, `X + 0 = K`, `X =
+  X`, and not a source under `NOT`, under `OR`, or anywhere below the
+  top-level `AND`s. A `K` that is any other constant expression
+  (`line_no = 2 + 3`) is not handled yet (#179).
+- Of two sources for one column, the *last* is used; the earlier one is
+  rewritten like any other term. Sources for different columns are all
+  used.
+- Every occurrence of a source's column in every other term, at any
+  depth (under `NOT`, `OR`, in `IN` lists, `BETWEEN`, `LIKE` and its
+  `ESCAPE`, arithmetic, `||`, comparisons, `IS`), is replaced by the
+  constant; the source used keeps its own column. A term before the
+  source is rewritten as well as one after it.
+- The replacement holds the value the constant would have if stored in
+  the column: the column's affinity is applied to it (`line_no = '05'`,
+  `= 5.0` and `= ' 5'` give the INTEGER `5`; a REAL column's `r = 1`
+  gives `1.0`; a TEXT column's `line = 5` gives `'5'`; a constant the
+  affinity cannot convert, `line_no = 'x'`, stays as it is).
+- The replaced operand is still the column as far as affinity goes: as
+  an operand of a comparison, `IS`, `IN`'s left side or `BETWEEN` it
+  has the column's affinity (`line_no > '4'` with `line_no` replaced
+  by `5` is `5 > 4`, `TRUE`). Inside an expression (`line_no + 0`,
+  `line_no || ''`) it has none, as the column has none there.
+- Only the `WHERE` is rewritten. The select list, `GROUP BY`,
+  `HAVING` (whether its terms move below the aggregate or not), `ORDER
+  BY` and aggregate arguments keep the column, and a `HAVING` term is
+  never a source.
+- A comparison whose collation is not `BINARY` is not a source in
+  SQLite. v1 has no `COLLATE` and every column is `BINARY`, so there is
+  no such case yet.
+
+The planner does this, not the optimizer, so `--no-pushdown` rewrites
+the same terms; the `WHERE` `Filter` holds the rewritten terms, and a
+`WHERE` with no source is left exactly as bound. A term the rewrite
+leaves with no column reference (`line_no > 5` beside `line_no = 5`)
+is decided by SQLite once before any row; historian evaluates it per
+row, in order, as it does any constant term (#171, #180).
+
 ### Expression evaluation
 
 `exec/expression.py` walks an expression against a row and returns a
@@ -694,7 +749,11 @@ The optimizer's one job in v1.
    is not split - a disjunction is one term, and pushes down only if a
    scan accepts the whole thing.
 2. Offer each term to the scan beneath it, left to right, one
-   `accepts(term)` call per term. Only the `WHERE` filter directly
+   `accepts(term)` call per term. The terms offered are the terms as
+   rewritten by constant propagation (see above), the same objects the
+   `Filter` keeps: a term in which a column became a constant is
+   offered with the constant in it, and a scan that recognises only a
+   column does not accept it. Only the `WHERE` filter directly
    above the scan is negotiated - never `HAVING`, and never the
    `Filter` of `HAVING` terms that moved below the aggregate (see
    above), which sits above it, or directly above the scan when there

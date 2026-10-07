@@ -270,6 +270,39 @@ def test_clause_shapes(tiny_repo, empty_conn, query, expected):
     _assert_same_error(empty_conn, tiny_repo, query)
 
 
+# --- An ordinal SQLite rejects at its own turn --------------------------------
+#
+# Found by the sweep below, outside the walk: SQLite checks an ORDER BY
+# or GROUP BY term that is an integer (through any unary signs and
+# parentheses) when it reaches that term, and rejects it there if it is
+# below 1 or above 65535; an ordinal in between that is past the end of
+# the select list is rejected only after every term's names (#115).
+# A value outside a 32-bit int is no ordinal to SQLite at all.
+
+ORDINAL_CASES = [
+    ("SELECT path FROM blame ORDER BY 0, ghost", "1st ORDER BY term out of range - should be between 1 and 1"),
+    ("SELECT path FROM blame ORDER BY -1, ghost", "1st ORDER BY term out of range - should be between 1 and 1"),
+    ("SELECT path FROM blame ORDER BY - - 0, ghost", "1st ORDER BY term out of range - should be between 1 and 1"),
+    ("SELECT path FROM blame ORDER BY 65536, ghost", "1st ORDER BY term out of range - should be between 1 and 1"),
+    ("SELECT path FROM blame ORDER BY path, 0, ghost", "2nd ORDER BY term out of range - should be between 1 and 1"),
+    ("SELECT path FROM blame ORDER BY (-1), count(count(*))", "1st ORDER BY term out of range - should be between 1 and 1"),
+    ("SELECT path FROM blame ORDER BY ghost, 0", "no such column: ghost"),
+    ("SELECT path FROM blame ORDER BY 65535, ghost", "no such column: ghost"),
+    ("SELECT path FROM blame ORDER BY 2, ghost", "no such column: ghost"),
+    ("SELECT path FROM blame ORDER BY 2147483648, ghost", "no such column: ghost"),
+    ("SELECT path FROM blame GROUP BY 0, ghost", "1st GROUP BY term out of range - should be between 1 and 1"),
+    ("SELECT path FROM blame GROUP BY -1, ghost", "1st GROUP BY term out of range - should be between 1 and 1"),
+    ("SELECT path FROM blame GROUP BY 70000, ghost", "1st GROUP BY term out of range - should be between 1 and 1"),
+    ("SELECT path FROM blame GROUP BY 2, ghost", "no such column: ghost"),
+]
+
+
+@pytest.mark.parametrize(("query", "expected"), ORDINAL_CASES)
+def test_ordinal_rejected_at_its_turn(tiny_repo, empty_conn, query, expected):
+    _assert_measured(empty_conn, query, expected)
+    _assert_same_error(empty_conn, tiny_repo, query)
+
+
 # --- The generated sweep -----------------------------------------------------
 #
 # Random expression trees up to three levels deep over the leaves and

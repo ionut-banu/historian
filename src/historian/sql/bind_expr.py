@@ -123,6 +123,8 @@ from historian.sql.ast import (
     ColumnRef,
     Expr,
     FunctionCall,
+    Is,
+    Like,
     Literal,
     SelectStatement,
     Star,
@@ -132,7 +134,8 @@ from historian.sql.walk import (
     BoundColumnRef,
     children,
     contains_aggregate,
-    with_children,
+    resolution_children,
+    with_resolution_children,
 )
 
 
@@ -182,22 +185,28 @@ class _Context:
     alias_fallback: bool = False
     alias_first: bool = False
     #: `True` while binding a clause where an aggregate call is never
-    #: legal, regardless of name or arity: `WHERE`, and `ORDER BY` of
-    #: a non-aggregate query. `False` (the default) for the select
-    #: list, `GROUP BY` and `HAVING`.
+    #: legal, regardless of name or arity: `WHERE`, `ORDER BY` of a
+    #: non-aggregate query, and `LIMIT`/`OFFSET`. `False` (the default)
+    #: for the select list, `GROUP BY` and `HAVING`.
     reject_aggregates: bool = False
-    #: Issue #115: where a rejected aggregate goes. `None` raises it on
-    #: the spot (WHERE of a non-aggregate query). A list collects it
-    #: instead, and binding goes on as if the call were legal: `bind()`
-    #: raises the first collected error only after GROUP BY, because
-    #: that is when SQLite reports an aggregate call in the WHERE of an
-    #: aggregate query, or in the ORDER BY of a non-aggregate one. See
-    #: `sql/binder.py`'s "Resolution order".
+    #: Issue #115: where a rejected aggregate goes. `None` records it
+    #: in the walk, where it stands (WHERE of a non-aggregate query,
+    #: LIMIT/OFFSET). A list collects it instead, and the walk goes on
+    #: as if the call were legal: `bind()` raises the first collected
+    #: error only after GROUP BY, and only if nothing else was raised,
+    #: because that is when SQLite reports an aggregate call in the
+    #: WHERE of an aggregate query, or in the ORDER BY of a
+    #: non-aggregate one. See `sql/binder.py`'s "Resolution order".
     late_misuse: list[BindError] | None = None
     #: Issue #144: the clause `reject_aggregates` is set for, named in
     #: the misuse message (`"WHERE"`, `"ORDER BY"`), so the message
-    #: names the clause the call was found in.
+    #: names the clause the call was found in. Empty for LIMIT/OFFSET,
+    #: whose message names no clause.
     clause: str = ""
+    #: Issue #144: `False` for LIMIT/OFFSET, which SQLite resolves
+    #: against no table at all - every column reference there, a real
+    #: column or an alias, is "no such column".
+    columns_visible: bool = True
 
 
 # --- FROM-table resolution -------------------------------------------------
@@ -222,40 +231,25 @@ def _resolve_table(stmt: SelectStatement, catalog: dict[str, Schema]) -> _Contex
 
 
 # --- Column and Star resolution --------------------------------------------
+#
+# Every lookup here returns the error it finds rather than raising it:
+# the walk below decides whether an error is the one reported (#144).
+
+
+def _column_error(ref: ColumnRef, available: tuple[str, ...]) -> BindError:
+    """`no such column`, naming the reference as written - `name`, or
+    the whole dotted `table.name`."""
+    display = f"{ref.table}.{ref.name}" if ref.table is not None else ref.name
+    return BindError(f"no such column: {display}", ref.position, available)
 
 
 def _lookup_column(ref: ColumnRef, ctx: _Context) -> BoundColumnRef | None:
-    """Look up `ref` against `ctx.schema` alone; `None` if no real
-    column matches by name.
-
-    A qualifier that does not match the FROM table - whether a real,
-    unrelated table or an unknown name - still raises immediately
-    rather than returning `None`: "no such column: <qualifier>.<name>",
-    the whole dotted reference verbatim, never "no such table". This is
-    the opposite of `_bind_star`'s qualifier check below; both are
-    separately confirmed against `sqlite3` and must not be unified.
-    Factored out of `_bind_column_ref` so `_resolve_name` can try the
-    real-column candidate without a raise-and-catch dance.
-    """
-    if ref.table is not None and not _same_name(ref.table, ctx.table_name):
-        raise BindError(f"no such column: {ref.table}.{ref.name}", ref.position, ctx.schema.names)
+    """Look up `ref.name` against `ctx.schema` alone; `None` if no real
+    column matches by name. The qualifier is the caller's to check."""
     for offset, column in enumerate(ctx.schema.columns):
         if _same_name(column.name, ref.name):
             return BoundColumnRef(offset=offset, name=column.name, position=ref.position)
     return None
-
-
-def _bind_column_ref(ref: ColumnRef, ctx: _Context) -> BoundColumnRef:
-    """Resolve a bare or table-qualified `ColumnRef` against the FROM
-    table's schema only - no select-list alias fallback. Used directly
-    wherever alias fallback does not apply (select-list items, a
-    qualified reference anywhere) and as the schema-only half of
-    `_resolve_name`'s fallback below."""
-    bound = _lookup_column(ref, ctx)
-    if bound is not None:
-        return bound
-    display = f"{ref.table}.{ref.name}" if ref.table is not None else ref.name
-    raise BindError(f"no such column: {display}", ref.position, ctx.schema.names)
 
 
 def _find_alias_expr(name: str, ctx: _Context) -> Expr | None:
@@ -281,65 +275,48 @@ def _find_alias_expr(name: str, ctx: _Context) -> Expr | None:
     return None
 
 
-def _reject_aliased_aggregate(ref: ColumnRef, resolved: Expr, ctx: _Context) -> None:
-    # Issue #102: a real column is never an aggregate call, so this
-    # only ever fires for the alias branch - a bare reference to a
-    # select-list alias that turns out to name an aggregate call,
-    # reached in a clause where an aggregate is never legal at all
-    # (`ctx.reject_aggregates`, the same flag `_validate_function_call`
-    # already checks for a *literal* aggregate call written directly
-    # here). `WHERE c > 1` (c aliasing `count(*)`) is exactly this -
-    # `sqlite3`'s own "misuse of aggregate: count()", confirmed against
-    # the oracle - and it must be rejected unconditionally, before any
-    # row is ever considered, the same way the literal-call case
-    # already is.
-    if ctx.reject_aggregates and contains_aggregate(resolved):
-        _reject_aggregate(
-            BindError(
-                f"misuse of aggregate: aliased column {ref.name} refers to an aggregate call, "
-                "which is not allowed here",
-                ref.position,
-                (),
-            ),
-            ctx,
-        )
+def _resolve_column(ref: ColumnRef, ctx: _Context) -> tuple[Expr | None, BindError | None]:
+    """Resolve `ref` to a bound column or, with `ctx.alias_fallback`, a
+    select-list alias's bound expression - see the module docstring's
+    "`WHERE` resolving a select-list alias" section (issue #32).
+    Returns `(bound, None)`, or `(None, error)` when nothing matches.
 
+    A qualifier that does not match the FROM table - whether a real,
+    unrelated table or an unknown name - is "no such column: <qualifier>.
+    <name>", the whole dotted reference verbatim, never "no such
+    table". This is the opposite of `_bind_star`'s qualifier check
+    below; both are separately confirmed against `sqlite3` and must not
+    be unified. A qualified reference never falls back to an alias -
+    confirmed against `sqlite3` (`select b as x from t where t.x = 10`
+    still raises "no such column: t.x"): aliases have no table
+    qualifier to match against.
 
-def _resolve_name(ref: ColumnRef, ctx: _Context) -> Expr:
-    """Resolve `ref`, falling back to a select-list alias of the same
-    name when no real column claims it - see the module docstring's
-    "`WHERE` resolving a select-list alias" section for the full
-    rationale (issue #32). Only called when `ctx.alias_fallback` is
-    set; `_bind_expr` calls `_bind_column_ref` directly otherwise.
+    For an unqualified name with the fallback on, both a real-column
+    match and an alias match are looked up, and `ctx.alias_first`
+    decides which one wins when both exist: `False` for `WHERE`/`GROUP
+    BY`/`HAVING` (the real column wins), `True` for `ORDER BY` (the
+    alias wins instead - confirmed against `sqlite3`, the one clause
+    where the four are not uniform).
 
-    A table-qualified `ref` skips the fallback entirely and resolves
-    exactly as `_bind_column_ref` always has. For an unqualified name,
-    both a real-column match and an alias match are looked up, and
-    `ctx.alias_first` decides which one wins when both exist: `False`
-    for `WHERE`/`GROUP BY`/`HAVING` (the real column wins), `True` for
-    `ORDER BY` (the alias wins instead - confirmed against `sqlite3`,
-    the one clause where the four are not uniform). `bind()` calls it
-    with both values.
+    With `ctx.columns_visible` off (LIMIT/OFFSET) nothing resolves.
     """
-    if ref.table is not None:
-        return _bind_column_ref(ref, ctx)
-
+    if not ctx.columns_visible:
+        return None, _column_error(ref, ())
+    if ref.table is not None and not _same_name(ref.table, ctx.table_name):
+        return None, _column_error(ref, ctx.schema.names)
     column_match = _lookup_column(ref, ctx)
-    alias_match = _find_alias_expr(ref.name, ctx)
-
+    alias_match = None
+    if ref.table is None and ctx.alias_fallback:
+        alias_match = _find_alias_expr(ref.name, ctx)
     if ctx.alias_first:
         first, second = alias_match, column_match
     else:
         first, second = column_match, alias_match
     if first is not None:
-        resolved = first
-    elif second is not None:
-        resolved = second
-    else:
-        raise BindError(f"no such column: {ref.name}", ref.position, ctx.schema.names)
-
-    _reject_aliased_aggregate(ref, resolved, ctx)
-    return resolved
+        return first, None
+    if second is not None:
+        return second, None
+    return None, _column_error(ref, ctx.schema.names)
 
 
 def _bind_star(star: Star, ctx: _Context) -> list[BoundColumnRef]:
@@ -349,7 +326,7 @@ def _bind_star(star: Star, ctx: _Context) -> list[BoundColumnRef]:
     A qualifier that does not match the FROM table raises "no such
     table: <qualifier>", never "no such column" - confirmed against
     `sqlite3` for both an unrelated real table and an unknown name,
-    and the opposite of `_bind_column_ref`'s qualifier check above.
+    and the opposite of `_resolve_column`'s qualifier check above.
     """
     if star.table is not None and not _same_name(star.table, ctx.table_name):
         raise BindError(f"no such table: {star.table}", star.position, ctx.catalog_names)
@@ -359,40 +336,97 @@ def _bind_star(star: Star, ctx: _Context) -> list[BoundColumnRef]:
     ]
 
 
-# --- Aggregate-call validation (issue #60) ----------------------------------
+# --- Where an aggregate call is allowed (issues #60, #102, #115, #144) -------
+#
+# SQLite's `NC_AllowAgg`, plus where a rejected call is reported. One
+# value per point of the walk, carried on each pending entry:
+#
+# - `_AGG_ALLOWED`: the select list, `GROUP BY`, `HAVING`, `ORDER BY` of
+#   an aggregate query. (An aggregate key in `GROUP BY` is rejected after
+#   the walk, by `sql/bind_clauses.py`.)
+# - `_AGG_LATE`: allowed in the walk, but the call is collected in
+#   `ctx.late_misuse` and reported after every clause, if nothing else
+#   is: `WHERE` of an aggregate query, `ORDER BY` of a non-aggregate one.
+# - `_AGG_CLAUSE`: the clause never allows one, and a call records its
+#   misuse where it stands: `WHERE` of a non-aggregate query,
+#   `LIMIT`/`OFFSET`.
+# - `_AGG_NESTED`: inside an allowed aggregate call's arguments, where
+#   a nested aggregate records its misuse where it stands, in any clause.
+
+_AGG_ALLOWED = 0
+_AGG_LATE = 1
+_AGG_CLAUSE = 2
+_AGG_NESTED = 3
 
 
-def _validate_function_call(call: FunctionCall, ctx: _Context) -> None:
-    """Name and arity for one `FunctionCall`, plus the WHERE-rejects-
-    aggregates rule - see the module docstring's "Aggregate calls"
-    section. Raises `BindError`; never returns a value, mirroring
-    `_bind_column_ref`'s own "raise or fall through" shape.
+def _initial_permission(ctx: _Context) -> int:
+    """The aggregate permission at the root of a clause's expression."""
+    if not ctx.reject_aggregates:
+        return _AGG_ALLOWED
+    if ctx.late_misuse is not None:
+        return _AGG_LATE
+    return _AGG_CLAUSE
 
-    Order matters, and is SQLite's (issue #115): an unrecognised name
-    first, then the arity, then `ctx.reject_aggregates` - so `WHERE
-    foo(x) > 1` reports "no such function" and `WHERE avg() = 1`
-    reports "wrong number of arguments to function avg()", never the
-    aggregate misuse. A rejected aggregate goes through
-    `_reject_aggregate`, which raises it or, when `ctx.late_misuse` is
-    a list, collects it for `bind()` to raise later.
-    """
-    name = ascii_fold(call.name)
-    if name not in _AGGREGATE_NAMES:
-        raise BindError(
-            f"no such function: {call.name}", call.position, tuple(sorted(_AGGREGATE_NAMES))
-        )
-    arity_error = _arity_error(call)
-    if arity_error is not None:
-        raise arity_error
-    if ctx.reject_aggregates:
-        _reject_aggregate(
-            BindError(
-                f"misuse of aggregate function {call.name}(): aggregate calls are not allowed in {ctx.clause}",
-                call.position,
-                (),
-            ),
-            ctx,
-        )
+
+def _collect_late(error: BindError, ctx: _Context) -> None:
+    """Keep *error* in `ctx.late_misuse` if it is the first one there
+    (issue #115)."""
+    assert ctx.late_misuse is not None
+    if not ctx.late_misuse:
+        ctx.late_misuse.append(error)
+
+
+def _clause_misuse(call: FunctionCall, ctx: _Context) -> BindError:
+    """The misuse of an aggregate call in a clause that never allows
+    one, naming that clause (`ctx.clause`) when it has a name."""
+    message = f"misuse of aggregate function {call.name}()"
+    if ctx.clause:
+        message += f": aggregate calls are not allowed in {ctx.clause}"
+    return BindError(message, call.position, ())
+
+
+def _aliased_aggregate_error(
+    ref: ColumnRef, resolved: Expr, ctx: _Context, permission: int
+) -> BindError | None:
+    """Issue #102: a reference that resolved to a select-list alias
+    naming an aggregate call, reached where an aggregate is not
+    allowed. A real column is never an aggregate call, so only the
+    alias branch of `_resolve_column` can get here.
+
+    Inside an aggregate's arguments (`HAVING count(c) > 0`, `c`
+    aliasing `count(*)`) it is `sqlite3`'s "misuse of aliased aggregate
+    c", recorded where it stands; in a late clause (`WHERE c > 1` of an
+    aggregate query) it is collected, as a call written there would
+    be. `None` when there is nothing to record."""
+    if permission == _AGG_ALLOWED or not contains_aggregate(resolved):
+        return None
+    if permission == _AGG_NESTED:
+        return BindError(f"misuse of aliased aggregate {ref.name}", ref.position, ())
+    error = BindError(
+        f"misuse of aggregate: aliased column {ref.name} refers to an aggregate call, "
+        "which is not allowed here",
+        ref.position,
+        (),
+    )
+    if permission == _AGG_LATE:
+        _collect_late(error, ctx)
+        return None
+    return error
+
+
+def _bind_column(ref: ColumnRef, ctx: _Context, permission: int) -> tuple[Expr | None, BindError | None]:
+    """Rule 1 of the walk: `ref` resolved, or the error it records."""
+    resolved, error = _resolve_column(ref, ctx)
+    if error is not None:
+        return None, error
+    assert resolved is not None
+    error = _aliased_aggregate_error(ref, resolved, ctx, permission)
+    if error is not None:
+        return None, error
+    return resolved, None
+
+
+# --- Aggregate calls (issue #60) ----------------------------------------------
 
 
 def _arity_error(call: FunctionCall) -> BindError | None:
@@ -414,84 +448,233 @@ def _arity_error(call: FunctionCall) -> BindError | None:
     return None
 
 
-def _reject_aggregate(error: BindError, ctx: _Context) -> None:
-    """Raise *error* now, or - when `ctx.late_misuse` is a list -
-    keep the first such error there and return, so binding goes on as
-    if the aggregate were legal (issue #115)."""
-    if ctx.late_misuse is None:
-        raise error
-    if not ctx.late_misuse:
-        ctx.late_misuse.append(error)
+def _is_aggregate_call(call: FunctionCall) -> bool:
+    """A known aggregate name with an argument count it accepts."""
+    return ascii_fold(call.name) in _AGGREGATE_NAMES and _arity_error(call) is None
 
 
-# --- General expression binding --------------------------------------------
-#
-# One case per `sql/ast.py` node type. Every type other than
-# `ColumnRef` and `Star` is reused unchanged and rebuilt via
-# `dataclasses.replace` with its children bound - no new type, no
-# dynamic dispatch, just an explicit `isinstance` chain matching the
-# style already established by the parser's own precedence methods.
-
-
-def _rebuild_with_bound_operands(node: Expr, results: list[Expr], ctx: _Context) -> Expr:
-    """Take *node*'s bound operands off the end of *results* and
-    rebuild *node* around them; a `FunctionCall` also gets the nested-
-    aggregate check, after all of its arguments are bound."""
-    first = len(results) - len(children(node))
-    bound_operands = results[first:]
-    del results[first:]
-    if isinstance(node, FunctionCall):
-        _check_no_nested_aggregate(node, bound_operands, ctx)
-    return with_children(node, bound_operands)
-
-
-def _bind_leaf(node: Expr, ctx: _Context) -> Expr | None:
-    """Bind *node* on the spot when it has no operands to wait for, or
-    return `None` when it has some. A `Star` and a `BoundColumnRef` here
-    always raise."""
-    if isinstance(node, Literal):
-        return node
-    if isinstance(node, ColumnRef):
-        if ctx.alias_fallback:
-            return _resolve_name(node, ctx)
-        return _bind_column_ref(node, ctx)
-    if isinstance(node, Star):
-        # A whole, alias-less select-list item and count(*)'s sole
-        # unqualified argument are handled by their own callers before
-        # ever reaching here - see `_bind_select_item` and the
-        # `FunctionCall` case in `_start_function_call`. Any other
-        # position is exactly the parser-permissiveness backstop: `* AS
-        # alias`, `*` inside a general expression, and `count(blame.*)`
-        # (a *qualified* star as a function argument) all reach this
-        # branch and are rejected here rather than crashing or
-        # silently mis-expanding.
-        raise BindError(
-            "* is only allowed as a whole select-list item or the sole argument to a function call",
-            node.position,
+def _call_error(call: FunctionCall, ctx: _Context, permission: int) -> BindError | None:
+    """Rule 2 of the walk: the one error *call* records before its
+    arguments are walked, or `None`. An unrecognised name first, then
+    the arity, then aggregate misuse - SQLite's order within one call
+    (issue #115): `WHERE foo(x) > 1` is "no such function", `WHERE
+    avg() = 1` is "wrong number of arguments to function avg()", never
+    the misuse. A misuse in a late clause is collected in
+    `ctx.late_misuse` instead of recorded."""
+    if ascii_fold(call.name) not in _AGGREGATE_NAMES:
+        return BindError(f"no such function: {call.name}", call.position, tuple(sorted(_AGGREGATE_NAMES)))
+    arity_error = _arity_error(call)
+    if arity_error is not None:
+        return arity_error
+    if permission == _AGG_CLAUSE:
+        return _clause_misuse(call, ctx)
+    if permission == _AGG_NESTED:
+        return BindError(
+            f"misuse of aggregate function {call.name}(): aggregate function calls cannot be nested",
+            call.position,
             (),
         )
+    if permission == _AGG_LATE:
+        _collect_late(_clause_misuse(call, ctx), ctx)
+    return None
+
+
+def _argument_permission(call: FunctionCall, permission: int) -> int:
+    """The aggregate permission inside *call*'s arguments: an aggregate
+    call accepted where it stands (allowed, or collected late) allows
+    none in its arguments; any other call - unknown, wrong arity, or
+    itself a misuse - leaves the permission as it was, as SQLite does."""
+    if permission in (_AGG_ALLOWED, _AGG_LATE) and _is_aggregate_call(call):
+        return _AGG_NESTED
+    return permission
+
+
+def _is_star_call(call: FunctionCall) -> bool:
+    """`f(*)`: SQLite's tree has no argument there at all, so there is
+    nothing to walk - `count(*)` binds as it is, passed through
+    unexpanded (`*` here means "no columns", not "all columns", see
+    `sql/bound.py`'s docstring). A *qualified* sole argument
+    (`count(blame.*)`) is not this, and reaches the `Star` backstop."""
+    return len(call.args) == 1 and isinstance(call.args[0], Star) and call.args[0].table is None
+
+
+# --- The walk (issues #107, #144) ---------------------------------------------
+#
+# One explicit stack of `(node, step, permission)` entries, no
+# recursion. `_VISIT` is a node's first visit. `_REBUILD` comes back to
+# a node whose operands are all bound and rebuilds it around them.
+# `_RETURN` does the same for a function call, `LIKE` or `IS NULL`, and
+# is also the frame marker an ABORT unwinds to. `_IS_RIGHT` is rule 5's
+# right-hand column, already resolved, met again after the left operand.
+
+_VISIT = 0
+_REBUILD = 1
+_RETURN = 2
+_IS_RIGHT = 3
+
+
+def _star_backstop(star: Star) -> BindError:
+    # A whole, alias-less select-list item and a call's sole
+    # unqualified `*` are handled before the walk ever reaches one -
+    # see `_bind_select_item` and `_is_star_call`. Any other position is
+    # exactly the parser-permissiveness backstop: `* AS alias`, `*`
+    # inside a general expression, and `count(blame.*)` (a *qualified*
+    # star as a function argument, a syntax error in SQLite) all reach
+    # here and are rejected at once rather than crashing or silently
+    # mis-expanding.
+    return BindError(
+        "* is only allowed as a whole select-list item or the sole argument to a function call",
+        star.position,
+        (),
+    )
+
+
+def _is_null_test(node: Is) -> bool:
+    """`x IS NULL` / `x IS NOT NULL` (SQLite's `TK_ISNULL`/`TK_NOTNULL`):
+    the parser builds both as `Is` with a `NULL` literal on the right."""
+    return isinstance(node.right, Literal) and node.right.value is None
+
+
+def _push_operands(
+    node: Expr, step: int, permission: int, operands: tuple[Expr, ...], pending: list[tuple[Expr, int, int]]
+) -> None:
+    """Come back to *node* with *step* once *operands* are walked, left
+    to right."""
+    pending.append((node, step, permission))
+    for operand in reversed(operands):
+        pending.append((operand, _VISIT, permission))
+
+
+def _visit(
+    node: Expr,
+    permission: int,
+    tripped: bool,
+    ctx: _Context,
+    pending: list[tuple[Expr, int, int]],
+    results: list[Expr],
+) -> tuple[BindError | None, bool]:
+    """The first visit to *node*: SQLite's `resolveExprStep`, one
+    branch per rule of the module docstring's "Which error is
+    reported". *tripped* is whether an error is already recorded.
+    Returns the error *node* records, if any, and whether the walk
+    ABORTs here. Pushes what is left to walk onto *pending* and a bound
+    leaf onto *results*."""
+    if isinstance(node, ColumnRef):
+        # Rule 1. A column that resolves never trips, whatever is
+        # recorded already.
+        bound, error = _bind_column(node, ctx, permission)
+        if error is not None:
+            return error, True
+        assert bound is not None
+        results.append(bound)
+        return None, False
+    if isinstance(node, FunctionCall):
+        # Rule 2. The call's own error first; then its arguments, in a
+        # list an ABORT ends without ending anything around the call.
+        error = _call_error(node, ctx, permission)
+        if _is_star_call(node):
+            results.append(node)
+        else:
+            _push_operands(node, _RETURN, _argument_permission(node, permission), node.args, pending)
+        return error, False
+    if isinstance(node, Like):
+        # Rule 3. `x NOT LIKE y` is a NOT - rule 6 - around the call.
+        if node.negated and tripped:
+            return None, True
+        _push_operands(node, _RETURN, permission, resolution_children(node), pending)
+        return None, False
+    if isinstance(node, Is) and _is_null_test(node):
+        # Rule 4.
+        _push_operands(node, _RETURN, permission, children(node), pending)
+        return None, False
+    if isinstance(node, Is) and isinstance(node.right, ColumnRef) and node.right.table is None:
+        # Rule 5. The right-hand name is resolved before anything else,
+        # then the node trips like any other, then the left operand is
+        # walked and the resolved right is met again (`_IS_RIGHT`).
+        bound, error = _bind_column(node.right, ctx, permission)
+        if error is not None:
+            return error, True
+        if tripped:
+            return None, True
+        assert bound is not None
+        pending.append((node, _REBUILD, permission))
+        pending.append((bound, _IS_RIGHT, permission))
+        pending.append((node.left, _VISIT, permission))
+        return None, False
+    if isinstance(node, Star):
+        raise _star_backstop(node)
     if isinstance(node, BoundColumnRef):
         raise AssertionError("sql/binder.py: a BoundColumnRef reached _bind_expr; it is already bound")
-    return None
+    # Rule 6: every other node.
+    if tripped:
+        return None, True
+    operands = resolution_children(node)
+    if len(operands) == 0:
+        results.append(node)
+    else:
+        _push_operands(node, _REBUILD, permission, operands, pending)
+    return None, False
 
 
-def _start_function_call(call: FunctionCall, ctx: _Context) -> Expr | None:
-    """The first visit to a `FunctionCall`: run its checks before any
-    argument is bound, and return the call itself for `count(*)`, or
-    `None` when its arguments still have to be bound."""
-    # Issue #60: name/arity/WHERE-rejection, before anything else -
-    # see _validate_function_call and the module docstring's
-    # "Aggregate calls" section. Every FunctionCall past this point
-    # is a real, correctly-arity aggregate call.
-    _validate_function_call(call, ctx)
-    if len(call.args) == 1 and isinstance(call.args[0], Star) and call.args[0].table is None:
-        # count(*): passed through unexpanded. `*` here means "no
-        # columns", not "all columns" - see `sql/bound.py`'s docstring.
-        # A *qualified* sole argument (count(blame.*)) does not
-        # take this path and falls through to the general Star
-        # rejection in `_bind_leaf`.
-        return call
-    return None
+def _rebuild(node: Expr, results: list[Expr]) -> Expr:
+    """Take *node*'s bound operands off the end of *results*, in
+    `resolution_children` order, and rebuild *node* around them."""
+    first = len(results) - len(resolution_children(node))
+    bound_operands = results[first:]
+    del results[first:]
+    return with_resolution_children(node, bound_operands)
+
+
+def _unwind_to_enclosing_call(pending: list[tuple[Expr, int, int]]) -> None:
+    """An ABORT: drop every pending entry down to the nearest enclosing
+    function call, `LIKE` or `IS NULL` (`_RETURN`), which then returns
+    normally, so the walk goes on with whatever follows it - or, with
+    none, drop everything: the root is over."""
+    while len(pending) > 0 and pending[-1][1] != _RETURN:
+        pending.pop()
+
+
+def _bind_exprs(roots: tuple[Expr, ...], ctx: _Context) -> tuple[Expr, ...]:
+    """Bind *roots*, walked as one tree whose root has them as its
+    children left to right (an ABORT in one skips the rest), and raise
+    the error recorded last, if any - see the module docstring's "Which
+    error is reported". Every other caller binds one root, through
+    `_bind_expr`; LIMIT and OFFSET are one tree in SQLite and are
+    walked together.
+
+    Not recursive (issue #107): *pending* is an explicit stack of
+    `(node, step, permission)` entries (see the comment above
+    `_VISIT`) and *results* the bound subtrees finished so far. Once an
+    error is recorded no tree is built any more - only which error is
+    reported is still open.
+    """
+    permission = _initial_permission(ctx)
+    pending: list[tuple[Expr, int, int]] = []
+    for root in reversed(roots):
+        pending.append((root, _VISIT, permission))
+    results: list[Expr] = []
+    recorded: BindError | None = None
+    while len(pending) > 0:
+        node, step, permission = pending.pop()
+        abort = False
+        if step == _REBUILD or step == _RETURN:
+            if recorded is None:
+                results.append(_rebuild(node, results))
+        elif step == _IS_RIGHT:
+            if recorded is not None:
+                abort = True
+            else:
+                results.append(node)
+        else:
+            error, abort = _visit(node, permission, recorded is not None, ctx, pending, results)
+            if error is not None:
+                recorded = error
+        if abort:
+            _unwind_to_enclosing_call(pending)
+    if recorded is not None:
+        raise recorded
+    assert len(results) == len(roots)
+    return tuple(results)
 
 
 def _bind_expr(expr: Expr, ctx: _Context) -> Expr:
@@ -502,67 +685,6 @@ def _bind_expr(expr: Expr, ctx: _Context) -> Expr:
     invisible to each other; on for the `_Context`s `bind()` builds
     for the other clauses. `ctx` is the same for every node of the tree,
     so the fallback applies to a `ColumnRef` at any depth in the tree,
-    not only at the top.
-
-    Not recursive (issue #107; the children table it walks is
-    `sql/walk.py`'s `children`, shared with the planner and the
-    parser): *pending* holds `(node, operands_done)` pairs and
-    *results* the bound subtrees finished so far. A node is first seen
-    with `operands_done=False` - a leaf is bound on the spot; any other
-    node is pushed back with `operands_done=True`, then its operands in
-    reverse so they are bound left to right; seen again, it takes its
-    bound operands off *results* and is rebuilt around them. That is
-    the recursive version's order exactly: a `FunctionCall`'s name and
-    arity are checked before any argument is bound, and the nested-
-    aggregate check runs after all of them are.
-    """
-    pending: list[tuple[Expr, bool]] = [(expr, False)]
-    results: list[Expr] = []
-    while pending:
-        node, operands_done = pending.pop()
-        if operands_done:
-            results.append(_rebuild_with_bound_operands(node, results, ctx))
-            continue
-        leaf = _bind_leaf(node, ctx)
-        if leaf is not None:
-            results.append(leaf)
-            continue
-        if isinstance(node, FunctionCall):
-            passed_through = _start_function_call(node, ctx)
-            if passed_through is not None:
-                results.append(passed_through)
-                continue
-        # #51: a LIKE's escape is an ordinary operand expression, bound
-        # the same way left/pattern already are - `children` leaves it
-        # out when there is no ESCAPE clause, so there is nothing to bind.
-        pending.append((node, True))
-        for operand in reversed(children(node)):
-            pending.append((operand, False))
-    (result,) = results
-    return result
-
-
-def _check_no_nested_aggregate(call: FunctionCall, bound_args: list[Expr], ctx: _Context) -> None:
-    """Issue #102: an aggregate call can never be another aggregate
-    call's own argument - `count(count(*))` is `sqlite3`'s own "misuse
-    of aggregate function count()". This has to run after binding each
-    argument, not on the raw AST, because a `ColumnRef` argument only
-    reveals whether it secretly names an aggregate call once alias
-    resolution (`_resolve_name`) has spliced that alias's own bound
-    expression in - a bound argument that is itself a `FunctionCall`,
-    whether written directly or reached through a select-list alias, is
-    exactly what `contains_aggregate` was already built to detect."""
-    for raw_arg, bound_arg in zip(call.args, bound_args):
-        if not contains_aggregate(bound_arg):
-            continue
-        if isinstance(raw_arg, ColumnRef) and _find_alias_expr(raw_arg.name, ctx) is not None:
-            # Reached through a select-list alias - `sqlite3`'s own
-            # message names the alias, not the outer function:
-            # "misuse of aliased aggregate c".
-            raise BindError(f"misuse of aliased aggregate {raw_arg.name}", raw_arg.position, ())
-        raise BindError(
-            f"misuse of aggregate function {call.name}(): aggregate function calls "
-            "cannot be nested",
-            raw_arg.position,
-            (),
-        )
+    not only at the top. One root of the walk: `_bind_exprs`."""
+    (bound,) = _bind_exprs((expr,), ctx)
+    return bound

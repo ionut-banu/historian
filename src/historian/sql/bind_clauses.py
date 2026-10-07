@@ -12,11 +12,8 @@ from __future__ import annotations
 
 import dataclasses
 
-from historian.ascii import ascii_fold
 from historian.sql.ast import (
-    ColumnRef,
     Expr,
-    FunctionCall,
     Literal,
     OrderByItem,
     SelectItem,
@@ -25,14 +22,13 @@ from historian.sql.ast import (
     UnaryOperator,
 )
 from historian.sql.bind_expr import (
-    _AGGREGATE_NAMES,
     _Context,
-    _arity_error,
     _bind_expr,
+    _bind_exprs,
     _bind_star,
 )
 from historian.sql.bound import BindError, BoundOrderByItem, BoundSelectItem
-from historian.sql.walk import BoundColumnRef, children, contains_aggregate
+from historian.sql.walk import BoundColumnRef, contains_aggregate
 
 # --- GROUP BY / HAVING (issue #69) ------------------------------------------
 #
@@ -120,9 +116,11 @@ def _bind_limit_offset(expr: Expr, clause: str) -> int:
     subquery).
 
     Called last, after every error SQLite itself raises (issue #115):
-    a column reference or aggregate call here has already been
-    reported by `_check_limit_offset_names`, at LIMIT's own turn, so
-    what reaches this rejection is a shape SQLite accepts."""
+    a column reference, an unknown function or an aggregate call here
+    has already been reported by `_resolve_limit_offset`, at LIMIT's
+    own turn, so what reaches this rejection is a shape SQLite accepts
+    (or, until #183, a call to one of SQLite's built-in functions,
+    which historian reports as unknown)."""
     value = _ordinal_value(expr)
     if value is None:
         raise BindError(
@@ -134,67 +132,28 @@ def _bind_limit_offset(expr: Expr, clause: str) -> int:
     return value
 
 
-def _walk_limit_offset_expr(expr: Expr, soft: BindError | None) -> BindError | None:
-    """Walk one `LIMIT`/`OFFSET` expression for `_check_limit_offset_names`:
-    raise at the first hard error, otherwise return the soft error
-    pending after this expression - *soft* as it came in, or the one
-    this expression replaced it with."""
-    pending: list[tuple[Expr, bool]] = [(expr, False)]
-    while pending:
-        node, inside_aggregate = pending.pop()
-        if isinstance(node, ColumnRef):
-            display = f"{node.table}.{node.name}" if node.table is not None else node.name
-            error = BindError(f"no such column: {display}", node.position, ())
-            if not inside_aggregate:
-                raise error
-            soft = error
-            continue
-        if isinstance(node, FunctionCall):
-            if ascii_fold(node.name) not in _AGGREGATE_NAMES:
-                continue
-            arity_error = _arity_error(node)
-            if arity_error is not None:
-                soft = arity_error
-            else:
-                soft = BindError(f"misuse of aggregate function {node.name}()", node.position, ())
-            inside_aggregate = True
-        for operand in reversed(children(node)):
-            pending.append((operand, inside_aggregate))
-    return soft
-
-
-def _check_limit_offset_names(exprs: tuple[Expr, ...]) -> None:
+def _resolve_limit_offset(exprs: tuple[Expr, ...], ctx: _Context) -> None:
     """The errors SQLite raises for `LIMIT` and `OFFSET` (*exprs*, in
     that order), at their turn in the resolution order: right after the
-    FROM table, before the select list (issue #115). SQLite resolves
-    them against no columns at all and with no select-list alias, so
-    every column reference is "no such column", real column or not.
-
-    Measured against the oracle, two strengths of error:
-
-    - A column reference outside every aggregate call is reported at
-      once (`LIMIT ghost_l OFFSET ghost_f` reports `ghost_l`).
-    - An aggregate call is always an error here, but a soft one: the
-      call's arity error or, failing that, its misuse, and then any
-      column reference inside its arguments, each replacing the one
-      before - and a later hard error, or a later soft one, in either
-      clause replaces it again. Only if both clauses are walked
-      without a hard error is the last soft error raised (`LIMIT
-      avg(1) OFFSET ghost_f` reports `ghost_f`; `LIMIT count(*) OFFSET
-      sum(1)` reports `sum`; `LIMIT count(ghost_x)` reports
-      `ghost_x`).
-
-    A call to a function that is not an aggregate is left alone, along
-    with its arguments: SQLite rejects it here too, but the order of
-    that against the rest is #144, so it reaches `_bind_limit_offset`'s
-    literal-only rejection instead. Pre-order, left to right, over an
-    explicit stack of `(node, inside an aggregate call)` (issue #107).
-    """
-    soft: BindError | None = None
-    for expr in exprs:
-        soft = _walk_limit_offset_expr(expr, soft)
-    if soft is not None:
-        raise soft
+    FROM table, before the select list (issue #115). The same walk as
+    every other expression (issue #144), over one tree with `LIMIT` on
+    the left and `OFFSET` on the right, as SQLite builds it - so an
+    ABORT in `LIMIT` means `OFFSET` is never reached - in a context
+    where no column resolves (a real column or an alias is "no such
+    column" too), no alias is looked up and no aggregate is allowed.
+    Nothing is bound: `_bind_limit_offset`'s literal-only rule runs
+    last, at step 10."""
+    limit_ctx = dataclasses.replace(
+        ctx,
+        select_items=(),
+        alias_fallback=False,
+        alias_first=False,
+        reject_aggregates=True,
+        late_misuse=None,
+        clause="",
+        columns_visible=False,
+    )
+    _bind_exprs(exprs, limit_ctx)
 
 
 # --- Ordinals out of range, shared by GROUP BY and ORDER BY ------------------

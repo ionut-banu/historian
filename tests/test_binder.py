@@ -1113,11 +1113,11 @@ def test_star_as_non_sole_function_argument_raises_defensive_error():
     sole argument" and is rejected rather than silently expanded or
     passed through.
 
-    The error it gets today is the arity check, which `_validate_
-    function_call` runs before the `Star` check is reached: every
-    aggregate takes at most one argument, so a two-argument call never
-    gets as far as "* is only allowed ..." (issue #108's `match=`
-    sweep, pinning the message this query actually has)."""
+    Until #144 the error was the arity check, raised before the
+    arguments were looked at. Now the arity error is recorded and the
+    argument walk goes on, and the misplaced `*` is raised where it is
+    met: it stands for a syntax error in SQLite, which comes before
+    every name error, so it is never left behind one."""
     call = FunctionCall(
         name="count",
         args=(Star(table=None, position=_POS), ColumnRef(table=None, name="path", position=_POS)),
@@ -1134,7 +1134,7 @@ def test_star_as_non_sole_function_argument_raises_defensive_error():
         offset=None,
         position=_POS,
     )
-    with pytest.raises(BindError, match=r"wrong number of arguments to function count\(\)"):
+    with pytest.raises(BindError, match=r"^\* is only allowed as a whole select-list item"):
         bind(stmt, SCHEMAS)
 
 
@@ -1952,7 +1952,7 @@ def test_order_by_aggregate_call_with_no_group_by_and_no_select_aggregate_is_a_b
     HAVING-style allowance."""
     with pytest.raises(
         BindError,
-        match=r"misuse of aggregate function count\(\): aggregate calls are not allowed in WHERE",
+        match=r"misuse of aggregate function count\(\): aggregate calls are not allowed in ORDER BY",
     ):
         _bind("SELECT path FROM blame ORDER BY count(*)")
 
@@ -2165,10 +2165,12 @@ def test_limit_rejects_null():
 
 
 def test_limit_rejects_function_call():
-    with pytest.raises(
-        BindError,
-        match=r"LIMIT must be a literal integer, optionally wrapped in unary \+/- and parentheses",
-    ):
+    """SQLite accepts `LIMIT abs(-2)`. Since #144 LIMIT goes through the
+    same walk as every other expression, where every function but the
+    five aggregates is unknown, so this is `no such function: abs`
+    rather than the literal-only rejection - the accepted difference
+    #183 removes, by telling SQLite's built-ins from unknown names."""
+    with pytest.raises(BindError, match=r"^no such function: abs$"):
         _bind("SELECT path FROM blame LIMIT abs(-2)")
 
 

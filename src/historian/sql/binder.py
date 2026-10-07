@@ -103,7 +103,7 @@ from historian.sql.bind_clauses import (
     _bind_limit_offset,
     _bind_order_by,
     _bind_select_item,
-    _check_limit_offset_names,
+    _resolve_limit_offset,
 )
 from historian.sql.bind_expr import _bind_expr, _bind_star, _Context, _resolve_table
 from historian.sql.bound import (
@@ -144,12 +144,14 @@ def _step1_from_table(stmt: SelectStatement, catalog: dict[str, Schema]) -> _Con
     return ctx
 
 
-def _step2_limit_offset_names(stmt: SelectStatement) -> None:
-    """Step 2: LIMIT, then OFFSET: only what SQLite rejects there (a
-    column reference, an aggregate call). The literal-only rule (#77)
-    is historian's own and waits for step 10."""
+def _step2_limit_offset_names(stmt: SelectStatement, ctx: _Context) -> None:
+    """Step 2: LIMIT, then OFFSET, walked as one tree: only what SQLite
+    rejects there (a column reference, an unknown function, an
+    aggregate call). The literal-only rule (#77) is historian's own and
+    waits for step 10."""
     limit_offset = tuple(expr for expr in (stmt.limit, stmt.offset) if expr is not None)
-    _check_limit_offset_names(limit_offset)
+    if limit_offset:
+        _resolve_limit_offset(limit_offset, ctx)
 
 
 def _step3_select_list(stmt: SelectStatement, ctx: _Context) -> tuple[BoundSelectItem, ...]:
@@ -360,7 +362,7 @@ def bind(stmt: SelectStatement, catalog: dict[str, Schema]) -> BoundSelectStatem
     production call site that does.
     """
     ctx = _step1_from_table(stmt, catalog)
-    _step2_limit_offset_names(stmt)
+    _step2_limit_offset_names(stmt, ctx)
     items = _step3_select_list(stmt, ctx)
     # Whether the query aggregates at all - GROUP BY written, or an
     # aggregate call anywhere in the select list. An aggregate call in

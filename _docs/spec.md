@@ -819,27 +819,72 @@ Four kinds, all of them the user's fault and none of them tracebacks:
   an actual row.
 
 When a statement has more than one binding error, historian reports
-the one SQLite reports. SQLite's order, measured against the oracle
-(`_docs/decisions.md`, 2026-10-02, re-checked under the pinned oracle
-in #117): the `FROM` table and the
-qualifier of any `x.*` select-list item; `LIMIT`, then `OFFSET`, for
-what SQLite rejects there (a column reference, reported at once, or
-an aggregate call, reported only once neither clause has a column
-reference outside one); the select list, left to right; `HAVING` on a
-non-aggregate query; `HAVING`; `WHERE`; `ORDER BY`; `GROUP BY`; then
-an aggregate call in the `WHERE` of an aggregate query or in the
-`ORDER BY` of a non-aggregate one (an aggregate query has `GROUP BY`
-or an aggregate call in its select list; in a non-aggregate query an
-aggregate call in `WHERE` is reported at `WHERE`'s turn). Within an
-`ORDER BY` or `GROUP BY` clause, every name error comes before an
-out-of-range ordinal, and in `GROUP BY` an ordinal before an
-aggregate key. Within one call, an unknown function comes before a
-wrong argument count, and that before aggregate misuse. historian's
+the one SQLite reports. SQLite's order of the clauses, measured
+against the oracle (`_docs/decisions.md`, 2026-10-02, re-checked
+under the pinned oracle in #117): the `FROM` table and the qualifier
+of any `x.*` select-list item; `LIMIT` and `OFFSET`, walked as one
+expression with `LIMIT` first (below); the select list, left to
+right; `HAVING` on a non-aggregate query; `HAVING`; `WHERE`; `ORDER
+BY`; `GROUP BY`; then an aggregate call in the `WHERE` of an aggregate
+query or in the `ORDER BY` of a non-aggregate one (an aggregate query
+has `GROUP BY` or an aggregate call in its select list; in a
+non-aggregate query an aggregate call in `WHERE` is reported at
+`WHERE`'s turn). Within an `ORDER BY` or `GROUP BY` clause the terms
+are taken left to right, and an integer term below 1 or above 65535
+is rejected at its own turn; any other out-of-range ordinal comes
+after every term's name errors, and in `GROUP BY` an ordinal before an
+aggregate key (`_docs/decisions.md`, 2026-10-07, #144). historian's
 own rejections of queries SQLite accepts - the bare column that is
 neither a `GROUP BY` key nor inside an aggregate, the `SELECT
 DISTINCT ... ORDER BY` key, a `LIMIT`/`OFFSET` that is not a literal
 integer - come after every error SQLite raises, so they never hide
 one.
+
+Inside one expression (`_docs/decisions.md`, 2026-10-07, #144),
+SQLite resolves names by walking the tree, a node first and then its
+children left to right, with one error slot that each new error
+overwrites, so the error reported is the last one recorded. What the
+walk does after an error depends on the node it meets:
+
+1. A column reference that resolves: the walk goes on. One that does
+   not records `no such column` and ABORTs.
+2. A function call records at most one error of its own before its
+   arguments: aggregate misuse if it is an aggregate (right name,
+   right argument count) where none is allowed, else `no such
+   function`, else `wrong number of arguments`. Then it walks its
+   arguments left to right, stopping at the first ABORT, and returns
+   normally. Inside an aggregate's arguments no aggregate is allowed,
+   so a nested one records its misuse where it stands, and so does a
+   select-list alias naming one.
+3. `x LIKE y [ESCAPE z]` is a call with no error of its own over `y`,
+   `x`, `z`, in that order; `x NOT LIKE y` is a `NOT` (rule 6) around
+   it.
+4. `x IS NULL` and `x IS NOT NULL` walk `x` whatever is recorded, and
+   return normally.
+5. `x IS y` and `x IS NOT y` with `y` a bare column name resolve `y`
+   first, and ABORT if it does not resolve.
+6. Every other node ABORTs at once if an error is already recorded;
+   otherwise it walks its children and passes an ABORT up.
+
+An ABORT stops at the nearest enclosing function call, `LIKE` or `IS
+NULL`, or ends the root: one select-list item, one `WHERE`, `HAVING`,
+`GROUP BY` or `ORDER BY` term, or `LIMIT` and `OFFSET` together. In
+`LIMIT` and `OFFSET` no column resolves, real or alias, and no
+aggregate is allowed. The late errors above (the aggregate call in a
+`WHERE` or `ORDER BY` reported after `GROUP BY`, an aggregate `GROUP
+BY` key, an out-of-range ordinal) and historian's own rejections are
+not recorded during the walk: they are raised after it, if nothing
+was recorded. An aggregate-misuse message keeps historian's wording
+(#102) and names the clause the call was found in.
+
+Accepted difference: historian implements none of SQLite's built-in
+scalar functions (§1), so a call to one - `abs`, `length`, the
+two-argument `max`, and so on - is `no such function` to historian
+(the two-argument `max`/`min`, a wrong argument count) wherever it
+stands, where SQLite accepts the call or reports something else. This
+includes `LIMIT abs(2)`, which SQLite accepts and historian rejects
+with `no such function: abs`. #183 tells SQLite's built-ins apart
+from names SQLite does not have.
 
 Do not invent runtime type errors. SQLite is permissive - comparing a
 string to an integer is a valid comparison with a defined answer, not

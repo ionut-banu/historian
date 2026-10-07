@@ -22,7 +22,7 @@ away entirely at the select-list level, into one `BoundColumnRef` per
 column of the FROM table's schema in declared order - except as the
 sole, unqualified argument of a `FunctionCall` (`count(*)`), where it
 is passed through untouched: `*` there means "no columns", not "all
-columns"; `_validate_function_call` checks the function name.
+columns"; `_call_error` checks the function name.
 
 Because v1 has exactly one FROM table and no `JOIN`, a `BoundColumnRef`
 does not track which table it came from - the offset alone is

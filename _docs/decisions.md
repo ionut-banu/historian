@@ -3509,3 +3509,141 @@ negotiating the original terms and filtering on the rewritten ones
 `tests/pushdown/test_blame_pushdown.py` and the optimizer's), and the
 reverse (the differential error cases, the planner and `--explain`
 tests).
+
+2026-10-07 - Inside one expression, report the error SQLite's name
+resolution walk reports
+
+Issue #144. Replicated, as decided for #141 and #142. This entry
+supersedes the 2026-10-02 (#115) entry's "Not changed" paragraph, its
+step 2 (`LIMIT`/`OFFSET`) and its "every name error, then an
+out-of-range ordinal" within `ORDER BY`/`GROUP BY` (see "Where the
+oracle went further" below); the rest of the cross-clause order
+stands.
+
+The rule. SQLite resolves one expression tree by walking it, node
+first and then its children left to right (`resolveExprStep`,
+`sqlite3WalkExprNN`), with one error slot for the statement that each
+new error overwrites, so the error reported is the last one recorded.
+What the walk does after an error depends on the node:
+
+1. A column that resolves: the walk goes on, whatever is recorded. One
+   that does not records `no such column` and ABORTs.
+2. A function call records at most one error of its own before its
+   arguments: misuse if it is an aggregate (known name, right count)
+   where none is allowed, else `no such function`, else `wrong number
+   of arguments`. It then walks its arguments left to right, stopping
+   at the first ABORT, and returns normally. Only an aggregate that
+   is accepted where it stands (allowed, or collected as a late
+   misuse) disallows aggregates in its arguments; a call that records
+   an error leaves the permission as it was, so `sum(count(*), 1)` is
+   the arity error, not a misuse.
+3. `x LIKE y [ESCAPE z]` is the call `like(y, x, z)` with no error of
+   its own; `x NOT LIKE y` is a `NOT` (rule 6) around it.
+4. `x IS [NOT] NULL` walks `x` whatever is recorded, and returns
+   normally.
+5. `x IS [NOT] y` with `y` a bare column name resolves `y` first and
+   ABORTs if it fails; then the node trips like rule 6; then `x` is
+   walked; then the resolved `y` is met again and trips if `x`
+   recorded an error. That last step is not in the issue's statement
+   of the rule: `(nofn(1) IS path) + ghost` is `nofn`, because the
+   already-resolved `path` ABORTs on the recorded `nofn` and takes the
+   whole `+` with it, where a walk that only resolved `y` first would
+   go on to `ghost`. It is SQLite's code - the right operand, now a
+   resolved column, is walked again and hits the end of
+   `resolveExprStep` - and the oracle agrees.
+6. Every other node ABORTs at once if an error is already recorded;
+   otherwise it walks its children and passes an ABORT up.
+
+An ABORT stops at the nearest enclosing call, `LIKE` or `IS NULL`, or
+ends the root: one select-list item, one `WHERE`/`HAVING`/`GROUP BY`/
+`ORDER BY` term, or `LIMIT` and `OFFSET` together, which SQLite walks
+as one tree with `LIMIT` on the left. In `LIMIT`/`OFFSET` no column
+resolves, real or alias, and no aggregate is allowed. A select-list
+alias naming an aggregate, reached inside an aggregate's arguments,
+records `misuse of aliased aggregate` and ABORTs, like a column that
+does not resolve. The late errors #115 models (an aggregate call in
+the `WHERE` of an aggregate query or the `ORDER BY` of a non-aggregate
+one, an aggregate `GROUP BY` key, an in-range ordinal past the select
+list) and historian's own rejections are not recorded in the walk:
+they are raised after it, if nothing was recorded.
+
+Measurement. Oracle: Python's `sqlite3`, SQLite 3.50.4. The PM's
+model of the six rules predicted SQLite's message on 108,000
+generated statements (90,416 rejected) over three seeds, apart from
+two classes it left out on purpose; the old body's answers, measured
+on 3.45.1, were re-measured on 3.50.4 and none changed.
+`tests/differential/test_error_walk.py` adds 125 hand-written cases
+(the issue's 18-row table, every rule, aggregate misuse, `LIMIT`/
+`OFFSET`, every clause, and ordinals) and a seeded sweep: 3,000
+random trees of depth up to 3 over unknown and real columns,
+literals, `nofn(..)`, `sum(..)` with 0 to 2 arguments, `count(..)`,
+`count(*)`, `count(DISTINCT ..)`, `max(..)`, an alias `c`, `LIKE`
+with and without `NOT` and `ESCAPE`, `IS [NOT] NULL`, `IS [NOT]` a
+column, `BETWEEN`, `IN`, unary and binary operators, each placed in
+the issue's nine shapes and two more (`WHERE` and `ORDER BY` of
+`SELECT count(*) AS c`): 23,143 distinct statements, of which the
+oracle rejects 21,593 at prepare time. The generator knows nothing of
+the rule. On `main` at ac2971d historian reported a different error
+on 5,405 of the 21,593 and on 12 of the issue's 18 rows; after, on
+none. The sweep runs by default, about 14 seconds. As a drift check
+only (not the oracle): Apple's `/usr/bin/python3`, SQLite 3.51.0,
+gives the same message on all 21,712 statements when they are run -
+not `EXPLAIN`ed: that build reports no unknown function under
+`EXPLAIN` (`SQLITE_ENABLE_UNKNOWN_SQL_FUNCTION`), which the oracle
+does.
+
+Where the oracle went further than the issue. An `ORDER BY` or
+`GROUP BY` term that is an integer (through unary signs and
+parentheses) is checked by SQLite when it reaches that term
+(`resolveOrderGroupBy`): if it fits a 32-bit int and is below 1 or
+above 65535 it is rejected there, before any later term's names, so
+`ORDER BY 0, ghost` is "1st ORDER BY term out of range" and `GROUP BY
+70000, ghost` likewise. An ordinal from 1 to 65535 past the end of
+the select list is still reported after every term's names, which is
+all #115's measurement contained (`ORDER BY 99, ghost` is `ghost`).
+The sweep found it (`ORDER BY (-1), count(...)`); the issue keeps the
+statement-level order out of scope, but the oracle decides and the
+sweep must show no mismatch, so it is fixed here and flagged on the
+issue for the owner.
+
+Design. One walk, `_bind_exprs` in `sql/bind_expr.py`, used for every
+clause: an explicit stack of `(node, step, permission)` entries
+(#107), the error slot a local variable, and an ABORT a loop popping
+entries down to the nearest call's `_RETURN` entry - no recursion and
+no exception for control flow; the one recorded error is raised when
+the walk ends. The permission is one of allowed, late (collected in
+`_Context.late_misuse`), forbidden by the clause, and nested in an
+aggregate's arguments. Once an error is recorded no tree is built.
+`LIMIT` and `OFFSET` are one call with two roots and a context with
+`columns_visible` off; `_walk_limit_offset_expr` and
+`_check_limit_offset_names` are gone. SQLite's `LIKE` order is
+`resolution_children` in `sql/walk.py`; `children` is unchanged.
+Every statement the tests and sweeps bind - 68,570 parsed, 40,849 of
+them bound on ac2971d - binds to the identical tree after (by `repr`;
+the 42 deepest on a large stack), and none binds that did not.
+
+Messages. A misuse message names the clause the call was found in:
+an aggregate call in the `ORDER BY` of a non-aggregate query said
+"not allowed in WHERE" and now says `ORDER BY`. A nested aggregate
+is reported at the inner call and names it (`sum(count(*))` names
+`count()`, as SQLite does; it named `sum()`). The kinds and
+historian's wording are otherwise unchanged (#102). A misplaced `*`
+in a hand-built call (`count(*, path)`, a syntax error in SQLite) is
+raised where the walk meets it, no longer behind the call's arity
+error.
+
+Accepted difference, until #183. historian implements none of
+SQLite's built-in scalar functions, so `abs(..)`, `length(..)`, the
+two-argument `max` and the rest are `no such function` (or an arity
+error) wherever they stand. `LIMIT abs(2)`, which SQLite accepts, was
+rejected with the literal-only message and is now rejected with `no
+such function: abs`, which is untrue until #183; both are historian
+rejecting what SQLite accepts. The owner may overrule this, or ask
+for #183 to land with this issue.
+
+Found and not fixed, each outside this issue: `ORDER BY 2147483648`
+(an integer outside a 32-bit int) is a constant expression to SQLite
+and accepted, and historian rejects it as an out-of-range ordinal;
+`SELECT 1 + NOT 0` parses in SQLite (`2`) and is a parse error in
+historian; `x IS TRUE` is SQLite's truth test, and historian reads
+`TRUE` as a column name.

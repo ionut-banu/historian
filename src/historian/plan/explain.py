@@ -16,6 +16,10 @@ as the group key's or the call's own text, so the `Project` of
 `SELECT author_name, count(*) ...` reads `author_name, count(*)`, not
 `group_1, count`.
 
+A column the planner replaced by a propagated constant (#142,
+`FixedColumnRef`) prints as the constant, so the `WHERE` `Filter` line
+shows the rewritten terms the scan was offered.
+
 Expressions print as SQL text. A child is parenthesized when SQLite's
 precedence needs it, and always when it is a nested `AND`/`OR`/`NOT`
 (other than an `AND` inside an `AND` or an `OR` inside an `OR`, which
@@ -59,6 +63,7 @@ from historian.sql.ast import (
     UnaryOperator,
 )
 from historian.sql.binder import BoundColumnRef
+from historian.sql.walk import FixedColumnRef
 
 __all__ = ["format_expr", "format_plan"]
 
@@ -158,6 +163,10 @@ def _format(expr: Expr, slots: tuple[Expr, ...] | None) -> str:
             parts = [_literal_text(node.value)]
         elif isinstance(node, BoundColumnRef):
             parts = [node.name]
+        elif isinstance(node, FixedColumnRef):
+            # A column replaced by a propagated constant (#142) prints as
+            # that constant, already converted by the column's affinity.
+            parts = [_literal_text(node.value)]
         elif isinstance(node, ColumnRef):
             parts = [node.name if node.table is None else f"{node.table}.{node.name}"]
         elif isinstance(node, Star):

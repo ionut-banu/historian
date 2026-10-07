@@ -270,8 +270,13 @@ AFFINITY_CASES = [
     (f"{S} {_guard('line_no', '9223372036854775807')} AND line_no = 9223372036854775807", ERROR),
     (f"{S} {_guard('line_no', '9.22337203685478e+18')} AND line_no = 9223372036854775808", ERROR),
     (f"{S} {_guard('line_no', '-9223372036854775808')} AND line_no = -9223372036854775808", ERROR),
-    (f"{S} {_guard('line_no', '-9.22337203685478e+18')} AND line_no = -9223372036854775808.0", ERROR),
-    (f"{S} {_guard('line_no', '-9223372036854775808')} AND line_no = -9223372036854775808.0", []),
+    # A whole REAL just inside the int64 range becomes an INTEGER. (The
+    # boundary itself, `-9223372036854775808.0`, stays REAL in SQLite,
+    # but historian reads that literal as the INTEGER int64 minimum
+    # everywhere - a literal bug of its own, not propagation's - so it
+    # is pinned at the unit level, `tests/test_expression.py`.)
+    (f"{S} {_guard('line_no', '-9223372036854774784')} AND line_no = -9223372036854774784.0", ERROR),
+    (f"{S} {_guard('line_no', '-9.22337203685477e+18')} AND line_no = -9223372036854774784.0", []),
     # A constant the affinity cannot convert stays as it is.
     (f"{S} {GUARD_A} AND line_no = 'x'", []),
     (f"{S} {_guard('line_no', 'x')} AND line_no = 'x'", ERROR),

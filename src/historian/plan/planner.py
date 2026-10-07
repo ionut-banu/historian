@@ -20,7 +20,11 @@ ceremony with no decision behind it. `plan()` therefore builds
 The one rewrite step after it is `plan/optimizer.py`'s `optimize()`
 (#121, pushdown negotiation), which `cli.py` calls on this
 tree before iterating it; it records pushed terms on the tree's
-`Scan` and changes nothing else.
+`Scan` and changes nothing else. Two rewrites SQLite makes before it
+runs a query change which errors are raised, so they are part of
+building the tree, here, and `--no-pushdown` (which skips
+`optimize()`) still gets them: `HAVING` terms that move below the
+aggregate (#141) and constant propagation in `WHERE` (#142).
 
 The table -> scan-factory mapping
 ------------------------------------
@@ -68,6 +72,7 @@ from pathlib import Path
 
 from collections.abc import Sequence
 
+from historian.exec.expression import apply_column_affinity, evaluate
 from historian.exec.operators import (
     Aggregate,
     AggregateCall,
@@ -81,18 +86,23 @@ from historian.exec.operators import (
     Sort,
     SortKey,
 )
-from historian.sql.ast import Expr, FunctionCall, Literal, OrderDirection, Star
+from historian.schema import Schema
+from historian.sql.ast import BinaryOp, Expr, FunctionCall, In, Literal, Operator as BinaryOperator
+from historian.sql.ast import OrderDirection, Star, UnaryOp
 from historian.sql.binder import BoundColumnRef, BoundOrderByItem, BoundSelectItem, BoundSelectStatement
 from historian.sql.walk import (
     children,
     contains_aggregate,
     expr_shape_equal,
+    fix_columns,
     is_aggregate_query,
     join_conjuncts,
     references_only_keys,
+    replace_conjuncts,
     split_conjuncts,
     with_children,
 )
+from historian.values import Value
 
 __all__ = ["ScanFactory", "plan"]
 
@@ -327,6 +337,102 @@ def _move_having_terms(stmt: BoundSelectStatement) -> tuple[Expr | None, Expr | 
     return join_conjuncts(moved), (join_conjuncts(kept) if len(kept) > 0 else None)
 
 
+# --- Constant propagation in WHERE (#142) ----------------------------------
+#
+# `_docs/spec.md` §3, "Constant propagation in `WHERE`". SQLite
+# (`propagateConstants` in select.c) finds every top-level `WHERE`
+# conjunct of the form `column = constant` - a source - and replaces
+# every other occurrence of that column in the `WHERE` with the
+# constant, which keeps the column's affinity. The rows that pass never
+# change (each one already has that value in that column), but which
+# sub-expressions run does, and so which queries raise.
+#
+# A source is `X = K`, `K = X` or `X IN (K)` (one element, not negated,
+# which SQLite's parser turns into `X = K`), with `X` a bound column
+# and `K` a literal or a chain of unary `+`/`-` over a numeric literal.
+# A constant that is any other expression is #179. Of two sources for
+# one column SQLite keeps the last (`findConstInWhere` walks the `AND`
+# tree right side first and ignores a column it already has), and the
+# earlier one is rewritten like any other term. The source used keeps
+# its own column; nothing else in the `WHERE` does, at any depth.
+#
+# The replacement is a `FixedColumnRef` holding the constant converted
+# by the column's affinity (`apply_column_affinity`) - the value
+# SQLite's `OP_Affinity` gives it. Only the `WHERE` is rewritten: the
+# select list, `GROUP BY`, `HAVING` (moved or not, #141), `ORDER BY`
+# and aggregate arguments keep the column, and a `HAVING` term is never
+# a source. v1 has no `COLLATE` and no non-`BINARY` column, the one
+# case SQLite does not propagate.
+
+
+def _constant_of(expr: Expr) -> Literal | UnaryOp | None:
+    """*expr* if it is a source's constant - a `Literal`, or a chain of
+    unary `+`/`-` over a numeric `Literal` - and `None` otherwise."""
+    node = expr
+    while isinstance(node, UnaryOp):
+        node = node.operand
+    if not isinstance(node, Literal):
+        return None
+    if node is not expr and not isinstance(node.value, (int, float)):
+        return None
+    assert isinstance(expr, (Literal, UnaryOp))
+    return expr
+
+
+def _source_of(term: Expr) -> tuple[BoundColumnRef, Literal | UnaryOp] | None:
+    """`(column, constant)` when one top-level `WHERE` term is a source,
+    `None` otherwise."""
+    if isinstance(term, BinaryOp) and term.op is BinaryOperator.EQ:
+        right_constant = _constant_of(term.right)
+        if isinstance(term.left, BoundColumnRef) and right_constant is not None:
+            return term.left, right_constant
+        left_constant = _constant_of(term.left)
+        if isinstance(term.right, BoundColumnRef) and left_constant is not None:
+            return term.right, left_constant
+        return None
+    if isinstance(term, In) and not term.negated and len(term.values) == 1:
+        constant = _constant_of(term.values[0])
+        if isinstance(term.left, BoundColumnRef) and constant is not None:
+            return term.left, constant
+    return None
+
+
+def _propagate_constants(where: Expr, schema: Schema) -> Expr:
+    """*where* with SQLite's constant propagation applied - see the
+    section comment above. *where* itself when it has no source, so a
+    `WHERE` with none plans exactly as before #142; otherwise the same
+    `AND` shape with every term but the sources used rewritten, and a
+    term with nothing to replace kept as the same object. *schema* is
+    the scan's, which the `WHERE` `Filter` reads.
+
+    Loops only (#107): `split_conjuncts`, a backwards scan for the
+    sources, and the iterative `fix_columns` and `replace_conjuncts`."""
+    terms = split_conjuncts(where)
+    fixed: dict[int, Value] = {}
+    source_index: dict[int, int] = {}
+    for index in range(len(terms) - 1, -1, -1):
+        found = _source_of(terms[index])
+        if found is None:
+            continue
+        column, constant = found
+        if column.offset in fixed:
+            continue
+        value = evaluate(constant, (), schema)
+        assert not isinstance(value, bool), "plan/planner.py: a source constant is a value, not a condition"
+        fixed[column.offset] = apply_column_affinity(value, schema.columns[column.offset].type)
+        source_index[column.offset] = index
+    if len(fixed) == 0:
+        return where
+    kept = set(source_index.values())
+    rewritten: list[Expr] = []
+    for index, term in enumerate(terms):
+        if index in kept:
+            rewritten.append(term)
+        else:
+            rewritten.append(fix_columns(term, fixed))
+    return replace_conjuncts(where, rewritten)
+
+
 def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory]) -> Operator:
     """Build the operator tree for *stmt*, a repository at *repo*.
 
@@ -339,6 +445,10 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory])
     catalog`. Tests pass a fake factory with no repository and no git
     subprocess, per this module's own docstring; `cli.py` passes
     `historian.catalog.SCAN_FACTORIES`.
+
+    The `WHERE` `Filter` holds the `WHERE` after constant propagation
+    (`_propagate_constants`, #142): `stmt.where` itself when it has no
+    `column = constant` term.
 
     Tree shape, per `_docs/spec.md` §3: `Scan -> Filter (WHERE) ->
     Filter (HAVING terms moved below the aggregate, not negotiable) ->
@@ -397,7 +507,7 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory])
     source = tables[stmt.from_table](repo)
     tree: Operator = Scan(source)
     if stmt.where is not None:
-        tree = Filter(tree, stmt.where)
+        tree = Filter(tree, _propagate_constants(stmt.where, tree.schema))
     moved_having, kept_having = _move_having_terms(stmt)
     if moved_having is not None:
         tree = Filter(tree, moved_having, negotiable=False)

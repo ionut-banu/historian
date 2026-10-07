@@ -3553,6 +3553,10 @@ What the walk does after an error depends on the node:
    `resolveExprStep` - and the oracle agrees.
 6. Every other node ABORTs at once if an error is already recorded;
    otherwise it walks its children and passes an ABORT up.
+7. `x [NOT] IN (e)` with one element, and that element constant, is
+   SQLite's `x = +e` (`NOT (x = +e)`): the node trips like rule 6, `x`
+   is walked, then the `+` trips if an error is recorded, then `e` is
+   walked. See "A one-element `IN` list" below.
 
 An ABORT stops at the nearest enclosing call, `LIKE` or `IS NULL`, or
 ends the root: one select-list item, one `WHERE`/`HAVING`/`GROUP BY`/
@@ -3591,6 +3595,54 @@ gives the same message on all 21,712 statements when they are run -
 not `EXPLAIN`ed: that build reports no unknown function under
 `EXPLAIN` (`SQLITE_ENABLE_UNKNOWN_SQL_FUNCTION`), which the oracle
 does.
+
+A one-element `IN` list (round 2, found by QA on round 1). SQLite's
+parser (`parse.y`, the `in_op` rule) rewrites `x IN (e)` to `x = +e`
+when the list has one element and `sqlite3ExprIsConstant` holds for
+it, before any name is resolved. The `+` is one more node, between
+`x` and `e`, that trips on an error recorded while `x` was walked, so
+the ABORT takes the `IN` and everything up to the nearest call, `LIKE`
+or `IS NULL` with it. It shows only when `e` is a node that would not
+trip itself (`IS NULL`, `LIKE`): QA's `SELECT zz2 LIKE (nofn2(zz1) IN
+(3 IS NULL)) FROM blame` is `no such column: zz1` (historian said
+`zz2`), and `LIMIT (nofn(line_no) IN ((-3 IS NOT NULL))) OFFSET zz2`
+is `line_no` (historian said `zz2`). Measured on the oracle, not taken
+from the QA wording: constant is no column reference and no function
+call anywhere in `e`, through any parentheses, signs, literals
+(strings, `NULL`, integers past 64 bits), `IS [NOT] NULL`, `IS`,
+`BETWEEN`, `AND`/`OR`/`NOT`, binary operators and nested `IN` lists;
+`LIKE` (with or without `ESCAPE`) over constants is constant, because
+SQLite's `like()` is a constant function; a qualified column, an alias
+(`c`), `count(*)` or an unknown call is not, and neither is any call
+to a scalar built-in historian does not have (`abs(1)` is constant to
+SQLite; until #183 historian reports it as unknown wherever it
+stands). `NOT IN` is the same rule under a `NOT`; two elements stay
+an `IN` list whatever they are; the left side is anything that
+records an error without tripping (a call, a misuse, `IS NULL`,
+`LIKE`); a late misuse (`ORDER BY count(*) IN (..)` of a
+non-aggregate query) is not recorded, so nothing trips. The `+` is
+`_IN_PLUS` in `sql/bind_expr.py`, the predicate `is_constant` in
+`sql/walk.py`; it is asked only when the `+` is reached with an error
+recorded, the one time the answer matters, so nested one-element
+lists are not checked once per level (an `IN` met with an error
+recorded trips at its own visit and never reaches its `+`). SQLite
+also folds `x AND 0` and `x IN ()` (no call in `x`) to a constant at
+parse time, which makes an element such as `(ghost AND 0) IS NULL`
+constant there and not here; that is #185's class and left to it.
+`tests/differential/test_error_walk.py` adds 65 hand-written cases
+(40 differed before) and a second seeded sweep, seed 1442: the same
+eleven shapes and 3,000 trees, three non-leaf nodes in ten a
+one-element `IN` list whose element is a constant tree three times in
+four - 24,193 distinct statements, 21,048 rejected by the oracle, 45
+of them different before, none after. The first sweep's draws are
+unchanged, so its 21,593 statements are the same. Separately, five
+fresh seeds (9001, 31337 and 2026 at depth 4, 777 and 4242 at depth
+3, with and without the `IN` lists): 266,002 distinct statements,
+244,443 rejected, none different. Of 213,771 distinct statements
+from the same generators (seeds 9001, 2026, 777 and 1442, the eleven
+shapes and two more with an `IN` list in `WHERE`), the ones that bind
+before the change (48,488 of the 312,000 generated) bind to the
+identical tree after (by `repr`), and no other binds.
 
 Where the oracle went further than the issue. An `ORDER BY` or
 `GROUP BY` term that is an integer (through unary signs and
@@ -3646,4 +3698,12 @@ Found and not fixed, each outside this issue: `ORDER BY 2147483648`
 and accepted, and historian rejects it as an out-of-range ordinal;
 `SELECT 1 + NOT 0` parses in SQLite (`2`) and is a parse error in
 historian; `x IS TRUE` is SQLite's truth test, and historian reads
-`TRUE` as a column name.
+`TRUE` as a column name, in `x IN (true)` too. Round 2: `x IN ()`
+with no call in `x` is folded to a constant by SQLite's parser, so
+`SELECT ghost IN () FROM blame` is accepted and `(ghost1 IN ()) +
+ghost2` is `ghost2`, where historian says `ghost1` - #185's class.
+`sql/parser.py`'s `_node_height` folds `x AND 0` and `x IN ()` to a
+leaf even when `x` has a function call in it, which SQLite does not
+(`EP_HasFunc`): `SELECT nofn(1 + 1 + ... + 1) AND 0 FROM blame`, 999
+ones, is "Expression tree is too large" to SQLite and `no such
+function: nofn` to historian.

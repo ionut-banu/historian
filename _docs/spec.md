@@ -865,6 +865,15 @@ walk does after an error depends on the node it meets:
    first, and ABORT if it does not resolve.
 6. Every other node ABORTs at once if an error is already recorded;
    otherwise it walks its children and passes an ABORT up.
+7. `x IN (e)` and `x NOT IN (e)`, with one element and that element
+   constant - no column reference and no function call anywhere in
+   it; `LIKE` over constants counts as constant - are SQLite's `x =
+   +e` and `NOT (x = +e)`: the node ABORTs like rule 6, then `x` is
+   walked, then the `+` ABORTs if an error is recorded, then `e` is
+   walked. It matters only when `e` is a node that does not ABORT on
+   its own (`IS NULL`, `LIKE`): `(nofn(1) IN (3 IS NULL)) + ghost` is
+   `no such function: nofn`, where with two elements, or with a
+   column in `e`, the walk goes on to `ghost`.
 
 An ABORT stops at the nearest enclosing function call, `LIKE` or `IS
 NULL`, or ends the root: one select-list item, one `WHERE`, `HAVING`,

@@ -622,3 +622,70 @@ def test_where_is_still_pushed_beside_a_moved_term(tiny_repo):
         list(tree.rows())
     assert built[0].blamed_paths == ["src/utils.py"]
     assert built[0].git_invocations == 2
+
+
+# --- Constant propagation in WHERE (#142) ------------------------------------
+#
+# The terms negotiated with the scan are the terms as rewritten: a
+# `path` term beside a `path = constant` source has the constant in
+# `path`'s place and is not one the scan accepts. Before #142 each
+# `path` term below was pushed; the numbers on `main` are in each
+# docstring.
+
+
+def test_a_like_beside_a_path_source_is_not_pushed(tiny_repo):
+    """`path LIKE 'src/%'` becomes `'src/utils.py' LIKE 'src/%'`; only
+    the source is pushed. The same one path is blamed, in the same two
+    git invocations, as on `main` (where both terms were pushed).
+    Oracle: `2`."""
+    rows = _check(
+        "SELECT count(*) FROM blame WHERE path = 'src/utils.py' AND path LIKE 'src/%'",
+        tiny_repo,
+        blamed=["src/utils.py"],
+        invocations=2,
+        pushed=1,
+    )
+    assert rows == [(2,)]
+
+
+def test_of_two_path_sources_the_last_is_pushed(tiny_repo):
+    """SQLite uses the last of two sources for one column and rewrites
+    the first into `'src/utils.py' = 'feature/thing.py'`, so only
+    `path = 'src/utils.py'` is pushed and that path is blamed. `main`
+    pushed both and blamed nothing, in one git invocation. Oracle:
+    `0`."""
+    rows = _check(
+        "SELECT count(*) FROM blame WHERE path = 'feature/thing.py' AND path = 'src/utils.py'",
+        tiny_repo,
+        blamed=["src/utils.py"],
+        invocations=2,
+        pushed=1,
+    )
+    assert rows == [(0,)]
+
+
+def test_an_in_list_beside_a_path_source_is_not_pushed(tiny_repo):
+    """`path IN ('a', 'b')` becomes `'src/utils.py' IN ('a', 'b')`.
+    `main` pushed both terms and blamed nothing, in one git invocation.
+    Oracle: `0`."""
+    rows = _check(
+        "SELECT count(*) FROM blame WHERE path = 'src/utils.py' AND path IN ('a', 'b')",
+        tiny_repo,
+        blamed=["src/utils.py"],
+        invocations=2,
+        pushed=1,
+    )
+    assert rows == [(0,)]
+
+
+def test_a_line_no_source_leaves_path_pushdown_alone(tiny_repo):
+    """`line_no` is never pushed and `path` has no source, so `path =
+    'src/utils.py'` is pushed as before."""
+    _check(
+        "SELECT count(*) FROM blame WHERE path = 'src/utils.py' AND line_no = 1 AND line_no >= 1",
+        tiny_repo,
+        blamed=["src/utils.py"],
+        invocations=2,
+        pushed=1,
+    )
+

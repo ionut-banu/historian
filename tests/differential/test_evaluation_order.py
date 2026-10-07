@@ -35,14 +35,19 @@ capabilities, and the `HAVING` leaves that constrain `path` move below
 the aggregate, where nothing is negotiated - #141), so the rows the
 scan serves are the rows the real scan would.
 
-The sweep's leaves avoid `column = constant`. SQLite propagates such
-a top-level `WHERE` conjunct into the other conjuncts and folds what
-becomes constant (`WHERE NOT (line_no = 5 AND ERR) AND line_no = 5`
-raises in SQLite: `5 = 5` folds away and `ERR` is left), which is the
-known constant-folding difference (`_docs/decisions.md`, 2026-09-25,
-#51), not evaluation order. Measured: with `=` leaves, 36 of 22,050
-generated queries differ from the evaluation-order model for exactly
-that reason, and with the leaves below none do.
+The main placements' leaves avoid `column = constant`: SQLite
+propagates a top-level `WHERE` conjunct of that form into the other
+conjuncts (#142, spec §3 "Constant propagation in `WHERE`"), which is
+a rewrite, not evaluation order. The `propagated` placement covers it:
+`WHERE NOT (<formula>) AND line_no = 5`, over leaves that compare
+`line_no`, so every `line_no` in the formula becomes `5` (`WHERE NOT
+(line_no = 5 AND ERR) AND line_no = 5` raises: `5 = 5` is `TRUE` and
+`ERR` runs). The whole `NOT (...)` is one conjunct and contains `path`
+through `ERR`, or else only comparisons that are per row in both
+engines, so no conjunct is left with no column. What remains is a
+conjunct that does become constant - `WHERE ERR AND line_no = 1 AND
+line_no = 2`, or `line_no > 5 AND line_no = 5` - which SQLite decides
+before any row (#171, #180).
 """
 
 from __future__ import annotations
@@ -279,6 +284,14 @@ def test_condition_context_results_are_nonempty_where_expected(tiny_repo, tiny_c
 # HISTORIAN_SWEEP_OPERATORS=3 is set; the default is 2 (13,872
 # queries, plus 17,424 for `having_mixed`). See _docs/decisions.md (2026-10-01, #111) for the full
 # k <= 3 run against both engines.
+#
+# An eighth placement, `propagated` (#142), is `WHERE NOT (<formula>) AND
+# line_no = 5` over seven leaves comparing `line_no` (and `ERR`), so
+# SQLite's constant propagation replaces every `line_no` in the formula
+# with `5`. Its alphabet is seven leaves: 11,774 queries up to two
+# operators, and 768,320 more for k = 3 - but each runs over three rows
+# with nothing to group, so the k = 3 part is about three minutes and
+# it is not capped.
 
 _SWEEP_OPERATORS = int(os.environ.get("HISTORIAN_SWEEP_OPERATORS", "2"))
 
@@ -300,6 +313,21 @@ KEY_LEAVES = {
     "T": "path >= ''",
     "F": "path > 'zzzz'",
     "N": "path < NULL",
+    "E": ERR,
+}
+#: `propagated`'s alphabet (#142): each `line_no` leaf becomes a
+#: comparison of `5` once `line_no = 5` is propagated into the formula -
+#: `Q` and `G` and `T` true, `D` and `L` false, `N` NULL - while over a
+#: row of `tiny` (`line_no` 1 or 2) they are what they say: `Q`, `D`,
+#: `G`, `L`, `T`, `N` are `line_no = 5`, `<> 5`, `> 4`, `< 5`, `>= 1`,
+#: `< NULL`.
+PROPAGATED_LEAVES = {
+    "Q": "line_no = 5",
+    "D": "line_no <> 5",
+    "G": "line_no > 4",
+    "L": "line_no < 5",
+    "T": "line_no >= 1",
+    "N": "line_no < NULL",
     "E": ERR,
 }
 #: `having_mixed`'s alphabet: upper case a key-only leaf, lower case the
@@ -411,6 +439,15 @@ _HAVING_MIXED_GROUPS = [
 ]
 
 
+_PROPAGATED_GROUPS = [
+    pytest.param(
+        [f"SELECT path, line_no FROM blame WHERE NOT ({_sql(f, PROPAGATED_LEAVES)}) AND line_no = 5" for f in formulas],
+        id=f"propagated-{name}",
+    )
+    for name, formulas in _formula_groups(_SWEEP_OPERATORS, alphabet="QDGLTNE")
+]
+
+
 def _in_between_groups() -> list:
     """`x IN (a[, b[, c]])` and `NOT IN`, the left side from the leaf
     set and each element from the leaf set or the left side itself
@@ -497,6 +534,17 @@ def test_sweep_size():
     assert in_between == 2 * (1240 + 128)
 
 
+def test_propagated_sweep_size():
+    """`propagated` (#142): seven leaves - 14 + 784 + 10,976 formulas up
+    to two operators (leaf NOTs up to one operator), in 1 + 4 + 32
+    groups, and 5 * 8 * 8 * 7**4 = 768,320 more in 320 groups at three."""
+    sizes = {2: (1 + 4 + 32, 14 + 784 + 10976), 3: (1 + 4 + 32 + 320, 14 + 784 + 10976 + 768320)}
+    if _SWEEP_OPERATORS in sizes:
+        groups, queries = sizes[_SWEEP_OPERATORS]
+        assert len(_PROPAGATED_GROUPS) == groups
+        assert sum(len(param.values[0]) for param in _PROPAGATED_GROUPS) == queries
+
+
 @pytest.mark.parametrize("queries", _SWEEP_GROUPS)
 def test_and_or_not_sweep(tiny_repo, tiny_conn, cached_tables, queries):
     _assert_all_agree(tiny_conn, tiny_repo, queries, cached_tables)
@@ -504,6 +552,11 @@ def test_and_or_not_sweep(tiny_repo, tiny_conn, cached_tables, queries):
 
 @pytest.mark.parametrize("queries", _HAVING_MIXED_GROUPS)
 def test_having_mixed_sweep(tiny_repo, tiny_conn, cached_tables, queries):
+    _assert_all_agree(tiny_conn, tiny_repo, queries, cached_tables)
+
+
+@pytest.mark.parametrize("queries", _PROPAGATED_GROUPS)
+def test_propagated_sweep(tiny_repo, tiny_conn, cached_tables, queries):
     _assert_all_agree(tiny_conn, tiny_repo, queries, cached_tables)
 
 

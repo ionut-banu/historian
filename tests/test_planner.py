@@ -1622,3 +1622,246 @@ def test_a_5000_term_hand_built_having_plans_and_runs():
     assert len(walk.split_conjuncts(_chain(tree)[1].predicate())) == _DEEP // 2
     assert len(walk.split_conjuncts(_chain(tree)[3].predicate())) == _DEEP // 2
     assert list(tree.rows()) == [("a.py",), ("b.py",)]
+
+
+# --- Constant propagation in WHERE (#142) -------------------------------------
+#
+# Bound through the real parser and binder against `widgets` (path TEXT,
+# line_no INTEGER, author_email TEXT), planned against `_EstimatingSource`:
+# no git anywhere. `walk.FixedColumnRef` is looked up at run time.
+
+
+def _where_terms(tree) -> list:
+    """The terms of the `Filter` directly above the `Scan`."""
+    ops = _chain(tree)
+    assert isinstance(ops[-1], Scan) and isinstance(ops[-2], Filter)
+    return walk.split_conjuncts(ops[-2].predicate())
+
+
+def _fixed_refs(expr) -> list:
+    """Every `FixedColumnRef` in *expr*, left to right."""
+    found = []
+    pending = [expr]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, walk.FixedColumnRef):
+            found.append(node)
+        pending.extend(reversed(walk.children(node)))
+    return found
+
+
+def _column_refs(expr) -> list:
+    found = []
+    pending = [expr]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, BoundColumnRef):
+            found.append(node)
+        pending.extend(reversed(walk.children(node)))
+    return found
+
+
+def test_the_source_is_kept_and_the_guard_rewritten():
+    """`NOT (line_no = 5 AND ERR) AND line_no = 5`: the `Filter` holds
+    the source as bound and the guard with `line_no` replaced by a
+    `FixedColumnRef` holding `5`; `ERR` is the bound object itself."""
+    bound, tree = _planned(f"SELECT path FROM widgets WHERE NOT (line_no = 5 AND {_ERR}) AND line_no = 5")
+    guard, source = _where_terms(tree)
+    bound_guard, bound_source = walk.split_conjuncts(bound.where)
+    assert source is bound_source
+    assert isinstance(guard, Not) and guard is not bound_guard
+    inner = guard.operand
+    assert isinstance(inner, And)
+    assert inner.right is bound_guard.operand.right
+    fixed = inner.left.left
+    assert isinstance(fixed, walk.FixedColumnRef)
+    assert (fixed.offset, fixed.name, fixed.value) == (1, "line_no", 5)
+    assert type(fixed.value) is int
+    assert inner.left.right is bound_guard.operand.left.right
+    assert _column_refs(guard) == [bound_guard.operand.right.left]
+
+
+def test_a_source_in_the_middle_rewrites_terms_before_and_after():
+    bound, tree = _planned("SELECT path FROM widgets WHERE line_no > 0 AND line_no = 5 AND line_no < 9")
+    before, source, after = _where_terms(tree)
+    assert source is walk.split_conjuncts(bound.where)[1]
+    for term in (before, after):
+        assert [ref.value for ref in _fixed_refs(term)] == [5]
+        assert _column_refs(term) == []
+
+
+def test_sources_on_two_columns_are_both_used():
+    bound, tree = _planned(
+        "SELECT path FROM widgets WHERE NOT (line_no = 1 AND path = 'q') AND line_no = 1 AND path = 'q'"
+    )
+    guard, line_source, path_source = _where_terms(tree)
+    _g, bound_line, bound_path = walk.split_conjuncts(bound.where)
+    assert line_source is bound_line and path_source is bound_path
+    assert [(ref.name, ref.value) for ref in _fixed_refs(guard)] == [("line_no", 1), ("path", "q")]
+    assert _column_refs(guard) == []
+
+
+def test_of_two_sources_for_one_column_the_last_is_used():
+    """SQLite takes the last (`findConstInWhere` walks right to left and
+    keeps the first source it meets per column); the earlier one is
+    rewritten like any other term, so `1 = 1.0` reads `1`, not `1.0`."""
+    bound, tree = _planned("SELECT path FROM widgets WHERE line_no = 1.0 AND line_no = 1")
+    first, last = _where_terms(tree)
+    assert last is bound.where.right
+    assert first is not bound.where.left
+    (fixed,) = _fixed_refs(first)
+    assert fixed.value == 1 and type(fixed.value) is int
+    assert first.right is bound.where.left.right
+
+
+@pytest.mark.parametrize(
+    "constant, value",
+    [("'05'", 5), ("5.0", 5), ("' 5'", 5), ("'5.0'", 5), ("5.5", 5.5), ("'x'", "x"), ("NULL", None), ("-5", -5)],
+)
+def test_the_replacement_is_converted_by_the_columns_affinity(constant, value):
+    _bound_stmt, tree = _planned(f"SELECT path FROM widgets WHERE line_no > 0 AND line_no = {constant}")
+    (fixed,) = _fixed_refs(_where_terms(tree)[0])
+    assert fixed.value == value and type(fixed.value) is type(value)
+
+
+def test_a_text_column_gets_a_text_replacement():
+    _bound_stmt, tree = _planned("SELECT path FROM widgets WHERE path > '' AND path = 5.0")
+    (fixed,) = _fixed_refs(_where_terms(tree)[0])
+    assert fixed.value == "5.0"
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        "line_no IS 5 AND line_no > 0",
+        "line_no <> 5 AND line_no > 0",
+        "line_no BETWEEN 5 AND 5 AND line_no > 0",
+        "line_no IN (5, 5) AND line_no > 0",
+        "line_no NOT IN (5) AND line_no > 0",
+        "+line_no = 5 AND line_no > 0",
+        "line_no + 0 = 5 AND line_no > 0",
+        "line_no = line_no AND line_no > 0",
+        "NOT (line_no = 5) AND line_no > 0",
+        "(line_no = 5 OR line_no = 6) AND line_no > 0",
+        "path LIKE 'a' AND path > ''",
+    ],
+)
+def test_terms_that_are_not_sources_leave_the_where_as_bound(where):
+    bound, tree = _planned(f"SELECT path FROM widgets WHERE {where}")
+    assert _chain(tree)[-2].predicate() is bound.where
+
+
+#: A `WHERE` with no source plans to exactly what `main` built.
+_NO_SOURCE_PLANS = {
+    "SELECT path FROM widgets WHERE path LIKE 'a%' AND line_no > 1": (
+        "Project (path)\n"
+        "  Filter (path LIKE 'a%' AND line_no > 1)\n"
+        "    WidgetScan (pushed: none -> 0 of 0 paths)\n"
+    ),
+    "SELECT path FROM widgets WHERE line_no = 5 OR line_no = 6": (
+        "Project (path)\n"
+        "  Filter (line_no = 5 OR line_no = 6)\n"
+        "    WidgetScan (pushed: none -> 0 of 0 paths)\n"
+    ),
+    "SELECT path FROM widgets WHERE line_no <> 5": (
+        "Project (path)\n"
+        "  Filter (line_no <> 5)\n"
+        "    WidgetScan (pushed: none -> 0 of 0 paths)\n"
+    ),
+    "SELECT path FROM widgets": (
+        "Project (path)\n"
+        "  WidgetScan (pushed: none -> 0 of 0 paths)\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("sql", list(_NO_SOURCE_PLANS))
+def test_a_where_with_no_source_plans_the_tree_main_built(sql):
+    bound, tree = _planned(sql)
+    assert format_plan(tree) == _NO_SOURCE_PLANS[sql]
+    if bound.where is not None:
+        assert _chain(tree)[-2].predicate() is bound.where
+
+
+def test_having_is_neither_a_source_nor_a_target():
+    """A `WHERE` source does not reach the moved `HAVING` terms or the
+    kept ones, and a `HAVING` `column = constant` is no source: the
+    moved `Filter` holds the bound terms themselves, and nothing above
+    the `WHERE` `Filter` holds a `FixedColumnRef`."""
+    sql = (
+        f"SELECT count(*) FROM widgets WHERE line_no = 5 AND path > '' GROUP BY line_no, path "
+        f"HAVING NOT (line_no = 5 AND {_ERR}) AND count(*) > 0 AND path = 'q'"
+    )
+    bound, tree = _planned(sql)
+    assert _kinds(tree) == ["Project", "Filter", "Aggregate", "Filter", "Filter", "Scan"]
+    _project, kept, _aggregate, moved, where, _scan = _chain(tree)
+    guard, _count, path_term = walk.split_conjuncts(bound.having)
+    moved_terms = walk.split_conjuncts(moved.predicate())
+    assert len(moved_terms) == 2 and moved_terms[0] is guard and moved_terms[1] is path_term
+    assert _fixed_refs(kept.predicate()) == []
+    # The WHERE itself is rewritten: `path > ''` has no source, `line_no = 5` is one.
+    assert walk.split_conjuncts(where.predicate())[0] is bound.where.left
+    # Without the WHERE source the HAVING side plans identically.
+    _b2, plain = _planned(sql.replace("WHERE line_no = 5 AND path > ''", "WHERE line_no >= 5 AND path > ''"))
+    assert walk.expr_shape_equal(kept.predicate(), _chain(plain)[1].predicate())
+    assert walk.expr_shape_equal(moved.predicate(), _chain(plain)[3].predicate())
+
+
+def test_propagation_does_not_mutate_the_bound_statement():
+    sql = f"SELECT path FROM widgets WHERE NOT (line_no = 5 AND {_ERR}) AND line_no = 5 AND path > ''"
+    bound = _bound(sql)
+    where_before = bound.where
+    snapshot = repr(bound)
+    plan(bound, Path("/nonexistent"), tables=_fake_tables(_FakeSource([])))
+    assert bound.where is where_before
+    assert repr(bound) == snapshot
+    assert bound == _bound(sql)
+
+
+def test_propagated_rows_are_the_rows_without_propagation():
+    rows = [("a.py", 1, None), ("b.py", 1, "x"), ("c.py", 2, None)]
+    _b, tree = _planned("SELECT path FROM widgets WHERE line_no = 1.0 AND line_no || 'x' = '1x'", rows)
+    assert list(tree.rows()) == [("a.py",), ("b.py",)]
+    _b, tree = _planned("SELECT path FROM widgets WHERE line_no = 1.0 AND line_no || 'x' = '1.0x'", rows)
+    assert list(tree.rows()) == []
+
+
+def test_a_900_term_where_with_the_source_last_plans_and_runs():
+    """Through the real parser: 899 `line_no >= 0` terms then `line_no =
+    1`, every earlier term rewritten, with no `RecursionError` (#107)."""
+    terms = ["line_no >= 0"] * 899 + ["line_no = 1"]
+    rows = [("a.py", 1, None), ("b.py", 2, None)]
+    bound, tree = _planned(f"SELECT path FROM widgets WHERE {' AND '.join(terms)}", rows)
+    got = _where_terms(tree)
+    assert len(got) == 900
+    assert got[-1] is walk.split_conjuncts(bound.where)[-1]
+    assert all(len(_fixed_refs(term)) == 1 for term in got[:-1])
+    assert list(tree.rows()) == [("a.py",)]
+    format_plan(tree)
+
+
+def test_a_5000_term_hand_built_where_plans_and_runs():
+    """Deeper than the parser allows: a recursive split, rewrite or
+    rebuild would hit the recursion limit."""
+    where = _bin(Op.GE, _col("line_no"), _lit(0))
+    for _index in range(1, _DEEP - 1):
+        where = And(left=where, right=_bin(Op.GE, _col("line_no"), _lit(0)), position=_POS)
+    where = And(left=where, right=_bin(Op.EQ, _col("line_no"), _lit(2)), position=_POS)
+    stmt = _stmt([_select_item(_col("path"))], where=where)
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(_FakeSource([("a.py", 1, None), ("b.py", 2, None)])))
+    got = _where_terms(tree)
+    assert len(got) == _DEEP
+    assert got[-1] is where.right
+    assert list(tree.rows()) == [("b.py",)]
+
+
+def test_a_deep_guard_is_rewritten_without_recursion():
+    """One guard term 5000 levels deep (`line_no + 1 + 1 ...`), hand
+    built: the column replacement walk is iterative too."""
+    deep = _deep_chain(_DEEP, lambda: _col("line_no"))
+    where = And(left=_bin(Op.GT, deep, _lit(0)), right=_bin(Op.EQ, _col("line_no"), _lit(1)), position=_POS)
+    stmt = _stmt([_select_item(_col("path"))], where=where)
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(_FakeSource([("a.py", 1, None), ("b.py", 2, None)])))
+    guard, _source = _where_terms(tree)
+    assert len(_fixed_refs(guard)) == len(_column_refs(deep))
+    assert list(tree.rows()) == [("a.py",)]

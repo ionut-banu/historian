@@ -12,6 +12,7 @@ chains that translate to a Rust `match`).
 from __future__ import annotations
 
 import dataclasses
+import sys
 import types
 import typing
 from dataclasses import dataclass
@@ -724,3 +725,82 @@ def test_resolution_order_raises_on_an_unknown_node_type():
         walk.resolution_children(node)
     with pytest.raises(AssertionError, match="unhandled expression node type Unknown"):
         walk.with_resolution_children(node, [])
+
+
+# --- SQLite's parse-time constant (issue #144, round 2) ------------------------
+#
+# SQLite's parser rewrites `x IN (e)` to `x = +e` when `e` is constant
+# (`sqlite3ExprIsConstant`): no column and no function call anywhere in
+# it. `LIKE` is SQLite's built-in `like()`, a constant function, so it
+# counts as constant when its operands are.
+
+
+def _lit(value=1):
+    return Literal(value, _POS)
+
+
+def _is_null(operand):
+    return Is(left=operand, right=Literal(None, _POS), negated=False, position=_POS)
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        _lit(),
+        _lit(None),
+        _lit("a"),
+        UnaryOp(op=UnaryOperator.NEG, operand=_lit(3), position=_POS),
+        _is_null(_lit(3)),
+        _is_null(_is_null(_lit())),
+        Like(left=_lit("a"), pattern=_lit("b"), negated=False, position=_POS, escape=_lit("c")),
+        In(left=_lit(2), values=(_lit(3), _is_null(_lit())), negated=True, position=_POS),
+        Between(operand=_lit(1), low=_lit(2), high=_lit(3), negated=False, position=_POS),
+        Not(operand=And(left=_lit(1), right=Or(left=_lit(0), right=_lit(1), position=_POS), position=_POS), position=_POS),
+        BinaryOp(op=Operator.ADD, left=_lit(1), right=_lit(2), position=_POS),
+    ],
+)
+def test_a_tree_of_literals_is_constant(expr):
+    assert walk.is_constant(expr) is True
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        ColumnRef(None, "path", _POS),
+        ColumnRef("blame", "path", _POS),
+        BoundColumnRef(offset=0, name="path", position=_POS),
+        walk.FixedColumnRef(offset=0, name="path", value=1, position=_POS),
+        Star(None, _POS),
+        FunctionCall("nofn", (_lit(),), _POS),
+        FunctionCall("count", (Star(None, _POS),), _POS),
+        FunctionCall("abs", (_lit(),), _POS),
+        _is_null(ColumnRef(None, "path", _POS)),
+        _is_null(_is_null(FunctionCall("nofn", (), _POS))),
+        Like(left=_lit("a"), pattern=ColumnRef(None, "path", _POS), negated=False, position=_POS),
+        In(left=_lit(2), values=(_lit(3), ColumnRef(None, "c", _POS)), negated=False, position=_POS),
+        BinaryOp(op=Operator.ADD, left=_lit(1), right=ColumnRef(None, "ghost", _POS), position=_POS),
+    ],
+)
+def test_a_tree_with_a_column_or_a_call_is_not_constant(expr):
+    assert walk.is_constant(expr) is False
+
+
+@pytest.fixture
+def recursion_limit_1000_walk():
+    previous = sys.getrecursionlimit()
+    sys.setrecursionlimit(1000)
+    yield
+    sys.setrecursionlimit(previous)
+
+
+def test_is_constant_on_a_deep_tree(recursion_limit_1000_walk):
+    """Not recursive (#107): 20,000 levels at a recursion limit of 1000,
+    the column at the far end."""
+    node = _lit()
+    for _ in range(20_000):
+        node = _is_null(node)
+    assert walk.is_constant(node) is True
+    node = ColumnRef(None, "path", _POS)
+    for _ in range(20_000):
+        node = _is_null(node)
+    assert walk.is_constant(node) is False

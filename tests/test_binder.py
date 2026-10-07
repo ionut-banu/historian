@@ -3089,3 +3089,88 @@ def test_deep_nested_calls_unwind_one_argument_list_at_a_time(recursion_limit_10
         expr = FunctionCall("nofn", (expr, Literal(1, _POS)), _POS)
     with pytest.raises(BindError, match=r"^no such column: ghost$"):
         bind(_place("where", expr), SCHEMAS)
+
+
+# --- A one-element IN list of a constant (issue #144, round 2) -----------------
+#
+# SQLite's `x IN (e)`, `e` constant, is `x = +e`: the `+` stops the walk
+# on an error recorded while `x` was walked. The differential cases are
+# in `tests/differential/test_error_walk.py`; these are the deep trees.
+
+
+def _in_one(left, element):
+    from historian.sql.ast import In
+
+    return In(left=left, values=(element,), negated=False, position=_POS)
+
+
+def _is_null_chain(bottom):
+    from historian.sql.ast import Is
+
+    node = bottom
+    for _ in range(_VERY_DEEP):
+        node = Is(left=node, right=Literal(None, _POS), negated=False, position=_POS)
+    return node
+
+
+@pytest.mark.parametrize("clause", _CLAUSES)
+def test_deep_constant_in_element_stops_the_walk(clause, recursion_limit_1000):
+    """`(nofn(1) IN (((1 IS NULL) IS NULL) ...)) + ghost`, 20,000 levels
+    of `IS NULL`: constant, so `ghost` is never reached."""
+    nofn = FunctionCall("nofn", (Literal(1, _POS),), _POS)
+    expr = BinaryOp(
+        op=Operator.ADD,
+        left=_in_one(nofn, _is_null_chain(Literal(1, _POS))),
+        right=ColumnRef(None, "ghost", _POS),
+        position=_POS,
+    )
+    with pytest.raises(BindError, match=r"^no such function: nofn$"):
+        bind(_place(clause, expr), SCHEMAS)
+
+
+@pytest.mark.parametrize("clause", ["select", "where", "having", "group_by", "order_by"])
+def test_deep_in_element_with_a_column_at_the_bottom_goes_on(clause, recursion_limit_1000):
+    """The same with `path` at the bottom: not constant, an IN list, and
+    `ghost` overwrites."""
+    nofn = FunctionCall("nofn", (Literal(1, _POS),), _POS)
+    expr = BinaryOp(
+        op=Operator.ADD,
+        left=_in_one(nofn, _is_null_chain(ColumnRef(None, "path", _POS))),
+        right=ColumnRef(None, "ghost", _POS),
+        position=_POS,
+    )
+    with pytest.raises(BindError, match=r"^no such column: ghost$"):
+        bind(_place(clause, expr), SCHEMAS)
+
+
+def test_deep_chain_of_one_element_in_lists_binds(recursion_limit_1000):
+    """`path IN (path IN (... IN (1 IS NULL)))`, 20,000 deep, no error:
+    binds, and to the same tree as written."""
+    node = _is_null_chain(Literal(1, _POS))
+    for _ in range(_VERY_DEEP):
+        node = _in_one(ColumnRef(None, "path", _POS), node)
+    bound = bind(_place("where", node), SCHEMAS)
+    count = 0
+    current = bound.where
+    while type(current).__name__ == "In":
+        assert isinstance(current.left, BoundColumnRef)
+        assert len(current.values) == 1
+        current = current.values[0]
+        count += 1
+    assert count == _VERY_DEEP
+
+
+def test_deep_chain_of_one_element_in_lists_with_errors_on_the_left(recursion_limit_1000):
+    """`nofn(1) IN ((nofn(1) IN ((... (1 IS NULL)) IS NULL)) IS NULL)`:
+    every element has a call in it, so none is constant, and every inner
+    `IN` stops on its own; the ABORT ends at the `IS NULL` around it and
+    the walk goes on to `ghost`. Linear: no element is checked twice."""
+    from historian.sql.ast import Is
+
+    node = Literal(1, _POS)
+    for _ in range(_VERY_DEEP):
+        nofn = FunctionCall("nofn", (Literal(1, _POS),), _POS)
+        node = Is(left=_in_one(nofn, node), right=Literal(None, _POS), negated=False, position=_POS)
+    expr = BinaryOp(op=Operator.ADD, left=node, right=ColumnRef(None, "ghost", _POS), position=_POS)
+    with pytest.raises(BindError, match=r"^no such column: ghost$"):
+        bind(_place("select", expr), SCHEMAS)

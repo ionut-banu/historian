@@ -3440,7 +3440,7 @@ quotes held, with these differences, where the oracle is followed:
 - The "not sources" list returns no rows as the issue says, except
   `line_no <> 5`, `NOT (line_no = 5)`, `line_no NOT IN (5)` and
   `line_no = line_no`, which return all three rows, with no error.
-  `LIMIT 1` raises like `LIMIT 0` does not.
+  `LIMIT 1` raises; `LIMIT 0` returns no rows, as the issue says.
 
 Design. The rewrite is `plan()`'s (`_propagate_constants`), like
 #141's move, because `--no-pushdown` skips `optimize()` and must still

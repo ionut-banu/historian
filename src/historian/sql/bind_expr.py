@@ -194,6 +194,10 @@ class _Context:
     #: aggregate query, or in the ORDER BY of a non-aggregate one. See
     #: `sql/binder.py`'s "Resolution order".
     late_misuse: list[BindError] | None = None
+    #: Issue #144: the clause `reject_aggregates` is set for, named in
+    #: the misuse message (`"WHERE"`, `"ORDER BY"`), so the message
+    #: names the clause the call was found in.
+    clause: str = ""
 
 
 # --- FROM-table resolution -------------------------------------------------
@@ -383,7 +387,7 @@ def _validate_function_call(call: FunctionCall, ctx: _Context) -> None:
     if ctx.reject_aggregates:
         _reject_aggregate(
             BindError(
-                f"misuse of aggregate function {call.name}(): aggregate calls are not allowed in WHERE",
+                f"misuse of aggregate function {call.name}(): aggregate calls are not allowed in {ctx.clause}",
                 call.position,
                 (),
             ),

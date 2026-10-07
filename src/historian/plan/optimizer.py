@@ -26,7 +26,11 @@ pushed into scans"). Issue #121.
 A term is the bound AST subexpression itself (`exec/operators.py`'s
 `Predicate = Expr`), so a scan recognises what it can use with the
 same explicit `isinstance` checks the evaluator uses, and pushed terms
-carry `BoundColumnRef` offsets into the scan's own schema.
+carry `BoundColumnRef` offsets into the scan's own schema. The `WHERE`
+read here is the one `plan()` built, after constant propagation
+(#142): a term in which a column became a constant holds a
+`FixedColumnRef` in its place and is offered as it is, so the terms
+offered and pushed are the very objects the `Filter` evaluates.
 
 The step is separate from `plan()` on purpose: `cli.py` calls it
 between planning and execution, `--no-pushdown` (#43) is "do not call

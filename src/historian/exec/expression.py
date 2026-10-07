@@ -174,6 +174,7 @@ from historian.sql.ast import (
 )
 from historian.sql.binder import BoundColumnRef
 from historian.sql.lexer import Position
+from historian.sql.walk import FixedColumnRef
 from historian.values import INT64_MAX, INT64_MIN, Bool3, Value
 
 # The BoundColumnRef import above is the one place this module's import
@@ -199,6 +200,7 @@ from historian.values import INT64_MAX, INT64_MIN, Bool3, Value
 
 __all__ = [
     "EvalError",
+    "apply_column_affinity",
     "arithmetic_operand",
     "coerce_to_bool3",
     "coerce_to_value",
@@ -497,6 +499,11 @@ def _start(
         return
     if isinstance(node, BoundColumnRef):
         results.append(row[node.offset])
+        return
+    if isinstance(node, FixedColumnRef):
+        # A column the planner replaced by a constant (#142): its value,
+        # never the row's cell.
+        results.append(node.value)
         return
     if isinstance(node, Star):
         # The binder expands every Star before this module ever sees a
@@ -1005,6 +1012,10 @@ def _affinity_of(expr: Expr, schema: Schema) -> ColumnType | None:
     know which operator produced the row."""
     if isinstance(expr, BoundColumnRef):
         return schema.columns[expr.offset].type
+    if isinstance(expr, FixedColumnRef):
+        # Still the column, known to hold one value (#142): SQLite's
+        # `EP_FixedCol` node keeps the column's affinity.
+        return schema.columns[expr.offset].type
     return None
 
 
@@ -1025,6 +1036,70 @@ def _apply_affinity(
     if left_affinity is ColumnType.TEXT or right_affinity is ColumnType.TEXT:
         return _coerce_to_text(left), _coerce_to_text(right)
     return left, right
+
+
+def apply_column_affinity(value: Value, column_type: ColumnType | None) -> Value:
+    """*value* as a column of *column_type* would store it - SQLite's
+    `applyAffinity` (`OP_Affinity`), the conversion `INSERT` applies.
+    The planner uses it for the constant it puts in place of a column
+    (#142): SQLite codes that constant and then applies the column's
+    affinity to it, so `line_no = '05'` replaces `line_no` with the
+    INTEGER `5` and `r = 1` (a REAL column) with `1.0`.
+
+    Not the comparison conversion (`_apply_affinity`), which leaves an
+    `int` an `int` and a `float` a `float` - a comparison cannot tell
+    `5` from `5.0`, but `||` can:
+
+    - `INTEGER`: text that is a whole number goes through
+      `try_numeric_affinity`, the same whole-string rule a comparison
+      uses; a REAL that is a whole number strictly inside the int64
+      range then becomes that INTEGER (`5.0` and `'5.0'` are `5`,
+      `-0.0` is `0`, `2.0**63` and `-2.0**63` stay REAL - SQLite's
+      `sqlite3VdbeIntegerAffinity`).
+    - `REAL`: the same text rule, then an INTEGER becomes the nearest
+      REAL (`_int_as_real`).
+    - `TEXT`: a number becomes its text (`_coerce_to_text`).
+    - no affinity: unchanged.
+
+    `NULL` is never converted, and text that is not a number stays text
+    (`line_no = 'x'` replaces `line_no` with `'x'`). Measured on the
+    pinned oracle, `tests/differential/test_where_propagation.py`."""
+    if value is None or column_type is None:
+        return value
+    if column_type is ColumnType.TEXT:
+        return _coerce_to_text(value)
+    numeric = try_numeric_affinity(value)
+    if column_type is ColumnType.INTEGER:
+        if isinstance(numeric, float):
+            return _real_as_integer(numeric)
+        return numeric
+    if isinstance(numeric, int):
+        return _int_as_real(numeric)
+    return numeric
+
+
+def _real_as_integer(value: float) -> int | float:
+    """SQLite's `sqlite3VdbeIntegerAffinity`: a REAL that is a whole
+    number strictly between int64's minimum and maximum becomes that
+    INTEGER; any other REAL (a fraction, an infinity, `-2.0**63`, or
+    anything from `2.0**63` up) stays as it is. `int()` of a finite
+    float is exact, so the range test compares exact integers."""
+    if math.isinf(value) or not value.is_integer():
+        return value
+    whole = int(value)
+    if INT64_MIN < whole < INT64_MAX:
+        return whole
+    return value
+
+
+def _int_as_real(value: int) -> float:
+    """An INTEGER stored in a REAL column: the nearest double, as C's
+    `(double)` cast gives it (`9007199254740993` is `9007199254740992.0`).
+    Storage, not comparison: the comparison path never converts an
+    `int` to `float` (see `tests/test_expression.py`'s
+    `test_no_stray_float_calls_outside_the_named_exceptions`, which
+    names this function)."""
+    return float(value)
 
 
 def _strip_numeric_whitespace(text: str) -> str:

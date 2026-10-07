@@ -94,9 +94,11 @@ def test_no_where_has_no_filter_line_and_pushed_none():
 
 
 def test_pushed_terms_are_joined_in_order_on_the_scan_line_only():
-    lines = _explain("SELECT path FROM blame WHERE path = 'a' AND line_no > 3 AND path = 'b'")
-    assert lines[-1] == "    FakeScan (pushed: path = 'a', path = 'b' -> 2 of 5 paths)"
-    assert lines[1] == "  Filter (path = 'a' AND line_no > 3 AND path = 'b')"
+    # No column appears in two terms, so constant propagation (#142)
+    # rewrites nothing.
+    lines = _explain("SELECT path FROM blame WHERE path = 'a' AND author_name > 'x' AND line_no = 4")
+    assert lines[-1] == "    FakeScan (pushed: path = 'a', line_no = 4 -> 2 of 5 paths)"
+    assert lines[1] == "  Filter (path = 'a' AND author_name > 'x' AND line_no = 4)"
 
 
 def test_estimate_is_called_once_with_the_pushed_terms():
@@ -160,7 +162,7 @@ def test_a_propagated_constant_prints_in_the_columns_place():
     )
     assert lines == [
         "Project (path)",
-        "  Filter (NOT (5 = 5 AND path LIKE 'a' ESCAPE 'ab') AND line_no = '05')",
+        "  Filter ((NOT (5 = 5 AND path LIKE 'a' ESCAPE 'ab')) AND line_no = '05')",
         "    FakeScan (pushed: line_no = '05' -> 1 of 5 paths)",
     ]
 
@@ -271,7 +273,7 @@ def test_deeply_nested_expression_does_not_hit_the_recursion_limit():
     sql = "line_no = " + " + ".join(["1"] * depth)
     text = _where(sql)
     assert text == sql
-    long_and = " AND ".join(["line_no = 1"] * 900)
+    long_and = " AND ".join(["line_no > 1"] * 900)
     assert _where(long_and) == long_and
 
 

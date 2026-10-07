@@ -261,18 +261,23 @@ def test_a_scan_with_no_capabilities_is_never_offered_anything():
 
 
 def test_only_the_accepted_subset_is_pushed_in_order():
+    """Since #142 the first `a = 1` is offered as `1 = 1` - the last
+    source for `a` is the one used, and the earlier one is rewritten -
+    so the double accepts only the last; `b = 2` and `c = 3` are offered
+    and rejected as before."""
     source = _RecordingGadgetSource()
     bound = _bind("SELECT a FROM gadgets WHERE b = 2 AND a = 1 AND c = 3 AND a = 1")
     tree = optimize(plan(bound, Path("/nonexistent"), tables={"gadgets": lambda repo: source}))
     list(tree.rows())
 
-    a_terms = [term for term in source.offered if term.left.name == "a"]
+    terms = split_conjuncts(bound.where)
     assert len(source.offered) == 4
-    assert source.accepted == a_terms
+    assert source.offered[0] is terms[0] and source.offered[2] is terms[2] and source.offered[3] is terms[3]
+    assert source.offered[1] is not terms[1]
+    assert source.accepted == [terms[3]]
     assert len(source.scan_calls) == 1
-    assert list(source.scan_calls[0]) == a_terms
-    assert all(term.left.name == "a" for term in source.scan_calls[0])
-    assert _scan_of(tree).pushed() == tuple(a_terms)
+    assert list(source.scan_calls[0]) == [terms[3]]
+    assert _scan_of(tree).pushed() == (terms[3],)
 
 
 def test_rejected_term_never_appears_in_pushed():

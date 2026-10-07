@@ -2508,7 +2508,7 @@ def test_no_stray_float_calls_outside_the_named_exceptions():
 
     Walks this module's own source with `ast`, and asserts every
     `float(` call site sits inside a function on an explicit allowlist
-    of three. Text-to-number *conversion* is not on it: since issue
+    of four. Text-to-number *conversion* is not on it: since issue
     #134, `_scan_number` converts text to a REAL with
     `historian.atof.text_to_real` (SQLite's own, not correctly rounded,
     algorithm), never `float()`, so a `float(` call there now fails
@@ -2540,6 +2540,12 @@ def test_no_stray_float_calls_outside_the_named_exceptions():
       either was REAL) - reporting a REAL result needs converting that
       exact `int` remainder to `float`, kept in its own function for
       the same reason `_int64_bounded` is.
+    - `_int_as_real` - storage, not comparison (issue #142): the value
+      an INTEGER constant has once stored in a REAL column, which
+      `apply_column_affinity` computes for the constant the planner
+      puts in place of a propagated column. SQLite converts it with a
+      C `(double)` cast, the nearest double, as `float()` does. Never
+      called from the comparison path.
 
     Any `float(` call appearing anywhere else in this module - most
     plausibly, a future "normalize this before comparing" edit to the
@@ -2550,7 +2556,7 @@ def test_no_stray_float_calls_outside_the_named_exceptions():
 
     from historian.exec import expression
 
-    allowed_functions = {"_format_float", "_int64_bounded", "_mod_result"}
+    allowed_functions = {"_format_float", "_int64_bounded", "_mod_result", "_int_as_real"}
     tree = ast.parse(inspect.getsource(expression))
 
     violations: list[tuple[str, int]] = []

@@ -295,8 +295,11 @@ def test_in_is_exact_not_case_folded(casefold_repo):
 
 
 def test_two_pushed_terms_intersect(casefold_repo):
+    """A two-element `IN`, not `path = 'SRC/b.py'`: since #142 a `path =`
+    source makes the `LIKE` beside it a constant, which is not pushed
+    (`test_a_like_beside_a_path_source_is_not_pushed`)."""
     _check(
-        "SELECT path FROM blame WHERE path LIKE 'src/%' AND path = 'SRC/b.py'",
+        "SELECT path FROM blame WHERE path LIKE 'src/%' AND path IN ('SRC/b.py', 'nope.py')",
         casefold_repo,
         blamed=["SRC/b.py"],
         invocations=2,

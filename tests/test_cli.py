@@ -848,13 +848,15 @@ def test_explain_pushed_term_matching_nothing(tiny_repo, capsys):
 def test_explain_two_terms_intersect_and_filter_keeps_everything(tiny_repo, capsys):
     _ret, out, _err = _explain(
         tiny_repo,
-        "SELECT path FROM blame WHERE path LIKE 'src/%' AND path = 'src/utils.py'",
+        "SELECT path FROM blame WHERE path LIKE 'src/%' AND path IN ('src/utils.py', 'x.py')",
         capsys,
     )
+    # A two-element `IN` is not a `path = constant` source (#142), so
+    # neither term is rewritten and both are pushed.
     assert out == (
         "Project (path)\n"
-        "  Filter (path LIKE 'src/%' AND path = 'src/utils.py')\n"
-        "    BlameScan (pushed: path LIKE 'src/%', path = 'src/utils.py' -> 1 of 2 paths)\n"
+        "  Filter (path LIKE 'src/%' AND path IN ('src/utils.py', 'x.py'))\n"
+        "    BlameScan (pushed: path LIKE 'src/%', path IN ('src/utils.py', 'x.py') -> 1 of 2 paths)\n"
     )
 
 
@@ -914,7 +916,7 @@ def test_explain_shows_a_propagated_constant_in_the_columns_place(tiny_repo, cap
     assert ret == 0
     assert out == (
         "Project (path)\n"
-        "  Filter (NOT (5 = 5 AND path LIKE 'a' ESCAPE 'ab') AND line_no = 5)\n"
+        "  Filter ((NOT (5 = 5 AND path LIKE 'a' ESCAPE 'ab')) AND line_no = 5)\n"
         "    BlameScan (pushed: none -> 2 of 2 paths)\n"
     )
 

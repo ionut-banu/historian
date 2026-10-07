@@ -1,7 +1,8 @@
 """The shared expression-tree walks: what a node's children are, how to
 rebuild a node around new ones, whether two trees have the same shape,
 whether a query aggregates, how a condition splits into `AND`-terms and
-joins back, and whether a term reads only `GROUP BY` keys.
+joins back, whether a term reads only `GROUP BY` keys, and how a column
+is replaced by a constant (#142).
 
 Issue #112. Before it, `sql/binder.py`, `plan/planner.py` and
 `sql/parser.py` each kept their own copy of the children table, and the
@@ -23,9 +24,11 @@ stays in its own module; only the walking of fields lives here.
 because the functions below must know it and the binder imports this
 module, not the other way round. `sql/binder.py` re-exports it, so
 `from historian.sql.binder import BoundColumnRef` still names this
-same class.
+same class. `FixedColumnRef` (#142), the column the planner has
+replaced by a constant, is defined here for the same reason.
 
-Imports only the standard library, `historian.ascii`, `sql/ast.py` and
+Imports only the standard library, `historian.ascii`,
+`historian.values` (for the `Value` type), `sql/ast.py` and
 `sql/lexer.py`: no git, no subprocess, no binder.
 """
 
@@ -53,15 +56,19 @@ from historian.sql.ast import (
     UnaryOp,
 )
 from historian.sql.lexer import Position
+from historian.values import Value
 
 __all__ = [
     "BoundColumnRef",
+    "FixedColumnRef",
     "children",
     "contains_aggregate",
     "expr_shape_equal",
+    "fix_columns",
     "is_aggregate_query",
     "join_conjuncts",
     "references_only_keys",
+    "replace_conjuncts",
     "split_conjuncts",
     "with_children",
 ]
@@ -86,13 +93,36 @@ class BoundColumnRef(Expr):
     position: Position
 
 
+@dataclass(frozen=True)
+class FixedColumnRef(Expr):
+    """A column reference the planner has replaced by a constant: SQLite's
+    `EP_FixedCol` (#142, spec §3 "Constant propagation in `WHERE`").
+
+    It evaluates to `value`, never to the row's own cell, and as an
+    operand of a comparison it still has the declared affinity of the
+    column at `offset` - it is the column, known to hold `value`, not a
+    literal. `value` is the source's constant already converted by that
+    affinity (`exec/expression.py`'s `apply_column_affinity`): the value
+    the constant would have if stored in the column. `name` is the
+    column's declared spelling and `position` the replaced reference's,
+    as on `BoundColumnRef`. Not a subclass of `BoundColumnRef`, so no
+    code that reads a row by offset or recognises a column (a scan's
+    `accepts()`, `GROUP BY` key typing) can mistake it for one.
+    """
+
+    offset: int
+    name: str
+    value: Value
+    position: Position
+
+
 def children(expr: Expr) -> tuple[Expr, ...]:
     """*expr*'s direct sub-expressions, left to right - field-declaration
     order, with `In.left` before its values and `Like.escape` last and
     left out when absent. Every walk visits children in this order,
     which is what keeps error order, short-circuit order and aggregate
     slot order what they are. A leaf has none."""
-    if isinstance(expr, (Literal, ColumnRef, BoundColumnRef, Star)):
+    if isinstance(expr, (Literal, ColumnRef, BoundColumnRef, FixedColumnRef, Star)):
         return ()
     if isinstance(expr, FunctionCall):
         return expr.args
@@ -115,7 +145,7 @@ def with_children(expr: Expr, new_children: Sequence[Expr]) -> Expr:
     """*expr* rebuilt via `dataclasses.replace` with *new_children* - one
     per entry of `children(expr)`, in the same order - in place of its
     own children. A leaf takes none and comes back as it is."""
-    if isinstance(expr, (Literal, ColumnRef, BoundColumnRef, Star)):
+    if isinstance(expr, (Literal, ColumnRef, BoundColumnRef, FixedColumnRef, Star)):
         assert len(new_children) == 0
         return expr
     if isinstance(expr, FunctionCall):
@@ -178,6 +208,14 @@ def _same_node_fields(a: Expr, b: Expr) -> bool:
         return a.table == b.table and a.name == b.name
     if isinstance(a, BoundColumnRef):
         return a.offset == b.offset and a.name == b.name
+    if isinstance(a, FixedColumnRef):
+        # The value compares the way a `Literal`'s does.
+        return (
+            a.offset == b.offset
+            and a.name == b.name
+            and type(a.value) is type(b.value)
+            and a.value == b.value
+        )
     if isinstance(a, Star):
         return a.table == b.table
     if isinstance(a, FunctionCall):
@@ -311,3 +349,88 @@ def _matches_a_key(expr: Expr, keys: Sequence[Expr]) -> bool:
         if expr_shape_equal(expr, key):
             return True
     return False
+
+
+def replace_conjuncts(expr: Expr, terms: Sequence[Expr]) -> Expr:
+    """*expr* with its conjunctive terms - those `split_conjuncts(expr)`
+    gives, left to right - replaced by *terms*, one each, in order, and
+    the `And` nodes above them kept as they are: the same shape, so
+    evaluation stops at the same `And`s it did. An `And` whose two sides
+    come back unchanged is the same object, so *expr* comes back as it
+    is when every term is.
+
+    Not recursive (#107): *pending* holds `(node, operands_done)` pairs
+    over the `And` spine only, left side first, so the terms are met in
+    `split_conjuncts`' order; *results* holds the rebuilt subtrees."""
+    pending: list[tuple[Expr, bool]] = [(expr, False)]
+    results: list[Expr] = []
+    next_term = 0
+    while pending:
+        node, operands_done = pending.pop()
+        if operands_done:
+            assert isinstance(node, And)
+            right = results.pop()
+            left = results.pop()
+            if left is node.left and right is node.right:
+                results.append(node)
+            else:
+                results.append(dataclasses.replace(node, left=left, right=right))
+            continue
+        if isinstance(node, And):
+            pending.append((node, True))
+            pending.append((node.right, False))
+            pending.append((node.left, False))
+            continue
+        assert next_term < len(terms), "sql/walk.py: replace_conjuncts has fewer terms than conjuncts"
+        results.append(terms[next_term])
+        next_term += 1
+    assert next_term == len(terms), "sql/walk.py: replace_conjuncts has more terms than conjuncts"
+    (result,) = results
+    return result
+
+
+def fix_columns(expr: Expr, fixed: dict[int, Value]) -> Expr:
+    """*expr* - already bound - with every `BoundColumnRef` whose offset
+    is a key of *fixed* replaced by a `FixedColumnRef` holding that
+    key's value, at any depth, in every child slot (#142). The
+    reference keeps its name and position. A subtree with nothing to
+    replace is returned as the same object, so *expr* itself comes back
+    when nothing in it changes.
+
+    Not recursive (#107): the same `(node, operands_done)` stack as
+    `plan/planner.py`'s `_split_expr`, visiting children left to
+    right."""
+    pending: list[tuple[Expr, bool]] = [(expr, False)]
+    results: list[Expr] = []
+    while pending:
+        node, operands_done = pending.pop()
+        if operands_done:
+            original = children(node)
+            first = len(results) - len(original)
+            rebuilt = results[first:]
+            del results[first:]
+            unchanged = True
+            for old_child, new_child in zip(original, rebuilt):
+                if old_child is not new_child:
+                    unchanged = False
+            results.append(node if unchanged else with_children(node, rebuilt))
+            continue
+        if isinstance(node, BoundColumnRef):
+            if node.offset in fixed:
+                results.append(
+                    FixedColumnRef(offset=node.offset, name=node.name, value=fixed[node.offset], position=node.position)
+                )
+            else:
+                results.append(node)
+            continue
+        if isinstance(node, ColumnRef):
+            raise AssertionError("sql/walk.py: fix_columns needs a bound tree")
+        node_children = children(node)
+        if len(node_children) == 0:
+            results.append(node)
+            continue
+        pending.append((node, True))
+        for child in reversed(node_children):
+            pending.append((child, False))
+    (result,) = results
+    return result

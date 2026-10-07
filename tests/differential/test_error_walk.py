@@ -162,7 +162,7 @@ RULE_CASES = [
     ("nofn(1) + path + ghost", "no such column: ghost"),
     ("path BETWEEN ghost1 AND ghost2", "no such column: ghost1"),
     ("nofn(1) + (path IN (ghost1, ghost2))", "no such function: nofn"),
-    ("nofn(1) + NOT ghost", "no such function: nofn"),
+    ("nofn(1) + (NOT ghost)", "no such function: nofn"),
     ("nofn(1) || -ghost", "no such function: nofn"),
     ("nofn(1) AND ghost", "no such column: ghost"),
     ("nofn(1) OR (ghost = 1)", "no such function: nofn"),

@@ -1,4 +1,5 @@
-"""The shared expression-tree walks: what a node's children are, how to
+"""The shared expression-tree walks: what a node's children are (and in
+which order SQLite resolves their names, #144), how to
 rebuild a node around new ones, whether two trees have the same shape,
 whether a query aggregates, how a condition splits into `AND`-terms and
 joins back, whether a term reads only `GROUP BY` keys, and how a column
@@ -69,8 +70,10 @@ __all__ = [
     "join_conjuncts",
     "references_only_keys",
     "replace_conjuncts",
+    "resolution_children",
     "split_conjuncts",
     "with_children",
+    "with_resolution_children",
 ]
 
 
@@ -168,6 +171,32 @@ def with_children(expr: Expr, new_children: Sequence[Expr]) -> Expr:
         operand, low, high = new_children
         return dataclasses.replace(expr, operand=operand, low=low, high=high)
     raise AssertionError(f"sql/walk.py: unhandled expression node type {type(expr).__name__}")
+
+
+def resolution_children(expr: Expr) -> tuple[Expr, ...]:
+    """*expr*'s children in the order SQLite's name resolution walks
+    them (#144): `children(expr)`, except that `LIKE` gives its pattern
+    first - SQLite's tree holds `x LIKE y ESCAPE z` as the call
+    `like(y, x, z)`. Only the binder's error walk uses this order;
+    evaluation, short-circuiting and every other walk keep `children`.
+    """
+    if isinstance(expr, Like):
+        if expr.escape is None:
+            return (expr.pattern, expr.left)
+        return (expr.pattern, expr.left, expr.escape)
+    return children(expr)
+
+
+def with_resolution_children(expr: Expr, new_children: Sequence[Expr]) -> Expr:
+    """`with_children`, with *new_children* in `resolution_children`
+    order rather than `children` order."""
+    if isinstance(expr, Like):
+        if expr.escape is None:
+            pattern, left = new_children
+            return dataclasses.replace(expr, left=left, pattern=pattern)
+        pattern, left, escape = new_children
+        return dataclasses.replace(expr, left=left, pattern=pattern, escape=escape)
+    return with_children(expr, new_children)
 
 
 def expr_shape_equal(a: Expr, b: Expr) -> bool:

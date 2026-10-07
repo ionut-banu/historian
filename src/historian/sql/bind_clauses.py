@@ -175,6 +175,17 @@ def _ordinal_suffix(number: int) -> str:
     return f"{number}th"
 
 
+def _rejected_at_its_turn(ordinal: int) -> bool:
+    """Whether SQLite rejects ordinal *ordinal* when it reaches the term,
+    before any later term's names, rather than after every term's names
+    (issue #144, measured): an integer that fits a 32-bit int - SQLite's
+    `sqlite3ExprIsInteger` - and is below 1 or above 65535. Any other
+    ordinal is range-checked after the names, as before (#115)."""
+    if ordinal < -2147483647 or ordinal > 2147483647:
+        return False
+    return ordinal < 1 or ordinal > 65535
+
+
 def _check_ordinal(raw_expr: Expr, index: int, clause: str, item_count: int) -> int:
     """The ordinal value of *raw_expr*, the *index*-th (zero-based)
     term of *clause* (`"GROUP BY"`/`"ORDER BY"`), checked against the
@@ -222,6 +233,8 @@ def _bind_group_by(
        `HAVING`). Name errors (no such column or function, arity, a
        nested aggregate) raise here, so `GROUP BY 99, ghost` reports
        `ghost`.
+       An ordinal below 1 or above 65535 is rejected here, at its
+       own turn (`_rejected_at_its_turn`, #144).
     2. Every ordinal (`_ordinal_value`, shared with `ORDER BY`) is
        checked against `bound_items` (the select list *after* `Star`
        expansion, matching `sqlite3`'s own "1st GROUP BY term"
@@ -245,11 +258,14 @@ def _bind_group_by(
         late_misuse=None,
     )
     keys: list[Expr | None] = []
-    for raw_expr in group_by:
-        if _ordinal_value(raw_expr) is None:
+    for index, raw_expr in enumerate(group_by):
+        ordinal = _ordinal_value(raw_expr)
+        if ordinal is None:
             keys.append(_bind_expr(raw_expr, group_ctx))
-        else:
-            keys.append(None)
+            continue
+        if _rejected_at_its_turn(ordinal):
+            _check_ordinal(raw_expr, index, "GROUP BY", len(bound_items))
+        keys.append(None)
     for index, raw_expr in enumerate(group_by):
         if keys[index] is None:
             ordinal = _check_ordinal(raw_expr, index, "GROUP BY", len(bound_items))
@@ -290,7 +306,10 @@ def _bind_order_by(
     to right - the caller supplies `alias_first=True`, and whichever
     `reject_aggregates`/`late_misuse` the query's aggregate status
     calls for; this function decides neither - so `ORDER BY 99, ghost`
-    reports `ghost`; then every ordinal (`_ordinal_value`) is checked,
+    reports `ghost` - except an ordinal below 1 or above 65535, which
+    is rejected at its own turn (`_rejected_at_its_turn`, #144), so
+    `ORDER BY 0, ghost` reports the ordinal; then every ordinal
+    (`_ordinal_value`) is checked,
     1-based, against `bound_items`, out-of-range (0, negative, or past
     the end) raising the same "Nth ... term out of range" shape
     `GROUP BY` uses, and resolves to the referenced item's own bound
@@ -298,11 +317,14 @@ def _bind_order_by(
     call is never rejected (see the section comment above).
     """
     exprs: list[Expr | None] = []
-    for item in order_by:
-        if _ordinal_value(item.expr) is None:
+    for index, item in enumerate(order_by):
+        ordinal = _ordinal_value(item.expr)
+        if ordinal is None:
             exprs.append(_bind_expr(item.expr, ctx))
-        else:
-            exprs.append(None)
+            continue
+        if _rejected_at_its_turn(ordinal):
+            _check_ordinal(item.expr, index, "ORDER BY", len(bound_items))
+        exprs.append(None)
     bound: list[BoundOrderByItem] = []
     for index, item in enumerate(order_by):
         expr = exprs[index]

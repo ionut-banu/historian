@@ -512,6 +512,9 @@ _REBUILD = 1
 _RETURN = 2
 _IS_RIGHT = 3
 
+#: The walk's explicit stack of `(node, step, permission)` entries.
+_Pending = list[tuple[Expr, int, int]]
+
 
 def _star_backstop(star: Star) -> BindError:
     # A whole, alias-less select-list item and a call's sole
@@ -535,9 +538,7 @@ def _is_null_test(node: Is) -> bool:
     return isinstance(node.right, Literal) and node.right.value is None
 
 
-def _push_operands(
-    node: Expr, step: int, permission: int, operands: tuple[Expr, ...], pending: list[tuple[Expr, int, int]]
-) -> None:
+def _push_operands(node: Expr, step: int, permission: int, operands: tuple[Expr, ...], pending: _Pending) -> None:
     """Come back to *node* with *step* once *operands* are walked, left
     to right."""
     pending.append((node, step, permission))
@@ -545,13 +546,51 @@ def _push_operands(
         pending.append((operand, _VISIT, permission))
 
 
+def _visit_column(ref: ColumnRef, permission: int, ctx: _Context, results: list[Expr]) -> tuple[BindError | None, bool]:
+    """Rule 1: a column that resolves never trips, whatever is recorded
+    already; one that does not records its error and ABORTs."""
+    bound, error = _bind_column(ref, ctx, permission)
+    if error is not None:
+        return error, True
+    assert bound is not None
+    results.append(bound)
+    return None, False
+
+
+def _visit_call(
+    call: FunctionCall, permission: int, ctx: _Context, pending: _Pending, results: list[Expr]
+) -> tuple[BindError | None, bool]:
+    """Rule 2: the call's own error first; then its arguments, in a
+    list an ABORT ends without ending anything around the call."""
+    error = _call_error(call, ctx, permission)
+    if _is_star_call(call):
+        results.append(call)
+    else:
+        _push_operands(call, _RETURN, _argument_permission(call, permission), call.args, pending)
+    return error, False
+
+
+def _visit_is_column(
+    node: Is, right: ColumnRef, permission: int, tripped: bool, ctx: _Context, pending: _Pending
+) -> tuple[BindError | None, bool]:
+    """Rule 5: the bare column on the right is resolved before anything
+    else, then the node trips like any other, then the left operand is
+    walked and the resolved right is met again (`_IS_RIGHT`), where it
+    trips too, as SQLite's already-resolved column does."""
+    bound, error = _bind_column(right, ctx, permission)
+    if error is not None:
+        return error, True
+    if tripped:
+        return None, True
+    assert bound is not None
+    pending.append((node, _REBUILD, permission))
+    pending.append((bound, _IS_RIGHT, permission))
+    pending.append((node.left, _VISIT, permission))
+    return None, False
+
+
 def _visit(
-    node: Expr,
-    permission: int,
-    tripped: bool,
-    ctx: _Context,
-    pending: list[tuple[Expr, int, int]],
-    results: list[Expr],
+    node: Expr, permission: int, tripped: bool, ctx: _Context, pending: _Pending, results: list[Expr]
 ) -> tuple[BindError | None, bool]:
     """The first visit to *node*: SQLite's `resolveExprStep`, one
     branch per rule of the module docstring's "Which error is
@@ -560,52 +599,28 @@ def _visit(
     ABORTs here. Pushes what is left to walk onto *pending* and a bound
     leaf onto *results*."""
     if isinstance(node, ColumnRef):
-        # Rule 1. A column that resolves never trips, whatever is
-        # recorded already.
-        bound, error = _bind_column(node, ctx, permission)
-        if error is not None:
-            return error, True
-        assert bound is not None
-        results.append(bound)
-        return None, False
+        return _visit_column(node, permission, ctx, results)
     if isinstance(node, FunctionCall):
-        # Rule 2. The call's own error first; then its arguments, in a
-        # list an ABORT ends without ending anything around the call.
-        error = _call_error(node, ctx, permission)
-        if _is_star_call(node):
-            results.append(node)
-        else:
-            _push_operands(node, _RETURN, _argument_permission(node, permission), node.args, pending)
-        return error, False
+        return _visit_call(node, permission, ctx, pending, results)
     if isinstance(node, Like):
-        # Rule 3. `x NOT LIKE y` is a NOT - rule 6 - around the call.
+        # Rule 3: a call over (pattern, left, escape) with no error of
+        # its own. `x NOT LIKE y` is a NOT - rule 6 - around the call.
         if node.negated and tripped:
             return None, True
         _push_operands(node, _RETURN, permission, resolution_children(node), pending)
         return None, False
     if isinstance(node, Is) and _is_null_test(node):
-        # Rule 4.
+        # Rule 4: the operand is walked whatever is recorded, and an
+        # ABORT in it stops here.
         _push_operands(node, _RETURN, permission, children(node), pending)
         return None, False
     if isinstance(node, Is) and isinstance(node.right, ColumnRef) and node.right.table is None:
-        # Rule 5. The right-hand name is resolved before anything else,
-        # then the node trips like any other, then the left operand is
-        # walked and the resolved right is met again (`_IS_RIGHT`).
-        bound, error = _bind_column(node.right, ctx, permission)
-        if error is not None:
-            return error, True
-        if tripped:
-            return None, True
-        assert bound is not None
-        pending.append((node, _REBUILD, permission))
-        pending.append((bound, _IS_RIGHT, permission))
-        pending.append((node.left, _VISIT, permission))
-        return None, False
+        return _visit_is_column(node, node.right, permission, tripped, ctx, pending)
     if isinstance(node, Star):
         raise _star_backstop(node)
     if isinstance(node, BoundColumnRef):
         raise AssertionError("sql/binder.py: a BoundColumnRef reached _bind_expr; it is already bound")
-    # Rule 6: every other node.
+    # Rule 6: every other node trips on a recorded error.
     if tripped:
         return None, True
     operands = resolution_children(node)
@@ -625,7 +640,7 @@ def _rebuild(node: Expr, results: list[Expr]) -> Expr:
     return with_resolution_children(node, bound_operands)
 
 
-def _unwind_to_enclosing_call(pending: list[tuple[Expr, int, int]]) -> None:
+def _unwind_to_enclosing_call(pending: _Pending) -> None:
     """An ABORT: drop every pending entry down to the nearest enclosing
     function call, `LIKE` or `IS NULL` (`_RETURN`), which then returns
     normally, so the walk goes on with whatever follows it - or, with
@@ -649,7 +664,7 @@ def _bind_exprs(roots: tuple[Expr, ...], ctx: _Context) -> tuple[Expr, ...]:
     reported is still open.
     """
     permission = _initial_permission(ctx)
-    pending: list[tuple[Expr, int, int]] = []
+    pending: _Pending = []
     for root in reversed(roots):
         pending.append((root, _VISIT, permission))
     results: list[Expr] = []

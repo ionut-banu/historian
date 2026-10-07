@@ -21,8 +21,10 @@ measured, that is checked too, so a change of the pinned SQLite that
 moves an answer fails loudly instead of quietly following it.
 
 Three parts: the issue's table, one hand-written group per rule and
-clause, and a generated sweep - random expression trees placed in
-eleven statement shapes, the oracle deciding which are rejected.
+clause (with SQLite's one-element `IN` list of a constant, found by
+QA on round 1), and two generated sweeps - random expression trees
+placed in eleven statement shapes, the oracle deciding which are
+rejected; the second mixes in one-element `IN` lists of a constant.
 """
 
 from __future__ import annotations
@@ -270,6 +272,101 @@ def test_clause_shapes(tiny_repo, empty_conn, query, expected):
     _assert_same_error(empty_conn, tiny_repo, query)
 
 
+# --- A one-element IN list of a constant --------------------------------------
+#
+# Found by QA on round 1. SQLite's parser rewrites `x IN (e)`, with one
+# element and that element constant - no column and no function call
+# anywhere in it; `LIKE` is SQLite's constant `like()` - to `x = +e`
+# (and `x NOT IN (e)` to `NOT (x = +e)`). The `+` is one more node that
+# stops on an error recorded while `x` was walked, so the walk does not
+# go on past the `IN`. It only shows when `e` itself would not stop
+# (`IS NULL`, `LIKE`): any other element stops on its own. Two elements,
+# or an element with a column or a call in it, stay an `IN` list.
+
+IN_CASES = [
+    # QA's two statements.
+    ("SELECT zz2 LIKE (nofn2(zz1) IN (3 IS NULL)) FROM blame", "no such column: zz1"),
+    ("SELECT path FROM blame LIMIT (nofn(line_no) IN ((-3 IS NOT NULL))) OFFSET zz2", "no such column: line_no"),
+    # The element: what counts as constant, through any parentheses.
+    ("(nofn(1) IN (3 IS NULL)) + ghost", "no such function: nofn"),
+    ("(nofn(1) NOT IN (3 IS NULL)) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN (((3 IS NULL)))) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN (3 IS NOT NULL)) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN (-3 IS NULL)) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN ('a' IS NULL)) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN (NULL IS NULL)) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN (9223372036854775808 IS NULL)) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN (1+2 IS NULL)) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN ((1 IS NULL) IS NULL)) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN ((1 IS 2) IS NULL)) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN ((NOT 1) IS NULL)) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN (((1 AND 0) OR 1) IS NULL)) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN ((1 BETWEEN 2 AND 3) IS NULL)) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN ((2 IN (3, 4)) IS NULL)) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN ((2 IN (3)) IS NULL)) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN ('a' LIKE 'b')) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN ('a' LIKE 'b' ESCAPE 'c')) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN (('a' || 'b') LIKE 'c')) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN (('a' LIKE 'b') IS NULL)) + ghost", "no such function: nofn"),
+    # Not constant, or not one element: an IN list, which goes on.
+    ("(nofn(1) IN (path IS NULL)) + ghost", "no such column: ghost"),
+    ("(nofn(1) IN (blame.path IS NULL)) + ghost", "no such column: ghost"),
+    ("(nofn(1) IN ((path + 1) IS NULL)) + ghost", "no such column: ghost"),
+    ("(nofn(1) IN ((1 IS path) IS NULL)) + ghost", "no such column: ghost"),
+    ("(nofn(1) IN ((ghost2 IN (1)) IS NULL)) + ghost", "no such column: ghost"),
+    ("(nofn(1) IN ((nofn2(1) IS NULL) IS NULL)) + ghost", "no such column: ghost"),
+    ("(nofn(1) IN ((count(*) IS NULL))) + ghost", "no such column: ghost"),
+    ("(nofn(1) IN ('a' LIKE path)) + ghost", "no such column: ghost"),
+    ("(nofn(1) IN (nofn2(1))) + ghost", "no such column: ghost"),
+    ("(nofn(1) IN (count(*))) + ghost", "no such column: ghost"),
+    ("(nofn(1) IN (3 IS NULL, 4 IS NULL)) + ghost", "no such column: ghost"),
+    ("(nofn(1) NOT IN (3 IS NULL, 4 IS NULL)) + ghost", "no such column: ghost"),
+    ("SELECT count(*) AS c FROM blame ORDER BY (nofn(1) IN (c IS NULL)) + ghost", "no such column: ghost"),
+    # An element that stops on its own anyway: the same either way.
+    ("(nofn(1) IN (3)) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN ('a' NOT LIKE 'b')) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN (1 IS 2)) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN (+(1 IS NULL))) + ghost", "no such function: nofn"),
+    ("(nofn(1) IN (3 IS NULL, 4)) + ghost", "no such function: nofn"),
+    # The left side: whatever records an error without stopping.
+    ("(path IN (1 IS NULL)) + ghost", "no such column: ghost"),
+    ("(ghost2 IN (1 IS NULL)) + ghost", "no such column: ghost2"),
+    ("((ghost2 IS NULL) IN (1 IS NULL)) + ghost", "no such column: ghost2"),
+    ("((ghost2 LIKE 'a') IN (1 IS NULL)) + ghost", "no such column: ghost2"),
+    ("(-nofn(1) IN (1 IS NULL)) + ghost", "no such function: nofn"),
+    ("(sum(ghost2, 1) IN (1 IS NULL)) + ghost", "no such column: ghost2"),
+    ("(sum() IN (1 IS NULL)) + ghost", "wrong number of arguments to function sum()"),
+    ("SELECT (sum(count(*)) IN (1 IS NULL)) + ghost FROM blame", "misuse"),
+    ("SELECT path FROM blame WHERE (count(*) IN (1 IS NULL)) + ghost", "misuse"),
+    ("SELECT count(*) AS c FROM blame HAVING (sum(c) IN (1 IS NULL)) + ghost", "misuse"),
+    # A late misuse is not recorded in the walk, so nothing stops.
+    ("SELECT path FROM blame ORDER BY (count(*) IN (1 IS NULL)) + ghost", "no such column: ghost"),
+    # The ABORT ends at the nearest call, LIKE or IS NULL, or the root.
+    ("ghost LIKE (nofn(1) IN (1 IS NULL))", "no such function: nofn"),
+    ("((nofn(1) IN (1 IS NULL)) IS NULL) + ghost", "no such column: ghost"),
+    ("nofn3(nofn(1) IN (1 IS NULL), ghost)", "no such function: nofn3"),
+    ("(nofn(1) IN (1 IS NULL)) || ghost", "no such function: nofn"),
+    ("SELECT nofn(1) IN (1 IS NULL), ghost FROM blame", "no such function: nofn"),
+    # Every clause.
+    ("SELECT path FROM blame WHERE (nofn(1) IN (1 IS NULL)) AND ghost", "no such function: nofn"),
+    ("SELECT count(*) AS c FROM blame WHERE (nofn(1) IN (1 IS NULL)) + ghost", "no such function: nofn"),
+    ("SELECT count(*) FROM blame HAVING (nofn(1) IN (1 IS NULL)) + ghost", "no such function: nofn"),
+    ("SELECT path FROM blame GROUP BY (nofn(1) IN (1 IS NULL)) + ghost", "no such function: nofn"),
+    ("SELECT path FROM blame ORDER BY (nofn(1) IN (1 IS NULL)) + ghost", "no such function: nofn"),
+    ("SELECT path FROM blame ORDER BY nofn(1) IN (1 IS NULL), ghost", "no such function: nofn"),
+    ("SELECT path FROM blame LIMIT nofn(1) IN (1 IS NULL) OFFSET ghost", "no such function: nofn"),
+    ("SELECT path FROM blame LIMIT count(*) IN (1 IS NULL) OFFSET ghost", "misuse"),
+    ("SELECT path FROM blame LIMIT 1 OFFSET (nofn(1) IN (1 IS NULL)) + ghost", "no such function: nofn"),
+]
+
+
+@pytest.mark.parametrize(("case", "expected"), IN_CASES)
+def test_one_element_in_list(tiny_repo, empty_conn, case, expected):
+    query = _statement(case)
+    _assert_measured(empty_conn, query, expected)
+    _assert_same_error(empty_conn, tiny_repo, query)
+
+
 # --- An ordinal SQLite rejects at its own turn --------------------------------
 #
 # Found by the sweep below, outside the walk: SQLite checks an ORDER BY
@@ -334,38 +431,100 @@ _CALLS = (
 _BINARY = ("+", "*", "||", "=", "AND", "OR")
 
 
-def _tree(rnd: random.Random, depth: int) -> str:
+def _tree(rnd: random.Random, depth: int, in_lists: bool = False) -> str:
+    """A random tree. With *in_lists*, three non-leaf nodes in ten are a
+    one-element `IN` list, its element most often a constant tree (see
+    `_one_element_in`); without it, the draws are exactly the ones the
+    first sweep was generated with, so its statements do not move."""
     if depth == 0 or rnd.random() < 0.25:
         return rnd.choice(_LEAVES)
     below = depth - 1
+    if in_lists and rnd.random() < 0.3:
+        return _one_element_in(rnd, below)
     pick = rnd.random()
     if pick < 0.32:
         name, arity = rnd.choice(_CALLS)
         if arity == "*":
             return f"{name}(*)"
         if arity == "DISTINCT":
-            return f"{name}(DISTINCT {_tree(rnd, below)})"
-        return f"{name}({', '.join(_tree(rnd, below) for _ in range(arity))})"
+            return f"{name}(DISTINCT {_tree(rnd, below, in_lists)})"
+        return f"{name}({', '.join(_tree(rnd, below, in_lists) for _ in range(arity))})"
     if pick < 0.40:
         form = rnd.randrange(3)
         if form == 0:
-            return f"({_tree(rnd, below)} LIKE {_tree(rnd, below)})"
+            return f"({_tree(rnd, below, in_lists)} LIKE {_tree(rnd, below, in_lists)})"
         if form == 1:
-            return f"({_tree(rnd, below)} NOT LIKE {_tree(rnd, below)})"
-        return f"({_tree(rnd, below)} LIKE {_tree(rnd, below)} ESCAPE {_tree(rnd, below)})"
+            return f"({_tree(rnd, below, in_lists)} NOT LIKE {_tree(rnd, below, in_lists)})"
+        return (
+            f"({_tree(rnd, below, in_lists)} LIKE {_tree(rnd, below, in_lists)}"
+            f" ESCAPE {_tree(rnd, below, in_lists)})"
+        )
     if pick < 0.47:
-        return f"({_tree(rnd, below)} IS {rnd.choice(('', 'NOT '))}NULL)"
+        return f"({_tree(rnd, below, in_lists)} IS {rnd.choice(('', 'NOT '))}NULL)"
     if pick < 0.54:
-        right = rnd.choice(_IS_RIGHT) if rnd.random() < 0.7 else _tree(rnd, below)
-        return f"({_tree(rnd, below)} IS {rnd.choice(('', 'NOT '))}{right})"
+        right = rnd.choice(_IS_RIGHT) if rnd.random() < 0.7 else _tree(rnd, below, in_lists)
+        return f"({_tree(rnd, below, in_lists)} IS {rnd.choice(('', 'NOT '))}{right})"
     if pick < 0.60:
-        return f"({_tree(rnd, below)} {rnd.choice(('', 'NOT '))}BETWEEN {_tree(rnd, below)} AND {_tree(rnd, below)})"
+        return (
+            f"({_tree(rnd, below, in_lists)} {rnd.choice(('', 'NOT '))}BETWEEN"
+            f" {_tree(rnd, below, in_lists)} AND {_tree(rnd, below, in_lists)})"
+        )
     if pick < 0.66:
-        values = ", ".join(_tree(rnd, below) for _ in range(rnd.randrange(1, 3)))
-        return f"({_tree(rnd, below)} {rnd.choice(('', 'NOT '))}IN ({values}))"
+        values = ", ".join(_tree(rnd, below, in_lists) for _ in range(rnd.randrange(1, 3)))
+        return f"({_tree(rnd, below, in_lists)} {rnd.choice(('', 'NOT '))}IN ({values}))"
     if pick < 0.74:
-        return f"({rnd.choice(('-', '+', 'NOT '))}{_tree(rnd, below)})"
-    return f"({_tree(rnd, below)} {rnd.choice(_BINARY)} {_tree(rnd, below)})"
+        return f"({rnd.choice(('-', '+', 'NOT '))}{_tree(rnd, below, in_lists)})"
+    return f"({_tree(rnd, below, in_lists)} {rnd.choice(_BINARY)} {_tree(rnd, below, in_lists)})"
+
+
+_CONSTANT_LEAVES = ("1", "-3", "'a'", "NULL")
+
+
+def _constant_tree(rnd: random.Random, depth: int) -> str:
+    """A tree with no column and no function call anywhere in it - what
+    SQLite's parser counts as constant - rooted, more often than not, at
+    a node that does not stop on a recorded error (`IS NULL`, `LIKE`)."""
+    if depth == 0 or rnd.random() < 0.3:
+        return rnd.choice(_CONSTANT_LEAVES)
+    below = depth - 1
+    pick = rnd.random()
+    if pick < 0.35:
+        return f"({_constant_tree(rnd, below)} IS {rnd.choice(('', 'NOT '))}NULL)"
+    if pick < 0.55:
+        form = rnd.randrange(3)
+        if form == 0:
+            return f"({_constant_tree(rnd, below)} LIKE {_constant_tree(rnd, below)})"
+        if form == 1:
+            return f"({_constant_tree(rnd, below)} NOT LIKE {_constant_tree(rnd, below)})"
+        return (
+            f"({_constant_tree(rnd, below)} LIKE {_constant_tree(rnd, below)}"
+            f" ESCAPE {_constant_tree(rnd, below)})"
+        )
+    if pick < 0.62:
+        return f"({_constant_tree(rnd, below)} IS {rnd.choice(('', 'NOT '))}{_constant_tree(rnd, below)})"
+    if pick < 0.69:
+        return (
+            f"({_constant_tree(rnd, below)} {rnd.choice(('', 'NOT '))}BETWEEN"
+            f" {_constant_tree(rnd, below)} AND {_constant_tree(rnd, below)})"
+        )
+    if pick < 0.80:
+        values = ", ".join(_constant_tree(rnd, below) for _ in range(rnd.randrange(1, 3)))
+        return f"({_constant_tree(rnd, below)} {rnd.choice(('', 'NOT '))}IN ({values}))"
+    if pick < 0.88:
+        # The space keeps `- -3` from being read as a `--` comment.
+        return f"({rnd.choice(('-', '+', 'NOT'))} {_constant_tree(rnd, below)})"
+    return f"({_constant_tree(rnd, below)} {rnd.choice(_BINARY)} {_constant_tree(rnd, below)})"
+
+
+def _one_element_in(rnd: random.Random, depth: int) -> str:
+    """`x [NOT] IN (e)` with one element: a constant tree three times in
+    four, which SQLite's parser rewrites to `x = +e`, else any tree,
+    which it keeps as an `IN` list."""
+    if rnd.random() < 0.75:
+        element = _constant_tree(rnd, depth)
+    else:
+        element = _tree(rnd, depth, True)
+    return f"({_tree(rnd, depth, True)} {rnd.choice(('', 'NOT '))}IN ({element}))"
 
 
 SWEEP_SHAPES = (
@@ -386,17 +545,17 @@ _SWEEP_SEED = 144
 _SWEEP_TREES = 3000
 
 
-def _rejected_sweep() -> list[str]:
+def _rejected_sweep(seed: int, in_lists: bool) -> list[str]:
     """The sweep's statements SQLite rejects at prepare time, in
     generation order, each once."""
     conn = sqlite3.connect(":memory:")
     conn.execute(create_table_sql("blame", BLAME_SCHEMA))
-    rnd = random.Random(_SWEEP_SEED)
+    rnd = random.Random(seed)
     seen: set[str] = set()
     rejected: list[str] = []
     for _ in range(_SWEEP_TREES):
-        t = _tree(rnd, 3)
-        u = _tree(rnd, 2)
+        t = _tree(rnd, 3, in_lists)
+        u = _tree(rnd, 2, in_lists)
         for shape in SWEEP_SHAPES:
             query = shape.format(t=t, u=u)
             if query in seen:
@@ -410,7 +569,7 @@ def _rejected_sweep() -> list[str]:
     return rejected
 
 
-SWEEP = _rejected_sweep()
+SWEEP = _rejected_sweep(_SWEEP_SEED, in_lists=False)
 
 
 def test_sweep_size():
@@ -420,4 +579,24 @@ def test_sweep_size():
 
 @pytest.mark.parametrize("query", SWEEP)
 def test_sweep(tiny_repo, empty_conn, query):
+    _assert_same_error(empty_conn, tiny_repo, query)
+
+
+# The second sweep: the same shapes, with one-element IN lists of a
+# constant mixed in (`_one_element_in`), which the first one almost
+# never builds around an error that does not stop the walk - QA's
+# round-1 probes found that class. Its own seed, so the first sweep's
+# statements stay what they were.
+
+_IN_SWEEP_SEED = 1442
+
+IN_SWEEP = _rejected_sweep(_IN_SWEEP_SEED, in_lists=True)
+
+
+def test_in_sweep_size():
+    assert len(IN_SWEEP) >= 20_000
+
+
+@pytest.mark.parametrize("query", IN_SWEEP)
+def test_in_sweep(tiny_repo, empty_conn, query):
     _assert_same_error(empty_conn, tiny_repo, query)

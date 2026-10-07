@@ -6,6 +6,49 @@ expression tree at a time against a `_Context`; per-clause binding is
 `sql/bind_clauses.py`, the order the clauses run in is `sql/binder.py`.
 Imports `sql/bound.py` and below.
 
+Which error is reported (issue #144)
+-------------------------------------
+
+When one expression holds several errors, the binder reports the one
+SQLite reports, by walking the tree the way SQLite's name resolution
+does (`resolveExprStep`): a node first, then its children left to
+right, with one error slot that each new error overwrites - the error
+raised is the last one recorded. What the walk does after an error
+depends on the node it meets (`_visit`, one branch per rule):
+
+1. A column reference that resolves: the walk goes on, whatever is
+   recorded. One that does not records `no such column` and ABORTs.
+2. A function call records at most one error of its own before its
+   arguments (`_call_error`): aggregate misuse if it is an aggregate -
+   known name, right argument count - where none is allowed, else `no
+   such function`, else `wrong number of arguments`. Then it walks its
+   arguments left to right, stopping at the first ABORT, and returns
+   normally. Inside the arguments of an aggregate accepted where it
+   stands, no aggregate is allowed (`_argument_permission`).
+3. `x LIKE y [ESCAPE z]` is SQLite's call `like(y, x, z)`, with no
+   error of its own (`sql/walk.py`'s `resolution_children`); `x NOT
+   LIKE y` is a `NOT` (rule 6) around it.
+4. `x IS NULL` / `x IS NOT NULL` walks `x` whatever is recorded, and
+   returns normally.
+5. `x IS y` / `x IS NOT y` with `y` a bare column name resolves `y`
+   first and ABORTs if it fails; then the node trips like rule 6; then
+   `x` is walked, and the resolved `y` met again trips too if `x`
+   recorded an error.
+6. Every other node ABORTs at once if an error is already recorded;
+   otherwise it walks its children and passes an ABORT up.
+
+An ABORT unwinds to the nearest enclosing call, `LIKE` or `IS NULL`,
+which returns normally, or ends the root. A root is one select-list
+item, one `WHERE`/`HAVING`/`GROUP BY`/`ORDER BY` term, or `LIMIT` and
+`OFFSET` together (`_bind_exprs` takes several roots for that). The
+walk is an explicit stack (#107) and an ABORT is a loop popping it
+down to a call's frame marker - no recursion, and no exception used
+for control flow: the recorded error is raised once, when the walk
+ends. The late aggregate misuse (`_Context.late_misuse`) and
+historian's own rejections are never recorded here; `sql/binder.py`
+raises them after every clause, and only if nothing else was raised.
+See `_docs/decisions.md`, 2026-10-07.
+
 Aggregate calls (issue #60)
 -----------------------------
 
@@ -14,22 +57,24 @@ v1's grammar has no scalar functions at all (`_docs/spec.md` §1:
 need them rather than up front" - none chosen yet), so `_AGGREGATE_NAMES`
 below (`count`/`sum`/`avg`/`min`/`max`) is not a partial registry
 alongside some other kind of function - it is every `FunctionCall`
-name this grammar can ever legally bind. `_validate_function_call`
-checks a call's name (ASCII-fold, same rule as every other identifier
-in this module) against that set before anything else in the
-`FunctionCall` branch of `_bind_expr` runs: an unrecognised name is
-`BindError("no such function: ...")` immediately, closing the gap
-#45 complained about (`SELECT nonexistent_fn(path) FROM blame` used
-to bind successfully and only fail later, generically, in
-`exec/expression.py`). A recognised name still gets its arity checked
-(`count` takes zero or one argument, `*` counts as one; `sum`/`avg`/
-`min`/`max` take exactly one, and never `*`) and, when `ctx.
-reject_aggregates` is set (`bind()` turns this on for `WHERE`, and
-for `ORDER BY` in a non-aggregate query), is rejected - `WHERE
-count(*) > 1` is `BindError`, matching `sqlite3`'s own "misuse of
-aggregate function" rejection, though not its wording (§3's Errors
-section does not require that). Rejected does not always mean raised
-at once: see `sql/binder.py`'s "Resolution order" for when it is reported.
+name this grammar can ever legally bind. `_call_error` checks a
+call's name (ASCII-fold, same rule as every other identifier in this
+module) against that set first: an unrecognised name is "no such
+function: ...", closing the gap #45 complained about (`SELECT
+nonexistent_fn(path) FROM blame` used to bind successfully and only
+fail later, generically, in `exec/expression.py`). Until #183 that
+includes every one of SQLite's own built-in scalar functions - `abs`,
+`length` - which SQLite accepts: an accepted difference. A recognised
+name still gets its arity checked (`count` takes zero or one
+argument, `*` counts as one; `sum`/`avg`/`min`/`max` take exactly one,
+and never `*`) and, where the walk's permission forbids an aggregate
+(`WHERE` of a non-aggregate query, `LIMIT`/`OFFSET`, or another
+aggregate's arguments), is a misuse - `WHERE count(*) > 1` matches
+`sqlite3`'s own "misuse of aggregate function" rejection, though not
+its wording (§3's Errors section does not require that); the message
+names the clause. In `WHERE` of an aggregate query and `ORDER BY` of
+a non-aggregate one the misuse is collected instead, and reported
+late: see `sql/binder.py`'s "Resolution order".
 
 Two more aggregate-misuse shapes, closed by issue #102, follow the
 same "reject at bind time, unconditionally" rule rather than waiting
@@ -37,32 +82,22 @@ to see whether any row would actually reach the trouble:
 
 - **Nesting.** An aggregate call cannot be another aggregate call's
   argument (`count(count(*))`) - `sqlite3` calls this "misuse of
-  aggregate function count()". `_bind_expr`'s `FunctionCall` branch
-  checks every bound argument, after binding it, for an aggregate call
-  anywhere in its tree (`contains_aggregate`, `sql/walk.py`) and raises immediately
-  if one is found - this is why the check has to run *after* the
-  argument is bound rather than on the raw AST: an argument that is a
-  `ColumnRef` to a select-list alias only reveals whether it is
-  secretly an aggregate call once `_resolve_name` has spliced the
-  alias's own bound expression in.
+  aggregate function count()". The inner call records it where it
+  stands, naming itself, because the outer call's arguments are walked
+  with aggregates forbidden (rule 2).
 - **An alias to an aggregate, reached other than directly.** Every
   clause that lets a select-list alias stand in for a real column
-  (`_resolve_name`, above) allows a bare reference to an aliased
+  (`_resolve_column`, below) allows a bare reference to an aliased
   aggregate to be used exactly where a real aggregate call could be
   used directly (`HAVING c > 1`, `ORDER BY c`) - but never anywhere
   else, most importantly never as *another* aggregate call's own
   argument (`HAVING count(c) > 0`, where `c` aliases `count(*)`) and
-  never in `WHERE` at all, however it is reached (`WHERE c > 1`). The
-  nesting case above already catches the former once the alias is
-  spliced in, since the substituted subtree is exactly a `FunctionCall`
-  now. The latter - `WHERE`, or `ORDER BY` before the query is known to
-  aggregate - is caught in `_resolve_name` itself: once the winning
-  candidate is chosen (real column or alias), a `ctx.reject_aggregates`
-  clause raises if that candidate's tree contains an aggregate call,
-  the same rejection `_validate_function_call` already gives a
-  *literal* aggregate call written directly in such a clause. Both
-  checks read only `contains_aggregate` over an already-bound
-  subtree - no new walk, no change to what nesting itself means.
+  never in `WHERE` at all, however it is reached (`WHERE c > 1`).
+  `_aliased_aggregate_error` checks the resolved candidate's bound
+  tree with `contains_aggregate`: inside an aggregate's arguments it
+  is `sqlite3`'s "misuse of aliased aggregate c", recorded where the
+  reference stands; in `WHERE` of an aggregate query it is collected
+  as a late misuse, like a call written there.
 
 
 `WHERE` resolving a select-list alias
@@ -72,7 +107,7 @@ Issue #32. SQLite falls back to a select-list alias for any name no
 real column claims, in every clause except the select list itself
 (`select path as p, line_no from blame where p = 'a.py'` succeeds via
 the alias) - with the real column always winning when a name is both,
-*except* in `ORDER BY`, where the alias wins instead. `_resolve_name`
+*except* in `ORDER BY`, where the alias wins instead. `_resolve_column`
 below implements this as one function taking a precedence-direction
 flag (`alias_first`), rather than a `WHERE`-specific helper, because
 `GROUP BY`, `HAVING` and `ORDER BY` need the same rule with their own
@@ -95,8 +130,8 @@ with no memoization by this module.
 A table-qualified reference (`t.x`) is never a candidate for the
 fallback - confirmed against `sqlite3` (`select b as x from t where
 t.x = 10` still raises "no such column: t.x") - aliases have no table
-qualifier to match against, so a qualified `ColumnRef` goes straight to
-`_bind_column_ref` exactly as before.
+qualifier to match against, so a qualified `ColumnRef` is looked up
+among the real columns only.
 
 
 ASCII-only case folding

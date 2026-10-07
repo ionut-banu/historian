@@ -239,7 +239,7 @@ def _bind_group_by(
        checked against `bound_items` (the select list *after* `Star`
        expansion, matching `sqlite3`'s own "1st GROUP BY term"
        counting) and resolved to that item's own bound expression -
-       purely by position, never through `_resolve_name`, since an
+       purely by position, never through `_resolve_column`, since an
        ordinal is not a name.
     3. A term that is, or reaches, an aggregate call - written
        directly, an alias of one, or an ordinal pointing at one - is
@@ -277,7 +277,7 @@ def _bind_group_by(
 #
 # The one clause that reverses two rules every other clause here holds:
 # the select-list alias wins over a same-named real column
-# (`_resolve_name`'s `alias_first=True` - #32's own reserved-but-unused
+# (`_resolve_column`'s `alias_first=True` - #32's own reserved-but-unused
 # direction, confirmed against sqlite3:
 # `select a as real_a, b as a from t order by a` sorts by the alias
 # `b`, not the real column `a`), and an aggregate call is legal even

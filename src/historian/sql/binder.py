@@ -55,21 +55,23 @@ query (`tests/differential/test_error_order.py`), the order is:
 1. The FROM table, then the qualifier of any `x.*` select-list item
    (`SELECT ghost_s, ghost.* FROM blame` reports `no such table:
    ghost`).
-2. LIMIT, then OFFSET - only what SQLite rejects there: a column
-   reference (any, even a real column or an alias: LIMIT sees no
-   columns) or an aggregate call. A column reference outside every
-   aggregate call is reported at once; an error inside an aggregate
-   call only once both clauses have no such column reference, the
-   last one found winning (`_check_limit_offset_names`).
+2. LIMIT and OFFSET, walked as one expression with LIMIT on the
+   left, as SQLite builds it (#144) - only what SQLite rejects there:
+   a column reference (any, even a real column or an alias: LIMIT
+   sees no columns), an unknown function, a wrong argument count or
+   an aggregate call. Which of several is reported follows the walk
+   below (`_resolve_limit_offset`).
 3. The select list, items left to right.
 4. `HAVING` on a non-aggregate query.
 5. `HAVING`.
 6. `WHERE`. In a non-aggregate query an aggregate call here is
    reported in place, in left-to-right order with the clause's names.
-7. `ORDER BY`, terms left to right: every name error first, then an
-   out-of-range ordinal.
-8. `GROUP BY`, terms left to right: every name error first, then an
-   out-of-range ordinal, then an aggregate key.
+7. `ORDER BY`, terms left to right: every name error, and an
+   integer term below 1 or above 65535 at its own turn (#144); then an
+   ordinal past the end of the select list.
+8. `GROUP BY`, terms left to right: every name error, and an integer
+   term below 1 or above 65535 at its own turn; then an ordinal past
+   the end of the select list, then an aggregate key.
 9. Late: an aggregate call in the `WHERE` of an aggregate query, or in
    the `ORDER BY` of a non-aggregate one (`_Context.late_misuse`).
    "Aggregate query" means `GROUP BY` is written or the select list
@@ -81,13 +83,17 @@ query (`tests/differential/test_error_order.py`), the order is:
     literal integer. They come after every error SQLite raises, so
     when a query has both, SQLite's wins.
 
-Within one clause expression, operands are visited left to right, so
-the leftmost unresolved name wins (`select ghost1, ghost2 from blame`
-reports `ghost1`); within one call the name is checked first, then
-the arity, then aggregate misuse (`WHERE avg() = 1` reports the
-arity), and a nested aggregate is reported where it is found, in any
-clause. The order of different error kinds inside one expression tree
-is #144. None of this is `SelectStatement`'s own field order
+Each select-list item and each `ORDER BY`/`GROUP BY` term is its
+own root, and the first root with an error ends resolution, so
+`select ghost1, ghost2 from blame` reports `ghost1`. Inside one root,
+the error reported is the one SQLite's resolution walk records last:
+a function call records its own error (unknown name, then arity,
+then aggregate misuse) before walking its arguments, a column that
+does not resolve records and stops the walk up to the nearest call,
+and most other nodes stop at once when an error is recorded - see
+`sql/bind_expr.py`'s "Which error is reported" (#144) for the six
+rules. A nested aggregate is reported where it is found, in any
+clause. None of this is `SelectStatement`'s own field order
 (`select_list`, `from_table`, `where`, ...), which a naive walk of the
 dataclass's fields would follow instead.
 """

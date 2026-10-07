@@ -58,7 +58,7 @@ from historian.sql.walk import BoundColumnRef, children, expr_shape_equal, is_ag
 # it already resolves to the referenced select-list item's own bound
 # expression (`_bind_order_by`, above), which trivially
 # shape-matches itself as the first `group_keys` entry checked. A
-# select-list alias reference is the same story: `_resolve_name`
+# select-list alias reference is the same story: `_resolve_column`
 # (`ctx.alias_first=True` for ORDER BY) already splices in that item's
 # own bound expression in its place.
 #

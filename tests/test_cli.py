@@ -921,6 +921,19 @@ def test_explain_shows_a_propagated_constant_in_the_columns_place(tiny_repo, cap
     )
 
 
+def test_explain_prints_the_constant_guard_and_never_evaluates_it(tiny_repo, capsys):
+    """#171: the term would raise if it ran; `--explain` only prints it."""
+    ret, out, err = _explain(tiny_repo, "SELECT path FROM blame WHERE path = 'src/utils.py' AND 'a' LIKE 'a' ESCAPE 'ab'", capsys)
+    assert ret == 0
+    assert err == ""
+    assert out == (
+        "Project (path)\n"
+        "  ConstantGuard ('a' LIKE 'a' ESCAPE 'ab')\n"
+        "    Filter (path = 'src/utils.py' AND 'a' LIKE 'a' ESCAPE 'ab')\n"
+        "      BlameScan (pushed: path = 'src/utils.py' -> 1 of 2 paths)\n"
+    )
+
+
 @pytest.mark.parametrize(
     "query",
     ["SELEC path FROM blame", "SELECT path FROM", "SELECT nope FROM blame", "SELECT path FROM 'x"],
@@ -989,6 +1002,14 @@ def test_stats_reports_work_done_not_planned(tiny_repo, capsys, built):
     assert err.splitlines()[:2] == ["0 paths blamed, 0 skipped", "0 git invocations"]
 
 
+def test_stats_after_a_false_constant_shows_no_work(tiny_repo, capsys, built):
+    """#171: `WHERE 1=0` is decided before the scan is read."""
+    ret, out, err = _stats(tiny_repo, "SELECT count(*) FROM blame WHERE path = 'src/utils.py' AND 1=0", capsys)
+    assert ret == 0
+    assert out.splitlines()[1:] == ["0"]
+    assert err.splitlines()[:2] == ["0 paths blamed, 0 skipped", "0 git invocations"]
+
+
 @pytest.mark.parametrize(
     "query",
     [
@@ -998,6 +1019,8 @@ def test_stats_reports_work_done_not_planned(tiny_repo, capsys, built):
         "SELECT path FROM blame LIMIT 1",
         "SELECT path FROM blame LIMIT 0",
         "SELECT count(*) FROM blame WHERE author_name = 'Bo Lindqvist'",
+        "SELECT count(*) FROM blame WHERE 1=0",
+        "SELECT path FROM blame WHERE 1=1 AND path = 'src/utils.py'",
     ],
 )
 def test_stats_numbers_equal_the_scans_own_record(tiny_repo, capsys, built, query):

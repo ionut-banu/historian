@@ -2,9 +2,10 @@
 which order SQLite resolves their names, #144), how to
 rebuild a node around new ones, whether two trees have the same shape,
 whether a tree is what SQLite's parser calls constant (#144), whether a
-query aggregates, how a condition splits into `AND`-terms and
-joins back, whether a term reads only `GROUP BY` keys, and how a column
-is replaced by a constant (#142).
+`WHERE` term has no column (#171), whether a query aggregates, how a
+condition splits into `AND`-terms and joins back, whether a term reads
+only `GROUP BY` keys, and how a column is replaced by a constant
+(#142).
 
 Issue #112. Before it, `sql/binder.py`, `plan/planner.py` and
 `sql/parser.py` each kept their own copy of the children table, and the
@@ -69,6 +70,7 @@ __all__ = [
     "fix_columns",
     "is_aggregate_query",
     "is_constant",
+    "is_constant_term",
     "join_conjuncts",
     "references_only_keys",
     "replace_conjuncts",
@@ -303,6 +305,28 @@ def is_constant(expr: Expr) -> bool:
         node = pending.pop()
         if isinstance(node, (ColumnRef, BoundColumnRef, FixedColumnRef, FunctionCall, Star)):
             return False
+        pending.extend(children(node))
+    return True
+
+
+def is_constant_term(expr: Expr) -> bool:
+    """Whether *expr* - one bound `WHERE` term, after constant
+    propagation - has no column reference, so SQLite decides it once,
+    before any row (#171): no `BoundColumnRef`, no `Star` and no
+    `FunctionCall` anywhere in its tree. A `FixedColumnRef` (#142) is
+    the column replaced by its constant: it evaluates to its value and
+    never reads the row, so it does not count, where for `is_constant`
+    (the parser's notion, #144) it does. The two answer different
+    questions and must not be merged. A loop over an explicit stack of
+    nodes (#107); the order they are visited in does not matter for a
+    yes/no answer."""
+    pending: list[Expr] = [expr]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (BoundColumnRef, FunctionCall, Star)):
+            return False
+        if isinstance(node, ColumnRef):
+            raise AssertionError("sql/walk.py: is_constant_term needs a bound tree")
         pending.extend(children(node))
     return True
 

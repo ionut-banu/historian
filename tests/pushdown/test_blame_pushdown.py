@@ -654,28 +654,31 @@ def test_a_like_beside_a_path_source_is_not_pushed(tiny_repo):
 def test_of_two_path_sources_the_last_is_pushed(tiny_repo):
     """SQLite uses the last of two sources for one column and rewrites
     the first into `'src/utils.py' = 'feature/thing.py'`, so only
-    `path = 'src/utils.py'` is pushed and that path is blamed. `main`
-    pushed both and blamed nothing, in one git invocation. Oracle:
+    `path = 'src/utils.py'` is pushed. That rewritten term has no column
+    and is `FALSE`, so since #171 it is decided before the scan is read
+    and nothing is blamed (#142 alone blamed `src/utils.py` in two git
+    invocations; before #142 both were pushed and one ran). Oracle:
     `0`."""
     rows = _check(
         "SELECT count(*) FROM blame WHERE path = 'feature/thing.py' AND path = 'src/utils.py'",
         tiny_repo,
-        blamed=["src/utils.py"],
-        invocations=2,
+        blamed=[],
+        invocations=0,
         pushed=1,
     )
     assert rows == [(0,)]
 
 
 def test_an_in_list_beside_a_path_source_is_not_pushed(tiny_repo):
-    """`path IN ('a', 'b')` becomes `'src/utils.py' IN ('a', 'b')`.
-    `main` pushed both terms and blamed nothing, in one git invocation.
-    Oracle: `0`."""
+    """`path IN ('a', 'b')` becomes `'src/utils.py' IN ('a', 'b')`,
+    which is not pushed. It has no column and is `FALSE`, so since #171
+    the scan is never read (#142 alone blamed `src/utils.py`). Oracle:
+    `0`."""
     rows = _check(
         "SELECT count(*) FROM blame WHERE path = 'src/utils.py' AND path IN ('a', 'b')",
         tiny_repo,
-        blamed=["src/utils.py"],
-        invocations=2,
+        blamed=[],
+        invocations=0,
         pushed=1,
     )
     assert rows == [(0,)]

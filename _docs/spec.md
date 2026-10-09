@@ -732,14 +732,44 @@ evaluation stops depends on where the expression is used:
   it stops `AND` there, and as `TRUE` under an odd number, where it
   stops `OR`. `x BETWEEN low AND high` is `x >= low AND x <= high` and
   stops the same way; `x NOT BETWEEN ...` is `NOT (x BETWEEN ...)`.
+- **An integer-literal operand in condition context** decides an
+  `AND`/`OR` before either operand runs. An operand is an *always-true*
+  or *always-false* literal when it is an unsigned integer literal that
+  fits in 32 bits (`0` to `2147483647`; leading zeros do not count, so
+  `01` and `00` are ones), any parentheses around it, or an `AND`/`OR`
+  that this rule itself turns into such a literal: nonzero is true,
+  zero is false. `x OR <true>` is the literal and `x AND <false>` is
+  the literal, so `x` is never evaluated, wherever it sits (`WHERE ERR
+  OR 1` and `WHERE NOT (ERR AND 0)` keep every row); `x AND <true>`
+  and `x OR <false>` are `x`. Both operands are simplified first, so
+  `ERR OR (0 OR 1)` and `(ERR AND 1) OR 1` count. Nothing else is such
+  a literal: not `-1`, `+1`, `1.0`, `'1'`, `NULL`, `1 = 1`, `NOT 0`,
+  `2147483648` or wider, a column that constant propagation replaced
+  by a constant, or a `NOT` around a literal. One condition is one
+  `WHERE` term - the `WHERE` is split on its top-level `AND`s first,
+  so its terms are not simplified against each other, and `WHERE
+  CONSTERR AND 0` still evaluates `CONSTERR` (that SQLite decides the
+  column-free `0` first is #171) - or the whole `HAVING`, top-level
+  `AND`s included: `HAVING max(path) LIKE 'a' ESCAPE 'ab' AND 0` keeps
+  no group and raises nothing. A `HAVING` term that moves below the
+  aggregate is a `WHERE` term. Value context is never simplified
+  (`SELECT ERR OR 1` raises), nor is an operand of anything but
+  `AND`/`OR`/`NOT` (`WHERE (ERR OR 1) IS NULL` raises). SQLite's hex
+  literals follow the same 32-bit rule (`0x7fffffff` is one,
+  `0x80000000` is not); the v1 grammar does not have them yet (#6).
 - `IN` stops at the first list element equal to its left side, in
   both contexts. A `NULL` element or left side does not stop it. `IN ()`
   evaluates nothing in condition context and its left side in value
   context.
 
 The evaluator has one entry point per context: `evaluate()` for a
-value, `evaluate_condition()` for `Filter`. A future `CASE WHEN` or
-`JOIN ... ON` condition is condition context and uses the second.
+value, `evaluate_condition()` for one condition. `Filter` calls the
+second once per `WHERE` term, left to right, until a term is not
+`TRUE`, and once on the whole `HAVING`; it holds the predicate as
+written, so `--explain` and pushdown see the query's own terms, and
+the literal rule above is applied as the condition is evaluated. A
+future `CASE WHEN` or `JOIN ... ON` condition is condition context and
+uses the second.
 
 ### Pushdown negotiation
 

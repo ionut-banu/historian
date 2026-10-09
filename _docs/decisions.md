@@ -3707,3 +3707,80 @@ leaf even when `x` has a function call in it, which SQLite does not
 (`EP_HasFunc`): `SELECT nofn(1 + 1 + ... + 1) AND 0 FROM blame`, 999
 ones, is "Expression tree is too large" to SQLite and `no such
 function: nofn` to historian.
+
+2026-10-09 - Replicate SQLite's integer-literal simplification of a condition AND/OR
+
+Issue #189, split out of #171 while grooming it. #171 decides a
+`WHERE` term with no column once, before any row; without this issue
+it would make `WHERE line_no < 0 AND (CONSTERR OR 1)` raise, where
+SQLite and historian both return no rows today, so this lands first.
+Replicate, not accept: carried over from #141 and #142 (the owner's
+choice for that family, confirmed for #142 on 2026-10-07). It was not
+confirmed for #189 itself, and the owner may overrule it at review.
+
+The rule. Before SQLite evaluates an `AND`/`OR` in condition context
+(`sqlite3ExprIfTrue`/`IfFalse`) it simplifies it
+(`sqlite3ExprSimplifiedAndOr`): both operands first, then `x OR
+<true>` and `x AND <false>` become the literal and `x AND <true>`, `x
+OR <false>` become `x`. A literal is always true or false only with
+`EP_IsTrue`/`EP_IsFalse`, set on an integer token that passes
+`sqlite3GetInt32`: unsigned, at most 2^31 - 1. historian copies the
+answers, not the code: `_simplified_condition` in
+`exec/expression.py`.
+
+Measured on the pinned oracle (Python `sqlite3` 3.50.4) through the
+differential harness's loader over `tiny`, and the boundary again with
+`tests/oracle.py`. Every answer the issue quotes held. The boundary:
+`2147483647`, `00000000002147483647`, `000000000001`, `01` and `00`
+are literals; `2147483648`, `4294967297` and `9223372036854775807` are
+not. Hex, on the SQLite side only (the v1 grammar has no hex, #6):
+`0x7fffffff`, `0x1`, `0x00000000001` true, `0x0` false, `0x80000000`
+and `0xFFFFFFFFFFFFFFFF` not literals. `TRUE`/`FALSE` are literals in
+SQLite too; the v1 grammar has no boolean literals. Found beyond the
+issue's lists, and followed:
+
+- `HAVING` is one condition, top-level `AND`s included, where a
+  `WHERE` is split into terms first. `GROUP BY path HAVING max(path)
+  LIKE 'a' ESCAPE 'ab' AND 0` and `SELECT count(*) FROM blame HAVING
+  CONSTERR AND 0` return no rows and raise nothing. The issue said the
+  false side applies "only below the top-level ANDs of the WHERE";
+  for `HAVING` the oracle says the top level too. SQLite replaces a
+  term it moves below the aggregate (#141) by the literal `1` in the
+  `HAVING`, which simplifies away, so dropping it as the planner does
+  is the same. A moved term is a `WHERE` term (`GROUP BY path HAVING
+  ERR AND 0` raises).
+- A select-list alias for a literal is that literal: `SELECT 1 AS one,
+  path FROM blame WHERE ERR OR one` keeps every row (SQLite copies the
+  aliased expression with its flags; the binder splices the same node).
+- A column replaced by constant propagation (#142) is not a literal:
+  `WHERE line_no = 1 AND (ERR OR line_no)` raises (SQLite's
+  `EP_FixedCol` node is still a column). A `NOT` around a literal is
+  not one, and `+1`, `-1` are not.
+
+Design: in the evaluator, as the condition is evaluated, not as a
+rewrite of the plan. A rewrite would change what is a column-free
+term: `WHERE ERR AND NOT (path LIKE 'x' OR 1)` would become `ERR AND
+NOT 1`, and #171 would decide `NOT 1` before any row and return
+nothing, where SQLite keeps that term per row (it has a column) and
+raises through `ERR` (measured). It also keeps `--explain` and the
+terms offered to the scan as written. `evaluate_condition` simplifies
+the whole condition it is given in one iterative pass over the
+`AND`/`OR`/`NOT` skeleton (#107), returning the same tree when
+nothing changes, then evaluates it. `Filter` gains `split_terms`:
+`True` (the `WHERE` and the moved-`HAVING` `Filter`) evaluates each
+top-level `AND` term as a condition of its own, left to right, until
+one is not `TRUE`; `False` (`HAVING`, set by the planner) evaluates
+the whole predicate as one. The two give the same rows and differ only
+in which operands run. The cost is one walk of the skeleton per
+condition per row.
+
+Tests. `tests/differential/test_and_or_literal.py` pins every shape
+to the oracle's outcome; the hex and exponent spellings are pinned on
+the SQLite side and assert historian's parse error, so #6 has to move
+them in. The sweep gains `where_literal` (`WHERE (<formula>) OR 0`, so
+the whole `WHERE` is one term and a column-free term never sits beside
+a raising one, which is #171's order) and `having_literal`, over the
+leaves `T`, `F`, `N`, `E`, `1`, `0`. Two #111 deep-chain unit tests
+started from the literals `0`/`1`, which are now decided before
+evaluation; they start from `1 = 0`/`1 = 1` to keep testing the
+short-circuit, and new deep tests cover the literals.

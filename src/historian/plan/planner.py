@@ -4,7 +4,7 @@ pipeline (`_docs/spec.md` §3 - "planner    AST -> operator tree").
 `sql/binder.py` produces a `BoundSelectStatement` with every column
 reference resolved to an integer offset, and `exec/operators.py`
 implements the operators. This module's whole job is assembly -
-deciding which of the seven operator classes to build, and in what
+deciding which of the eight operator classes to build, and in what
 order, from one bound statement plus a repository path.
 
 One plan representation, not two
@@ -15,8 +15,8 @@ because every logical operation here has exactly one implementation,
 so a second tree type plus a translation pass between them would be
 ceremony with no decision behind it. `plan()` therefore builds
 `exec/operators.py`'s actual `Operator` instances directly - up to
-`Scan`, `Filter`, `Aggregate`, `Filter`, `Sort`, `Project`,
-`Distinct` and `Limit` (see `plan()`) - and returns that tree as-is.
+`Scan`, `Filter`, `Filter`, `ConstantGuard`, `Aggregate`, `Filter`,
+`Sort`, `Project`, `Distinct` and `Limit` (see `plan()`) - and returns that tree as-is.
 The one rewrite step after it is `plan/optimizer.py`'s `optimize()`
 (#121, pushdown negotiation), which `cli.py` calls on this
 tree before iterating it; it records pushed terms on the tree's
@@ -24,7 +24,9 @@ tree before iterating it; it records pushed terms on the tree's
 runs a query change which errors are raised, so they are part of
 building the tree, here, and `--no-pushdown` (which skips
 `optimize()`) still gets them: `HAVING` terms that move below the
-aggregate (#141) and constant propagation in `WHERE` (#142).
+aggregate (#141) and constant propagation in `WHERE` (#142). So is the
+`ConstantGuard` that decides the column-free terms before any row
+(#171).
 
 The table -> scan-factory mapping
 ------------------------------------
@@ -76,6 +78,7 @@ from historian.exec.expression import apply_column_affinity, evaluate
 from historian.exec.operators import (
     Aggregate,
     AggregateCall,
+    ConstantGuard,
     Distinct,
     Filter,
     Limit,
@@ -96,6 +99,7 @@ from historian.sql.walk import (
     expr_shape_equal,
     fix_columns,
     is_aggregate_query,
+    is_constant_term,
     join_conjuncts,
     references_only_keys,
     replace_conjuncts,
@@ -433,6 +437,41 @@ def _propagate_constants(where: Expr, schema: Schema) -> Expr:
     return replace_conjuncts(where, rewritten)
 
 
+# --- WHERE terms with no column, decided before any row (#171) -------------
+#
+# `_docs/spec.md` §3, "`WHERE` terms with no column reference". SQLite
+# evaluates every `WHERE` term that reads no column once, before the
+# first row, in `WHERE` order (`sqlite3WhereBegin` codes each term with
+# no table dependency ahead of the loop): the first that is not `TRUE`
+# ends the query over zero rows, and one that raises raises on empty
+# input too. The terms are the `WHERE` after constant propagation
+# (#142), split on its top-level `AND`s as the `Filter` splits it, so a
+# column replaced by a `FixedColumnRef` no longer counts; the moved
+# `HAVING` terms (#141) that have no column follow, in `HAVING` order.
+#
+# They go in one `ConstantGuard` directly above the topmost of the two
+# `Filter`s - below `Aggregate`, so a whole-table aggregate over a false
+# constant still emits its one row. Both `Filter`s keep every term,
+# constants included: by the time a row reaches them every constant is
+# `TRUE` and cannot raise, so evaluating it again is harmless, and
+# pushdown negotiation sees the same terms it did before. Built here,
+# not in the optimizer, so `--no-pushdown` gets it too.
+
+
+def _constant_terms(where: Expr | None, moved_having: Expr | None) -> list[Expr]:
+    """The column-free terms of *where* (already propagated) in order,
+    then those of *moved_having* in order - the very term objects the
+    two `Filter`s split their predicates into."""
+    terms: list[Expr] = []
+    for predicate in (where, moved_having):
+        if predicate is None:
+            continue
+        for term in split_conjuncts(predicate):
+            if is_constant_term(term):
+                terms.append(term)
+    return terms
+
+
 def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory]) -> Operator:
     """Build the operator tree for *stmt*, a repository at *repo*.
 
@@ -452,8 +491,10 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory])
 
     Tree shape, per `_docs/spec.md` §3: `Scan -> Filter (WHERE) ->
     Filter (HAVING terms moved below the aggregate, not negotiable) ->
-    Aggregate (grouped or whole-table) -> Filter (HAVING) -> Sort ->
-    Project -> Distinct -> Limit`. The moved-terms `Filter` exists only
+    ConstantGuard -> Aggregate (grouped or whole-table) -> Filter
+    (HAVING) -> Sort -> Project -> Distinct -> Limit`. `ConstantGuard`
+    exists only when a term of either `Filter` below it has no column
+    (`_constant_terms`, #171). The moved-terms `Filter` exists only
     with a `GROUP BY` and at least one term that moves
     (`_move_having_terms`, #141); the `HAVING` `Filter` holds the terms
     that stay, and is left out when every term moved. `Limit` is outermost, present only
@@ -506,11 +547,15 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory])
     """
     source = tables[stmt.from_table](repo)
     tree: Operator = Scan(source)
-    if stmt.where is not None:
-        tree = Filter(tree, _propagate_constants(stmt.where, tree.schema))
+    where = _propagate_constants(stmt.where, tree.schema) if stmt.where is not None else None
+    if where is not None:
+        tree = Filter(tree, where)
     moved_having, kept_having = _move_having_terms(stmt)
     if moved_having is not None:
         tree = Filter(tree, moved_having, negotiable=False)
+    constant_terms = _constant_terms(where, moved_having)
+    if len(constant_terms) > 0:
+        tree = ConstantGuard(tree, constant_terms)
 
     # Aggregate when GROUP BY is written or an aggregate call appears
     # in the select list, HAVING or ORDER BY - for a bound statement the

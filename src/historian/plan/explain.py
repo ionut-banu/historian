@@ -20,6 +20,10 @@ A column the planner replaced by a propagated constant (#142,
 `FixedColumnRef`) prints as the constant, so the `WHERE` `Filter` line
 shows the rewritten terms the scan was offered.
 
+`ConstantGuard` (#171) prints its column-free terms joined by `AND`,
+spelled as the `Filter` line below it spells them. Nothing here runs
+the tree, so the guard is never evaluated.
+
 Expressions print as SQL text. A child is parenthesized when SQLite's
 precedence needs it, and always when it is a nested `AND`/`OR`/`NOT`
 (other than an `AND` inside an `AND` or an `OR` inside an `OR`, which
@@ -35,6 +39,7 @@ from __future__ import annotations
 
 from historian.exec.operators import (
     Aggregate,
+    ConstantGuard,
     Distinct,
     Filter,
     Limit,
@@ -63,7 +68,7 @@ from historian.sql.ast import (
     UnaryOperator,
 )
 from historian.sql.binder import BoundColumnRef
-from historian.sql.walk import FixedColumnRef
+from historian.sql.walk import FixedColumnRef, join_conjuncts
 
 __all__ = ["format_expr", "format_plan"]
 
@@ -272,6 +277,11 @@ def _operator_line(op: Operator, slots: tuple[Expr, ...] | None) -> str:
         return f"Project ({', '.join(items)})"
     if isinstance(op, Filter):
         return f"Filter ({_format(op.predicate(), slots)})"
+    if isinstance(op, ConstantGuard):
+        # Joined into one `AND` chain and printed as one expression, so
+        # each term is parenthesized exactly as on the `Filter` line.
+        # Printing never evaluates a term (#171).
+        return f"ConstantGuard ({_format(join_conjuncts(op.terms()), slots)})"
     if isinstance(op, Sort):
         keys = [_format(key.expr, slots) + (" DESC" if key.descending else " ASC") for key in op.keys()]
         return f"Sort ({', '.join(keys)})"

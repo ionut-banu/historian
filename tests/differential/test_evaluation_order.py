@@ -46,8 +46,8 @@ a rewrite, not evaluation order. The `propagated` placement covers it:
 through `ERR`, or else only comparisons that are per row in both
 engines, so no conjunct is left with no column. What remains is a
 conjunct that does become constant - `WHERE ERR AND line_no = 1 AND
-line_no = 2`, or `line_no > 5 AND line_no = 5` - which SQLite decides
-before any row (#171, #180).
+line_no = 2`, or `line_no > 5 AND line_no = 5` - which both engines
+decide before any row (#171); its family is #180's.
 """
 
 from __future__ import annotations

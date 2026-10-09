@@ -1592,9 +1592,11 @@ def test_a_column_outside_the_key_expression_keeps_the_term():
 
 
 def test_a_constant_term_moves():
+    """It moves, and having no column it is also a guard term (#171)."""
     bound, tree = _planned("SELECT count(*) FROM widgets GROUP BY path HAVING count(*) > 5 AND 1")
-    assert _kinds(tree) == ["Project", "Filter", "Aggregate", "Filter", "Scan"]
-    assert _chain(tree)[3].predicate() is _having_terms(bound)[1]
+    assert _kinds(tree) == ["Project", "Filter", "Aggregate", "ConstantGuard", "Filter", "Scan"]
+    assert _chain(tree)[4].predicate() is _having_terms(bound)[1]
+    assert _chain(tree)[3].terms() == (_having_terms(bound)[1],)
 
 
 def test_an_integer_literal_zero_term_stays():
@@ -1609,7 +1611,7 @@ def test_an_integer_literal_zero_term_stays():
     assert len(kept) == 2 and kept[1] is zero
     for constant in ("0.0", "-0"):
         _b, tree = _planned(f"SELECT count(*) FROM widgets GROUP BY path HAVING count(*) > 5 AND {constant}")
-        assert _kinds(tree) == ["Project", "Filter", "Aggregate", "Filter", "Scan"], constant
+        assert _kinds(tree) == ["Project", "Filter", "Aggregate", "ConstantGuard", "Filter", "Scan"], constant
 
 
 def test_not_over_and_is_one_term_and_moves_whole():

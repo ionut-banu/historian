@@ -443,7 +443,12 @@ def test_the_rewritten_terms_are_the_ones_offered_and_kept():
     tree = optimize(plan(bound, Path("/nonexistent"), tables={"gadgets": lambda repo: source}))
     from historian.sql.walk import FixedColumnRef
 
-    filter_terms = split_conjuncts(child_of(tree).predicate())
+    # `1 > 0` has no column left, so a `ConstantGuard` (#171) sits
+    # between `Project` and the `Filter`; it changes nothing offered.
+    guard = child_of(tree)
+    assert type(guard).__name__ == "ConstantGuard"
+    filter_terms = split_conjuncts(child_of(guard).predicate())
+    assert guard.terms() == (filter_terms[0],)
     assert len(source.offered) == 2
     assert all(offered is kept for offered, kept in zip(source.offered, filter_terms))
     rewritten, kept_source = source.offered

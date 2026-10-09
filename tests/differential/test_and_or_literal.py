@@ -12,7 +12,7 @@ running `x`. The literal is an unsigned integer literal that fits in
 
 `WHERE` is split into terms on its top-level `AND`s first, so the
 terms of a `WHERE` are not simplified against each other (a
-column-free term is #171's). `HAVING` is one condition, top-level
+column-free term is decided before any row, #171). `HAVING` is one condition, top-level
 `AND`s included, and a `HAVING` term that moves below the aggregate
 (#141) is a `WHERE` term.
 

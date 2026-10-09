@@ -590,8 +590,16 @@ A `Row` is a tuple of values. The schema lives on the operator, not in
 the row, so rows stay cheap and column references resolve to integer
 offsets at bind time rather than by name at runtime.
 
-Phase 1 operators: `Scan`, `Filter`, `Project`, `Aggregate`, `Sort`,
-`Limit`, `Distinct`. Phase 3 adds `HashJoin`.
+Phase 1 operators: `Scan`, `Filter`, `ConstantGuard`, `Project`,
+`Aggregate`, `Sort`, `Limit`, `Distinct`. Phase 3 adds `HashJoin`.
+`ConstantGuard` holds the `WHERE` terms that read no column and
+decides them before its child is pulled (see "`WHERE` terms with no
+column reference" below); a query with no such term has none.
+
+`Limit` with a limit of `0` yields nothing and pulls nothing, whatever
+the `OFFSET`: SQLite runs no part of a `LIMIT 0` query, so `WHERE
+path LIKE 'a' ESCAPE 'ab' LIMIT 0 OFFSET 1` returns no rows rather
+than raise.
 
 `Aggregate` handles both the grouped case and the whole-table case,
 which differ in one respect that matters: with no `GROUP BY` and no
@@ -643,10 +651,11 @@ against the oracle (`_docs/decisions.md`, 2026-10-06, #141):
   not part of it; the planner does this, not the optimizer, so
   `--no-pushdown` moves the same terms.
 
-A term with no column reference is a constant. SQLite evaluates a
-constant `WHERE` term once before any row, which historian does not do
-yet (#171), so a moved constant behaves as a constant in a plain
-`WHERE` does.
+A moved term with no column reference is a constant: like a constant
+`WHERE` term it is decided once, before any row, after every constant
+term of the `WHERE` (see "`WHERE` terms with no column reference"
+below). The integer literal `0` stays in `HAVING` and is not one of
+them, so `GROUP BY path HAVING 0 AND CONSTERR` raises.
 
 ### Constant propagation in `WHERE`
 
@@ -699,9 +708,71 @@ raises in both engines. The rule, measured against the oracle
 The planner does this, not the optimizer, so `--no-pushdown` rewrites
 the same terms; the `WHERE` `Filter` holds the rewritten terms, and a
 `WHERE` with no source is left exactly as bound. A term the rewrite
-leaves with no column reference (`line_no > 5` beside `line_no = 5`)
-is decided by SQLite once before any row; historian evaluates it per
-row, in order, as it does any constant term (#171, #180).
+leaves with no column reference (`line_no > 5` beside `line_no = 5`
+is `5 > 5`) is a constant term like any other and is decided once,
+before any row (next section): `WHERE path LIKE 'a' ESCAPE 'ab' AND
+line_no = 1 AND line_no = 2` returns no rows, and `WHERE path = 'zzz'
+AND path LIKE 'a' ESCAPE 'ab'` raises even though no path is `'zzz'`.
+The full family of such contradictions is pinned by #180.
+
+### `WHERE` terms with no column reference
+
+SQLite decides a `WHERE` term that reads no column once, before it
+reads the first row. The planner does the same, so the two engines
+raise the same errors and do the same work. The rule, measured
+against the oracle (Python `sqlite3` 3.50.4; `_docs/decisions.md`,
+2026-10-09, #171), with `ERR` for `path LIKE 'a' ESCAPE 'ab'` and
+`CONSTERR` for `'a' LIKE 'a' ESCAPE 'ab'`:
+
+1. **Terms.** The `WHERE`, after constant propagation, is split into
+   terms on every top-level `AND`, nested `AND`s and parentheses
+   flattened, left to right, as for pushdown. An `OR`, a `NOT (...)`
+   or anything else is one term and is never split: `ERR AND (line_no
+   = 1 AND line_no = 2)` has three terms, `ERR AND NOT (line_no = 1
+   AND line_no = 2)` two.
+2. **Constant term.** A term is constant when nothing in it is a
+   column reference, a `*` or a function call. A column that constant
+   propagation replaced by its constant is not a column reference
+   here: it never reads the row. A constant inside a term that has a
+   column is not hoisted: `line_no > 0 OR CONSTERR` is one per-row
+   term, raises only for a row where `line_no > 0` is not `TRUE`, and
+   raises nothing over zero rows.
+3. **Once, before any row, in order.** Every constant term is
+   evaluated exactly once, in `WHERE` order, before the first row is
+   read and before any other term, wherever it sits among them. Each
+   is evaluated as a condition (condition context, the integer-literal
+   rule included), so `line_no < 0 AND (1 = 1 OR CONSTERR)` and
+   `line_no < 0 AND (CONSTERR OR 1)` raise nothing and `line_no < 0
+   AND (CONSTERR AND 1 = 0)` raises. The first constant term that is
+   not `TRUE` - `FALSE` or `NULL` - ends it: later constant terms are
+   not evaluated, no row is read, and the result is what the query
+   returns over zero rows (`count(*)` is `0`, a `GROUP BY` gives no
+   rows). A constant term that raises raises whatever the input is,
+   empty included. So `WHERE ERR AND 0` returns no rows, `WHERE 1 = 0
+   AND CONSTERR` returns no rows, and `WHERE CONSTERR AND 1 = 0`
+   raises.
+4. **Moved `HAVING` terms.** With a `GROUP BY`, a `HAVING` term that
+   moves below the aggregate and has no column is a constant term of
+   the same list, after every constant term of the `WHERE`, in
+   `HAVING` order. A `HAVING` with no `GROUP BY` moves nothing and
+   runs once on the one aggregate row, as before.
+5. **Not evaluated when no row is pulled.** `LIMIT 0` evaluates
+   nothing: `WHERE CONSTERR LIMIT 0` returns no rows.
+6. **Everything per row is unchanged.** The other terms run per row,
+   left to right, after the constants. The `Filter` keeps every term,
+   constants included - by the time a row reaches it they are all
+   `TRUE` - and the terms offered to the scan are the same.
+
+The planner builds one `ConstantGuard` holding the constant terms, in
+that order, directly above the `WHERE` `Filter` and the `Filter` of
+moved `HAVING` terms (so below `Aggregate`, or below `Sort`, `Project`,
+`Distinct` and `Limit` when there is none). It evaluates its terms on
+the first pull of its rows, never when the tree is built, so
+`--explain` evaluates nothing; a false or `NULL` term means the scan is
+never read and does no work. The planner does this, not the optimizer,
+so `--no-pushdown` gets it too. The select list, `ORDER BY` and
+`GROUP BY` are not touched: `SELECT CONSTERR FROM blame` raises only
+when there is a row.
 
 ### Expression evaluation
 
@@ -748,8 +819,9 @@ evaluation stops depends on where the expression is used:
   by a constant, or a `NOT` around a literal. One condition is one
   `WHERE` term - the `WHERE` is split on its top-level `AND`s first,
   so its terms are not simplified against each other, and `WHERE
-  CONSTERR AND 0` still evaluates `CONSTERR` (that SQLite decides the
-  column-free `0` first is #171) - or the whole `HAVING`, top-level
+  CONSTERR AND 0` still evaluates `CONSTERR` (both are constant terms,
+  decided in order before any row, so it raises before the `0` is
+  reached) - or the whole `HAVING`, top-level
   `AND`s included: `HAVING max(path) LIKE 'a' ESCAPE 'ab' AND 0` keeps
   no group and raises nothing. A `HAVING` term that moves below the
   aggregate is a `WHERE` term. Value context is never simplified
@@ -1209,6 +1281,20 @@ Project (author_name, count(*))
         BlameScan (pushed: path LIKE 'src/auth/%' -> 12 of 4013 paths)
 ```
 
+A query with a `WHERE` term that reads no column (§3) has one more
+line, `ConstantGuard (<terms>)`, between the operators it sits
+between: its terms joined by ` AND `, spelled as the `Filter` line
+spells them, a propagated constant printed as its value. `--explain`
+never evaluates it. For `SELECT path FROM blame WHERE path = 'a' AND
+1 = 0`:
+
+```
+Project (path)
+  ConstantGuard (1 = 0)
+    Filter (path = 'a' AND 1 = 0)
+      BlameScan (pushed: path = 'a' -> 1 of 4013 paths)
+```
+
 The scan line is `<Name> (pushed: <terms> -> <n> of <total> paths)`:
 the pushed terms joined by `, ` (or `none`), the paths tracked at
 `HEAD`, and how many of them the scan would blame for those terms.
@@ -1238,7 +1324,8 @@ proves pushdown works in a test should be visible to a user. They go
 to stderr after the results, so stdout is identical with and without
 `--stats`, and only after a query that succeeded. The counts are what
 the scan actually did: `LIMIT 0` never reads the scan and prints
-`0 paths blamed, 0 skipped`.
+`0 paths blamed, 0 skipped`, and so does a `WHERE` with a constant
+term that is not `TRUE` (`WHERE 1 = 0`, §3).
 
 ### `--no-pushdown`
 

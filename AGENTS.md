@@ -21,7 +21,7 @@ Commands
   `large` benchmark fixture (`uv run pytest --build-large` too)
 - `HISTORIAN_SWEEP_OPERATORS=3 uv run pytest
   tests/differential/test_evaluation_order.py` - the full 3-operator
-  evaluation-order sweep (about 3.5 minutes); run it at milestone
+  evaluation-order sweep (about 11 minutes); run it at milestone
   boundaries and when #117 lands
 
 Layout

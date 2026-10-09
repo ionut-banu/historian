@@ -3787,3 +3787,98 @@ mismatches). Two #111 deep-chain unit tests
 started from the literals `0`/`1`, which are now decided before
 evaluation; they start from `1 = 0`/`1 = 1` to keep testing the
 short-circuit, and new deep tests cover the literals.
+
+2026-10-09 - Replicate SQLite deciding a column-free WHERE term before any row
+
+Issue #171. Replicate, not accept: groomed on the owner's choice for
+the same family (#141, #142, confirmed for #142 on 2026-10-07). It
+was not confirmed for #171 itself, and the owner may overrule it at
+review, in which case this becomes a spec paragraph and a pinning test.
+With #189 already landed, `WHERE line_no < 0 AND (CONSTERR OR 1)`
+stays no rows (the guard evaluates the term as a condition, and the
+literal rule makes it `1`).
+
+The rule. SQLite's `sqlite3WhereBegin` codes every `WHERE` term with
+no table dependency (`prereqAll == 0`) once, ahead of the row loop,
+with a jump past the loop when it is not true. historian copies the
+answers: the `WHERE`, after constant propagation, is split on its
+top-level `AND`s (nested ones flattened, as `split_conjuncts` does);
+a term with no `BoundColumnRef`, `Star` or `FunctionCall` - a
+`FixedColumnRef` does not count, it never reads the row - is a
+constant term; the moved `HAVING` terms (#141) with no column follow,
+in `HAVING` order (the integer literal `0` stays in `HAVING` and is not
+one). Each constant term is evaluated once, in order, as a condition,
+before the scan is read; the first that is `FALSE` or `NULL` ends the
+query over zero rows, and one that raises raises on empty input too.
+`LIMIT 0` evaluates nothing.
+
+Measured on the pinned oracle (Python `sqlite3` 3.50.4) with
+`tests/oracle.py`'s module and the differential harness's loader,
+over `tiny` and over an empty table of `blame`'s schema. Every answer
+the issue quotes held, the two empty-input `HAVING` lists included.
+Found beyond the issue's lists, and followed:
+
+- `WHERE line_no < 0 AND (CONSTERR OR 0)` raises: a literal that does
+  not decide the `OR` leaves `CONSTERR` to run. `WHERE ERR AND NOT
+  (CONSTERR OR 1)`, `ERR AND (0 OR NULL)`, `ERR AND (CONSTERR OR 1)
+  AND 0` and `ERR AND (1 OR CONSTERR) AND 1=0` return no rows: #189's
+  simplification applies inside a constant term. `WHERE ERR AND NOT
+  (path LIKE 'x' OR 1)` still raises: that term has a column, so it is
+  per row whatever it simplifies to.
+- `WHERE ERR AND path = 'zzz'` raises in SQLite as well as `path =
+  'zzz' AND ERR`: `ERR` becomes the constant `'zzz' LIKE 'a' ESCAPE
+  'ab'` either way. Both now agree, with and without `--no-pushdown`.
+- `GROUP BY path HAVING ERR AND 0.0` (and `-0`, `NULL`, `1 > 2`)
+  returns no rows: the trailing moved constant is decided first. The
+  #141 entry left these out for #171.
+- `WHERE CONSTERR LIMIT 0 OFFSET 1` and `WHERE ERR LIMIT 0 OFFSET 1`
+  return no rows; historian raised for both, before and after the
+  guard, because `Limit` skipped the offset (pulling a row) before it
+  looked at the limit. SQLite runs nothing for `LIMIT 0`, so `Limit`
+  now returns before skipping. The issue's `LIMIT 0`/`OFFSET`
+  criterion covers it; it was not in the issue's measurements.
+
+Design: one operator, `ConstantGuard`, built by `plan()` (so
+`--no-pushdown` gets it) directly above the topmost of the `WHERE`
+`Filter` and the moved-terms `Filter`, holding the constant terms -
+the same objects those `Filter`s split into. Its `rows()` is a
+generator: the terms are evaluated with `evaluate_condition` against
+an empty row on the first pull, before the child is pulled, so the
+scan does no work at all for a false constant (no `git ls-tree`
+either, as for `LIMIT 0`), a tree that is only printed (`--explain`)
+evaluates nothing, and every `rows()` call evaluates afresh. The
+`Filter`s keep every term, constants included: a constant is `TRUE`
+and cannot raise by the time a row reaches them, the optimizer still
+negotiates the `Filter` directly above the `Scan`, and "every term
+lives in a `Filter`" still holds. Placing it below `Aggregate` keeps
+`SELECT count(*) ... WHERE ERR AND 1=0` at `(0)`. The predicate is a
+new `is_constant_term` in `sql/walk.py`; `is_constant` (#144) answers
+the parser's question, in which a `FixedColumnRef` is a column, and
+is unchanged.
+
+Two pushdown work-done tests changed by design:
+`WHERE path = 'feature/thing.py' AND path = 'src/utils.py'` and
+`WHERE path = 'src/utils.py' AND path IN ('a', 'b')` blamed
+`src/utils.py` in two git invocations under #142; the rewritten term
+is a false constant, so they now blame nothing in none.
+
+This narrows the #51 accepted difference (parse-time constant
+folding) again. After #142, #189 and this issue, what is left of it
+is: propagation sources whose constant is an expression, and SQLite's
+second propagation pass (#179); parse-time folds that change whether
+a statement binds (`SELECT zz1 AND 0`, #185, #186); and parse-time
+`x AND 0` folding across a `HAVING` that moves terms (`HAVING path >
+'zzzz' AND 0 AND ERR`, the #141 entry). The contradiction family
+after propagation is pinned by #180, and pushdown hiding an error
+from an earlier per-row term is #172.
+
+Tests. `tests/differential/test_constant_guard.py` pins every shape to
+the oracle's outcome over `tiny` and over a zero-row factory loaded
+with `load_table_sql`, each run with pushdown and without; work-done
+tests in `tests/pushdown`, unit tests for the operator, its placement,
+its `--explain` line and `is_constant_term`. The #189 test that pinned
+`WHERE ERR AND 0` as a known gap now pins no rows. The three-operator
+evaluation-order sweep is unchanged (its leaves all read a column) and
+still shows 0 mismatches: 3,377 tests, 10 min 37 s as pytest reports
+it. Every mutation the issue lists was applied by hand and is caught
+by a named test (recorded on the issue).

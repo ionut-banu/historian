@@ -3780,7 +3780,10 @@ the SQLite side and assert historian's parse error, so #6 has to move
 them in. The sweep gains `where_literal` (`WHERE (<formula>) OR 0`, so
 the whole `WHERE` is one term and a column-free term never sits beside
 a raising one, which is #171's order) and `having_literal`, over the
-leaves `T`, `F`, `N`, `E`, `1`, `0`. Two #111 deep-chain unit tests
+leaves `T`, `F`, `N`, `E`, `1`, `0`: 15,000 queries up to two
+operators, 829,440 more at three, which adds about four minutes to the
+three-operator run (10 min 46 s in all on the implementing machine, 0
+mismatches). Two #111 deep-chain unit tests
 started from the literals `0`/`1`, which are now decided before
 evaluation; they start from `1 = 0`/`1 = 1` to keep testing the
 short-circuit, and new deep tests cover the literals.

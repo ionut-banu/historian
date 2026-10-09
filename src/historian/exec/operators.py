@@ -95,6 +95,7 @@ from historian.schema import Column, ColumnType, Row, Schema
 from historian.sql.ast import Expr
 from historian.sql.binder import BoundColumnRef, BoundSelectItem
 from historian.sql.lexer import Position
+from historian.sql.walk import split_conjuncts
 from historian.values import INT64_MAX, INT64_MIN
 
 __all__ = [
@@ -251,7 +252,9 @@ class Filter:
     (#111): this is the one condition context in the engine, the
     root of `WHERE`/`HAVING`, where `AND`/`OR`/`NOT`/`BETWEEN` stop as
     soon as whether the row is kept is decided, as SQLite's do. Every
-    other operator here evaluates values and calls `evaluate`.
+    other operator here evaluates values and calls `evaluate`. A
+    `WHERE` is evaluated term by term, a `HAVING` whole - see
+    `split_terms` (#189).
 
     `evaluate_condition(predicate, row, child.schema)` returns a `Value` for a
     value-shaped predicate (`WHERE line_no`, a bare column with no
@@ -273,10 +276,14 @@ class Filter:
     `TypeError`.
     """
 
-    def __init__(self, child: Operator, predicate: Expr, negotiable: bool = True) -> None:
+    def __init__(self, child: Operator, predicate: Expr, negotiable: bool = True, split_terms: bool = True) -> None:
         self._child = child
         self._predicate = predicate
         self._negotiable = negotiable
+        self._split_terms = split_terms
+        # The conditions `rows()` evaluates, in order: the top-level
+        # `AND` terms, or the whole predicate as one (`split_terms`).
+        self._conditions = tuple(split_conjuncts(predicate)) if split_terms else (predicate,)
         # A predicate can only remove rows, never add, rename, or
         # retype a column - the output schema is exactly the child's.
         self.schema = child.schema
@@ -296,11 +303,31 @@ class Filter:
         tree's shape."""
         return self._negotiable
 
+    def split_terms(self) -> bool:
+        """Whether the predicate is a `WHERE` - split on its top-level
+        `AND`s into terms, each evaluated as a condition of its own,
+        left to right, stopping at the first that is not `TRUE` - or,
+        when `False`, one condition, as SQLite evaluates a `HAVING`.
+        `True` for `WHERE` and for the `Filter` of `HAVING` terms that
+        moved below the aggregate (#141), which SQLite has made `WHERE`
+        terms; `False` for `HAVING`. The two agree on every row; they
+        differ only in which operands run, because `evaluate_condition`
+        simplifies an `AND` with an always-false literal operand (#189):
+        `HAVING CONSTERR AND 0` is the literal `0`, while `WHERE
+        CONSTERR AND 0` is two terms and `CONSTERR` raises."""
+        return self._split_terms
+
     def rows(self) -> Iterator[Row]:
         child_schema = self._child.schema
+        conditions = self._conditions
         for row in self._child.rows():
-            result = evaluate_condition(self._predicate, row, child_schema)
-            if values.is_true(coerce_to_bool3(result)):
+            kept = True
+            for condition in conditions:
+                result = evaluate_condition(condition, row, child_schema)
+                if not values.is_true(coerce_to_bool3(result)):
+                    kept = False
+                    break
+            if kept:
                 yield row
 
 

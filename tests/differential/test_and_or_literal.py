@@ -295,16 +295,12 @@ def test_top_level_and_terms_raise_on_both_sides(tiny_repo, tiny_conn):
     _check(tiny_conn, tiny_repo, f"SELECT path FROM blame WHERE line_no = 1 AND {CONSTERR} AND 0", ERROR)
 
 
-def test_where_err_and_0_is_left_to_issue_171(tiny_repo, tiny_conn):
+def test_where_err_and_0_returns_no_rows_through_the_constant_guard(tiny_repo, tiny_conn):
     """`WHERE ERR AND 0` returns no rows in SQLite because the term `0`
     is decided before any row (#171), not because of this rule: the
-    top-level terms are not simplified against each other, so historian
-    still raises per row. #171 flips this test."""
-    query = f"SELECT path FROM blame WHERE {ERR} AND 0"
-    assert tiny_conn.execute(query).fetchall() == []
-    with pytest.raises(EvalError) as raised:
-        run_historian(query, tiny_repo)
-    assert str(raised.value) == ESCAPE_MESSAGE
+    top-level terms are not simplified against each other. The `0` is a
+    constant term of its own, so no row reaches `ERR`."""
+    _check(tiny_conn, tiny_repo, f"SELECT path FROM blame WHERE {ERR} AND 0", [])
 
 
 # --- HAVING ------------------------------------------------------------------

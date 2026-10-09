@@ -280,3 +280,55 @@ def test_deeply_nested_expression_does_not_hit_the_recursion_limit():
 def test_format_expr_is_exported_for_a_bound_expression():
     bound = bind(parse(tokenize("SELECT path FROM blame WHERE path = 'a'")), catalog={"blame": BLAME_SCHEMA})
     assert format_expr(bound.where) == "path = 'a'"
+
+
+# --- ConstantGuard (#171) -----------------------------------------------------
+
+
+def test_a_constant_term_prints_a_guard_line_between_its_operators():
+    assert _explain("SELECT path FROM blame WHERE path = 'x' AND 1 = 0") == [
+        "Project (path)",
+        "  ConstantGuard (1 = 0)",
+        "    Filter (path = 'x' AND 1 = 0)",
+        "      FakeScan (pushed: path = 'x', 1 = 0 -> 2 of 5 paths)",
+    ]
+
+
+def test_guard_terms_are_spelled_as_the_filter_spells_them():
+    lines = _explain(
+        "SELECT path FROM blame WHERE line_no > 0 AND (1 = 0 OR NULL) AND 'a' LIKE 'a' ESCAPE 'ab'"
+    )
+    assert lines[1] == "  ConstantGuard ((1 = 0 OR NULL) AND 'a' LIKE 'a' ESCAPE 'ab')"
+    assert lines[2] == "    Filter (line_no > 0 AND (1 = 0 OR NULL) AND 'a' LIKE 'a' ESCAPE 'ab')"
+
+
+def test_a_propagated_constant_prints_as_its_value_on_the_guard_line():
+    lines = _explain("SELECT path FROM blame WHERE line_no = 1 AND line_no = '02'")
+    assert lines[:3] == [
+        "Project (path)",
+        "  ConstantGuard (2 = 1)",
+        "    Filter (2 = 1 AND line_no = '02')",
+    ]
+
+
+def test_a_moved_having_constant_prints_below_the_aggregate():
+    assert _explain("SELECT count(*) FROM blame WHERE 1 = 1 GROUP BY path HAVING 'a' = 'a' AND count(*) > 1") == [
+        "Project (count(*))",
+        "  Filter (count(*) > 1)",
+        "    Aggregate (group=[path], aggs=[count(*)])",
+        "      ConstantGuard (1 = 1 AND 'a' = 'a')",
+        "        Filter ('a' = 'a')",
+        "          Filter (1 = 1)",
+        "            FakeScan (pushed: 1 = 1 -> 1 of 5 paths)",
+    ]
+
+
+def test_explain_never_evaluates_the_guard():
+    """`_FakeSource.scan` raises if called, and the term would raise if
+    evaluated: printing does neither."""
+    lines = _explain("SELECT path FROM blame WHERE 'a' LIKE 'a' ESCAPE 'ab' AND 1 = 0")
+    assert lines[1] == "  ConstantGuard ('a' LIKE 'a' ESCAPE 'ab' AND 1 = 0)"
+
+
+def test_no_constant_term_no_guard_line():
+    assert not any("ConstantGuard" in line for line in _explain("SELECT path FROM blame WHERE line_no > 0 OR 1 = 0"))

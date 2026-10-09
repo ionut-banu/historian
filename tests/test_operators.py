@@ -40,6 +40,7 @@ from historian.exec.expression import EvalError
 from historian.exec.operators import (
     Aggregate,
     AggregateCall,
+    ConstantGuard,
     Distinct,
     Filter,
     Limit,
@@ -49,9 +50,10 @@ from historian.exec.operators import (
     SortKey,
 )
 from historian.schema import Column, ColumnType, Row, Schema
-from historian.sql.ast import And, BinaryOp, Like, Literal, Not, Operator as Op, Or
+from historian.sql.ast import And, BinaryOp, Is, Like, Literal, Not, Operator as Op, Or
 from historian.sql.binder import BoundColumnRef, BoundSelectItem
 from historian.sql.lexer import Position
+from historian.sql.walk import FixedColumnRef
 
 _POS = Position(line=1, column=1, offset=0)
 
@@ -424,6 +426,123 @@ def test_terms_run_left_to_right_and_stop_at_the_first_that_is_not_true(split_te
     assert tuple(Filter(_child(), nulls, split_terms=split_terms).rows()) == ()
     kept = And(_bin(Op.GT, _col("line_no"), _lit(3)), _bin(Op.LT, _col("line_no"), _lit(5)), _POS)
     assert tuple(Filter(_child(), kept, split_terms=split_terms).rows()) == (("a.py", 4, "cara@x.com"),)
+
+
+# --- ConstantGuard (issue #171) -------------------------------------------
+#
+# The `WHERE` terms with no column reference, decided once before any
+# row: on the first pull of `rows()`, in order, as conditions
+# (`evaluate_condition`), against an empty row. The first that is not
+# `TRUE` ends the query before the child is pulled at all.
+
+
+def test_a_true_guard_yields_every_child_row():
+    source = _CountingSource(_ROWS)
+    guard = ConstantGuard(Scan(source), [_lit(1), _bin(Op.EQ, _lit(1), _lit(1))])
+
+    assert guard.schema is _SCHEMA
+    assert tuple(guard.rows()) == _ROWS
+    assert source.pulled == len(_ROWS)
+
+
+@pytest.mark.parametrize(
+    "term",
+    [_bin(Op.EQ, _lit(1), _lit(0)), _lit(None), _lit(0), _bin(Op.EQ, _lit(None), _lit(None)), _lit("a")],
+    ids=["false", "null", "zero", "null-comparison", "text"],
+)
+def test_a_false_or_null_guard_never_pulls_the_child(term):
+    """A `NULL` constant ends the query as `FALSE` does - only `TRUE`
+    passes."""
+    source = _FakeSource(_ROWS)
+    guard = ConstantGuard(Scan(source), [term])
+
+    assert tuple(guard.rows()) == ()
+    assert source.scan_calls == []
+
+
+def test_a_raising_guard_raises_before_the_child_is_pulled():
+    source = _FakeSource(_ROWS)
+    guard = ConstantGuard(Scan(source), [_RAISES])
+
+    with pytest.raises(EvalError):
+        next(iter(guard.rows()))
+    assert source.scan_calls == []
+
+
+def test_a_raising_guard_raises_over_an_empty_child():
+    with pytest.raises(EvalError):
+        tuple(ConstantGuard(_child(()), [_RAISES]).rows())
+
+
+def test_the_guard_runs_on_the_first_pull_not_at_construction():
+    """`--explain` builds the tree and never runs it: building a guard
+    over a raising term must not raise, and neither may calling
+    `rows()` without pulling from it."""
+    source = _FakeSource(_ROWS)
+    guard = ConstantGuard(Scan(source), [_RAISES])
+    rows = guard.rows()
+    assert source.scan_calls == []
+    with pytest.raises(EvalError):
+        next(iter(rows))
+
+
+def test_the_guard_runs_before_the_first_row_is_read():
+    """Even a row the child would yield first does not come out."""
+    source = _CountingSource(_ROWS)
+    guard = ConstantGuard(Scan(source), [_bin(Op.EQ, _lit(1), _lit(0))])
+    assert list(guard.rows()) == []
+    assert source.pulled == 0
+
+
+def test_terms_run_in_order_and_stop_at_the_first_that_is_not_true():
+    """`1 = 0` before the raising term stops it; after it, the raising
+    term runs first. A `NULL` stops it the same way."""
+    assert tuple(ConstantGuard(_child(), [_bin(Op.EQ, _lit(1), _lit(0)), _RAISES]).rows()) == ()
+    assert tuple(ConstantGuard(_child(), [_lit(None), _RAISES]).rows()) == ()
+    with pytest.raises(EvalError):
+        tuple(ConstantGuard(_child(), [_RAISES, _bin(Op.EQ, _lit(1), _lit(0))]).rows())
+    with pytest.raises(EvalError):
+        tuple(ConstantGuard(_child(), [_lit(1), _RAISES, _lit(0)]).rows())
+
+
+def test_each_term_is_evaluated_as_a_condition():
+    """`1 = 1 OR CONSTERR` stops at its left side and `CONSTERR OR 1` is
+    the literal `1` (#189); as values both would run `CONSTERR`."""
+    assert tuple(ConstantGuard(_child(), [Or(_bin(Op.EQ, _lit(1), _lit(1)), _RAISES, _POS)]).rows()) == _ROWS
+    assert tuple(ConstantGuard(_child(), [Or(_RAISES, _lit(1), _POS)]).rows()) == _ROWS
+    assert tuple(ConstantGuard(_child(), [Not(And(_RAISES, _lit(0), _POS), _POS)]).rows()) == _ROWS
+    with pytest.raises(EvalError):
+        tuple(ConstantGuard(_child(), [And(_RAISES, _bin(Op.EQ, _lit(1), _lit(0)), _POS)]).rows())
+
+
+def test_a_fixed_column_ref_is_its_value_with_the_columns_affinity():
+    """`line_no = 5 AND line_no > '4'` after propagation: the term is
+    `5 > '4'` with `line_no`'s INTEGER affinity, so `TRUE`; the
+    `line_no = 6` term is `5 = 6`, `FALSE`."""
+    fixed = FixedColumnRef(offset=_SCHEMA.index_of("line_no"), name="line_no", value=5, position=_POS)
+    assert tuple(ConstantGuard(_child(), [_bin(Op.GT, fixed, _lit("4"))]).rows()) == _ROWS
+    assert tuple(ConstantGuard(_child(), [_bin(Op.EQ, fixed, _lit(6))]).rows()) == ()
+    assert tuple(ConstantGuard(_child(), [Is(fixed, _lit(None), True, _POS)]).rows()) == _ROWS
+
+
+def test_a_second_rows_call_gives_the_same_answer():
+    passing = ConstantGuard(_child(), [_lit(1)])
+    assert tuple(passing.rows()) == _ROWS
+    assert tuple(passing.rows()) == _ROWS
+    failing = ConstantGuard(_child(), [_lit(0)])
+    assert tuple(failing.rows()) == ()
+    assert tuple(failing.rows()) == ()
+    raising = ConstantGuard(_child(), [_RAISES])
+    for _ in range(2):
+        with pytest.raises(EvalError):
+            tuple(raising.rows())
+
+
+def test_the_guard_keeps_its_terms_in_order():
+    terms = [_lit(1), _RAISES, _lit(0)]
+    guard = ConstantGuard(_child(), terms)
+    assert guard.terms() == tuple(terms)
+    assert all(a is b for a, b in zip(guard.terms(), terms))
 
 
 # --- Project --------------------------------------------------------------
@@ -1981,6 +2100,17 @@ def test_limit_truncates_to_the_first_n_rows():
 def test_limit_zero_yields_no_rows():
     result = Limit(_child(_LIMIT_ROWS), limit=0)
     assert tuple(result.rows()) == ()
+
+
+def test_limit_zero_with_an_offset_pulls_nothing():
+    """`LIMIT 0 OFFSET 1` is no rows without reading any (#171):
+    SQLite returns `[]` for `WHERE CONSTERR LIMIT 0 OFFSET 1` and for
+    `WHERE ERR LIMIT 0 OFFSET 1`, where skipping the offset first would
+    run the `WHERE`."""
+    source = _CountingSource(_LIMIT_ROWS)
+    result = Limit(Scan(source), limit=0, offset=1)
+    assert tuple(result.rows()) == ()
+    assert source.pulled == 0
 
 
 def test_negative_limit_means_no_limit():

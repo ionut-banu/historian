@@ -22,10 +22,22 @@ from pathlib import Path
 import pytest
 
 from historian.catalog import SCAN_FACTORIES
-from historian.exec.operators import Aggregate, Distinct, Filter, Limit, Project, Scan, ScanEstimate, Sort, child_of
+from historian.exec.operators import (
+    Aggregate,
+    ConstantGuard,
+    Distinct,
+    Filter,
+    Limit,
+    Project,
+    Scan,
+    ScanEstimate,
+    Sort,
+    child_of,
+)
 from historian.plan import planner
 from historian.sql import walk
 from historian.plan.explain import format_plan
+from historian.plan.optimizer import optimize
 from historian.plan.planner import plan
 from historian.schema import Column, ColumnType, Row, Schema
 from historian.sql.ast import And, BinaryOp, FunctionCall, Is, Like, Literal, Not, OrderDirection, Operator as Op, Star
@@ -1898,3 +1910,166 @@ def test_a_deep_guard_is_rewritten_without_recursion():
     guard, _source = _where_terms(tree)
     assert len(_fixed_refs(guard)) == len(_column_refs(deep))
     assert list(tree.rows()) == [("a.py",)]
+
+
+# --- WHERE terms with no column, decided before any row (#171) -----------------
+#
+# `ConstantGuard` holds the `WHERE` terms (after propagation, #142) that
+# have no column reference, in `WHERE` order, then the moved `HAVING`
+# terms (#141) with none, in `HAVING` order. It sits directly above the
+# topmost of the `WHERE` `Filter` and the moved-terms `Filter`; both
+# keep every term, constants included.
+
+_CONSTERR = "'a' LIKE 'a' ESCAPE 'ab'"
+
+
+def _guard(tree) -> ConstantGuard:
+    (guard,) = [op for op in _chain(tree) if isinstance(op, ConstantGuard)]
+    return guard
+
+
+def _texts(terms) -> list[str]:
+    from historian.plan.explain import format_expr
+
+    return [format_expr(term) for term in terms]
+
+
+def test_a_constant_term_gets_a_guard_above_the_where_filter():
+    _bound_stmt, tree = _planned("SELECT path FROM widgets WHERE line_no > 0 AND 1 = 0")
+    assert _kinds(tree) == ["Project", "ConstantGuard", "Filter", "Scan"]
+    _project, guard, where, _scan = _chain(tree)
+    assert guard.schema is where.schema
+    terms = walk.split_conjuncts(where.predicate())
+    assert len(guard.terms()) == 1 and guard.terms()[0] is terms[1]
+
+
+def test_the_where_filter_keeps_every_term_constants_included():
+    bound, tree = _planned(f"SELECT path FROM widgets WHERE 1 = 1 AND line_no > 0 AND {_CONSTERR}")
+    where = _chain(tree)[2]
+    assert isinstance(where, Filter) and where.predicate() is bound.where
+    assert where.negotiable() is True
+    assert _texts(walk.split_conjuncts(where.predicate())) == ["1 = 1", "line_no > 0", _CONSTERR]
+    assert _texts(_guard(tree).terms()) == ["1 = 1", _CONSTERR]
+
+
+def test_a_query_with_no_constant_term_has_no_guard():
+    for sql in [
+        "SELECT path FROM widgets",
+        "SELECT path FROM widgets WHERE line_no > 0",
+        f"SELECT path FROM widgets WHERE line_no > 0 OR {_CONSTERR}",
+        f"SELECT path FROM widgets WHERE line_no > 5 AND NOT (line_no = 1 AND {_CONSTERR})",
+        f"SELECT path FROM widgets WHERE 1 IN (2, line_no, {_CONSTERR})",
+        f"SELECT {_CONSTERR} FROM widgets ORDER BY {_CONSTERR}",
+        f"SELECT count(*) FROM widgets HAVING {_CONSTERR}",
+        f"SELECT count(*) FROM widgets WHERE line_no > 0 HAVING 1 = 0 AND {_CONSTERR}",
+        "SELECT count(*) FROM widgets GROUP BY path HAVING count(*) > 1",
+    ]:
+        _bound_stmt, tree = _planned(sql)
+        assert "ConstantGuard" not in _kinds(tree), sql
+
+
+def test_nested_ands_flatten_into_terms_but_not_under_not_or_or():
+    _bound_stmt, tree = _planned(f"SELECT path FROM widgets WHERE line_no > 0 AND (path > 'a' AND (0 AND {_CONSTERR}))")
+    assert _texts(_guard(tree).terms()) == ["0", _CONSTERR]
+    _bound_stmt, tree = _planned("SELECT path FROM widgets WHERE line_no > 0 AND NOT (1 = 1 AND 1 = 0)")
+    assert _texts(_guard(tree).terms()) == ["NOT (1 = 1 AND 1 = 0)"]
+
+
+def test_a_propagated_column_counts_as_no_column():
+    """`line_no = 1 AND line_no = 2`: the last source is used, and the
+    first term becomes `2 = 1` - a `FixedColumnRef` beside a literal,
+    no row read - so the guard holds it and the scan is never pulled.
+    `line_no = 1` alone keeps its column and gets no guard."""
+    _bound_stmt, tree = _planned("SELECT path FROM widgets WHERE line_no = 1 AND line_no = 2", [("a.py", 1, None)])
+    (term,) = _guard(tree).terms()
+    assert isinstance(term, BinaryOp) and isinstance(term.left, walk.FixedColumnRef)
+    assert isinstance(term.right, Literal)
+    assert list(tree.rows()) == []
+    scan = _chain(tree)[-1]
+    assert scan.source().scan_calls == []
+
+    _bound_stmt, tree = _planned("SELECT path FROM widgets WHERE line_no = 1", [("a.py", 1, None)])
+    assert "ConstantGuard" not in _kinds(tree)
+    assert list(tree.rows()) == [("a.py",)]
+
+
+def test_a_hand_built_fixed_column_ref_term_is_guarded_and_a_bound_column_is_not():
+    fixed = walk.FixedColumnRef(offset=_SCHEMA.index_of("line_no"), name="line_no", value=7, position=_POS)
+    stmt = _stmt([_select_item(_col("path"))], where=_bin(Op.EQ, fixed, _lit(8)))
+    source = _FakeSource([("a.py", 7, None)])
+    tree = plan(stmt, Path("/unused"), tables=_fake_tables(source))
+    assert _kinds(tree) == ["Project", "ConstantGuard", "Filter", "Scan"]
+    assert list(tree.rows()) == []
+    assert source.scan_calls == []
+
+    stmt = _stmt([_select_item(_col("path"))], where=_bin(Op.EQ, _col("line_no"), _lit(8)))
+    source = _FakeSource([("a.py", 7, None)])
+    tree = plan(stmt, Path("/unused"), tables=_fake_tables(source))
+    assert _kinds(tree) == ["Project", "Filter", "Scan"]
+    assert list(tree.rows()) == []
+    assert source.scan_calls == [()]
+
+
+def test_moved_having_constants_follow_the_where_constants_in_having_order():
+    """The literal `0` stays in `HAVING` and is not a guard term."""
+    _bound_stmt, tree = _planned(
+        "SELECT count(*) FROM widgets WHERE 1 = 1 AND line_no > 0 AND NULL IS NULL GROUP BY path "
+        f"HAVING 0 AND 'a' = 'a' AND count(*) > 1 AND path > 'x' AND {_CONSTERR}"
+    )
+    assert _kinds(tree) == ["Project", "Filter", "Aggregate", "ConstantGuard", "Filter", "Filter", "Scan"]
+    _project, kept, _aggregate, guard, moved, where, _scan = _chain(tree)
+    assert _texts(guard.terms()) == ["1 = 1", "NULL IS NULL", "'a' = 'a'", _CONSTERR]
+    assert _texts(walk.split_conjuncts(moved.predicate())) == ["'a' = 'a'", "path > 'x'", _CONSTERR]
+    assert _texts(walk.split_conjuncts(where.predicate())) == ["1 = 1", "line_no > 0", "NULL IS NULL"]
+    assert kept.split_terms() is False
+    assert moved.negotiable() is False
+
+
+def test_a_moved_constant_with_no_where_sits_above_the_moved_filter():
+    _bound_stmt, tree = _planned(f"SELECT count(*) FROM widgets GROUP BY path HAVING {_CONSTERR}")
+    assert _kinds(tree) == ["Project", "Aggregate", "ConstantGuard", "Filter", "Scan"]
+    assert _texts(_guard(tree).terms()) == [_CONSTERR]
+
+
+def test_the_guard_sits_below_sort_project_distinct_and_limit():
+    _bound_stmt, tree = _planned("SELECT DISTINCT path FROM widgets WHERE 1 = 0 ORDER BY path LIMIT 2 OFFSET 1")
+    assert _kinds(tree) == ["Limit", "Distinct", "Project", "Sort", "ConstantGuard", "Filter", "Scan"]
+    _bound_stmt, tree = _planned("SELECT count(*) FROM widgets WHERE NULL")
+    assert _kinds(tree) == ["Project", "Aggregate", "ConstantGuard", "Filter", "Scan"]
+
+
+class _AcceptAllSource(_EstimatingSource):
+    def capabilities(self) -> set[str]:
+        return {"anything"}
+
+    def accepts(self, term) -> bool:
+        return True
+
+
+def test_negotiation_offers_every_where_term_once_constants_included():
+    """The guard changes nothing about pushdown: the `WHERE` `Filter` is
+    still directly above the `Scan` and negotiable, and a scan that
+    accepts everything is given each of its terms once, in order."""
+    bound = _bound(f"SELECT path FROM widgets WHERE 1 = 1 AND line_no > 0 AND line_no = 3 AND {_CONSTERR}")
+    tree = optimize(plan(bound, Path("/nonexistent"), tables=_fake_tables(_AcceptAllSource([]))))
+    assert _kinds(tree) == ["Project", "ConstantGuard", "Filter", "Scan"]
+    _project, guard, where, scan = _chain(tree)
+    assert where.negotiable() is True
+    terms = walk.split_conjuncts(where.predicate())
+    assert len(scan.pushed()) == len(terms) == 4
+    assert all(a is b for a, b in zip(scan.pushed(), terms))
+    assert all(any(t is g for t in terms) for g in guard.terms())
+
+
+def test_plan_builds_the_guard_without_optimize():
+    """`--no-pushdown` skips `optimize()`, never `plan()`."""
+    _bound_stmt, tree = _planned("SELECT path FROM widgets WHERE 1 = 0")
+    assert _kinds(tree) == ["Project", "ConstantGuard", "Filter", "Scan"]
+    assert _chain(tree)[-1].pushed() == ()
+
+
+def test_building_and_printing_a_raising_guard_evaluates_nothing():
+    _bound_stmt, tree = _planned(f"SELECT path FROM widgets WHERE {_CONSTERR}", [("a.py", 1, None)])
+    text = format_plan(tree)
+    assert f"ConstantGuard ({_CONSTERR})" in text
+    assert _chain(tree)[-1].source().scan_calls == []

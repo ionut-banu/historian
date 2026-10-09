@@ -2957,26 +2957,29 @@ def test_deep_comparison_chain_with_affinity():
     assert coerce_to_value(evaluate(expr, _ROW, _SCHEMA)) == 1
 
 
-@pytest.mark.parametrize("leftmost, expected", [(0, False), (None, None)], ids=["false", "null"])
+@pytest.mark.parametrize("leftmost, expected", [(_FALSE, False), (_lit(None), None)], ids=["false", "null"])
 def test_deep_and_chain_stops_on_the_leftmost_false_or_null_in_condition_context(leftmost, expected):
     """A FALSE or NULL leftmost leaf decides every AND above it at the
     root of a condition without touching a right operand - each right
     operand here is a FunctionCall, which raises EvalError if it is
-    ever evaluated (#111)."""
+    ever evaluated (#111). The FALSE leaf is `1 = 0`, not the literal
+    `0`: a literal `0` would decide the chain before it is evaluated at
+    all (#189, tested below), which is not what this test is about."""
     from historian.exec.expression import evaluate_condition
 
     call = FunctionCall(name="f", args=(), position=_POS)
-    expr = _lit(leftmost)
+    expr = leftmost
     for _ in range(_DEEP):
         expr = And(left=expr, right=call, position=_POS)
     assert _at_depth(700, lambda: evaluate_condition(expr, _ROW, _SCHEMA)) is expected
 
 
 def test_deep_or_chain_stops_on_the_leftmost_true_in_condition_context():
+    """`1 = 1`, not the literal `1`, for the reason above."""
     from historian.exec.expression import evaluate_condition
 
     call = FunctionCall(name="f", args=(), position=_POS)
-    expr = _lit(1)
+    expr = _TRUE
     for _ in range(_DEEP):
         expr = Or(left=expr, right=call, position=_POS)
     assert _at_depth(700, lambda: evaluate_condition(expr, _ROW, _SCHEMA)) is True
@@ -3292,3 +3295,215 @@ def test_a_fixed_column_keeps_its_columns_affinity_in_comparisons(expr, expected
     from historian.exec.expression import evaluate
 
     assert evaluate(expr(), (99, "99", 99.0), _SCHEMA) is expected
+
+
+# --- A condition AND/OR with an integer-literal operand (issue #189) -------
+#
+# In condition context SQLite replaces an `AND`/`OR` whose operand is an
+# always-true or always-false literal before evaluating it
+# (`sqlite3ExprSimplifiedAndOr`; spec §3 "Expression evaluation"):
+# `x OR <true>` is the literal, `x AND <false>` is the literal, `x AND
+# <true>` and `x OR <false>` are `x`. The literal is an unsigned integer
+# literal that fits in 32 bits, `0` false and anything else true, or a
+# nested `AND`/`OR` that simplifies to one; a `NOT` is never one.
+# `evaluate_condition` is one condition - the whole `HAVING`, or one
+# `WHERE` term (the `Filter` splits a `WHERE` on its top-level `AND`s,
+# tests/test_operators.py) - so its root `AND` is simplified too. Every
+# answer below is the one tests/differential/test_and_or_literal.py
+# pins against the oracle.
+
+_ALWAYS_TRUE_LITERALS = [1, 5, 2147483647]
+_NOT_LITERALS = [
+    ("2^31", lambda: _lit(2147483648)),
+    ("2^32+1", lambda: _lit(4294967297)),
+    ("int64 max", lambda: _lit(9223372036854775807)),
+    ("-1", lambda: _unary(UnaryOperator.NEG, _lit(1))),
+    ("+1", lambda: _unary(UnaryOperator.POS, _lit(1))),
+    ("1.0", lambda: _lit(1.0)),
+    ("1.5", lambda: _lit(1.5)),
+    ("'1'", lambda: _lit("1")),
+    ("'a'", lambda: _lit("a")),
+    ("NULL", lambda: _lit(None)),
+    ("1=1", lambda: _TRUE),
+    ("NOT 0", lambda: Not(_lit(0), _POS)),
+]
+
+
+@pytest.mark.parametrize("literal", _ALWAYS_TRUE_LITERALS)
+def test_or_with_an_always_true_literal_never_evaluates_the_other_operand(literal):
+    from historian.exec.expression import coerce_to_bool3, evaluate_condition
+
+    for expr in (Or(_POISON_LIKE, _lit(literal), _POS), Or(_lit(literal), _POISON_LIKE, _POS)):
+        assert coerce_to_bool3(evaluate_condition(expr, _ROW, _SCHEMA)) is True
+
+
+def test_and_with_a_false_literal_never_evaluates_the_other_operand():
+    """`NOT (ERR AND 0)` keeps the row; at the root of one condition
+    (`HAVING ... AND 0`) the AND is the literal `0`."""
+    from historian.exec.expression import coerce_to_bool3, evaluate_condition
+
+    assert evaluate_condition(Not(And(_POISON_LIKE, _lit(0), _POS), _POS), _ROW, _SCHEMA) is True
+    assert coerce_to_bool3(evaluate_condition(And(_POISON_LIKE, _lit(0), _POS), _ROW, _SCHEMA)) is False
+
+
+@pytest.mark.parametrize("name, build", _NOT_LITERALS, ids=[name for name, _ in _NOT_LITERALS])
+def test_nothing_but_a_32_bit_unsigned_integer_literal_simplifies(name, build):
+    """Signed, REAL, text, NULL, too wide, a comparison or a `NOT`: the
+    other operand still runs - on both sides of the OR, and as the
+    false side of an AND under NOT (a NULL is not false here)."""
+    from historian.exec.expression import EvalError, evaluate_condition
+
+    for expr in (
+        Or(_POISON_LIKE, build(), _POS),
+        Not(And(_POISON_LIKE, build(), _POS), _POS),
+    ):
+        with pytest.raises(EvalError):
+            evaluate_condition(expr, _ROW, _SCHEMA)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: Or(_POISON_LIKE, _lit(0), _POS),
+        lambda: Not(Or(_POISON_LIKE, _lit(0), _POS), _POS),
+        lambda: And(_POISON_LIKE, _lit(1), _POS),
+        lambda: Not(And(_POISON_LIKE, _lit(1), _POS), _POS),
+        lambda: And(_lit(1), _POISON_LIKE, _POS),
+        lambda: Or(_lit(0), _POISON_LIKE, _POS),
+        lambda: Or(_POISON_LIKE, Or(_lit(0), _lit(0), _POS), _POS),
+        lambda: Or(_POISON_LIKE, And(_lit(0), _lit(1), _POS), _POS),
+        lambda: Or(_POISON_LIKE, Not(And(_lit(1), _lit(0), _POS), _POS), _POS),
+        lambda: And(Or(_POISON_LIKE, _lit(1), _POS), _POISON_LIKE, _POS),
+    ],
+    ids=["E OR 0", "NOT (E OR 0)", "E AND 1", "NOT (E AND 1)", "1 AND E", "0 OR E",
+         "E OR (0 OR 0)", "E OR (0 AND 1)", "E OR NOT (1 AND 0)", "(E OR 1) AND E"],
+)
+def test_a_literal_that_does_not_decide_leaves_the_operand_to_run(build):
+    """`x AND 1` and `x OR 0` are `x`; a NOT around literals is not a
+    literal (it is simplified inside, never seen through)."""
+    from historian.exec.expression import EvalError, evaluate_condition
+
+    with pytest.raises(EvalError):
+        evaluate_condition(build(), _ROW, _SCHEMA)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: Or(Or(_POISON_LIKE, _lit(0), _POS), _lit(1), _POS),
+        lambda: Or(And(_POISON_LIKE, _lit(1), _POS), _lit(1), _POS),
+        lambda: Or(_POISON_LIKE, And(_lit(1), _lit(1), _POS), _POS),
+        lambda: Or(_POISON_LIKE, Or(_lit(0), _lit(1), _POS), _POS),
+        lambda: Or(_POISON_LIKE, Or(_lit(1), _POISON_LIKE, _POS), _POS),
+        lambda: Or(Or(_POISON_LIKE, _POISON_LIKE, _POS), _lit(1), _POS),
+        lambda: Not(Not(Or(_POISON_LIKE, _lit(1), _POS), _POS), _POS),
+        lambda: Not(And(And(_POISON_LIKE, Or(_lit(1), _POISON_LIKE, _POS), _POS), _lit(0), _POS), _POS),
+    ],
+    ids=["(E OR 0) OR 1", "(E AND 1) OR 1", "E OR (1 AND 1)", "E OR (0 OR 1)", "E OR (1 OR E)",
+         "(E OR E) OR 1", "NOT NOT (E OR 1)", "NOT (E AND (1 OR E) AND 0)"],
+)
+def test_a_nested_and_or_that_simplifies_to_a_literal_counts(build):
+    from historian.exec.expression import coerce_to_bool3, evaluate_condition
+
+    assert coerce_to_bool3(evaluate_condition(build(), _ROW, _SCHEMA)) is True
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: Or(_POISON_LIKE, _lit(1), _POS),
+        lambda: And(_POISON_LIKE, _lit(0), _POS),
+        lambda: Not(And(_POISON_LIKE, _lit(0), _POS), _POS),
+        lambda: Or(_POISON_LIKE, Or(_lit(0), _lit(1), _POS), _POS),
+    ],
+)
+def test_value_context_never_simplifies(build):
+    """`SELECT ERR OR 1`, `SELECT ERR AND 0`: every operand runs."""
+    from historian.exec.expression import EvalError, evaluate
+
+    with pytest.raises(EvalError):
+        evaluate(build(), _ROW, _SCHEMA)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: Is(left=Or(_POISON_LIKE, _lit(1), _POS), right=_lit(None), negated=False, position=_POS),
+        lambda: _bin(Operator.EQ, And(_POISON_LIKE, _lit(0), _POS), _lit(0)),
+        lambda: _unary(UnaryOperator.POS, Or(_POISON_LIKE, _lit(1), _POS)),
+        lambda: In(left=_lit(1), values=(Or(_POISON_LIKE, _lit(1), _POS),), negated=False, position=_POS),
+        lambda: Between(
+            operand=Or(_POISON_LIKE, _lit(1), _POS), low=_lit(0), high=_lit(5), negated=False, position=_POS
+        ),
+    ],
+    ids=["(E OR 1) IS NULL", "(E AND 0) = 0", "+(E OR 1)", "1 IN (E OR 1)", "(E OR 1) BETWEEN"],
+)
+def test_an_operand_of_any_other_operator_is_not_simplified_inside_a_condition(build):
+    from historian.exec.expression import EvalError, evaluate_condition
+
+    with pytest.raises(EvalError):
+        evaluate_condition(build(), _ROW, _SCHEMA)
+
+
+def test_a_fixed_column_is_not_a_literal():
+    """`line_no = 1 AND (ERR OR line_no)`: the propagated `line_no` is
+    SQLite's column with `EP_FixedCol`, not an integer literal, so the
+    OR still runs `ERR` (#142)."""
+    from historian.exec.expression import EvalError, evaluate_condition
+    from historian.sql.walk import FixedColumnRef
+
+    fixed = FixedColumnRef(offset=_SCHEMA.index_of("n"), name="n", value=1, position=_POS)
+    with pytest.raises(EvalError):
+        evaluate_condition(Or(_POISON_LIKE, fixed, _POS), _ROW, _SCHEMA)
+
+
+@pytest.mark.parametrize(
+    "build, cells, expected_reads",
+    [
+        # The literal decides: the column operand is never read.
+        (lambda: Or(_A, _lit(1), _POS), (_F,), []),
+        (lambda: Or(_lit(1), _A, _POS), (_F,), []),
+        (lambda: And(_A, _lit(0), _POS), (_T,), []),
+        (lambda: Not(And(_A, _lit(0), _POS), _POS), (_T,), []),
+        (lambda: Or(_A, Or(_B, _lit(1), _POS), _POS), (_F, _F), []),
+        # It does not: the operand is read, left to right.
+        (lambda: And(_A, _lit(1), _POS), (_T,), [0]),
+        (lambda: Or(_A, _lit(0), _POS), (_F,), [0]),
+        (lambda: And(_lit(1), _A, _POS), (_T,), [0]),
+        (lambda: Or(And(_A, _lit(1), _POS), _B, _POS), (_F, _T), [0, 1]),
+        (lambda: Or(_A, _lit(None), _POS), (_F,), [0]),
+    ],
+)
+def test_which_leaves_a_literal_operand_leaves_unread(build, cells, expected_reads):
+    _, reads = _reads("evaluate_condition", build(), *cells)
+    assert reads == expected_reads
+
+
+def test_value_context_reads_the_operand_beside_a_literal():
+    assert _reads("evaluate", Or(_A, _lit(1), _POS), _F) == (True, [0])
+    assert _reads("evaluate", And(_A, _lit(0), _POS), _T) == (False, [0])
+
+
+def test_deep_or_chain_ending_in_a_true_literal_simplifies_without_recursion():
+    """`((f OR f) OR f) ... OR 1`, 5000 deep: the literal at the top
+    decides it, and no `f` (which raises if evaluated) runs."""
+    from historian.exec.expression import coerce_to_bool3, evaluate_condition
+
+    call = FunctionCall(name="f", args=(), position=_POS)
+    expr = call
+    for _ in range(_DEEP):
+        expr = Or(left=expr, right=call, position=_POS)
+    expr = Or(left=expr, right=_lit(1), position=_POS)
+    assert coerce_to_bool3(_at_depth(700, lambda: evaluate_condition(expr, _ROW, _SCHEMA))) is True
+
+
+def test_deep_and_chain_with_a_false_literal_at_the_bottom_simplifies_without_recursion():
+    """`NOT (f AND (f AND ... (f AND 0)))`, right-deep: the `0` decides
+    every AND above it, so the NOT is TRUE and no `f` runs."""
+    from historian.exec.expression import evaluate_condition
+
+    call = FunctionCall(name="f", args=(), position=_POS)
+    expr = _lit(0)
+    for _ in range(_DEEP):
+        expr = And(left=call, right=expr, position=_POS)
+    assert _at_depth(700, lambda: evaluate_condition(Not(expr, _POS), _ROW, _SCHEMA)) is True

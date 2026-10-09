@@ -49,7 +49,7 @@ from historian.exec.operators import (
     SortKey,
 )
 from historian.schema import Column, ColumnType, Row, Schema
-from historian.sql.ast import And, BinaryOp, Literal, Not, Operator as Op
+from historian.sql.ast import And, BinaryOp, Like, Literal, Not, Operator as Op, Or
 from historian.sql.binder import BoundColumnRef, BoundSelectItem
 from historian.sql.lexer import Position
 
@@ -361,6 +361,69 @@ def test_filter_coerces_a_value_shaped_operand_nested_inside_not():
     result = Filter(_child(), predicate)
 
     assert tuple(result.rows()) == _ROWS
+
+
+# --- WHERE terms and the one HAVING condition (issue #189) ----------------
+#
+# SQLite splits a `WHERE` on its top-level `AND`s into terms and runs
+# each as a condition of its own, while `HAVING` is one condition. It
+# shows only through the integer-literal simplification of a condition
+# `AND`/`OR` (`exec/expression.py`): `ERR AND 0` is one `AND` to
+# simplify in `HAVING`, but two terms in `WHERE`, and the `0` does not
+# stop the `ERR` term before it. `_RAISES` is `'a' LIKE 'a' ESCAPE
+# 'ab'`, which raises whenever it runs.
+
+_RAISES = Like(left=_lit("a"), pattern=_lit("a"), negated=False, escape=_lit("ab"), position=_POS)
+
+
+def test_a_where_filter_does_not_simplify_its_terms_against_each_other():
+    """`WHERE CONSTERR AND 0` raises in SQLite (tests/differential/
+    test_and_or_literal.py): the `0` is a term of its own."""
+    result = Filter(_child(), And(_RAISES, _lit(0), _POS))
+
+    assert result.split_terms() is True
+    with pytest.raises(EvalError):
+        tuple(result.rows())
+
+
+def test_a_having_filter_is_one_condition_and_simplifies_its_top_level_and():
+    """`HAVING CONSTERR AND 0` is no rows in SQLite: the whole `HAVING`
+    is the literal `0`."""
+    result = Filter(_child(), And(_RAISES, _lit(0), _POS), split_terms=False)
+
+    assert result.split_terms() is False
+    assert tuple(result.rows()) == ()
+
+
+@pytest.mark.parametrize("split_terms", [True, False])
+def test_each_where_term_is_still_simplified_within_itself(split_terms):
+    """`WHERE line_no > 0 AND (CONSTERR OR 1) AND NOT (CONSTERR AND 0)`
+    keeps every row with either flag: the simplification reaches inside
+    each term."""
+    predicate = And(
+        And(_bin(Op.GT, _col("line_no"), _lit(0)), Or(_RAISES, _lit(1), _POS), _POS),
+        Not(And(_RAISES, _lit(0), _POS), _POS),
+        _POS,
+    )
+    result = Filter(_child(), predicate, split_terms=split_terms)
+
+    assert tuple(result.rows()) == _ROWS
+
+
+@pytest.mark.parametrize("split_terms", [True, False])
+def test_terms_run_left_to_right_and_stop_at_the_first_that_is_not_true(split_terms):
+    """`line_no > 4 AND CONSTERR`: only the row with `line_no` 5 reaches
+    the raising term; `line_no > 9 AND ...` stops every row first, and
+    so does a NULL term."""
+    reaches = And(_bin(Op.GT, _col("line_no"), _lit(4)), _RAISES, _POS)
+    with pytest.raises(EvalError):
+        tuple(Filter(_child(), reaches, split_terms=split_terms).rows())
+    stopped = And(And(_bin(Op.GT, _col("line_no"), _lit(9)), _RAISES, _POS), _RAISES, _POS)
+    assert tuple(Filter(_child(), stopped, split_terms=split_terms).rows()) == ()
+    nulls = And(_bin(Op.EQ, _col("line_no"), _lit(None)), _RAISES, _POS)
+    assert tuple(Filter(_child(), nulls, split_terms=split_terms).rows()) == ()
+    kept = And(_bin(Op.GT, _col("line_no"), _lit(3)), _bin(Op.LT, _col("line_no"), _lit(5)), _POS)
+    assert tuple(Filter(_child(), kept, split_terms=split_terms).rows()) == (("a.py", 4, "cara@x.com"),)
 
 
 # --- Project --------------------------------------------------------------

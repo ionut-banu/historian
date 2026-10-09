@@ -292,6 +292,11 @@ def test_condition_context_results_are_nonempty_where_expected(tiny_repo, tiny_c
 # operators, and 768,320 more for k = 3 - but each runs over three rows
 # with nothing to group, so the k = 3 part is about four minutes and
 # it is not capped.
+#
+# Two more, `where_literal` and `having_literal` (#189), add the
+# integer literals `1` and `0` to the leaves, which SQLite simplifies a
+# condition `AND`/`OR` by: 7,500 formulas each up to two operators,
+# 414,720 more each at three. See `_LITERAL_PLACEMENTS`.
 
 _SWEEP_OPERATORS = int(os.environ.get("HISTORIAN_SWEEP_OPERATORS", "2"))
 
@@ -330,6 +335,11 @@ PROPAGATED_LEAVES = {
     "N": "line_no < NULL",
     "E": ERR,
 }
+#: The `literal` placements' alphabets (#189): the row or aggregate
+#: leaves and the integer literals `1` and `0`, which an `AND`/`OR` in a
+#: condition is simplified by (`ERR OR 1` never runs `ERR`).
+LITERAL_ROW_LEAVES = {**ROW_LEAVES, "1": "1", "0": "0"}
+LITERAL_AGG_LEAVES = {**AGG_LEAVES, "1": "1", "0": "0"}
 #: `having_mixed`'s alphabet: upper case a key-only leaf, lower case the
 #: aggregate leaf with the same truth value.
 MIXED_LEAVES = {
@@ -448,6 +458,27 @@ _PROPAGATED_GROUPS = [
 ]
 
 
+#: The `literal` placements (#189), over six leaves: four plus `1` and
+#: `0`. `where_literal` is `WHERE (<formula>) OR 0`, so the whole
+#: `WHERE` is one term: a top-level `AND` of the formula is not split,
+#: and a term with no column (a formula of literals only) never sits
+#: beside a per-row term that raises - that order is #171's. (The `OR
+#: 0` is itself simplified away; it changes no row.) `having_literal`
+#: is `HAVING <formula>` over the aggregate leaves: `HAVING` is one
+#: condition, and a column-free term moves below the aggregate (#141),
+#: where it is the `WHERE`'s only term.
+_LITERAL_PLACEMENTS = {
+    "where_literal": lambda f: f"SELECT path, line_no FROM blame WHERE ({_sql(f, LITERAL_ROW_LEAVES)}) OR 0",
+    "having_literal": lambda f: f"SELECT path FROM blame GROUP BY path HAVING {_sql(f, LITERAL_AGG_LEAVES)}",
+}
+
+_LITERAL_GROUPS = [
+    pytest.param([_LITERAL_PLACEMENTS[placement](f) for f in formulas], id=f"{placement}-{name}")
+    for name, formulas in _formula_groups(_SWEEP_OPERATORS, alphabet="TFNE10")
+    for placement in _LITERAL_PLACEMENTS
+]
+
+
 def _in_between_groups() -> list:
     """`x IN (a[, b[, c]])` and `NOT IN`, the left side from the leaf
     set and each element from the leaf set or the left side itself
@@ -557,6 +588,35 @@ def test_having_mixed_sweep(tiny_repo, tiny_conn, cached_tables, queries):
 
 @pytest.mark.parametrize("queries", _PROPAGATED_GROUPS)
 def test_propagated_sweep(tiny_repo, tiny_conn, cached_tables, queries):
+    _assert_all_agree(tiny_conn, tiny_repo, queries, cached_tables)
+
+
+def test_literal_sweep_size():
+    """`where_literal` and `having_literal` (#189): six leaves - 12 + 576
+    + 6,912 formulas up to two operators (leaf NOTs up to one
+    operator), in 1 + 4 + 32 groups per placement, and 5 * 8 * 8 * 6**4
+    = 414,720 more in 320 groups at three."""
+    sizes = {2: (1 + 4 + 32, 12 + 576 + 6912), 3: (1 + 4 + 32 + 320, 12 + 576 + 6912 + 414720)}
+    if _SWEEP_OPERATORS in sizes:
+        groups, formulas = sizes[_SWEEP_OPERATORS]
+        assert len(_LITERAL_GROUPS) == 2 * groups
+        assert sum(len(param.values[0]) for param in _LITERAL_GROUPS) == 2 * formulas
+
+
+def test_literal_sweep_reaches_both_outcomes(tiny_repo, tiny_conn):
+    """The literal placements are not all one outcome: `ERR OR 1` keeps
+    every row where `ERR OR 0` raises, in both engines."""
+    keeps = _LITERAL_PLACEMENTS["where_literal"](("OR", ("L", "E"), ("L", "1")))
+    raises = _LITERAL_PLACEMENTS["where_literal"](("OR", ("L", "E"), ("L", "0")))
+    assert _assert_same_outcome(tiny_conn, tiny_repo, keeps) == "rows"
+    assert len(tiny_conn.execute(keeps).fetchall()) == 3
+    assert _assert_same_outcome(tiny_conn, tiny_repo, raises) == "error"
+    group_none = _LITERAL_PLACEMENTS["having_literal"](("AND", ("L", "E"), ("L", "0")))
+    assert _assert_same_outcome(tiny_conn, tiny_repo, group_none) == "rows"
+
+
+@pytest.mark.parametrize("queries", _LITERAL_GROUPS)
+def test_literal_sweep(tiny_repo, tiny_conn, cached_tables, queries):
     _assert_all_agree(tiny_conn, tiny_repo, queries, cached_tables)
 
 

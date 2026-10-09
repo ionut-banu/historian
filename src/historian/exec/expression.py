@@ -108,6 +108,12 @@ or condition context with `NULL` counting as `FALSE` or as `TRUE` -
 which only `AND`/`OR`/`NOT` pass on to their operands (`NOT` flipping
 it); every other node evaluates its operands as values. See `_run`.
 
+In condition context SQLite also simplifies an `AND`/`OR` with an
+integer-literal operand before evaluating it (issue #189): `x OR 1` is
+`1` and `x AND 0` is `0`, so `x` never runs. `evaluate_condition()`
+applies that first, in one pass over the condition
+(`_simplified_condition`); `evaluate()` never does.
+
 Column affinity
 ----------------
 
@@ -325,16 +331,123 @@ def evaluate(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
 
 
 def evaluate_condition(expr: Expr, row: Row, schema: Schema) -> Value | Bool3:
-    """Evaluate *expr* as the whole `WHERE` or `HAVING` condition
-    (`Filter`): like `evaluate()`, but `AND`, `OR`, `NOT` and `BETWEEN`
-    at the top of the tree stop as soon as whether the condition is
-    `TRUE` is decided, exactly where SQLite does (issue #111). The
-    result can then differ from `evaluate()`'s only between `FALSE` and
-    `NULL` - an `AND` stopped by a `NULL` left side is `NULL` even when
-    its right side would have made it `FALSE` - and never in whether it
-    is `TRUE`, which is all `Filter` asks of it.
+    """Evaluate *expr* as one condition - the whole `HAVING`, or one
+    term of a `WHERE` (`Filter` splits a `WHERE` on its top-level
+    `AND`s, as SQLite does): like `evaluate()`, but `AND`, `OR`, `NOT`
+    and `BETWEEN` at the top of the tree stop as soon as whether the
+    condition is `TRUE` is decided, exactly where SQLite does (issue
+    #111), and an `AND`/`OR` there with an integer-literal operand that
+    decides it is that literal, its other operand never evaluated
+    (issue #189, `_simplified_condition`).
+
+    The result can differ from `evaluate()`'s in which errors are
+    raised, and otherwise only between `FALSE` and `NULL` - an `AND`
+    stopped by a `NULL` left side is `NULL` even when its right side
+    would have made it `FALSE` - or in being the deciding literal's own
+    value (`x OR 5` is `5`), never in whether it is `TRUE`, which is
+    all `Filter` asks of it.
     """
-    return _run(expr, row, schema, _Context.NULL_IS_FALSE)
+    return _run(_simplified_condition(expr), row, schema, _Context.NULL_IS_FALSE)
+
+
+# --- A condition AND/OR with an integer-literal operand (issue #189) -------
+#
+# `_docs/spec.md` §3 "Expression evaluation". Before SQLite evaluates an
+# `AND` or `OR` reached in condition context, it replaces it by a
+# simpler expression when one operand is a literal that decides it
+# (`sqlite3ExprSimplifiedAndOr`, called from `sqlite3ExprIfTrue`/
+# `IfFalse`; measured on the pinned oracle, `_docs/decisions.md`
+# 2026-10-09): `x OR <true>` and `x AND <false>` become the literal, so
+# `x` never runs; `x AND <true>` and `x OR <false>` become `x`. Both
+# operands are simplified first, so a nested `AND`/`OR` that leaves such
+# a literal counts too (`ERR OR (0 OR 1)`). A literal is always true or
+# always false only when it is an unsigned integer literal that fits in
+# 32 bits - SQLite's `EP_IsTrue`/`EP_IsFalse`, set when the token
+# passes `sqlite3GetInt32` - so `-1`, `+1`, `1.0`, `'1'`, `NULL`, `1 =
+# 1`, `NOT 0` and `2147483648` are not. Parentheses are not nodes, so
+# `(1)` is one; a `FixedColumnRef` (#142) is a column, not a literal.
+#
+# Only an `AND`/`OR` reached through `AND`/`OR`/`NOT` from the root is
+# simplified: an operand of anything else is value context, where every
+# operand runs. The rewrite never changes whether the condition is
+# `TRUE` - `x OR 1` is `TRUE` whatever `x` is, `NULL` included - only
+# which operands run.
+
+
+#: The largest integer literal SQLite treats as always true:
+#: `sqlite3GetInt32` accepts a non-negative literal up to 2^31 - 1.
+_INT32_MAX = 2147483647
+
+
+def _is_int32_literal(expr: Expr) -> bool:
+    """Whether *expr* is an integer literal in `0..2147483647`. An `int`
+    `Literal` only ever comes from an `INTEGER` token (`sql/parser.py`;
+    a wider one is already a `float`), never from a sign, so the range
+    is the whole test."""
+    return isinstance(expr, Literal) and type(expr.value) is int and 0 <= expr.value <= _INT32_MAX
+
+
+def _always_true(expr: Expr) -> bool:
+    return _is_int32_literal(expr) and expr.value != 0
+
+
+def _always_false(expr: Expr) -> bool:
+    return _is_int32_literal(expr) and expr.value == 0
+
+
+def _simplified_and_or(node: And | Or, left: Expr, right: Expr) -> Expr:
+    """*node* given its already simplified operands *left* and *right*:
+    SQLite's rule, in its order - an always-true left or always-false
+    right side first, then the reverse. *node* itself when neither
+    decides and neither operand changed."""
+    is_and = isinstance(node, And)
+    if _always_true(left) or _always_false(right):
+        return right if is_and else left
+    if _always_true(right) or _always_false(left):
+        return left if is_and else right
+    if left is node.left and right is node.right:
+        return node
+    if is_and:
+        return And(left=left, right=right, position=node.position)
+    return Or(left=left, right=right, position=node.position)
+
+
+def _simplified_condition(expr: Expr) -> Expr:
+    """*expr* with every `AND`/`OR` reached from its root through
+    `AND`, `OR` and `NOT` replaced by SQLite's simplification of it -
+    see the section comment above. *expr* itself, the same object, when
+    nothing changes.
+
+    Not recursive (#107): one walk over an explicit stack of `(node,
+    operands_done)` pairs and a stack of finished subtrees, the shape
+    of `plan/planner.py`'s `_split_expr`. Only `AND`, `OR` and `NOT` are
+    descended into; any other node is a leaf here, and is evaluated as
+    written."""
+    pending: list[tuple[Expr, bool]] = [(expr, False)]
+    finished: list[Expr] = []
+    while pending:
+        node, operands_done = pending.pop()
+        if not operands_done:
+            if isinstance(node, (And, Or)):
+                pending.append((node, True))
+                pending.append((node.right, False))
+                pending.append((node.left, False))
+            elif isinstance(node, Not):
+                pending.append((node, True))
+                pending.append((node.operand, False))
+            else:
+                finished.append(node)
+            continue
+        if isinstance(node, Not):
+            operand = finished.pop()
+            finished.append(node if operand is node.operand else Not(operand=operand, position=node.position))
+            continue
+        assert isinstance(node, (And, Or))
+        right = finished.pop()
+        left = finished.pop()
+        finished.append(_simplified_and_or(node, left, right))
+    (result,) = finished
+    return result
 
 
 def _run(expr: Expr, row: Row, schema: Schema, context: _Context) -> Value | Bool3:

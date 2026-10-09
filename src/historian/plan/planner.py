@@ -525,15 +525,18 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory])
     having = _split_expr(kept_having, calls, stmt.group_by) if kept_having is not None else None
     order_keys = _split_order_by(stmt.order_by, calls, stmt.group_by)
 
+    # HAVING is one condition (`split_terms=False`): SQLite evaluates it
+    # whole, so an always-false literal simplifies its top-level AND
+    # (#189). The WHERE and moved-terms Filters above split theirs.
     if aggregate_query:
         tree = Aggregate(tree, calls, group_by=stmt.group_by)
         if having is not None:
-            tree = Filter(tree, having)
+            tree = Filter(tree, having, split_terms=False)
     elif having is not None:
         # See the docstring above: unreachable via bind(), kept only
         # so a hand-built BoundSelectStatement still gets a sane tree
         # rather than plan() crashing on it.
-        tree = Filter(tree, having)
+        tree = Filter(tree, having, split_terms=False)
 
     if order_keys:
         tree = Sort(tree, order_keys)

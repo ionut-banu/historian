@@ -1444,6 +1444,39 @@ def test_moved_filter_sits_above_the_where_filter():
     assert moved.negotiable() is False
 
 
+def test_where_and_moved_filters_split_their_terms_and_having_is_one_condition():
+    """#189: SQLite runs each `WHERE` term - a moved `HAVING` term is
+    one - as a condition of its own, and the whole `HAVING` as one, so
+    an always-false literal simplifies a `HAVING`'s top-level `AND`
+    but not a `WHERE`'s."""
+    _bound_stmt, tree = _planned(
+        f"SELECT count(*) FROM widgets WHERE line_no > 0 GROUP BY path HAVING count(*) > 5 AND {_ERR} AND 0"
+    )
+    assert _kinds(tree) == ["Project", "Filter", "Aggregate", "Filter", "Filter", "Scan"]
+    _project, kept, _aggregate, moved, where, _scan = _chain(tree)
+    assert where.split_terms() is True
+    assert moved.split_terms() is True
+    assert kept.split_terms() is False
+
+
+def test_having_without_group_by_is_one_condition():
+    _bound_stmt, tree = _planned("SELECT count(*) FROM widgets WHERE line_no > 0 HAVING count(*) > 5 AND 0")
+    assert _kinds(tree) == ["Project", "Filter", "Aggregate", "Filter", "Scan"]
+    _project, having, _aggregate, where, _scan = _chain(tree)
+    assert having.split_terms() is False
+    assert where.split_terms() is True
+
+
+def test_the_where_filter_keeps_the_predicate_as_bound():
+    """The simplification happens as the condition is evaluated, not in
+    the tree: the `Filter` holds the bound `WHERE`, so `--explain` and
+    the terms offered to the scan are the query as written (#171 needs
+    a term's columns as written, too)."""
+    bound, tree = _planned(f"SELECT path FROM widgets WHERE {_ERR} OR 1")
+    where = _chain(tree)[1]
+    assert where.predicate() is bound.where
+
+
 def test_two_moved_terms_are_one_left_deep_and_in_having_order():
     bound, tree = _planned(
         f"SELECT count(*) FROM widgets GROUP BY path HAVING {_ERR} AND count(*) > 5 AND path > 'x' AND path < 'y'"

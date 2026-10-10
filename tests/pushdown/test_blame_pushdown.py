@@ -654,28 +654,31 @@ def test_a_like_beside_a_path_source_is_not_pushed(tiny_repo):
 def test_of_two_path_sources_the_last_is_pushed(tiny_repo):
     """SQLite uses the last of two sources for one column and rewrites
     the first into `'src/utils.py' = 'feature/thing.py'`, so only
-    `path = 'src/utils.py'` is pushed and that path is blamed. `main`
-    pushed both and blamed nothing, in one git invocation. Oracle:
+    `path = 'src/utils.py'` is pushed. That rewritten term has no column
+    and is `FALSE`, so since #171 it is decided before the scan is read
+    and nothing is blamed (#142 alone blamed `src/utils.py` in two git
+    invocations; before #142 both were pushed and one ran). Oracle:
     `0`."""
     rows = _check(
         "SELECT count(*) FROM blame WHERE path = 'feature/thing.py' AND path = 'src/utils.py'",
         tiny_repo,
-        blamed=["src/utils.py"],
-        invocations=2,
+        blamed=[],
+        invocations=0,
         pushed=1,
     )
     assert rows == [(0,)]
 
 
 def test_an_in_list_beside_a_path_source_is_not_pushed(tiny_repo):
-    """`path IN ('a', 'b')` becomes `'src/utils.py' IN ('a', 'b')`.
-    `main` pushed both terms and blamed nothing, in one git invocation.
-    Oracle: `0`."""
+    """`path IN ('a', 'b')` becomes `'src/utils.py' IN ('a', 'b')`,
+    which is not pushed. It has no column and is `FALSE`, so since #171
+    the scan is never read (#142 alone blamed `src/utils.py`). Oracle:
+    `0`."""
     rows = _check(
         "SELECT count(*) FROM blame WHERE path = 'src/utils.py' AND path IN ('a', 'b')",
         tiny_repo,
-        blamed=["src/utils.py"],
-        invocations=2,
+        blamed=[],
+        invocations=0,
         pushed=1,
     )
     assert rows == [(0,)]
@@ -692,3 +695,79 @@ def test_a_line_no_source_leaves_path_pushdown_alone(tiny_repo):
         pushed=1,
     )
 
+
+
+# --- A constant WHERE term decided before the scan is read (#171) -------
+#
+# The `ConstantGuard` evaluates the column-free terms on the first pull,
+# before it pulls from the `Filter` and so before the scan starts: a
+# false or NULL constant makes the scan do no work at all - not even
+# `git ls-tree` - exactly as `LIMIT 0` does.
+
+CONSTERR = "'a' LIKE 'a' ESCAPE 'ab'"
+
+
+@pytest.mark.parametrize("constant", ["1=0", "NULL", "NULL = NULL", "'a' LIKE 'b'"])
+def test_a_false_constant_blames_nothing_and_runs_no_git(tiny_repo, constant):
+    rows = _check(
+        f"SELECT count(*) FROM blame WHERE {constant}", tiny_repo, blamed=[], invocations=0, pushed=0
+    )
+    assert rows == [(0,)]
+
+
+def test_a_false_constant_beside_a_pushed_path_term_blames_nothing(tiny_repo):
+    """Before #171 this blamed `src/utils.py`: the pushed term still
+    narrowed the scan, but the scan ran."""
+    rows = _check(
+        "SELECT path FROM blame WHERE path = 'src/utils.py' AND 1=0", tiny_repo, blamed=[], invocations=0, pushed=1
+    )
+    assert rows == []
+
+
+def test_a_true_constant_leaves_the_work_as_it_was(tiny_repo):
+    rows = _check(
+        "SELECT path FROM blame WHERE 1=1 AND path = 'src/utils.py'",
+        tiny_repo,
+        blamed=["src/utils.py"],
+        invocations=2,
+        pushed=1,
+    )
+    assert len(rows) == 2
+
+
+def test_a_raising_constant_runs_no_git_before_it_raises(tiny_repo):
+    from historian.exec.expression import EvalError
+
+    built: list[BlameScan] = []
+
+    def factory(r: Path) -> BlameScan:
+        built.append(BlameScan(r))
+        return built[-1]
+
+    query = f"SELECT path FROM blame WHERE path = 'src/utils.py' AND {CONSTERR}"
+    tree = optimize(plan(bind(parse(tokenize(query)), catalog=SCHEMAS), tiny_repo, tables={"blame": factory}))
+    with pytest.raises(EvalError):
+        list(tree.rows())
+    assert built[0].git_invocations == 0
+    assert built[0].blamed_paths == []
+
+
+def _run_no_pushdown(query: str, repo: Path):
+    built: list[BlameScan] = []
+
+    def factory(r: Path) -> BlameScan:
+        built.append(BlameScan(r))
+        return built[-1]
+
+    tree = plan(bind(parse(tokenize(query)), catalog=SCHEMAS), repo, tables={"blame": factory})
+    return list(tree.rows()), built[0]
+
+
+def test_no_pushdown_blames_every_path_only_when_the_guard_passes(tiny_repo):
+    rows, source = _run_no_pushdown("SELECT path FROM blame WHERE 1=1 AND path = 'src/utils.py'", tiny_repo)
+    assert len(rows) == 2
+    assert source.blamed_paths == TINY_PATHS
+    rows, source = _run_no_pushdown("SELECT path FROM blame WHERE path = 'src/utils.py' AND 1=0", tiny_repo)
+    assert rows == []
+    assert source.blamed_paths == []
+    assert source.git_invocations == 0

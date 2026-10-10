@@ -4,7 +4,7 @@ pipeline (`_docs/spec.md` §3 - "planner    AST -> operator tree").
 `sql/binder.py` produces a `BoundSelectStatement` with every column
 reference resolved to an integer offset, and `exec/operators.py`
 implements the operators. This module's whole job is assembly -
-deciding which of the seven operator classes to build, and in what
+deciding which of the eight operator classes to build, and in what
 order, from one bound statement plus a repository path.
 
 One plan representation, not two
@@ -15,8 +15,8 @@ because every logical operation here has exactly one implementation,
 so a second tree type plus a translation pass between them would be
 ceremony with no decision behind it. `plan()` therefore builds
 `exec/operators.py`'s actual `Operator` instances directly - up to
-`Scan`, `Filter`, `Aggregate`, `Filter`, `Sort`, `Project`,
-`Distinct` and `Limit` (see `plan()`) - and returns that tree as-is.
+`Scan`, `Filter`, `Filter`, `ConstantGuard`, `Aggregate`, `Filter`,
+`Sort`, `Project`, `Distinct` and `Limit` (see `plan()`) - and returns that tree as-is.
 The one rewrite step after it is `plan/optimizer.py`'s `optimize()`
 (#121, pushdown negotiation), which `cli.py` calls on this
 tree before iterating it; it records pushed terms on the tree's
@@ -24,7 +24,9 @@ tree before iterating it; it records pushed terms on the tree's
 runs a query change which errors are raised, so they are part of
 building the tree, here, and `--no-pushdown` (which skips
 `optimize()`) still gets them: `HAVING` terms that move below the
-aggregate (#141) and constant propagation in `WHERE` (#142).
+aggregate (#141) and constant propagation in `WHERE` (#142). So is the
+`ConstantGuard` that decides the column-free terms before any row
+(#171).
 
 The table -> scan-factory mapping
 ------------------------------------
@@ -76,6 +78,7 @@ from historian.exec.expression import apply_column_affinity, evaluate
 from historian.exec.operators import (
     Aggregate,
     AggregateCall,
+    ConstantGuard,
     Distinct,
     Filter,
     Limit,
@@ -87,7 +90,7 @@ from historian.exec.operators import (
     SortKey,
 )
 from historian.schema import Schema
-from historian.sql.ast import BinaryOp, Expr, FunctionCall, In, Literal, Operator as BinaryOperator
+from historian.sql.ast import And, BinaryOp, Expr, FunctionCall, In, Like, Literal, Operator as BinaryOperator, Or
 from historian.sql.ast import OrderDirection, Star, UnaryOp
 from historian.sql.binder import BoundColumnRef, BoundOrderByItem, BoundSelectItem, BoundSelectStatement
 from historian.sql.walk import (
@@ -96,6 +99,7 @@ from historian.sql.walk import (
     expr_shape_equal,
     fix_columns,
     is_aggregate_query,
+    is_constant_term,
     join_conjuncts,
     references_only_keys,
     replace_conjuncts,
@@ -302,38 +306,137 @@ def _split_order_by(
 
 
 def _moves_below_aggregate(term: Expr, group_by: Sequence[Expr]) -> bool:
-    """Whether one `AND`-term of `HAVING` moves: it has no aggregate
-    call, every column in it lies inside a `GROUP BY` key subexpression
-    (or it has no column), and it is not an integer literal `0` - the
-    always-false term SQLite 3.50.4 leaves in `HAVING`
-    (`ExprAlwaysFalse` in `havingToWhereExprCb`; measured, #141)."""
+    """Whether one `HAVING` term that is not always false (below) moves:
+    it has no aggregate call, and every column in it lies inside a
+    `GROUP BY` key subexpression (or it has no column)."""
     if contains_aggregate(term):
         return False
-    if not references_only_keys(term, group_by):
-        return False
-    if isinstance(term, Literal) and type(term.value) is int and term.value == 0:
-        return False
-    return True
+    return references_only_keys(term, group_by)
+
+
+# The `HAVING` that is planned - split, moved, kept and evaluated - is
+# the one SQLite's parser leaves, not the one written (#171, QA round
+# 1; measured on 3.50.4, `_docs/decisions.md` 2026-10-10):
+#
+# - The parser builds every `AND` with `sqlite3ExprAnd`, which replaces
+#   `x AND y` by the integer `0` when one side is always false and
+#   neither side contains a function call. Always false is an integer
+#   literal `0` (`0`, `00`, `(0)`; not `-0`, `+0`, `0.0`, `'0'`, `NOT
+#   0`), `x IN ()` with no call in `x`, or an `AND` already folded. A
+#   function call is a `FunctionCall` (aggregates included) or a `LIKE`.
+# - `x IN ()` with no call in `x` is replaced by `FALSE` (the integer
+#   `0`), `x NOT IN ()` by `TRUE` (`1`). With a call in `x` they are
+#   `FALSE AND x` and `TRUE OR x`, built without the fold.
+# - A select-list alias is a plain name when the `HAVING` is parsed:
+#   no call, not a literal. Its own expression was parsed, and folded,
+#   with the select list, and is spliced in after.
+# - `havingToWhere` then walks the `AND`s of the result: an always-
+#   false term stays (`ExprAlwaysFalse`) - an integer `0`, the
+#   `FALSE` of `x IN ()` over a call included, whose `x` is a term of
+#   its own - and every other term moves by `_moves_below_aggregate`.
+#
+# A fold only drops parts that call nothing outside an alias, so the
+# rewrite changes no row; it changes which terms move, which are
+# constant, and which operands a condition skips, as it does in SQLite.
+# An alias is recognised as the very select-list expression object the
+# binder splices in (`sql/bind_expr.py`, `_find_alias_expr`).
+
+
+def _is_alias(expr: Expr, aliases: Sequence[Expr]) -> bool:
+    for alias in aliases:
+        if expr is alias:
+            return True
+    return False
+
+
+def _is_zero(expr: Expr) -> bool:
+    return isinstance(expr, Literal) and type(expr.value) is int and expr.value == 0
+
+
+def _as_parsed(having: Expr, aliases: Sequence[Expr]) -> Expr:
+    """*having* as SQLite's parser leaves it: every `AND` it folds
+    replaced by `Literal(0)`, every `x IN ()`/`x NOT IN ()` by
+    `Literal(0)`/`Literal(1)` when `x` calls nothing and by `0 AND x`/
+    `1 OR x` when it does; *having* itself when nothing changes.
+    Bottom-up over an explicit stack (#107): `work` holds `(node,
+    in_alias, expanded)`, `results` one `(expr, always_false,
+    calls_function)` per finished node."""
+    results: list[tuple[Expr, bool, bool]] = []
+    work: list[tuple[Expr, bool, bool]] = [(having, False, False)]
+    while work:
+        node, in_alias, expanded = work.pop()
+        if not in_alias and _is_alias(node, aliases):
+            if not expanded:
+                work.append((node, False, True))
+                work.append((node, True, False))  # its own expression, its own parse
+                continue
+            body = results.pop()[0]
+            results.append((body, False, False))  # to the fold, a plain name
+            continue
+        kids = children(node)
+        if not expanded:
+            work.append((node, in_alias, True))
+            for kid in reversed(kids):
+                work.append((kid, in_alias, False))
+            continue
+        done = results[len(results) - len(kids) :]
+        del results[len(results) - len(kids) :]
+        calls = isinstance(node, (FunctionCall, Like))
+        for _expr, _false, kid_calls in done:
+            calls = calls or kid_calls
+        if isinstance(node, And) and (done[0][1] or done[1][1]) and not calls:
+            results.append((Literal(0, node.position), True, False))
+            continue
+        if isinstance(node, In) and len(node.values) == 0:
+            literal = Literal(1 if node.negated else 0, node.position)
+            if not calls:
+                results.append((literal, not node.negated, False))
+                continue
+            # Over a call: `FALSE AND x` / `TRUE OR x`, never folded.
+            left = done[0][0]
+            if node.negated:
+                results.append((Or(literal, left, node.position), False, True))
+            else:
+                results.append((And(literal, left, node.position), False, True))
+            continue
+        new_kids = [entry[0] for entry in done]
+        changed = False
+        for old, new in zip(kids, new_kids):
+            if old is not new:
+                changed = True
+        rebuilt = with_children(node, new_kids) if changed else node
+        results.append((rebuilt, _is_zero(node), calls))
+    return results[0][0]
 
 
 def _move_having_terms(stmt: BoundSelectStatement) -> tuple[Expr | None, Expr | None]:
-    """`(moved, kept)`: the `HAVING` terms that move below the
-    aggregate, and those that stay, each joined into one left-deep
-    `And` in `HAVING` order, or `None` when there are none. With no
-    `GROUP BY`, or when no term moves, `kept` is `stmt.having` itself,
-    so the tree is exactly the one built before #141. *stmt* is not
-    changed."""
-    if stmt.having is None or len(stmt.group_by) == 0:
-        return None, stmt.having
+    """`(moved, kept)`: the terms of the parsed `HAVING` (`_as_parsed`)
+    that move below the aggregate, and those that stay, each joined
+    into one left-deep `And` in `HAVING` order, or `None` when there
+    are none. With no `GROUP BY`, or when no term moves, `kept` is the
+    parsed `HAVING` - `stmt.having` itself when the parser changes
+    nothing, so the tree is exactly the one built before #141. *stmt*
+    is not changed."""
+    if stmt.having is None:
+        return None, None
+    aliases = [item.expr for item in stmt.select_list if item.alias is not None]
+    having = _as_parsed(stmt.having, aliases)
+    if len(stmt.group_by) == 0:
+        return None, having
     moved: list[Expr] = []
     kept: list[Expr] = []
-    for term in split_conjuncts(stmt.having):
-        if _moves_below_aggregate(term, stmt.group_by):
-            moved.append(term)
-        else:
+    pending: list[Expr] = [having]
+    while pending:
+        term = pending.pop()
+        if isinstance(term, And):
+            pending.append(term.right)
+            pending.append(term.left)
+        elif _is_zero(term) or not _moves_below_aggregate(term, stmt.group_by):
             kept.append(term)
+        else:
+            moved.append(term)
     if len(moved) == 0:
-        return None, stmt.having
+        return None, having
     return join_conjuncts(moved), (join_conjuncts(kept) if len(kept) > 0 else None)
 
 
@@ -433,6 +536,41 @@ def _propagate_constants(where: Expr, schema: Schema) -> Expr:
     return replace_conjuncts(where, rewritten)
 
 
+# --- WHERE terms with no column, decided before any row (#171) -------------
+#
+# `_docs/spec.md` §3, "`WHERE` terms with no column reference". SQLite
+# evaluates every `WHERE` term that reads no column once, before the
+# first row, in `WHERE` order (`sqlite3WhereBegin` codes each term with
+# no table dependency ahead of the loop): the first that is not `TRUE`
+# ends the query over zero rows, and one that raises raises on empty
+# input too. The terms are the `WHERE` after constant propagation
+# (#142), split on its top-level `AND`s as the `Filter` splits it, so a
+# column replaced by a `FixedColumnRef` no longer counts; the moved
+# `HAVING` terms (#141) that have no column follow, in `HAVING` order.
+#
+# They go in one `ConstantGuard` directly above the topmost of the two
+# `Filter`s - below `Aggregate`, so a whole-table aggregate over a false
+# constant still emits its one row. Both `Filter`s keep every term,
+# constants included: by the time a row reaches them every constant is
+# `TRUE` and cannot raise, so evaluating it again is harmless, and
+# pushdown negotiation sees the same terms it did before. Built here,
+# not in the optimizer, so `--no-pushdown` gets it too.
+
+
+def _constant_terms(where: Expr | None, moved_having: Expr | None) -> list[Expr]:
+    """The column-free terms of *where* (already propagated) in order,
+    then those of *moved_having* in order - the very term objects the
+    two `Filter`s split their predicates into."""
+    terms: list[Expr] = []
+    for predicate in (where, moved_having):
+        if predicate is None:
+            continue
+        for term in split_conjuncts(predicate):
+            if is_constant_term(term):
+                terms.append(term)
+    return terms
+
+
 def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory]) -> Operator:
     """Build the operator tree for *stmt*, a repository at *repo*.
 
@@ -452,8 +590,10 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory])
 
     Tree shape, per `_docs/spec.md` §3: `Scan -> Filter (WHERE) ->
     Filter (HAVING terms moved below the aggregate, not negotiable) ->
-    Aggregate (grouped or whole-table) -> Filter (HAVING) -> Sort ->
-    Project -> Distinct -> Limit`. The moved-terms `Filter` exists only
+    ConstantGuard -> Aggregate (grouped or whole-table) -> Filter
+    (HAVING) -> Sort -> Project -> Distinct -> Limit`. `ConstantGuard`
+    exists only when a term of either `Filter` below it has no column
+    (`_constant_terms`, #171). The moved-terms `Filter` exists only
     with a `GROUP BY` and at least one term that moves
     (`_move_having_terms`, #141); the `HAVING` `Filter` holds the terms
     that stay, and is left out when every term moved. `Limit` is outermost, present only
@@ -506,11 +646,15 @@ def plan(stmt: BoundSelectStatement, repo: Path, tables: dict[str, ScanFactory])
     """
     source = tables[stmt.from_table](repo)
     tree: Operator = Scan(source)
-    if stmt.where is not None:
-        tree = Filter(tree, _propagate_constants(stmt.where, tree.schema))
+    where = _propagate_constants(stmt.where, tree.schema) if stmt.where is not None else None
+    if where is not None:
+        tree = Filter(tree, where)
     moved_having, kept_having = _move_having_terms(stmt)
     if moved_having is not None:
         tree = Filter(tree, moved_having, negotiable=False)
+    constant_terms = _constant_terms(where, moved_having)
+    if len(constant_terms) > 0:
+        tree = ConstantGuard(tree, constant_terms)
 
     # Aggregate when GROUP BY is written or an aggregate call appears
     # in the select list, HAVING or ORDER BY - for a bound statement the

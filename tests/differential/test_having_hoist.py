@@ -229,9 +229,9 @@ def test_a_moved_term_is_never_pushed_into_the_scan(tiny_repo, tiny_conn):
 #: term that is an integer literal `0` (`havingToWhereExprCb` skips an
 #: always-false term), so `ERR` beside it still moves and raises,
 #: whichever side the `0` is on. Any other constant moves, and a false
-#: one in front of `ERR` stops it per row, as in `WHERE` - which needs
-#: no #171 machinery while the constant is on the left. The trailing
-#: forms (`ERR AND 0.0`) are #171 and are not pinned here.
+#: one in front of `ERR` stops it per row, as in `WHERE`. Behind `ERR`
+#: it stops it too: a moved term with no column is decided before any
+#: row (#171).
 LITERAL_ZERO_CASES = [
     (f"{G} HAVING 0 AND {ERR}", ERROR),
     (f"{G} HAVING {ERR} AND 0", ERROR),
@@ -244,6 +244,11 @@ LITERAL_ZERO_CASES = [
     (f"{G} HAVING -0 AND {ERR}", []),
     (f"{G} HAVING NULL AND {ERR}", []),
     (f"{G} HAVING 1 > 2 AND {ERR}", []),
+    (f"{G} HAVING {ERR} AND 0.0", []),
+    (f"{G} HAVING {ERR} AND -0", []),
+    (f"{G} HAVING {ERR} AND NULL", []),
+    (f"{G} HAVING {ERR} AND 1 > 2", []),
+    (f"{G} HAVING count(*) > 5 AND {ERR} AND 0.0", []),
 ]
 
 

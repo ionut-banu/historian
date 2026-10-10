@@ -804,3 +804,91 @@ def test_is_constant_on_a_deep_tree(recursion_limit_1000_walk):
     for _ in range(20_000):
         node = _is_null(node)
     assert walk.is_constant(node) is False
+
+
+# --- A WHERE term decided once, before any row (issue #171) ---------------------
+#
+# `is_constant_term` is the planner's question, asked of a bound term
+# after constant propagation (#142): no `BoundColumnRef`, no `Star`, no
+# `FunctionCall` anywhere in it. A `FixedColumnRef` - the column #142
+# replaced by its constant - evaluates to its value and never reads the
+# row, so it is not a column here, where for `is_constant` (#144, the
+# parser's notion) it is. The two must not be merged.
+
+
+def test_a_fixed_column_ref_is_a_constant_term_but_not_parse_time_constant():
+    fixed = _fixed()
+    assert walk.is_constant_term(fixed) is True
+    assert walk.is_constant(fixed) is False
+    term = BinaryOp(op=Operator.EQ, left=_fixed(value=1), right=_lit(2), position=_POS)
+    assert walk.is_constant_term(term) is True
+    assert walk.is_constant(term) is False
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        _lit(),
+        _lit(None),
+        Like(left=_lit("a"), pattern=_lit("a"), negated=False, position=_POS, escape=_lit("ab")),
+        Not(operand=Or(left=_lit(0), right=_fixed(), position=_POS), position=_POS),
+        In(left=_lit(1), values=(_lit(2), _fixed()), negated=False, position=_POS),
+        Between(operand=_fixed(), low=_lit(2), high=_lit(3), negated=False, position=_POS),
+        And(left=_lit(1), right=_lit(0), position=_POS),
+    ],
+)
+def test_a_term_with_no_column_is_constant(expr):
+    assert walk.is_constant_term(expr) is True
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        _col(),
+        Star(None, _POS),
+        _count(),
+        BinaryOp(op=Operator.GT, left=_col(1), right=_lit(0), position=_POS),
+        # A constant inside a term with a column is not hoisted.
+        Or(left=BinaryOp(op=Operator.GT, left=_col(1), right=_lit(0), position=_POS), right=_lit(1), position=_POS),
+        Not(operand=And(left=_lit(1), right=_col(), position=_POS), position=_POS),
+        In(left=_lit(1), values=(_lit(2), _col()), negated=False, position=_POS),
+        Like(left=_lit("a"), pattern=_lit("a"), negated=False, position=_POS, escape=_col()),
+    ],
+)
+def test_a_term_with_a_column_star_or_call_is_not_constant(expr):
+    assert walk.is_constant_term(expr) is False
+
+
+@pytest.mark.parametrize(("cls", "index"), _CHILD_CASES, ids=[f"{cls.__name__}[{index}]" for cls, index in _CHILD_CASES])
+def test_is_constant_term_looks_into_every_child_slot(cls, index):
+    node, kids = _build(cls, _Sentinels())
+    replaced = list(kids)
+    replaced[index] = _col()
+    assert walk.is_constant_term(with_children(node, replaced)) is False
+    replaced[index] = _fixed()
+    assert walk.is_constant_term(with_children(node, replaced)) is (cls is not FunctionCall)
+
+
+def test_is_constant_term_rejects_an_unbound_tree():
+    with pytest.raises(AssertionError, match="bound"):
+        walk.is_constant_term(ColumnRef(table=None, name="path", position=_POS))
+
+
+def test_is_constant_term_raises_on_an_unknown_node_type():
+    @dataclass(frozen=True)
+    class Unknown(Expr):
+        position: Position
+
+    with pytest.raises(AssertionError, match="unhandled expression node type Unknown"):
+        walk.is_constant_term(Unknown(_POS))
+
+
+def test_is_constant_term_on_a_deep_tree(recursion_limit_1000_walk):
+    node: Expr = _lit()
+    for _ in range(20_000):
+        node = _is_null(node)
+    assert walk.is_constant_term(node) is True
+    node = _col()
+    for _ in range(20_000):
+        node = _is_null(node)
+    assert walk.is_constant_term(node) is False

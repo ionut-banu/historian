@@ -14,7 +14,8 @@ row only once `line_no` has become `5`: no row of `tiny` has `line_no`
 5, so without the rewrite `line_no = 5` is `FALSE` and the `AND` stops
 before `ERRA`. Every guard keeps a column (`ERR`, `ERRA`), so it stays
 a per-row term after the rewrite - a conjunct with no column left is
-#171/#180, and no case here has one.
+decided before any row (#171; its family is #180's), and no case here
+has one.
 
 Each case pins SQLite's own outcome (`ERROR` for `ESCAPE expression
 must be a single character`, or the exact rows) before checking

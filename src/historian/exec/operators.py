@@ -1,7 +1,8 @@
-"""The operator layer: `Scan`, `Filter`, `Project`, `Aggregate`,
-`Sort`, `Limit`, `Distinct`.
+"""The operator layer: `Scan`, `Filter`, `ConstantGuard`, `Project`,
+`Aggregate`, `Sort`, `Limit`, `Distinct`.
 
-These are phase 1's seven operators. This is also where two rules
+These are phase 1's seven operators, plus `ConstantGuard` (#171), which
+decides a `WHERE`'s column-free terms before the first row is read. This is also where two rules
 from spec §3 are enforced: "Expression evaluation" (every predicate
 and select-list expression goes through `exec/expression.py`'s
 `evaluate(expr, row, schema)`) and "Determinism and row order" ("the
@@ -19,7 +20,7 @@ that uses a generator internally; none is a bare `def rows(): yield
 ...` function standing in for an object.
 
 `Operator` (a `Protocol`) documents that shared shape without adding a
-runtime dispatch mechanism none of the seven classes needs -
+runtime dispatch mechanism none of the eight classes needs -
 `AGENTS.md`'s "no metaclasses, no dynamic dispatch tricks, no clever
 descriptors" rules out both a shared ABC with template-method hooks and
 an `isinstance`-based dispatcher; a `Protocol` is a static-typing
@@ -34,8 +35,8 @@ imports or names it) - see `Scan`'s own docstring for how the terms
 it pushes are decided elsewhere, by `plan/optimizer.py` (#121).
 
 Determinism (`AGENTS.md`, spec §3): no operator introduces
-non-deterministic iteration. `Filter`, `Project` and `Limit` are a
-single pass over `child.rows()` in order - row order in is row order
+non-deterministic iteration. `Filter`, `ConstantGuard`, `Project` and
+`Limit` are a single pass over `child.rows()` in order - row order in is row order
 out, restricted or transformed per row, never rearranged. `Aggregate`
 and `Distinct` hold a `dict` or `set`, but only for lookup: they emit
 in first-seen order. `Sort` is the one operator that reorders rows,
@@ -101,6 +102,7 @@ from historian.values import INT64_MAX, INT64_MIN
 __all__ = [
     "Aggregate",
     "AggregateCall",
+    "ConstantGuard",
     "Distinct",
     "Filter",
     "Limit",
@@ -329,6 +331,53 @@ class Filter:
                     break
             if kept:
                 yield row
+
+
+class ConstantGuard:
+    """The `WHERE` terms with no column reference (#171, spec §3 "`WHERE`
+    terms with no column reference"), decided once, before any row.
+
+    SQLite evaluates a `WHERE` term that reads no column once, before it
+    reads the first row, in `WHERE` order, whatever terms sit between
+    them: the first that is not `TRUE` ends the query over zero rows,
+    and one that raises raises whatever the input is, empty included.
+    `plan/planner.py` collects those terms - after constant propagation
+    (#142), with the moved `HAVING` terms (#141) that have no column
+    after them - and puts this operator directly above the `WHERE`
+    `Filter` and the moved-terms `Filter`, which keep every term.
+
+    Evaluation happens in `rows()`, a generator, so on its first pull,
+    never at construction: a tree that is built and printed
+    (`--explain`) and never run evaluates nothing, and an operator
+    above that never pulls (`LIMIT 0`) never evaluates it either. It
+    happens again on every `rows()` call, so re-running the tree gives
+    the same answer. Each term goes through `evaluate_condition`, as a
+    `Filter` term does, against an empty row: a term here holds no
+    `BoundColumnRef`, and a `FixedColumnRef` evaluates to its own value
+    with its column's affinity from `schema`. The child is pulled only
+    once every term is `TRUE`; a `NULL` term stops it as `FALSE` does.
+    """
+
+    def __init__(self, child: Operator, terms: Sequence[Expr]) -> None:
+        self._child = child
+        self._terms = tuple(terms)
+        # Decides whether rows pass at all, never which: the schema is
+        # exactly the child's.
+        self.schema = child.schema
+
+    def terms(self) -> tuple[Expr, ...]:
+        """The column-free terms, in the order they are evaluated - read
+        by `plan/explain.py`."""
+        return self._terms
+
+    def rows(self) -> Iterator[Row]:
+        child_schema = self._child.schema
+        empty_row: Row = ()
+        for term in self._terms:
+            result = evaluate_condition(term, empty_row, child_schema)
+            if not values.is_true(coerce_to_bool3(result)):
+                return
+        yield from self._child.rows()
 
 
 # --- Aggregate ---------------------------------------------------------------
@@ -1042,6 +1091,14 @@ class Limit:
         return self._offset
 
     def rows(self) -> Iterator[Row]:
+        if self._limit == 0:
+            # LIMIT 0: zero rows, and - per the laziness contract - not
+            # even one row pulled from `child` to discover that, OFFSET
+            # or not. Checked before the offset is skipped: SQLite runs
+            # nothing for `LIMIT 0 OFFSET 1` (`WHERE <raises> LIMIT 0
+            # OFFSET 1` is no rows, #171), where skipping first would
+            # pull a row.
+            return
         child_iter = iter(self._child.rows())
         for _ in range(self._offset):
             try:
@@ -1059,10 +1116,6 @@ class Limit:
             yield from child_iter
             return
         remaining = self._limit
-        if remaining == 0:
-            # LIMIT 0: zero rows, and - per the laziness contract - not
-            # even one row pulled from `child` to discover that.
-            return
         for row in child_iter:
             yield row
             remaining -= 1
@@ -1144,6 +1197,8 @@ def child_of(op: Operator) -> Operator | None:
     if isinstance(op, Scan):
         return None
     if isinstance(op, Filter):
+        return op._child
+    if isinstance(op, ConstantGuard):
         return op._child
     if isinstance(op, Aggregate):
         return op._child

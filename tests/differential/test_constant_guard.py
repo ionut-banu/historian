@@ -433,3 +433,172 @@ def test_moved_having_constants(tiny_repo, tiny_conn, query, expected):
 @pytest.mark.parametrize("query, expected", HAVING_EMPTY_CASES)
 def test_moved_having_constants_on_empty_input(tiny_repo, empty_conn, query, expected):
     _check(empty_conn, tiny_repo, query, expected, EMPTY_TABLES)
+
+
+# --- A HAVING the parser folds, and IN () (QA round 1 on #171) ---------------------
+#
+# Which `HAVING` terms move - and so which constants the guard decides
+# before the per-row `WHERE` - is decided on the `HAVING` as SQLite's
+# parser leaves it. The parser folds `x AND y` to the integer `0` when
+# one side is always false (an integer literal `0`, `x IN ()` with no
+# function call in `x`, or an `AND` it has folded) and neither side
+# contains a function call (`LIKE` and aggregates included); a select-
+# list alias is a plain name at that point. Such a `0` stays in `HAVING`,
+# as does `x IN ()` with no call in `x`. `x IN ()` with a call in `x` is
+# `FALSE AND x`: the `FALSE` stays and `x` moves like any other term.
+# Every outcome below was measured on the pinned oracle through this
+# harness's loader; the queries marked "main agreed" agreed with
+# historian before #171's guard and are the round-1 regression.
+
+W = f"SELECT path FROM blame WHERE {ERR} GROUP BY path HAVING"
+P = "SELECT path FROM blame WHERE line_no > 0 GROUP BY path HAVING"
+N = "SELECT path FROM blame WHERE line_no < 0 GROUP BY path HAVING"
+
+FOLDED_HAVING_CASES = [
+    # The whole HAVING folds to 0: nothing moves, ERR raises per row (main agreed).
+    (f"{W} 1=0 AND 0", ERROR),
+    (f"{W} 0 AND 1=0", ERROR),
+    (f"{W} NULL AND 0", ERROR),
+    (f"{W} 1=1 AND 0 AND 1=0", ERROR),
+    (f"{W} (1=0 AND 0) AND path > 'a'", ERROR),
+    (f"{W} 1=0 AND path > 'zzz' AND 0", ERROR),
+    (f"{W} 1=0 AND (0)", ERROR),
+    (f"{W} 1=0 AND 00", ERROR),
+    (f"{W} 1=0 AND (1=1 AND 0)", ERROR),
+    (f"{W} (1=0 AND 0)", ERROR),
+    (f"{W} 1=0 AND (1=0 AND (1=0 AND 0))", ERROR),
+    (f"{W} 1=0 AND 0 AND 1=0 AND 1=0 AND 1=0", ERROR),
+    (f"{W} (1=0 OR 1=0) AND 0", ERROR),
+    (f"{W} 1=0 AND 1 IN (0) AND 0", ERROR),
+    (f"{W} 1=0 AND 1 IN (2) AND 0", ERROR),
+    (f"{W} 1=0 AND 1 BETWEEN 2 AND 3 AND 0", ERROR),
+    (f"{W} 1=0 AND 1 || 'a' AND 0", ERROR),
+    (f"SELECT path FROM blame WHERE {ERR} GROUP BY path, line_no HAVING line_no > 0 AND 1=0 AND 0", ERROR),
+    # IN () with no call in its operand is always false: it stays, and it folds an AND.
+    (f"{W} 1 IN ()", ERROR),
+    (f"{W} path IN ()", ERROR),
+    (f"{W} 1 IN () AND 1=0", ERROR),
+    (f"{W} 1=0 AND 1 IN ()", ERROR),
+    (f"{W} 1=0 AND path IN ()", ERROR),
+    (f"{W} NULL AND 1 IN ()", ERROR),
+    (f"{W} 1=0 AND NULL AND 1 IN ()", ERROR),
+    (f"{W} count(*) > 0 AND 1 IN ()", ERROR),
+    # A fold stops at a function call or an aggregate: the rest is split and 1=0 moves.
+    (f"{W} 1=0 AND 0 AND count(*) > 0", ERROR),
+    (f"{W} (1=0 AND 0) AND count(*) > 0", ERROR),
+    (f"{W} count(*) > 0 AND 1=0 AND 0", []),
+    (f"{W} (1=0 AND count(*) > 0) AND 0", []),
+    (f"{W} 1=0 AND (count(*) > 0 AND 0)", []),
+    (f"{W} 1=0 AND count(*) > 0 AND 0", []),
+    (f"{W} 1=0 AND count(*) > 0 AND 1 IN ()", []),
+    (f"{W} 1=0 AND 'a' LIKE 'b' AND 0", []),
+    (f"{W} 'a' LIKE 'b' AND 1=0 AND 0", []),
+    (f"{W} 1=0 AND ('a' LIKE 'b' AND 0)", []),
+    (f"{W} 1=0 AND {CONSTERR} AND 0", []),
+    (f"{W} 1=0 AND (0 AND {CONSTERR})", []),
+    (f"{W} 1=0 AND count(*) IN ()", []),
+    (f"{W} count(*) IN () AND 1=0", []),
+    (f"{W} 1=0 AND count(*) NOT IN ()", []),
+    # Not an always-false literal: -0, +0, 0.0, NOT 0, (0 OR 0), NOT IN ().
+    (f"{W} 1=0", []),
+    (f"{W} NULL", []),
+    (f"{W} 1=0 AND 0.0", []),
+    (f"{W} 1=0 AND 1", []),
+    (f"{W} 1=0 AND -0", []),
+    (f"{W} 1=0 AND +0", []),
+    (f"{W} 1=0 AND NOT 0", []),
+    (f"{W} 1=0 AND (0 OR 0)", []),
+    (f"{W} 1=0 AND 1 NOT IN ()", []),
+    (f"{W} NULL AND 1 NOT IN ()", []),
+    (f"{W} path > 'zzz' AND 1=0", []),
+    (f"{W} 1=0 AND {CONSTERR}", []),
+    (f"{W} NOT (1=1 AND 0) AND 1=0", []),
+    (f"{W} (1=1 AND 0) OR 1=0", []),
+    # Agreed before and after.
+    (f"{W} 0", ERROR),
+    (f"{W} 0 AND path > 'zzz'", ERROR),
+    (f"{W} path > 'zzz' AND 0", ERROR),
+    (f"{W} 1 NOT IN ()", ERROR),
+    (f"{W} NOT (1=0 AND 0) AND 0", ERROR),
+    # A folded 0 in front of a constant with a call: the constant still moves.
+    (f"{W} (1=0 AND 0) AND {CONSTERR}", ERROR),
+    (f"{W} {CONSTERR} AND (1=0 AND 0)", ERROR),
+    (f"{W} 1=0 AND 1 IN () AND {CONSTERR}", ERROR),
+    (f"{W} 1 IN () AND {CONSTERR}", ERROR),
+    (f"{W} 1 NOT IN () AND {CONSTERR}", ERROR),
+    # #141's recorded difference: path > 'zzzz' AND 0 folds, so ERR moves alone and raises.
+    (f"{P} path > 'zzzz' AND 0 AND {ERR}", ERROR),
+    (f"{P} (path > 'zzzz' AND 0) AND {ERR}", ERROR),
+    (f"{P} path > 'zzzz' AND ({ERR} AND 0)", []),
+    (f"{P} path > 'zzzz' AND {ERR} AND 0", []),
+    # x IN () with a call in x: FALSE stays, x moves (and runs).
+    (f"{W} ({CONSTERR} IN ()) AND 1=0", ERROR),
+    (f"{W} 1=0 AND ({CONSTERR} IN ())", []),
+    (f"{W} 1=0 AND (path > 'a' AND {CONSTERR} IN ())", []),
+    (f"{P} {ERR} IN () AND path > 'zzz'", ERROR),
+    (f"{P} ({ERR} || 'x') IN () AND path > 'zzz'", ERROR),
+    (f"{P} {ERR} NOT IN () AND path > 'zzz'", []),
+    (f"{P} path > 'zzzz' AND {ERR} IN ()", []),
+    (f"{P} ({CONSTERR} IN ()) AND path > 'zzz'", ERROR),
+    (f"{P} path > 'zzz' AND ({CONSTERR} IN ())", ERROR),
+    (f"{N} {CONSTERR} IN ()", ERROR),
+    (f"{N} ({CONSTERR} || 'x') IN ()", ERROR),
+    (f"{N} count(*) > 0 AND {CONSTERR} IN ()", ERROR),
+    (f"{N} {CONSTERR} IN () AND count(*) > 0", ERROR),
+    (f"{N} {CONSTERR} IN () AND 1=0", ERROR),
+    (f"{N} 1=0 AND {CONSTERR} IN ()", []),
+    (f"{N} NULL AND {CONSTERR} IN ()", []),
+    (f"{N} ({CONSTERR} IN ()) OR count(*) > 0", []),
+    (f"{N} NOT ({CONSTERR} IN ())", []),
+    (f"{N} {CONSTERR} NOT IN ()", []),
+    # A select-list alias is a plain name to the fold; its own expression was folded on its own.
+    (f"SELECT path, 1=0 AND 0 AS z FROM blame WHERE {ERR} GROUP BY path HAVING z", ERROR),
+    (f"SELECT path, 1=0 AS z FROM blame WHERE {ERR} GROUP BY path HAVING z AND 0", ERROR),
+    (f"SELECT path, 1 IN () AS z FROM blame WHERE {ERR} GROUP BY path HAVING z", ERROR),
+    (f"SELECT path, 0 AS z FROM blame WHERE {ERR} GROUP BY path HAVING z", ERROR),
+    (f"SELECT path, {CONSTERR} AS c FROM blame WHERE {ERR} GROUP BY path HAVING 1=0 AND c AND 0", ERROR),
+    (f"SELECT path, 0 AS z FROM blame WHERE {ERR} GROUP BY path HAVING 1=0 AND z", []),
+    (f"SELECT path, 0 AS z FROM blame WHERE {ERR} GROUP BY path HAVING z AND 1=0", []),
+    (f"SELECT path, 1 IN () AS z FROM blame WHERE {ERR} GROUP BY path HAVING 1=0 AND z", []),
+    (f"SELECT path, 1=0 AND path > 'a' AS z FROM blame WHERE {ERR} GROUP BY path HAVING z", []),
+    (f"SELECT path, {CONSTERR} AS c FROM blame WHERE {ERR} GROUP BY path HAVING 1=0 AND c", []),
+    (f"SELECT path, {CONSTERR} AS c FROM blame WHERE line_no < 0 GROUP BY path HAVING c AND 0", []),
+    (f"SELECT path, {CONSTERR} AS c FROM blame WHERE line_no < 0 GROUP BY path HAVING c IN ()", []),
+    (f"SELECT path, {CONSTERR} AS c FROM blame WHERE line_no < 0 GROUP BY path HAVING c", ERROR),
+    (f"SELECT path, {ERR} AS e FROM blame WHERE line_no > 0 GROUP BY path HAVING e IN () AND path > 'zzz'", []),
+    (f"SELECT path, {CONSTERR} IN () AS z FROM blame WHERE line_no < 0 GROUP BY path HAVING z", ERROR),
+    (f"SELECT path, 1=0 AND {CONSTERR} AS z FROM blame WHERE line_no < 0 GROUP BY path HAVING z", []),
+    (f"SELECT path, {CONSTERR} AND 0 AS z FROM blame WHERE line_no < 0 GROUP BY path HAVING z", ERROR),
+    # No GROUP BY: nothing moves, as before.
+    (f"SELECT count(*) FROM blame WHERE {ERR} HAVING 1=0 AND 0", ERROR),
+    (f"SELECT count(*) FROM blame WHERE 1=0 HAVING {CONSTERR} IN ()", []),
+    (f"SELECT count(*) FROM blame WHERE 1=0 HAVING {CONSTERR} NOT IN ()", [(0,)]),
+]
+
+FOLDED_HAVING_EMPTY_CASES = [
+    (f"{W} 1=0 AND 0", []),
+    (f"{W} 1 IN ()", []),
+    (f"{W} (1=0 AND 0) AND {CONSTERR}", ERROR),
+    (f"{W} {CONSTERR} AND (1=0 AND 0)", ERROR),
+    (f"{W} 1=0 AND 1 IN () AND {CONSTERR}", ERROR),
+    (f"{W} 1 IN () AND {CONSTERR}", ERROR),
+    (f"{W} 1=0 AND {CONSTERR} AND 0", []),
+    (f"{W} ({CONSTERR} IN ()) AND 1=0", ERROR),
+    (f"{P} ({CONSTERR} IN ()) AND path > 'zzz'", ERROR),
+    (f"{N} {CONSTERR} IN ()", ERROR),
+    (f"{N} count(*) > 0 AND {CONSTERR} IN ()", ERROR),
+    (f"{N} 1=0 AND {CONSTERR} IN ()", []),
+    (f"SELECT path, {CONSTERR} AS c FROM blame GROUP BY path HAVING c AND 0", []),
+    (f"SELECT path, {CONSTERR} AS c FROM blame GROUP BY path HAVING c", ERROR),
+    (f"SELECT path, {CONSTERR} IN () AS z FROM blame GROUP BY path HAVING z", ERROR),
+]
+
+
+@pytest.mark.parametrize("query, expected", FOLDED_HAVING_CASES)
+def test_a_having_term_moves_as_the_parser_leaves_it(tiny_repo, tiny_conn, query, expected):
+    _check(tiny_conn, tiny_repo, query, expected)
+
+
+@pytest.mark.parametrize("query, expected", FOLDED_HAVING_EMPTY_CASES)
+def test_a_having_term_moves_as_the_parser_leaves_it_on_empty_input(tiny_repo, empty_conn, query, expected):
+    _check(empty_conn, tiny_repo, query, expected, EMPTY_TABLES)

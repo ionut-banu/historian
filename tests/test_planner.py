@@ -2075,3 +2075,99 @@ def test_building_and_printing_a_raising_guard_evaluates_nothing():
     text = format_plan(tree)
     assert f"ConstantGuard ({_CONSTERR})" in text
     assert _chain(tree)[-1].source().scan_calls == []
+
+
+# --- HAVING as SQLite's parser leaves it (#171, QA round 1) -----------------------
+#
+# `tests/differential/test_constant_guard.py`, "A HAVING the parser
+# folds", has the measured answers. These pin which terms move, which
+# stay, and so what the guard holds.
+
+
+def test_a_having_the_parser_folds_to_0_moves_nothing():
+    for having in ("1 = 0 AND 0", "0 AND 1 = 0", "NULL AND 0", "1 = 1 AND 0 AND 1 = 0", "(1 = 0 AND 0) AND path > 'a'", "1 IN ()", "1 = 0 AND 1 IN ()", "1 = 0 AND path IN ()", "1 = 0 AND (1 = 0 AND (1 = 0 AND 0))", "(1 = 0 OR 1 = 0) AND 0"):
+        bound, tree = _planned(f"SELECT count(*) FROM widgets WHERE {_ERR} GROUP BY path HAVING {having}")
+        assert _kinds(tree) == ["Project", "Filter", "Aggregate", "Filter", "Scan"], having
+        assert _chain(tree)[1].predicate() is bound.having, having
+
+
+def test_a_term_that_is_not_an_always_false_literal_does_not_fold():
+    for having in ("1 = 0 AND 0.0", "1 = 0 AND -0", "1 = 0 AND NOT 0", "1 = 0 AND (0 OR 0)", "1 = 0 AND 1 NOT IN ()", "1 = 0 AND '0'"):
+        _bound_stmt, tree = _planned(f"SELECT count(*) FROM widgets GROUP BY path HAVING {having}")
+        assert _kinds(tree)[:3] == ["Project", "Aggregate", "ConstantGuard"], having
+        assert _texts(_guard(tree).terms())[0] == "1 = 0", having
+
+
+def test_a_function_call_stops_the_fold_and_the_folded_part_stays_as_one_term():
+    """`count(*) > 5 AND (1 = 0 AND 0) AND path > 'a'`: the inner `AND`
+    folds, the outer ones do not (an aggregate is a call), so the folded
+    `AND` stays whole, the aggregate stays, and `path > 'a'` moves."""
+    bound, tree = _planned("SELECT count(*) FROM widgets GROUP BY path HAVING count(*) > 5 AND (1 = 0 AND 0) AND path > 'a'")
+    assert _kinds(tree) == ["Project", "Filter", "Aggregate", "Filter", "Scan"]
+    _project, kept, _aggregate, moved, _scan = _chain(tree)
+    folded = bound.having.left.right
+    assert isinstance(folded, And)
+    assert moved.predicate() is bound.having.right
+    assert kept.predicate().right is folded
+    for having, guarded in (
+        ("1 = 0 AND count(*) > 0 AND 0", ["1 = 0"]),
+        ("1 = 0 AND 'a' LIKE 'b' AND 0", ["1 = 0", "'a' LIKE 'b'"]),
+        (f"(1 = 0 AND 0) AND {_CONSTERR}", [_CONSTERR]),
+        (f"1 IN () AND {_CONSTERR}", [_CONSTERR]),
+    ):
+        _b, tree = _planned(f"SELECT count(*) FROM widgets GROUP BY path HAVING {having}")
+        assert _texts(_guard(tree).terms()) == guarded, having
+
+
+def test_an_empty_in_over_a_call_keeps_the_in_and_moves_its_operand():
+    """`x IN ()` with a call in `x` is SQLite's `FALSE AND x`: the
+    `FALSE` stays in `HAVING` (here the `In` itself, which a condition
+    decides without reading `x`), and `x` is a term of its own."""
+    bound, tree = _planned(f"SELECT count(*) FROM widgets GROUP BY path HAVING ({_CONSTERR} IN ()) AND 1 = 0")
+    assert _kinds(tree) == ["Project", "Filter", "Aggregate", "ConstantGuard", "Filter", "Scan"]
+    _project, kept, _aggregate, guard, moved, _scan = _chain(tree)
+    empty_in, one_is_zero = bound.having.left, bound.having.right
+    assert kept.predicate() is empty_in
+    assert walk.split_conjuncts(moved.predicate()) == [empty_in.left, one_is_zero]
+    assert guard.terms()[0] is empty_in.left and guard.terms()[1] is one_is_zero
+    _b, tree = _planned(f"SELECT count(*) FROM widgets GROUP BY path HAVING {_ERR} NOT IN () AND 1 = 0")
+    assert _texts(walk.split_conjuncts(_chain(tree)[4].predicate())) == [f"{_ERR} NOT IN ()", "1 = 0"]
+
+
+def test_an_alias_is_a_plain_name_to_the_fold_and_its_own_expression_folds_alone():
+    bound, tree = _planned("SELECT path, 0 AS z FROM widgets GROUP BY path HAVING 1 = 0 AND z")
+    assert bound.having.right is bound.select_list[1].expr
+    assert _texts(_guard(tree).terms()) == ["1 = 0"]
+    for sql in (
+        "SELECT path, 1 = 0 AND 0 AS z FROM widgets GROUP BY path HAVING z",
+        "SELECT path, 1 = 0 AS z FROM widgets GROUP BY path HAVING z AND 0",
+        "SELECT path, 1 IN () AS z FROM widgets GROUP BY path HAVING z",
+        f"SELECT path, {_CONSTERR} AS c FROM widgets GROUP BY path HAVING 1 = 0 AND c AND 0",
+        f"SELECT path, {_CONSTERR} AS c FROM widgets GROUP BY path HAVING c IN ()",
+    ):
+        _b, tree = _planned(sql)
+        assert _kinds(tree) == ["Project", "Filter", "Aggregate", "Scan"], sql
+    _b, tree = _planned("SELECT path, 1 = 0 AND path > 'a' AS z FROM widgets GROUP BY path HAVING z")
+    assert _texts(_guard(tree).terms()) == ["1 = 0"]
+    _b, tree = _planned(f"SELECT path, {_CONSTERR} IN () AS z FROM widgets GROUP BY path HAVING z")
+    assert _texts(_guard(tree).terms()) == [_CONSTERR]
+
+
+def test_a_deep_having_chain_folds_without_recursion():
+    """A 5000-term `1 = 0 AND ... AND 0`, built by hand past the
+    parser's depth limit, folds whole; with a call at the end the
+    folded prefix stays and the call's term moves."""
+    one_is_zero = lambda: _bin(Op.EQ, _lit(1), _lit(0))  # noqa: E731
+    having = one_is_zero()
+    for _ in range(_DEEP - 2):
+        having = And(having, one_is_zero(), _POS)
+    folded = And(having, _lit(0), _POS)
+    stmt = _stmt([_select_item(_col("path"))], group_by=(_col("path"),), having=folded)
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(_FakeSource([])))
+    assert _kinds(tree) == ["Project", "Filter", "Aggregate", "Scan"]
+    like = Like(left=_lit("a"), pattern=_lit("a"), negated=False, position=_POS, escape=_lit("ab"))
+    stmt = _stmt([_select_item(_col("path"))], group_by=(_col("path"),), having=And(folded, like, _POS))
+    tree = plan(stmt, Path("/nonexistent"), tables=_fake_tables(_FakeSource([])))
+    assert _kinds(tree) == ["Project", "Filter", "Aggregate", "ConstantGuard", "Filter", "Scan"]
+    assert _guard(tree).terms() == (like,)
+    assert _chain(tree)[1].predicate() is folded

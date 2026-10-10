@@ -622,18 +622,49 @@ against the oracle (`_docs/decisions.md`, 2026-10-06, #141):
 - It applies only to a query with a `GROUP BY`. With none, nothing
   moves.
 - `HAVING` is split into terms on every `AND`, through nested `AND`s
-  and parentheses, left to right. An `OR`, a `NOT (...)`, a
-  comparison or anything else that is not an `AND` is one term and is
-  never split further.
+  and parentheses, left to right, as SQLite's parser leaves it (two
+  bullets down). An `OR`, a `NOT (...)`, a comparison or anything else
+  that is not an `AND` is one term and is never split further.
 - A term moves when it contains no aggregate call and every column
   reference in it lies inside a subexpression that matches a `GROUP BY`
   key by shape, or when it contains no column reference at all. A term
   with an aggregate anywhere in it stays in `HAVING`, `OR` branches
   included.
-- A term that is an integer literal `0` (`0`, `00`, `(0)`) stays in
-  `HAVING`: SQLite does not move a term it knows is always false.
-  Every other constant moves, `0.0`, `-0`, `NULL` and `1 > 2`
-  included.
+- The `HAVING` that is split is the one SQLite's parser leaves, not
+  the one written (`_docs/decisions.md`, 2026-10-10). The parser folds
+  `x AND y` to the integer `0` when one side is *always false* and
+  neither side contains a function call (`LIKE` and aggregate calls
+  are calls). Always false is an integer literal `0` (`0`, `00`,
+  `(0)`; not `-0`, `+0`, `0.0`, `'0'` or `NOT 0`), `x IN ()` when `x`
+  calls no function, or an `AND` already folded. The fold works up
+  from the innermost `AND` as written and stops at the first call:
+  `1 = 0 AND 0`, `NULL AND 1 IN ()` and `1 = 0 AND path > 'a' AND 0`
+  fold whole; in `1 = 0 AND count(*) > 0 AND 0` and `count(*) > 0 AND
+  1 = 0 AND 0` the `0` is a term of its own. A select-list alias is a
+  plain name to the fold, whatever it stands for, and its own
+  expression was folded on its own: with `CONSTERR AS c`, `1 = 0 AND c
+  AND 0` folds whole; with `1 = 0 AND 0 AS z`, `HAVING z` is always
+  false. `x IN ()` with a call in `x` is `FALSE AND x` to SQLite,
+  which the fold does not touch: the `FALSE` and `x` are two terms.
+- A term that is always false - an integer literal `0`, `x IN ()`
+  with no call in `x`, a folded `AND`, or the `FALSE` of `x IN ()`
+  over a call - stays in `HAVING`: SQLite does not move a term it
+  knows is always false. Every other constant moves, `0.0`, `-0`,
+  `NULL`, `1 > 2` and `1 NOT IN ()` included.
+- The planner plans that `HAVING`, with or without a `GROUP BY`: a
+  folded `AND` is the integer `0`, and `x IN ()` and `x NOT IN ()`
+  with no call in `x` are `0` and `1`, wherever they are, inside an
+  `OR` or a `NOT` too. So what is left decides whether a term has a
+  column (`(path > 'a' AND 0) OR 1 = 0` is the constant `0 OR 1 = 0`)
+  and which operands a condition skips (`NOT (NOT ERR AND (path IN ()
+  AND 1 = 1))` is `NOT (NOT ERR AND 0)`, which never runs `ERR`). A
+  fold drops only parts that call nothing outside an alias, so it
+  changes no row. `x IN ()` and `x NOT IN ()` with a call in `x` are
+  `0 AND x` and `1 OR x`: the `0` stays and `x` moves or stays as any
+  other term, a condition skips `x` (`HAVING max(path) LIKE 'a' ESCAPE
+  'ab' AND CONSTERR IN ()` raises nothing), and a value still
+  evaluates it (`HAVING (CONSTERR IN ()) = 0` raises). `--explain`
+  prints the `HAVING` it plans.
 - The moved terms run in `HAVING` order, after every term of the
   query's own `WHERE`, and each is evaluated as written, over the
   scan's row. They leave `HAVING`: the planner builds one `Filter`
@@ -654,8 +685,13 @@ against the oracle (`_docs/decisions.md`, 2026-10-06, #141):
 A moved term with no column reference is a constant: like a constant
 `WHERE` term it is decided once, before any row, after every constant
 term of the `WHERE` (see "`WHERE` terms with no column reference"
-below). The integer literal `0` stays in `HAVING` and is not one of
-them, so `GROUP BY path HAVING 0 AND CONSTERR` raises.
+below). An always-false term stays in `HAVING` and is not one of
+them, so `GROUP BY path HAVING 0 AND CONSTERR` raises, and `WHERE ERR
+GROUP BY path HAVING 1 = 0 AND 0` and `... HAVING 1 IN ()` raise
+through `ERR`: the `HAVING` is one always-false term, nothing moves,
+and no constant is decided before the rows. `HAVING (CONSTERR IN ())
+AND 1 = 0` raises before any row: `CONSTERR` is a moved constant term
+ahead of `1 = 0`.
 
 ### Constant propagation in `WHERE`
 
@@ -754,8 +790,11 @@ against the oracle (Python `sqlite3` 3.50.4; `_docs/decisions.md`,
 4. **Moved `HAVING` terms.** With a `GROUP BY`, a `HAVING` term that
    moves below the aggregate and has no column is a constant term of
    the same list, after every constant term of the `WHERE`, in
-   `HAVING` order. A `HAVING` with no `GROUP BY` moves nothing and
-   runs once on the one aggregate row, as before.
+   `HAVING` order. Which terms move is decided on the `HAVING` as
+   SQLite's parser leaves it, and an always-false term never moves
+   (see "`HAVING` terms that move below the aggregate"). A `HAVING`
+   with no `GROUP BY` moves nothing and runs once on the one
+   aggregate row, as before.
 5. **Not evaluated when no row is pulled.** `LIMIT 0` evaluates
    nothing: `WHERE CONSTERR LIMIT 0` returns no rows.
 6. **Everything per row is unchanged.** The other terms run per row,

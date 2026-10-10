@@ -3882,3 +3882,111 @@ evaluation-order sweep is unchanged (its leaves all read a column) and
 still shows 0 mismatches: 3,377 tests, 10 min 37 s as pytest reports
 it. Every mutation the issue lists was applied by hand and is caught
 by a named test (recorded on the issue).
+
+2026-10-10 - Moved HAVING terms are chosen from the HAVING SQLite's parser leaves
+
+Issue #171, QA round 1 (FAIL). The guard decided a moved `HAVING`
+constant before the per-row `WHERE` where SQLite does not: with `ERR`
+for `path LIKE 'a' ESCAPE 'ab'`, `SELECT path FROM blame WHERE ERR
+GROUP BY path HAVING 1=0 AND 0` and `... HAVING 1 IN ()` raise in
+SQLite and returned no rows, where `main` (no guard, the moved `1=0`
+per row after `ERR`) had agreed. The #141 entry's "the integer literal
+`0` stays" was the visible half of a wider rule, and #171's guard made
+the rest observable.
+
+The rule, measured on the pinned oracle (Python `sqlite3` 3.50.4)
+through the harness's loader over `tiny` and an empty `blame`, and
+consistent with SQLite's source:
+
+- The parser builds every `AND` with `sqlite3ExprAnd`, which replaces
+  `x AND y` by the integer `0` when one side has `EP_IsFalse` and
+  neither has `EP_HasFunc`. `EP_IsFalse` is on an integer token of
+  value 0 (`0`, `00`, `(0)`; not `-0`, `+0`, `0.0`, `'0'`, `NOT 0`,
+  `(0 OR 0)`), on `x IN ()` (replaced by `FALSE`) and on a folded `0`.
+  `EP_HasFunc` is any function call below, `LIKE` and aggregates
+  included; `BETWEEN`, `IN (...)`, `||` and comparisons are not calls.
+  So `1=0 AND 0`, `0 AND 1=0`, `NULL AND 0`, `1=1 AND 0 AND 1=0`,
+  `(1=0 OR 1=0) AND 0`, `1=0 AND 1 BETWEEN 2 AND 3 AND 0` and `NULL
+  AND 1 IN ()` fold whole; `1=0 AND count(*) > 0 AND 0`, `count(*) > 0
+  AND 1=0 AND 0`, `1=0 AND 'a' LIKE 'b' AND 0` and `1=0 AND (0 AND
+  CONSTERR)` do not, and their `1=0` moves (no rows). `1=0 AND 0 AND
+  count(*) > 0` folds its first `AND` and then stops: nothing moves.
+- `x IN ()` with a call in `x` is not replaced: `CONSTERR IN ()`
+  raises in a select list. It behaves as `FALSE AND x` built without
+  the fold: in `HAVING` its `FALSE` stays and `x` moves by the usual
+  rule, so `WHERE line_no < 0 GROUP BY path HAVING CONSTERR IN ()`
+  raises even over an empty table, `WHERE line_no > 0 ... HAVING ERR
+  IN () AND path > 'zzz'` raises, and `... HAVING NOT (CONSTERR IN
+  ())` and `... HAVING (CONSTERR IN ()) OR count(*) > 0` do not (one
+  term, decided `FALSE` without `x`). In `WHERE`, `CONSTERR IN ()`
+  returns no rows: the `FALSE` comes first.
+- A select-list alias is a name when `HAVING` is parsed: no call, not
+  a literal. Its expression was folded with the select list and is
+  spliced in after, before `havingToWhere`: with `0 AS z`, `HAVING 1=0
+  AND z` returns no rows (no fold; `z` stays, always false) and
+  `HAVING z` raises; with `1=0 AND 0 AS z`, `HAVING z` raises; with
+  `1=0 AS z`, `HAVING z AND 0` raises; with `CONSTERR AS c`, `HAVING
+  1=0 AND c AND 0` raises through `ERR`, `HAVING c AND 0` and `HAVING
+  c IN ()` never run `c`; with `1=0 AND path > 'a' AS z`, `HAVING z`
+  is split and its `1=0` moves.
+- `havingToWhere` walks the `AND`s of the result after name
+  resolution and leaves every always-false term (`ExprAlwaysFalse`) in
+  `HAVING`; every other term moves or stays by the #141 rule.
+
+Design: the planner plans the `HAVING` the parser leaves.
+`_as_parsed` rewrites the bound `HAVING` bottom-up over an explicit
+stack (no recursion; a 5000-term chain is tested): an `AND` that folds
+becomes `Literal(0)`, `x IN ()` / `x NOT IN ()` with no call in `x`
+become `Literal(0)` / `Literal(1)`, and with a call in `x` they
+become `0 AND x` / `1 OR x`; an alias is a name to the fold and its
+own expression is rewritten on its own; a `HAVING` that does not
+change is returned as the same object, so the plan of every other
+query is unchanged. `_move_having_terms` then splits the result on its
+`AND`s: an integer `0` stays and the rest moves by the #141 rule. A
+condition skips `x` in `0 AND x` by the #189 rule, as SQLite's does,
+and a value evaluates it, as SQLite's does (`HAVING (CONSTERR IN ()) =
+0` raises, `HAVING max(path) LIKE 'a' ESCAPE 'ab' AND CONSTERR IN ()`
+does not). An alias is recognised as the select-list expression object
+the binder splices in (`_find_alias_expr`), which a planner test pins.
+
+A first version only decided the split the same way and kept the bound
+terms as written. A seeded probe (below) showed why that is not
+enough: the move is also what exposes or hides a fold inside a term.
+`WHERE line_no = 1 GROUP BY path HAVING (1 AND 0 AND path IN () OR
+00) AND CONSTERR IN ()` is no rows in SQLite, where the first term is
+the constant `0 OR 00` decided before `CONSTERR`; kept as written it
+has a column, so `CONSTERR` was decided first and raised. `HAVING path
+IN () AND NOT (NOT (ERR AND -0) AND (path IN () AND 1 = 1)) AND path >
+'zzz'` (under `WHERE line_no > 0`) is no rows in SQLite, where the
+inner `AND` is `0` and the condition never reaches `ERR`; with `path
+IN ()` correctly left in `HAVING`, the term as written ran `ERR` per
+row. Both agreed on `main` only because `main` moved the always-false
+term and it filtered every row first. Rewriting fixes both, and the
+fold applies the same way to a `HAVING` with no `GROUP BY`: `SELECT
+count(*) FROM blame HAVING max(path) LIKE 'a' ESCAPE 'ab' AND 1 IN ()`
+returns no rows in both now (it raised in historian before).
+`--explain` prints the rewritten `HAVING`.
+
+The `WHERE` is not rewritten: its folds change pushdown negotiation
+and the guard's terms, and are left with the rest of the parse-time
+folding (#185, #191).
+
+This also replicates the difference the #141 entry recorded as not
+replicated: `WHERE line_no > 0 GROUP BY path HAVING path > 'zzzz' AND
+0 AND ERR` now raises in both (the folded `path > 'zzzz' AND 0` stays,
+`ERR` moves alone), and the #171 entry's list of what is left of the
+parse-time-folding difference loses that item.
+
+Left as they are, the same on `main`, recorded on #171 for triage:
+the same folds in `WHERE` (`WHERE ERR AND ((line_no > 0 AND 0) OR
+1=0)` is no rows in SQLite, where the term is the constant `0 OR 1=0`;
+`WHERE ERR AND path IN ()` likewise), which is #191's and #185's
+ground.
+
+Tests: `tests/differential/test_constant_guard.py` pins every shape
+above to the oracle's outcome, over `tiny` and over an empty table,
+each with and without pushdown; planner unit tests pin which terms
+move, stay and are guarded. One planner test changed by design: its
+`HAVING 0 AND 'a' = 'a' AND ...` folds `0 AND 'a' = 'a'`, so `'a' =
+'a'` no longer moves; the test now also covers the order with the `0`
+after a call, where it still moves.
